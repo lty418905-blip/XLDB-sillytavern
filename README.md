@@ -9,3 +9,4 @@ Windows x64 用户从 [最新 Release](https://github.com/lty418905-blip/XLDB-si
 本仓库提供 Tavern 入口；运行时依赖安装在包内 `.local/`，私有令牌与模型配置放在安装目录旁的私有目录。
 
 [连接与配置](INSTALL_TAVERN.md) · [故障恢复](RECOVERY.md) · [许可](LICENSE.md) · [第三方声明](THIRD_PARTY_NOTICES.md)
+首次安装会自动下载、校验权重与便携运行时。酒馆包双击 START-XLDB.cmd 即安装对应依赖并启动。
