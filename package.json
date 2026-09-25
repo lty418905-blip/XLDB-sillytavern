@@ -1,0 +1,14 @@
+{
+  "name": "xldb-sillytavern",
+  "version": "0.1.3-mvp",
+  "private": true,
+  "license": "SEE LICENSE IN LICENSE.md",
+  "type": "module",
+  "engines": {
+    "node": ">=24.18.1 <25"
+  },
+  "scripts": {
+    "start": "node src/server.ts",
+    "typecheck": "node .local/tooling/node_modules/typescript/bin/tsc -p tsconfig.json"
+  }
+}

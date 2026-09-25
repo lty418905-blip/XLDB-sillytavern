@@ -1,0 +1,70 @@
+{
+  "format": 1,
+  "tag": "agent-v0.1.0-mvp",
+  "baseUrl": "https://github.com/lty418905-blip/XLDB/releases/download/agent-v0.1.0-mvp/",
+  "model": {
+    "bytes": 2393718620,
+    "sha256": "a3c3503b71a04da0e30cbd17362f5733ba0a5ccae6d3eb5db7a84a2398a4953b",
+    "parts": [
+      {
+        "name": "AgentJev-model.part01",
+        "bytes": 268435456,
+        "sha256": "1c250742596183b1ce4d6bc58e543211cbe17f5c404e6e3a3fd2e5a26f203b86",
+        "offset": 0
+      },
+      {
+        "name": "AgentJev-model.part02",
+        "bytes": 268435456,
+        "sha256": "cf849814df5da333a9c5f053a6fe469677837300745f5a86232097ac542dd103",
+        "offset": 268435456
+      },
+      {
+        "name": "AgentJev-model.part03",
+        "bytes": 268435456,
+        "sha256": "735a55ef2aced36c18cf4cbe09316293fdeffe55c5c748e000a13745754ae67a",
+        "offset": 536870912
+      },
+      {
+        "name": "AgentJev-model.part04",
+        "bytes": 268435456,
+        "sha256": "e89524d3c249eecacc5f79500845eb2cf37c10afc2d750aca3aa5b47d90ec31d",
+        "offset": 805306368
+      },
+      {
+        "name": "AgentJev-model.part05",
+        "bytes": 268435456,
+        "sha256": "c49f4fdecaddf780a9ceaf153a67da60431fda6f280c5d5ed9558da98d41a147",
+        "offset": 1073741824
+      },
+      {
+        "name": "AgentJev-model.part06",
+        "bytes": 268435456,
+        "sha256": "cb865b13ad6ed4b58c404c4dc4d196e727cf5165365352354bbf253d5e47d9ac",
+        "offset": 1342177280
+      },
+      {
+        "name": "AgentJev-model.part07",
+        "bytes": 268435456,
+        "sha256": "4abc52a80a621bdb666ee7b55842c4c74884621c7a57de5ecbb3bf0493a8fd9b",
+        "offset": 1610612736
+      },
+      {
+        "name": "AgentJev-model.part08",
+        "bytes": 268435456,
+        "sha256": "833ac5dc5cdea40e1dc83fec0a8e4e27712a2ed64dd5c0eaaa38c40c5297c268",
+        "offset": 1879048192
+      },
+      {
+        "name": "AgentJev-model.part09",
+        "bytes": 246234972,
+        "sha256": "254b4c3bba7d8d3d4bd98e98bb8dd9660db23f81415714eec92472c58d9cd45a",
+        "offset": 2147483648
+      }
+    ]
+  },
+  "runtime": {
+    "name": "AgentJev-runtime.zip",
+    "bytes": 162408543,
+    "sha256": "51f6d03fc4e2a0366f6e6232f46c07f6effbf17b623a3789b7524c7347339cdd"
+  }
+}
