@@ -10,5 +10,7 @@ Windows x64 用户从 [最新 Release](https://github.com/lty418905-blip/XLDB-si
 
 首次安装请在酒馆包双击 START-XLDB.cmd会自动下载、校验权重与便携运行时。自动安装对应依赖并启动。
 
+建议预留至少5GB磁盘空间
+
 [连接与配置](INSTALL_TAVERN.md) · [故障恢复](RECOVERY.md) · [许可](LICENSE.md) · [第三方声明](THIRD_PARTY_NOTICES.md)
 
