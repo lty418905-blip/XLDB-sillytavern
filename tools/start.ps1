@@ -22,7 +22,8 @@ $private = [IO.Path]::GetFullPath($PrivateDirectory)
 $data = [IO.Path]::GetFullPath($DataDirectory)
 $receiptPath = Join-Path $root '.local\install\server-receipt.json'
 $installReceiptPath = Join-Path $root '.local\install\install-receipt.json'
-$serverPath = [IO.Path]::GetFullPath((Join-Path $root 'src\server.ts'))
+$serverPath = [IO.Path]::GetFullPath((Join-Path $root 'sillytavern\src\server.ts'))
+$legacyServerPath = [IO.Path]::GetFullPath((Join-Path $root 'src\server.ts'))
 
 function Write-JsonAtomic([string]$Path, [object]$Value) {
   if (Test-Path -LiteralPath $Path -PathType Container) { throw '运行记录目标是目录，无法保存。' }
@@ -129,6 +130,13 @@ if (Test-Path -LiteralPath $receiptPath -PathType Leaf) {
   try {
     $existing = [IO.File]::ReadAllText($receiptPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
     $existingPid = [int]$existing.pid
+    # A 0.1.3-mvp core (flat src\server.ts) still running under this same root after an overlay upgrade: name it
+    # instead of reporting an unknown process on the port. stop.ps1 accepts that record.
+    if ($existing.root -eq $root -and $existingPid -gt 0 -and
+        [IO.Path]::GetFullPath([string]$existing.serverPath) -eq $legacyServerPath -and
+        (Test-OwnedProcess $existingPid ([string]$existing.nodePath) $legacyServerPath)) {
+      throw "旧版 XLDB 核心（PID $existingPid）仍在运行；请先执行 tools\stop.ps1 停止它，再重新运行 START-XLDB.cmd。"
+    }
     if (Test-OwnedProcess $existingPid $nodePath $serverPath) {
       if ($existing.root -ne $root -or [int]$existing.port -ne $Port -or $existing.privateDirectory -ne $private -or $existing.dataDirectory -ne $data) {
         throw '已运行的 XLDB 属于同一安装根但启动参数不同；请显式 stop 后再按新参数启动。'
@@ -144,7 +152,7 @@ if (Test-Path -LiteralPath $receiptPath -PathType Leaf) {
       return
     }
   } catch {
-    if ($_.Exception.Message -like '已运行的 XLDB*' -or $_.Exception.Message -like '已有同根 XLDB*') { throw }
+    if ($_.Exception.Message -like '已运行的 XLDB*' -or $_.Exception.Message -like '已有同根 XLDB*' -or $_.Exception.Message -like '旧版 XLDB*') { throw }
   }
 }
 

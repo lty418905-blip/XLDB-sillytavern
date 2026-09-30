@@ -15,6 +15,17 @@ function packageVersion(base,name){
   return JSON.parse(fs.readFileSync(path.join(base,'node_modules',...name.split('/'),'package.json'),'utf8')).version;
 }
 
+/** assets_present, or why the core will rank NPC emotion deterministically: missing, incomplete or runtime_mismatch. */
+function agentJevAssets(assets){
+  const local=path.join(root,'.local','agentjev');
+  const model=path.join(local,'model','model.safetensors');
+  if(!fs.existsSync(model)||!fs.existsSync(path.join(local,'runtime','python.exe')))return 'missing';
+  if(fs.statSync(model).size!==assets.model.bytes)return 'incomplete';
+  let receipt='';
+  try{receipt=fs.readFileSync(path.join(local,'release-runtime.sha256'),'utf8').trim();}catch{}
+  return receipt===assets.runtime.sha256?'assets_present':'runtime_mismatch';
+}
+
 try {
   assert.equal(process.platform,'win32','Windows is required');
   assert.equal(process.arch,'x64','Windows x64 Node.js is required');
@@ -33,17 +44,16 @@ try {
   fs.mkdirSync(diagnostic,{recursive:true});
   const connection=await lance.connect(path.join(diagnostic,'lance'));
   if(typeof connection.close==='function')connection.close();
-  const server=await import(pathToFileURL(path.join(root,'src','server.ts')));
+  const server=await import(pathToFileURL(path.join(root,'sillytavern','src','server.ts')));
   assert.equal(typeof server.createServer,'function','Tavern core server entry is unavailable');
+  // AgentJev only ranks NPC emotion when more than four NPCs wait; without it the core runs in degraded mode with the
+  // deterministic order, so its absence is reported, never a failed install.
   const assets=JSON.parse(fs.readFileSync(path.join(root,'tools','agent-assets.json'),'utf8'));
-  const model=path.join(root,'.local','agentjev','model','model.safetensors');
-  assert.equal(fs.statSync(model).size,assets.model.bytes,'AgentJev model is incomplete');
-  const runtimeReceipt=fs.readFileSync(path.join(root,'.local','agentjev','release-runtime.sha256'),'utf8').trim();
-  assert.equal(runtimeReceipt,assets.runtime.sha256,'AgentJev runtime receipt does not match the release assets');
-  assert.ok(fs.existsSync(path.join(root,'.local','agentjev','runtime','python.exe')),'AgentJev runtime is missing');
+  const agentjev=agentJevAssets(assets);
 
-  if(!quiet)process.stdout.write(JSON.stringify({status:'ready',root,node:{version:process.versions.node,architecture:process.arch},
-    checks:{typescript:'5.9.3',lancedb:'0.39.0',lancedbNative:'0.39.0',tavernCore:'imported',agentjev:'assets_present'}})+'\n');
+  if(!quiet)process.stdout.write(JSON.stringify({status:agentjev==='assets_present'?'ready':'degraded',root,
+    node:{version:process.versions.node,architecture:process.arch},
+    checks:{typescript:'5.9.3',lancedb:'0.39.0',lancedbNative:'0.39.0',tavernCore:'imported',agentjev}})+'\n');
 } finally {
   const resolved=path.resolve(diagnostic);
   if(!resolved.startsWith(`${diagnosticBase}${path.sep}`))throw new Error('invalid install-check cleanup path');

@@ -7,7 +7,13 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
     "erasableSyntaxOnly": true,
-    "typeRoots": [".local/tooling/node_modules/@types"]
+    "typeRoots": [
+      ".local/tooling/node_modules/@types"
+    ]
   },
-  "include": ["src/**/*.ts"]
+  "include": [
+    "shared/src/**/*.ts",
+    "companion-agent/src/**/*.ts",
+    "sillytavern/src/**/*.ts"
+  ]
 }

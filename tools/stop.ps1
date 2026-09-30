@@ -6,7 +6,10 @@ Set-StrictMode -Version Latest
 
 $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $receiptPath = Join-Path $root '.local\install\server-receipt.json'
-$expectedServer = [IO.Path]::GetFullPath((Join-Path $root 'src\server.ts'))
+$expectedServer = [IO.Path]::GetFullPath((Join-Path $root 'sillytavern\src\server.ts'))
+# 0.1.3-mvp started the core from the flat src\server.ts; an overlay upgrade keeps that record under the same root,
+# so its still-running core stays stoppable. Only this one earlier entry is accepted.
+$legacyServer = [IO.Path]::GetFullPath((Join-Path $root 'src\server.ts'))
 
 function Write-JsonAtomic([string]$Path, [object]$Value) {
   $directory = Split-Path -Parent $Path
@@ -18,7 +21,9 @@ function Write-JsonAtomic([string]$Path, [object]$Value) {
 if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) { Write-Host '没有本安装根创建的运行记录；未终止任何进程。'; return }
 $receipt = [IO.File]::ReadAllText($receiptPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
 if ($receipt.root -ne $root) { throw '运行记录的安装根不匹配；未终止任何进程。' }
-if ([IO.Path]::GetFullPath([string]$receipt.serverPath) -ne $expectedServer) { throw '运行记录的核心入口不属于本安装根；未终止任何进程。' }
+$recordedServer = [IO.Path]::GetFullPath([string]$receipt.serverPath)
+if ($recordedServer -ne $expectedServer -and $recordedServer -ne $legacyServer) { throw '运行记录的核心入口不属于本安装根；未终止任何进程。' }
+$expectedServer = $recordedServer
 if ($receipt.status -ne 'running' -or $null -eq $receipt.pid) { Write-Host 'XLDB 已停止；未终止任何进程。'; return }
 $pidValue = [int]$receipt.pid
 $process = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction SilentlyContinue
