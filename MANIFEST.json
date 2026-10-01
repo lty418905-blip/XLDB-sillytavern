@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "d607ce09602c519a0773a46c15fcf753c7b01b4ce71ca70ca95d0eeddef816fc",
+  "sourceManifestSha256": "b1150e142dafd371e9d734e3c59c15bcb842990e31d12a661caec04d27abc493",
   "files": [
     {
       "file": ".gitattributes",
@@ -259,8 +259,8 @@
     },
     {
       "file": "shared/src/memory/retention.ts",
-      "sha256": "50873fc4c284737a5d678cc1e62288e7d116c9e77db605634c545422a114f99c",
-      "bytes": 30187
+      "sha256": "2eb64ff4f34e8c22d6dfe4f7ed0a1a8e212bb97c962106bb50b136124e2767ca",
+      "bytes": 30686
     },
     {
       "file": "shared/src/memory/retrieval.ts",
@@ -549,12 +549,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "2f986d535e244c77240083d8d164f6be2f9bb5714bef2bc6ed645be62eb0e472",
+      "sha256": "3a046ec9f8cc75430e201f5bf63a6fd6b37f6005f241f6a176b6358c4b580e63",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "819803f811800f3842aff998cb0f21a1729cad1e784ac5ba9220a26a3838140b",
+      "sha256": "1fccbe1b78ab70c521df253f249b8d38f386d43f5e831801ec4e84d8211622a4",
       "bytes": 355817
     }
   ]

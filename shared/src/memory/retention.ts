@@ -148,6 +148,8 @@ export function rememberedFragmentsOf(memory:Memory):string[] {
   // The scene comes first, then the sensory cues in stored order; a non-string candidate is skipped below.
   const candidates:unknown[]=[episode?.scene,...(Array.isArray(episode?.sensoryCues)?episode.sensoryCues:[])];
   const bound=FRAGMENT_TOTAL_RATIO*compact(memory.detail).length;
+  // The emotional evidence quote is stored evidence only (EmotionalProtection.basisQuote); empty when it has no letters.
+  const evidence=compact(memory.retention?.emotionalProtection?.basisQuote??'');
   const fragments:string[]=[];
   const seen=new Set<string>();
   let kept=0;
@@ -163,6 +165,8 @@ export function rememberedFragmentsOf(memory:Memory):string[] {
     if(size<minimum)continue;
     if(size>maximum)continue;
     const key=compact(fragment);
+    // Punctuation only ('-', an apostrophe): a word for units(), nothing to show.
+    if(!key)continue;
     // Half of the detail or more is the event, not a fragment; a dropped candidate adds nothing to the total.
     if(kept+key.length>=bound)continue;
     // A precise value of its own, whatever the detail contains.
@@ -170,6 +174,8 @@ export function rememberedFragmentsOf(memory:Memory):string[] {
     if(numericRanges(fragment).length>0)continue;
     // Defence in depth for hand-built or migrated episodes that carry protected facts.
     if(maskLayer(memory.detail,fragment,memory.protectedFacts).state!=='visible')continue;
+    // The evidence quote never reaches the faded view: a candidate that contains it or lies inside it is dropped.
+    if(evidence&&(key.includes(evidence)||evidence.includes(key)))continue;
     if(seen.has(key))continue;
     seen.add(key);fragments.push(fragment);kept+=key.length;
   }
