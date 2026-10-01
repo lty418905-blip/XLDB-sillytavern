@@ -126,6 +126,6 @@ export function utcDayKey(ms: unknown): string | null {
 export function redactSecret(text: unknown, secret: string | null): string {
   let out: string;
   try { out = typeof text === 'string' ? text : String(text); } catch { out = ''; }
-  if (typeof secret === 'string' && secret.length > 0) out = out.split(secret).join('[REDACTED]');
+  if (typeof secret === 'string' && secret.length > 0) out = out.replace(new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '[REDACTED]');
   return out.replace(/bearer\s+[^\s"',}]+/gi, 'Bearer [REDACTED]').slice(0, JUDGE_LIMITS.maxDetailChars);
 }

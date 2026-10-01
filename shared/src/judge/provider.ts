@@ -57,7 +57,7 @@ const record = (v: unknown): v is Record<string, unknown> => v !== null && typeo
 function networkCode(error: unknown, key: string): string {
   try {
     const e = error as {cause?: {code?: unknown}; code?: unknown; name?: unknown};
-    for (const v of [e?.cause?.code, e?.code, e?.name]) if (typeof v === 'string' && /^[A-Za-z0-9_]{1,40}$/.test(v)) return key !== '' && v.includes(key) ? 'network_error' : v;
+    for (const v of [e?.cause?.code, e?.code, e?.name]) if (typeof v === 'string' && /^[A-Za-z0-9_]{1,40}$/.test(v)) return key !== '' && v.toLowerCase().includes(key.toLowerCase()) ? 'network_error' : v;
   } catch { /* 回呼可能回傳無法讀取的錯誤。 */ }
   return 'network_error';
 }
@@ -89,9 +89,9 @@ export function createJudgeProvider(options: JudgeProviderOptions = {}): JudgePr
     if (m.own.day !== today) {m.own = {day: today, n: 0, atMs: now}; m.others = 0; m.othersNeedsUser = [];}
     return m;
   }
-  // REVIEW-1 L3：損壞的共享視窗不納入閘門，也不再寫回底稿。
+  // REVIEW-2 R1：24 小時合法視窗加 1 小時對時回退寬容，超過才丟棄。
   function discardOversizedWindow(model: {blockedUntilMs: number | null}, now: number): void {
-    if (model.blockedUntilMs !== null && model.blockedUntilMs > now + 86400000) model.blockedUntilMs = null;
+    if (model.blockedUntilMs !== null && model.blockedUntilMs > now + 86400000 + HOUR) model.blockedUntilMs = null;
   }
   function read(now: number): ReturnType<typeof readJudgeQuotaFile> {
     const r = readJudgeQuotaFile(quotaPath!, fs);
@@ -102,10 +102,10 @@ export function createJudgeProvider(options: JudgeProviderOptions = {}): JudgePr
   }
   function refresh(key: string, now: number): void {
     const m = memory(key, now);
+    discardOversizedWindow(m, now);
     if (quotaPath === null) return;
     const r = read(now);
     if (!r.ok) return;
-    discardOversizedWindow(m, now);
     const shared = r.file?.models[key];
     const writers = Object.entries(shared?.writers ?? {}).filter(([id, w]) => id !== writerId && w.day === m.own.day);
     m.others = writers.reduce((n, [, w]) => n + w.n, 0);
@@ -260,7 +260,7 @@ export function createJudgeProvider(options: JudgeProviderOptions = {}): JudgePr
                 if (typeof text !== 'string' || text.length > JUDGE_LIMITS.maxResponseChars) {finish('bad_response', 'response_too_long'); return;}
                 let body: unknown;
                 try {body = JSON.parse(text);} catch {finish('bad_response', 'invalid_json'); return;}
-                if (record(body) && typeof body.model === 'string' && JUDGE_MODEL_PATTERN.test(body.model) && !body.model.includes(key)) resolvedModel = body.model;
+                if (record(body) && typeof body.model === 'string' && JUDGE_MODEL_PATTERN.test(body.model) && !body.model.toLowerCase().includes(key.toLowerCase())) resolvedModel = body.model;
                 const parsed = parseSystemoneAnswers(request, body, preset.questionTypes);
                 if (!parsed.ok) {finish('bad_response', parsed.detail); return;}
                 finish('ok', null, parsed.answers); return;
