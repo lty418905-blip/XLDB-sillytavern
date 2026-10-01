@@ -1,5 +1,6 @@
 import { calculate } from '../core/arithmetic.ts';
 import type { PerspectivePlan } from './types.ts';
+import {legacyTemporalGuard} from './time-expressions.ts';
 
 export const WORLD_PLAYER_ID = 'player' as const;
 
@@ -195,7 +196,7 @@ interface ValidatedSettings {
 const MONEY = /^(?:0|[1-9]\d*)\.\d{2}$/;
 const POSITIVE_INTEGER = /^[1-9]\d*$/;
 const ISO_WITH_ZONE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:\d{2})$/;
-const TEMPORAL_GUARD = /计划|打算|准备(?:要)?|将(?:要|来)|明天(?:要|会)?|下次|如果|假如|回忆|想起|曾经|过去(?!了)|那时|当时|以前|\b(?:plan(?:ned|ning)?|will|would|tomorrow|if|remember(?:ed)?|recall(?:ed)?|ago|formerly)\b/iu;
+const TEMPORAL_GUARD = legacyTemporalGuard;
 const TIME_FACTORS = new Map<string, number>([
   ['milliseconds', 1], ['seconds', 1_000], ['minutes', 60_000], ['hours', 3_600_000], ['days', 86_400_000],
 ]);

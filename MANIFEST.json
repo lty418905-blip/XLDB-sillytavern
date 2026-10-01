@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "e2cfe1e1ce1d87bdeb634f39e02fd215f5f745e2300cd1e2858591d3af3dba84",
+  "sourceManifestSha256": "d607ce09602c519a0773a46c15fcf753c7b01b4ce71ca70ca95d0eeddef816fc",
   "files": [
     {
       "file": ".gitattributes",
@@ -439,8 +439,8 @@
     },
     {
       "file": "shared/src/scene/world-state.ts",
-      "sha256": "cc397c664efcfb89b136a400a62e49e7a82733f89f7e91bc039341542836add6",
-      "bytes": 39760
+      "sha256": "a5fe466c5419b950f1b72dc339693e532331f05521a32e6189eb5a97229ed8ff",
+      "bytes": 39603
     },
     {
       "file": "shared/third-party/agentjev/agentjev/model.py",
@@ -549,12 +549,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "c3f3f11ad0ff2f4618e695b3fb7e4ab54fb51a0e4ab708eed72ac613bdb6c22b",
+      "sha256": "2f986d535e244c77240083d8d164f6be2f9bb5714bef2bc6ed645be62eb0e472",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "a2d9b785c986ce692035242fa6557327e58ffc56c48bbcf17435e8bdfe6c53f1",
+      "sha256": "819803f811800f3842aff998cb0f21a1729cad1e784ac5ba9220a26a3838140b",
       "bytes": 355817
     }
   ]
