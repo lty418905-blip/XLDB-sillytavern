@@ -1,5 +1,5 @@
 import type {Retention,SemanticCue} from './retention.ts';
-import {retainedAccess,visibleLayer,isLegacyTemplate,protectedEmotionalReaction} from './retention.ts';
+import {retainedAccess,visibleLayer,isLegacyTemplate,protectedEmotionalReaction,rememberedFragmentsOf} from './retention.ts';
 export {visibleLayer} from './retention.ts';
 
 export interface Scope {
@@ -82,6 +82,8 @@ export interface MemoryView {
   gist?: string;
   feeling?: string;
   anchor?: string;
+  /** Short verbatim scene and sensory fragments of a faded, emotionally protected episode. Absent at clear. */
+  rememberedFragments?: string[];
   /** What has faded, as a code; contextFrom renders it in the story language. Absent at clear. */
   forgottenMarker?: ForgottenMarker;
 }
@@ -171,8 +173,10 @@ export function projectMemories(
         throw new Error('invalid_access');
     }
     const reaction=protectedEmotionalReaction(memory);
-    // The structured reaction stands in for the feeling; contextFrom renders it in the story language.
-    if(reaction){view.emotionalReaction=reaction;delete view.feeling;}
+    // The reaction stays structured next to the model's own feeling; a fallback phrase exists only in the context copy.
+    if(reaction)view.emotionalReaction=reaction;
+    const fragments=rememberedFragmentsOf(memory);
+    if(fragments.length)view.rememberedFragments=fragments;
     memories.push(view);
   }
   return {

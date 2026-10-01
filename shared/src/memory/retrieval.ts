@@ -365,7 +365,8 @@ export class Retrieval {
 }
 
 function allowedText(view: MemoryView): string {
-  const texts=[view.detail, view.gist, view.feeling, view.anchor, ...view.protectedFacts,view.episode?.scene,
+  // Remembered fragments are lexical only: semanticText below does not carry them.
+  const texts=[view.detail, view.gist, view.feeling, view.anchor, ...(view.rememberedFragments??[]), ...view.protectedFacts,view.episode?.scene,
     ...(view.episode?.participants??[]),...(view.episode?.sensoryCues??[]),view.episode?.appraisal]
     .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
   return unique(texts).filter(value=>!texts.some(other=>other.length>value.length&&other.includes(value))).join('\n');

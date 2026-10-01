@@ -127,6 +127,55 @@ export function protectedEmotionalReaction(memory:Memory) {
   return {reactions:[...checked.reactions],intensity:checked.intensity,feelingBasis:checked.feelingBasis};
 }
 
+/** Fragment length bands in units(): [minimum, maximum], both inclusive. Uncertain; MR7a reports. */
+export const FRAGMENT_BANDS={zh:[2,20],en:[1,12]} as const;
+export const FRAGMENT_LIMIT=4;
+/** All kept fragments together stay under this share of the compact detail. Uncertain; MR7a measures it. */
+export const FRAGMENT_TOTAL_RATIO=0.5;
+const FRAGMENT_RAW_LIMIT=1000;
+
+/**
+ * Short verbatim scene and sensory fragments that stay with an emotionally protected episode after automatic fading.
+ * A candidate that fails a rule is dropped whole, never cut or masked. Lexical index and foreground only: fragments
+ * are neither a semantic basis nor an accessible layer for the exact-cue check.
+ */
+export function rememberedFragmentsOf(memory:Memory):string[] {
+  if(!protectedEmotionalReaction(memory))return [];
+  if(memory.access!=='gist'&&memory.access!=='feeling')return [];
+  // A user-chosen granularity never re-exposes source text.
+  if(memory.accessOverride)return [];
+  const episode=memory.episode as {scene?:unknown;sensoryCues?:unknown}|undefined;
+  // The scene comes first, then the sensory cues in stored order; a non-string candidate is skipped below.
+  const candidates:unknown[]=[episode?.scene,...(Array.isArray(episode?.sensoryCues)?episode.sensoryCues:[])];
+  const bound=FRAGMENT_TOTAL_RATIO*compact(memory.detail).length;
+  const fragments:string[]=[];
+  const seen=new Set<string>();
+  let kept=0;
+  for(const candidate of candidates){
+    if(fragments.length>=FRAGMENT_LIMIT)break;
+    if(typeof candidate!=='string')continue;
+    if(candidate.length>FRAGMENT_RAW_LIMIT)continue;
+    const fragment=candidate.trim();
+    if(!fragment)continue;
+    // Verbatim in the detail itself: extraction validates against any evidence quote, which is not enough here.
+    if(!memory.detail.includes(fragment))continue;
+    const [minimum,maximum]=FRAGMENT_BANDS[scriptOf(fragment)],size=units(fragment);
+    if(size<minimum)continue;
+    if(size>maximum)continue;
+    const key=compact(fragment);
+    // Half of the detail or more is the event, not a fragment; a dropped candidate adds nothing to the total.
+    if(kept+key.length>=bound)continue;
+    // A precise value of its own, whatever the detail contains.
+    if(codeTokenRanges(fragment).length>0)continue;
+    if(numericRanges(fragment).length>0)continue;
+    // Defence in depth for hand-built or migrated episodes that carry protected facts.
+    if(maskLayer(memory.detail,fragment,memory.protectedFacts).state!=='visible')continue;
+    if(seen.has(key))continue;
+    seen.add(key);fragments.push(fragment);kept+=key.length;
+  }
+  return fragments;
+}
+
 /** A protected fact covering at least this share of the compact detail is trimmed on new peripheral facts. */
 export const PROTECTED_WHOLE_DETAIL_RATIO=0.8;
 
@@ -169,9 +218,19 @@ const EN_RESIDUAL_UNITS=4;
 const WORD_END=/[\p{Script=Latin}\p{N}]\p{M}*$/u;
 const WORD_START=/^[\p{Script=Latin}\p{N}]/u;
 
-/** The single copy guard for faded access; one call per memory layer at projection. */
-export function visibleLayer(memory:Pick<Memory,'detail'|'protectedFacts'|MemoryLayer>,layer:MemoryLayer):{text:string;state:LayerState} {
-  return maskLayer(memory.detail,memory[layer],memory.protectedFacts);
+/**
+ * Guard modes. `exact` differs from `standard` in one point: shared runs with a protected fact are not checked; whole
+ * protected facts, codes, templates and whole-detail copies are handled the same.
+ */
+export type GuardMode='standard'|'exact';
+
+/**
+ * The single copy guard for faded access; one call per memory layer at projection. The feeling of a retain or
+ * emotionally protected memory is checked for exact values only.
+ */
+export function visibleLayer(memory:Pick<Memory,'detail'|'protectedFacts'|MemoryLayer>&{retention?:Retention},layer:MemoryLayer):{text:string;state:LayerState} {
+  const exact=layer==='feeling'&&(memory.retention?.kind==='retain'||memory.retention?.emotionalProtection!==undefined);
+  return maskLayer(memory.detail,memory[layer],memory.protectedFacts,exact?'exact':'standard');
 }
 
 type MaskResult={readonly text:string;readonly state:LayerState};
@@ -214,17 +273,18 @@ function detailEntry(detail:string):DetailEntry {
  * Masks precise values out of a layer; a layer that is a legacy template, empty, the whole detail, or too little
  * after masking is blocked. Pure; memoised by content.
  */
-export function maskLayer(detail:string,layer:string,protectedFacts:readonly string[]=[]):MaskResult {
+export function maskLayer(detail:string,layer:string,protectedFacts:readonly string[]=[],mode:GuardMode='standard'):MaskResult {
   const entry=detailEntry(detail);
-  const key=JSON.stringify(protectedFacts)+LAYER_SEPARATOR+layer;
+  // The mode is part of the key: the two modes never share a cached result.
+  const key=mode+LAYER_SEPARATOR+JSON.stringify(protectedFacts)+LAYER_SEPARATOR+layer;
   let result=entry.results.get(key);
-  if(!result){result=Object.freeze(computeMask(entry,layer,protectedFacts));entry.results.set(key,result);}
+  if(!result){result=Object.freeze(computeMask(entry,layer,protectedFacts,mode));entry.results.set(key,result);}
   return result;
 }
 
 const BLOCKED:MaskResult=Object.freeze({text:'',state:'blocked'});
 
-function computeMask(entry:DetailEntry,layer:string,protectedFacts:readonly string[]):MaskResult {
+function computeMask(entry:DetailEntry,layer:string,protectedFacts:readonly string[],mode:GuardMode):MaskResult {
   if(isLegacyTemplate(layer)||!layer.trim())return BLOCKED;
   const compactLayer=compact(layer),compactDetail=entry.compact;
   if(compactLayer===compactDetail||(compactDetail.length>=6&&compactLayer.includes(compactDetail)))return BLOCKED;
@@ -240,6 +300,8 @@ function computeMask(entry:DetailEntry,layer:string,protectedFacts:readonly stri
         if(!zhFact&&!onWordBoundaries(layer,loose.start[at]!,loose.end[at+compactFact.length-1]!))continue;
         markLoose(at,at+compactFact.length);
       }
+      // Exact-only mode: a run shared with a protected fact is ordinary wording, not a copy of the value.
+      if(mode==='exact')continue;
       if(zhFact){
         for(const [from,to] of sharedRuns([...compactFact],[...loose.text],ZH_FACT_RUN,true))markLoose(from,to);
       }else{

@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "c25c9f8af1599bb1cbbc4b1c3e8c00b5b3c9b5bbcb1663385f2a7e7cbc2758aa",
+  "sourceManifestSha256": "70bf9fbf952960e2c58bf0e0d3eb5617842c00671136cc4a8b1a3730a47b3cdd",
   "files": [
     {
       "file": ".gitattributes",
@@ -239,8 +239,8 @@
     },
     {
       "file": "shared/src/memory/access.ts",
-      "sha256": "10cc3d225a6b915f4521f8ece99ef0e92263161e925687698424e1580935ae3d",
-      "bytes": 9485
+      "sha256": "a09aecac44102f2c47638a70febe38be75829c61cc7003c5659c65f3cb0b5e88",
+      "bytes": 9759
     },
     {
       "file": "shared/src/memory/context.ts",
@@ -254,18 +254,18 @@
     },
     {
       "file": "shared/src/memory/render.ts",
-      "sha256": "f65dc384742897133daffd49b8e3148db256844989779cc5dd1770a9067401b3",
-      "bytes": 2529
+      "sha256": "e1f32aa7e537aba58ba3743401f6994a06ba64469b6f1c5dc0602294ff8c9395",
+      "bytes": 5330
     },
     {
       "file": "shared/src/memory/retention.ts",
-      "sha256": "2e6d30910605bd06c74d78dbd9c43456703475a67b6f154ad877504aeadd46a4",
-      "bytes": 26755
+      "sha256": "50873fc4c284737a5d678cc1e62288e7d116c9e77db605634c545422a114f99c",
+      "bytes": 30187
     },
     {
       "file": "shared/src/memory/retrieval.ts",
-      "sha256": "b492590544a4c5df2bffaaa6742297ada28a23365d5d626f6f654bf93d887dd1",
-      "bytes": 38067
+      "sha256": "da392c945741848731737a664ae058e1cc6d58044885d7e73ec901df98288f04",
+      "bytes": 38186
     },
     {
       "file": "shared/src/memory/text-units.ts",
@@ -544,12 +544,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "e3a1fab384921a5a0ee5dd0139b0185b74d4cb1d0a39c9552d238f90a648e89c",
+      "sha256": "6864823896005f7f7fc329f00ddd6067745b7c4bcf96084be9025ba957e3f971",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "d9a0c8403e78a835aa94c94880da11fab0d26fb958d64cc47e378e03e47f359c",
+      "sha256": "b15567733c1bc433051816dbc2476833bb205eed7f96becc91183e1b09f8bb89",
       "bytes": 355817
     }
   ]
