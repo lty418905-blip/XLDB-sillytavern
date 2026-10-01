@@ -112,6 +112,11 @@ export interface WorldSourceEffects {
   acceptedAtMs: number;
   plan: PerspectivePlan;
   candidates: readonly unknown[];
+  /**
+   * True for a source whose stored analysis carries a unified story-clock analysis (SC3a). Its clock candidates are
+   * validated exactly as before and never applied: the story clock owns that source's time.
+   */
+  storyClockOwned?: boolean;
 }
 
 export interface WorldEffectReceipt {
@@ -123,7 +128,7 @@ export interface WorldEffectReceipt {
   readerIds: string[];
   timeClassification: TimeClassification;
   applied: boolean;
-  ignoredReason?: 'non_current' | 'companion_clock';
+  ignoredReason?: 'non_current' | 'companion_clock' | 'story_clock';
   balanceDeltaCents?: string;
   inventoryDelta?: number;
   ownerId?: string;
@@ -327,6 +332,7 @@ function applyCandidate(validated: ValidatedSettings, state: MutableState, purch
     if (timestamp === null) return {issue:issue(source,effectId,'invalid_clock_timestamp')};
     if (classification !== 'current') return {receipt:{...receipt,ignoredReason:'non_current'}};
     if (validated.settings.mode === 'companion') return {receipt:{...receipt,ignoredReason:'companion_clock'}};
+    if (source.storyClockOwned === true) return {receipt:{...receipt,ignoredReason:'story_clock'}};
     if (timestamp < state.timeMs) return {issue:issue(source,effectId,'world_time_backward')};
     state.timeMs=timestamp;
     return {receipt:{...receipt,applied:true,clockSetMs:timestamp}};
@@ -344,6 +350,7 @@ function applyCandidate(validated: ValidatedSettings, state: MutableState, purch
     if (delta === null) return {issue:issue(source,effectId,'invalid_clock_effect')};
     if (classification !== 'current') return {receipt:{...receipt,ignoredReason:'non_current'}};
     if (validated.settings.mode === 'companion') return {receipt:{...receipt,ignoredReason:'companion_clock'}};
+    if (source.storyClockOwned === true) return {receipt:{...receipt,ignoredReason:'story_clock'}};
     if (!Number.isSafeInteger(state.timeMs + delta)) return {issue:issue(source,effectId,'world_time_overflow')};
     state.timeMs+=delta;
     return {receipt:{...receipt,applied:true,clockDeltaMs:delta}};

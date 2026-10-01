@@ -7,6 +7,8 @@ import {captureReferenceRows,restoreReferenceRows} from './transfer.ts';
 import type {PersistedReferenceRow} from './transfer.ts';
 import {captureCalendarTodoRows,captureCalendarAckRows,restoreCalendarRows} from './calendar-store.ts';
 import type {PersistedCalendarTodoRow,PersistedCalendarAckRow} from './calendar-store.ts';
+import {captureStoryClockCorrectionRows,restoreStoryClockCorrectionRows} from './story-clock-store.ts';
+import type {PersistedStoryClockCorrectionRow} from './story-clock-store.ts';
 
 export interface SceneLifecycleCheckpoint {
   id: string;
@@ -60,6 +62,8 @@ interface SceneCheckpointSnapshot {
   references?:PersistedReferenceRow[];
   calendarTodos?:PersistedCalendarTodoRow[];
   calendarReminderAcks?:PersistedCalendarAckRow[];
+  /** Branch state bound to source ids and revisions: a snapshot without the field restores to no rows. */
+  storyClockCorrections?:PersistedStoryClockCorrectionRow[];
   /** Owned by an extension (SceneCheckpointHooks); absent from snapshots it does not own. */
   companionPreset?:unknown;
 }
@@ -241,6 +245,7 @@ export class SceneLifecycle {
       geographySettings:geographySettings??null,geographyMaps,geographyCorrections,geographyLayouts,
       references:captureReferenceRows(this.db,scope),calendarTodos:captureCalendarTodoRows(this.db,scope),
       calendarReminderAcks:captureCalendarAckRows(this.db,scope),
+      storyClockCorrections:captureStoryClockCorrectionRows(this.db,scope),
       worldSettings: settings ?? null,...(companionPreset===undefined?{}:{companionPreset}) };
   }
 
@@ -304,6 +309,7 @@ export class SceneLifecycle {
     if(snapshot.calendarTodos!==undefined||snapshot.calendarReminderAcks!==undefined)
       restoreCalendarRows(this.db,{worldId:worldId!,sessionId:sessionId!,branchId:branchId!,characterId:characterId!},
         snapshot.calendarTodos??[],snapshot.calendarReminderAcks??[]);
+    restoreStoryClockCorrectionRows(this.db,{worldId:worldId!,sessionId:sessionId!,branchId:branchId!,characterId:characterId!},snapshot.storyClockCorrections??[]);
     const insertSource = this.db.prepare(`INSERT INTO scene_sources
       (scope,id,revision,message,observed,status,processing,analysis) VALUES(?,?,?,?,?,?,?,?)`);
     for (const row of snapshot.sources) {

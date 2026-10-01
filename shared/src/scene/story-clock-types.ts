@@ -152,7 +152,11 @@ export interface StoryClockDate {
   /** 1..31, valid for the month (and year when known). */
   day: number;
 }
-/** A calendar date whose year is known (required to anchor an absolute clock). */
+/**
+ * A calendar date whose year is stated. Needed wherever a year must be known: SC0 conversions, a relabel or year-fill
+ * target, and StoryClockInferredOrigin.date. Origins, set_date cues, set_datetime and adoptions also accept a year-less
+ * StoryClockDate.
+ */
 export interface StoryClockFullDate {
   year: number;
   month: number;
@@ -680,7 +684,7 @@ export interface StoryClockFoldSource extends StoryClockSourceRef {
  *   added. `tavernRoleplay` is read by no other rule.
  */
 export interface StoryClockFoldInput {
-  /** True for a SillyTavern roleplay scope (as memory-clock.ts memoryClockMs); only affects 'legacy' sources. */
+  /** True for a SillyTavern roleplay scope (as the former memoryClockMs rule); only affects 'legacy' sources. */
   tavernRoleplay: boolean;
   /** Old anchor of a chat whose opening source is legacy, or null (new chats, or an old chat with no world settings); see StoryClockLegacyAnchor. */
   legacyAnchor: StoryClockLegacyAnchor | null;
@@ -711,7 +715,11 @@ export interface StoryClockState {
   dateKnown: boolean;
   /** False when only a month-day was given (reference year in `atMs`) and always false when dateKnown is false; true otherwise. */
   yearKnown: boolean;
-  /** False until a time of day is explicit, inferred or set (default 08:00 stands in). */
+  /**
+   * False while the clock is floating: the wall time is then a stand-in (08:00, or a legacy anchor's wall time) that is
+   * never evidence and never shown. It becomes true when a time or slot is explicit, inferred or set, and false again
+   * when an event sets another date without a time.
+   */
   timeOfDayKnown: boolean;
   /**
    * True iff timeOfDayKnown and the known time of day still rests on an inference: an origin timeOfDay with basis
@@ -732,13 +740,16 @@ export type StoryClockDegradeReason = (typeof STORY_CLOCK_DEGRADE_REASONS)[numbe
  * One movement of the clock, for the admin view ("+3 hours: quote"). A relabel or year fill (see the file header) is
  * not a movement and has no record; only the time part or the month-day move of the same event does. Source ref: the
  * source whose event moved the clock; a 'now' movement carries the last source of its turn, a fallback movement the
- * turn's player source. A re-anchor raises the anchor movement's deltaMs by its shift. SC4 highlights a narrative
+ * turn's player source. A re-anchor adjusts the anchor movement's deltaMs by its shift. SC4 highlights a narrative
  * set_date movement longer than its jump threshold and offers a revoke of its source.
  */
 export interface StoryClockAdvanceRecord extends StoryClockSourceRef {
   /** 0 for sources before the first accepted player source, else the 1-based turn number. */
   turn: number;
-  /** Signed clock movement in ms; negative only for basis 'correction'. */
+  /**
+   * Signed clock movement in ms. A re-anchor adds its shift X, which may be negative, to the anchor movement's deltaMs.
+   * The total is negative only for basis 'correction'.
+   */
   deltaMs: number;
   basis: StoryClockBasis;
   /** Cue kind, or null for an implicit, fallback, legacy or correction movement. */

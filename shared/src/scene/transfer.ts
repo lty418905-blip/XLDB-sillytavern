@@ -249,16 +249,18 @@ export class SceneTransfer {
   }
 
   /** Pieces for SceneAuthority.snapshot to merge; they do not replace its authority rows. */
-  projection(scope: SceneScope, characterId: string): {
+  projection(scope: SceneScope, characterId: string, state = this.authority.state(scope)): {
     messages: Map<string, {revision:number;status:'accepted'|'deleted'}>;
     memories: Map<string, Memory>;
   } {
-    const state = this.authority.state(scope);
     if (!state.roster.characters.some(character => character.id === characterId)) throw new Error('invalid_scene_character');
     const roleScope = npcScope(scope, characterId);
+    const references = this.references(scope, characterId);
+    // In a story scope a reference entry sits at the story origin on the unified clock; elsewhere the field stays absent.
+    const reading = references.length ? this.authority.storyClock.read(scope, state) : null;
     const messages = new Map<string, {revision:number;status:'accepted'|'deleted'}>();
     const memories = new Map<string, Memory>();
-    for (const reference of this.references(scope, characterId)) {
+    for (const reference of references) {
       const messageId = `reference:${reference.id}`;
       const memoryId = `${messageId}:${characterId}`;
       messages.set(messageId, {revision: 1, status: 'accepted'});
@@ -266,6 +268,7 @@ export class SceneTransfer {
         id: memoryId, scope: roleScope, status: 'accepted' as const, access: 'clear' as const,
         detail: reference.text, gist: reference.text, feeling: '', anchor: reference.text,
         protectedFacts: [reference.text], kind: 'fact' as const,
+        ...(reading ? {retentionAtMs: reading.result.originAtMs} : {}),
         source: {
           messageId, revision: 1, occurredAtMs: reference.occurredAtMs, knownAtMs: reference.importedAtMs,
           knowledge: {kind: 'reference', observationId: reference.id, start: 0, end: reference.text.length},

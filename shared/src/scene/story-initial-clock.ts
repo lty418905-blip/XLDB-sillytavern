@@ -2,13 +2,22 @@ import type {SceneReference} from './transfer.ts';
 import type {SceneState} from './types.ts';
 import type {WorldSettings} from './world-state.ts';
 
-interface DateClue {date:string;time:string;year:number}
+interface DateClue {date:string;time:string;year:number;explicitTime:boolean}
 const datePattern=/(?<!\d)(\d{4})(?:-(\d{1,2})-(\d{1,2})|年\s*(\d{1,2})月\s*(\d{1,2})[日号])(?:[ T]\s*([01]?\d|2[0-3]):([0-5]\d))?(?!\d)/g;
 const yearPattern=/(?<!\d)(\d{4})\s*年(?!\s*\d{1,2}月\s*\d{1,2}[日号])/g;
 const openingCue=/(?:剧情|故事)(?:起始|开始|开场|当前时间|当前日期|发生于)|故事背景|设定年代|开场(?:时间|日期|是|于)?|当前(?:日期|时间|是)|现在是|今天是|开始时间|起始日期|^\s*(?:起始|时间|日期)\s*[:：]|start date|current date|story start/i;
 
 /** Derives a fixed opening clock only; later prose belongs to ordinary world effects. */
 export function initialStorySettings(state:SceneState,references:readonly SceneReference[],timeZone:string):WorldSettings|null{
+  return initialStoryAnchor(state,references,timeZone)?.settings??null;
+}
+
+/**
+ * The same derivation with what the rule found: `dated` iff startTimeMs came from a date clue, `timeKnown` iff that
+ * clue matched an explicit HH:MM (otherwise its 00:00 default stood in).
+ */
+export function initialStoryAnchor(state:SceneState,references:readonly SceneReference[],timeZone:string):
+  {settings:WorldSettings;dated:boolean;timeKnown:boolean}|null{
   if(!Number.isSafeInteger(state.createdAtMs)||state.createdAtMs<=0||!validZone(timeZone))return null;
   const initialReferences=references.filter(reference=>
     !/^initialization\/(example_dialogue|future_idea)(?:\/|$)/.test(reference.table));
@@ -20,7 +29,7 @@ export function initialStorySettings(state:SceneState,references:readonly SceneR
   // A selected world's opening setting outranks the first exchange. The first
   // exchange is considered only when world material has no year/date clue.
   const selected=referenceClues.dates.length||referenceClues.years.length?referenceClues:openingClues;
-  let startTimeMs=state.createdAtMs;
+  let startTimeMs=state.createdAtMs,dated=false,timeKnown=false;
   if(selected.dates.length){
     const unique=[...new Set(selected.dates.map(item=>`${item.date}T${item.time}`))];
     if(unique.length!==1)return null;
@@ -28,7 +37,7 @@ export function initialStorySettings(state:SceneState,references:readonly SceneR
     if(selected.years.some(year=>year!==date.year))return null;
     const resolved=resolveLocal(date.date,date.time,timeZone);
     if(resolved===null)return null;
-    startTimeMs=resolved;
+    startTimeMs=resolved;dated=true;timeKnown=selected.dates.some(item=>item.explicitTime);
   }else if(selected.years.length)return null;
   const playerName=firstAccepted?.envelope.playerName?.trim()||'玩家';
   const used=new Set<string>([playerName]);
@@ -39,7 +48,7 @@ export function initialStorySettings(state:SceneState,references:readonly SceneR
     for(const label of labels)used.add(label);
     actorLabels[actor.id]=labels;
   }
-  return {mode:'story',startTimeMs,actorLabels,playerName,publicTime:true,balances:[],inventory:[]};
+  return {settings:{mode:'story',startTimeMs,actorLabels,playerName,publicTime:true,balances:[],inventory:[]},dated,timeKnown};
 }
 
 function clues(texts:readonly string[]):{dates:DateClue[];years:number[]}{
@@ -51,7 +60,7 @@ function clues(texts:readonly string[]):{dates:DateClue[];years:number[]}{
         const year=Number(match[1]),month=Number(match[2]??match[4]),day=Number(match[3]??match[5]);
         if(year<1970||year>9999||!validDate(year,month,day)){years.push(year);continue;}
         dates.push({date:`${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`,
-          time:`${String(Number(match[6]??0)).padStart(2,'0')}:${match[7]??'00'}`,year});
+          time:`${String(Number(match[6]??0)).padStart(2,'0')}:${match[7]??'00'}`,year,explicitTime:match[6]!==undefined});
       }
       for(const match of segment.matchAll(yearPattern))years.push(Number(match[1]));
     }

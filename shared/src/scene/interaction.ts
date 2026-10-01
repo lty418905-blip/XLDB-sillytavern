@@ -2,6 +2,8 @@ import {createHash} from 'node:crypto';
 import type {DatabaseSync} from 'node:sqlite';
 import {scopeKey} from '../core/types.ts';
 import type {SceneScope} from './types.ts';
+import type {StoryClockReading} from './story-clock-store.ts';
+import type {StoryClockView} from './story-clock-types.ts';
 
 export type InteractionHost='sillytavern'|'agent'|'agent-roleplay';
 export type InteractionMode='roleplay'|'companion';
@@ -32,15 +34,24 @@ interface InteractionRow {
 interface BindingRow {owner:string;mode:InteractionMode;physical_scope:string;physical_key:string}
 
 type StoryClock=(scope:SceneScope,now:number)=>unknown;
+/** The unified story clock as the hosts see it: three fields, never the fold state or its input. */
+export interface InteractionStoryClock {status:StoryClockReading['status'];pending:boolean;view:StoryClockView|null}
+type UnifiedClock=(scope:SceneScope)=>InteractionStoryClock|null;
 
 /** Persistent host/mode control. Content stays in ordinary, isolated scene scopes. */
 export class SceneInteractions {
   private savepointSequence=0;
   private db:DatabaseSync;
   private storyClock:StoryClock;
-  constructor(db:DatabaseSync,storyClock:StoryClock) {
+  private unified?:UnifiedClock;
+  /**
+   * `storyClock` is the world port (the world fold of a scope, or null without world settings). `unified` is asked for
+   * the unified story clock only when the world port returned null; a world result carries its own summary.
+   */
+  constructor(db:DatabaseSync,storyClock:StoryClock,unified?:UnifiedClock) {
     this.db=db;
     this.storyClock=storyClock;
+    this.unified=unified;
     db.exec(`CREATE TABLE IF NOT EXISTS scene_interactions (
       owner TEXT PRIMARY KEY, base_scope TEXT NOT NULL, host TEXT NOT NULL,
       active_mode TEXT NOT NULL, revision INTEGER NOT NULL,
@@ -147,8 +158,16 @@ export class SceneInteractions {
     const world=this.storyClock(state.scope,now);
     const timeMs=world&&typeof world==='object'&&'state' in world&&world.state&&typeof world.state==='object'&&'timeMs' in world.state
       ? world.state.timeMs : undefined;
-    return {kind:'story' as const,known:Number.isSafeInteger(timeMs),timeMs:Number.isSafeInteger(timeMs)?timeMs:null,
+    // kind, known and timeMs stay the legacy Unix-domain clock until SC3b and SC4b migrate their readers.
+    const legacy={kind:'story' as const,known:Number.isSafeInteger(timeMs),timeMs:Number.isSafeInteger(timeMs)?timeMs:null,
       configuredTimeZone:state.configuredTimeZone,timeZone:state.timeZone};
+    if(!this.unified)return legacy;
+    // This object is returned by the interaction-clock route as it is, so it carries exactly three clock fields.
+    // One summary per call: the world result's own, and the unified port only when there is no world result.
+    const summary=world
+      ?(typeof world==='object'&&'storyClock' in world?world.storyClock as InteractionStoryClock|null|undefined:null)??null
+      :this.unified(state.scope);
+    return {...legacy,storyClock:summary?{status:summary.status,pending:summary.pending,view:summary.view}:null};
   }
 
   modeOf(scope:SceneScope):InteractionMode|undefined {

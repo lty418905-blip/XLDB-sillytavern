@@ -12,7 +12,7 @@ import {retentionSnapshot} from '../memory/retention.ts';
 import { emotionIdentitySeed, npcScope } from './types.ts';
 import type { SceneScope, SceneRoster, SceneMessage, SceneSource, SceneState, SceneAnalysis, SceneWriteGuard, SceneProfileCandidate } from './types.ts';
 import {foldWorldState,projectWorldState} from './world-state.ts';
-import type {WorldSettings,WorldSourceEffects} from './world-state.ts';
+import type {WorldFoldResult,WorldProjection,WorldSettings,WorldSourceEffects} from './world-state.ts';
 import {SceneLifecycle} from './lifecycle.ts';
 import {Processing} from './processing.ts';
 import {SceneTransfer} from './transfer.ts';
@@ -26,7 +26,12 @@ import {PhysiologyStore} from '../common/physiology.ts';
 import {GeographyStore} from '../common/geography.ts';
 import {SceneCalendarStore} from './calendar-store.ts';
 import {initialStorySettings} from './story-initial-clock.ts';
-import {memoryClockMs} from './memory-clock.ts';
+import {StoryClockStore,storyClockLine} from './story-clock-store.ts';
+import type {StoryClockLegacySettings,StoryClockSummary} from './story-clock-store.ts';
+import {STORY_CLOCK_DEGRADE_REASONS} from './story-clock-types.ts';
+import type {StoryClockDegradeReason,StoryClockIssue,StoryClockSourceRef,StoryClockView} from './story-clock-types.ts';
+import {storyLanguageOf} from '../memory/text-units.ts';
+import type {StoryLanguage} from '../memory/text-units.ts';
 import {defaultSceneHooks} from './extension.ts';
 import type {ContactEmotionProjection,SceneAuthorityExtensionFactory,SceneAuthorityHooks,SceneSubjectBinding} from './extension.ts';
 
@@ -48,6 +53,8 @@ export class SceneAuthority {
   readonly calendar:SceneCalendarStore;
   readonly physiology:PhysiologyStore;
   readonly geography:GeographyStore;
+  /** The unified story clock (SC3a). This class only delegates: it builds no fold input and does no clock arithmetic. */
+  readonly storyClock:StoryClockStore;
   private readonly hooks:SceneAuthorityHooks;
   /**
    * `extension` adds members and hooks (the Agent companion); without it every hook is a no-op, subject() is null and
@@ -76,7 +83,19 @@ export class SceneAuthority {
       scope TEXT NOT NULL, character TEXT NOT NULL, version INTEGER NOT NULL, PRIMARY KEY(scope,character));`);
     this.processing=new Processing(db);
     this.transfer=new SceneTransfer(db,this);
-    this.interactions=new SceneInteractions(db,(scope,now)=>this.world(scope,undefined,now));
+    this.storyClock=new StoryClockStore(db,{
+      state:scope=>this.state(scope),
+      isStoryScope:scope=>this.isStoryScope(scope),
+      tavernRoleplay:scope=>this.interactions.isTavernRoleplay(scope),
+      worldFold:(_scope,sources,settings)=>foldWorldState(settings,this.worldSources(sources)),
+      legacySettings:scope=>this.legacyWorldSettings(scope),
+      frozenRoleplayTime:scope=>this.interactions.frozenRoleplayTime(scope),
+      afterCorrection:scope=>{this.rebuildEmotionStates(scope);this.bump(scope);this.rebuildDerived(scope);},
+    });
+    this.interactions=new SceneInteractions(db,(scope,now)=>this.world(scope,undefined,now),scope=>{
+      const summary=this.storyClock.summary(scope);
+      return summary&&{status:summary.status,pending:summary.pending,view:summary.view};
+    });
     this.npcResources=new NpcResourceController(db);
     this.initialization=new SceneInitialization(db,this);
     this.director=new SceneDirector(db);
@@ -104,6 +123,8 @@ export class SceneAuthority {
     }
     this.hooks=hooks;
     this.lifecycle=new SceneLifecycle(db,scope=>{
+      // N16 first: it decides which sources are 'ready', which both rebuilds read.
+      this.requeueOpening(scope);
       this.rebuildEmotionStates(scope);
       this.rebuildDerived(scope);
       this.invalidateDirector(scope);
@@ -239,6 +260,8 @@ export class SceneAuthority {
       if (changed) {
         const dependentChanges=this.invalidateDependents(scope);
         this.invalidateCausalSuffix(scope,[...causalChanges,...dependentChanges]);
+        // N16 after the two invalidations (they decide which source is now the opening), before the single bump.
+        this.requeueOpening(scope);
         this.bump(scope);
         if(userActivityChanged)this.hooks.onUserActivity(scope,now);
         this.rebuildDerived(scope);
@@ -360,13 +383,19 @@ export class SceneAuthority {
       });
       const settings=this.worldSettings(scope);
       const effective=[...state.sources];
+      // The whole final timeline of this commit, complete before the first clock read and never assigned to afterwards:
+      // the story-clock reading is cached by this array's identity, so it must not be the array the loop mutates.
+      const timeline=state.sources.map(source=>{
+        const result=prepared.find(item=>item.id===source.id);
+        return result?{...source,processing:'ready' as const,analysis:result.analysis}:source;
+      });
       for(const [index,source] of state.sources.entries()){
         const result=prepared.find(item=>item.id===source.id);if(!result)continue;
         effective[index]={...source,processing:'ready',analysis:result.analysis};
         result.analysis=validateCommitmentAnalysis(source,result.analysis,state.roster,{
           realClockTimeMs:source.acceptedAtMs,
           // Replay this source's accepted story effects; never consult current time.
-          storyClockTimeMs:settings?.mode==='story'?this.emotionTime(scope,effective.slice(0,index+1),source.acceptedAtMs):undefined,
+          storyClockTimeMs:settings?.mode==='story'?this.legacyEmotionTime(scope,effective.slice(0,index+1),source.acceptedAtMs,timeline):undefined,
           timeZone:source.acceptedTimeZone,
         });
         effective[index]={...source,processing:'ready',analysis:result.analysis};
@@ -438,9 +467,27 @@ export class SceneAuthority {
     });
   }
 
-  fail(scope: SceneScope, version: number, sourceIds?:readonly string[]) {
+  /**
+   * `storyClock` (the post-SC failure path, SC3b): in a story scope every source this call moves from 'pending' to
+   * 'failed' also gets analysis.storyClock = {kind:'degraded',reason,issues}, in the same transaction. Without it, or
+   * outside a story scope, the rows are exactly today's.
+   */
+  fail(scope: SceneScope, version: number, sourceIds?:readonly string[],
+    storyClock?:{reason:StoryClockDegradeReason;issues?:readonly StoryClockIssue[]}) {
+    if(storyClock!==undefined&&!(STORY_CLOCK_DEGRADE_REASONS as readonly unknown[]).includes(storyClock?.reason))
+      throw new Error('invalid_story_clock_degrade');
     this.transaction(() => {
       if (this.state(scope).version !== version) return;
+      if(storyClock!==undefined&&this.isStoryScope(scope)){
+        const marker=JSON.stringify({kind:'degraded',reason:storyClock.reason,issues:storyClock.issues??[]});
+        // A null analysis takes the shape reconcile leaves on an edited source, so readers of analysis.characters keep working.
+        const fail=this.db.prepare(`UPDATE scene_sources SET processing='failed',
+          analysis=json_set(COALESCE(analysis,'{"plan":null,"characters":{}}'),'$.storyClock',json(?))
+          WHERE scope=? AND id=? AND status='accepted' AND processing='pending'`);
+        const ids=sourceIds?.length?new Set(sourceIds):new Set(this.state(scope).sources.map(source=>source.id));
+        for(const sourceId of ids)fail.run(marker,scopeKey(scope),sourceId);
+        return;
+      }
       if(sourceIds?.length){
         const fail=this.db.prepare("UPDATE scene_sources SET processing='failed' WHERE scope=? AND id=? AND status='accepted' AND processing='pending'");
         for(const sourceId of new Set(sourceIds))fail.run(scopeKey(scope),sourceId);
@@ -454,9 +501,8 @@ export class SceneAuthority {
     const sources = state.sources.filter(source => source.status === 'accepted' && source.processing === 'ready' && source.analysis);
     const controls = this.db.prepare('SELECT id,revision,access FROM scene_controls WHERE scope=? AND character=?').all(scopeKey(scope),characterId) as {id:string;revision:number;access:Access}[];
     const memories = new Map<string,Memory>();
-    const storyClock=this.worldSettings(scope)?.mode==='story'||this.interactions.frozenRoleplayTime(scope)!==undefined;
-    // The tavern floor joins both ends of a memory's age only when the snapshot carries its own memory clock.
-    const tavernRoleplay=storyClock&&this.interactions.isTavernRoleplay(scope);
+    // One fold of the final timeline; null for a scope without a story clock (companion, unbound without story settings).
+    const reading=this.storyClock.read(scope,state);
     for (const source of sources) {
       const plan=source.analysis!.plan;
       if(!plan)continue;
@@ -474,8 +520,10 @@ export class SceneAuthority {
           later.status==='accepted'&&later.processing==='ready'&&later.analysis?.plan?.observations.some(item=>
             item.readers.includes(characterId)&&candidate.retention!.cues.some(cue=>item.quote.includes(cue)))).at(-1):undefined;
         const retentionSource=rehearsed??source;
-        const retentionPrefix=state.sources.slice(0,state.sources.indexOf(retentionSource)+1);
-        const retentionAtMs=memoryClockMs(this.emotionTime(scope,retentionPrefix,retentionSource.acceptedAtMs),retentionPrefix,tavernRoleplay);
+        // The per-source state on the final timeline, so a relabel, year fill or re-anchor moves both ends together.
+        const retentionAtMs=reading
+          ?this.storyClock.atSource(reading,{sourceId:retentionSource.id,revision:retentionSource.revision})??reading.result.state.atMs
+          :retentionSource.acceptedAtMs;
         memories.set(id,{...candidate,id,scope:roleScope,status:'accepted',access,accessOverride:control!==undefined,retentionAtMs,
           source:{messageId:source.id,revision:source.revision,occurredAtMs:source.acceptedAtMs,knownAtMs:Math.max(source.acceptedAtMs,source.observedAtMs),
             author:{role:source.role,actorId:source.role==='user'?'player':source.automatic?'narrator':source.speakerId!},
@@ -484,7 +532,7 @@ export class SceneAuthority {
               observationId:observation.id,start:observation.start,end:observation.end}}});
       }
     }
-    const references=this.transfer.projection(scope,characterId);
+    const references=this.transfer.projection(scope,characterId,state);
     for(const [id,memory] of references.memories)memories.set(id,memory);
     const messages=new Map<string,{revision:number;status:'accepted'|'deleted'}>(sources.map(source => [source.id,{revision:source.revision,status:'accepted' as const}]));
     for(const [id,message] of references.messages)messages.set(id,message);
@@ -497,13 +545,13 @@ export class SceneAuthority {
     }
     return {scope:roleScope,version:state.version,messages,memories,
       ...(replyParents.size?{replyParents}:{}),
-      ...(storyClock?{memoryTimeMs:memoryClockMs(this.emotionTime(scope,state.sources,Date.now()),state.sources,tavernRoleplay)}:{})};
+      ...(reading?{memoryTimeMs:reading.result.state.atMs}:{})};
   }
 
   emotion(scope: SceneScope, characterId: string, now = Date.now(), state = this.state(scope)) {
     const {emotion,settings}=this.emotionBase(scope,characterId,state);
     const clock=this.interactions.modeOf(scope)?this.interactions.clock(scope,now):null;
-    return emotionAt(emotion,this.emotionTime(scope,state.sources,now),settings,
+    return emotionAt(emotion,this.legacyEmotionTime(scope,state.sources,now),settings,
       clock===null?this.worldSettings(scope)?.mode==='story'?'UTC':null:clock.known?clock.timeZone:null);
   }
 
@@ -519,7 +567,7 @@ export class SceneAuthority {
     const rows=this.db.prepare("SELECT s.id,s.revision,j.value AS body FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j WHERE s.scope=? AND s.status='accepted' AND s.processing='ready' AND j.key=?")
       .all(scopeKey(scope),characterId) as {id:string;revision:number;body:string}[];
     const storedBySource=new Map(rows.map(row=>[JSON.stringify([row.id,row.revision]),row.body]));
-    const initialTime=this.emotionTime(scope,[],state.createdAtMs);
+    const initialTime=this.legacyEmotionTime(scope,[],state.createdAtMs,state.sources);
     const events: {stored:EmotionState|undefined;body:string|undefined;delta:import('../emotion/openher.ts').EmotionDelta;at:number|undefined}[]=[];
     for(const [index,source] of state.sources.entries()){
       if(source.status!=='accepted'||source.processing!=='ready')continue;
@@ -528,7 +576,7 @@ export class SceneAuthority {
       const stored=source.analysis?.emotionStates?.[characterId];
       const body=stored?JSON.stringify(stored):storedBySource.get(JSON.stringify([source.id,source.revision]));
       events.push({stored,body,delta:analysis.emotion,
-        at:body===undefined?this.emotionTime(scope,state.sources.slice(0,index+1),source.acceptedAtMs):undefined});
+        at:body===undefined?this.legacyEmotionTime(scope,state.sources.slice(0,index+1),source.acceptedAtMs,state.sources):undefined});
     }
     const replayKey=createHash('sha256').update(JSON.stringify([scopeKey(scope),characterId,character.emotion,
       initialTime,events.map(event=>[event.body,event.body===undefined?event.delta:undefined,event.at])])).digest('hex');
@@ -562,17 +610,37 @@ export class SceneAuthority {
     return this.hooks.contactEmotion(scope,characterId,nowMs,state,currentReply,base)??{emotion:base,affect:null};
   }
 
-  /** Story metabolism follows accepted narrative time, not wall-clock waiting. */
+  /** Every roleplay binding, and an unbound scope whose stored world settings are a story world, has a story clock. */
+  private isStoryScope(scope:SceneScope):boolean {
+    return this.worldSettings(scope)?.mode==='story'||this.interactions.frozenRoleplayTime(scope)!==undefined;
+  }
+
+  /**
+   * The unified story clock value (StoryClockMs). Without `ref` it is the clock after the last accepted source; with
+   * `ref` it is the final-timeline value after that source revision.
+   */
+  storyClockAt(scope:SceneScope,state=this.state(scope),ref?:StoryClockSourceRef):number {
+    const reading=this.storyClock.read(scope,state);
+    if(!reading)throw new Error('invalid_story_clock_scope');
+    if(ref===undefined)return reading.result.state.atMs;
+    const at=this.storyClock.atSource(reading,ref);
+    if(at===null)throw new Error('invalid_story_clock_source');
+    return at;
+  }
+
+  /**
+   * OpenHer's story metabolism time, in the old Unix domain until OH3: the legacy world time over `sources` plus the
+   * explicit cue movement of their post-SC analyses, read from the one fold of `timeline` (the whole list the caller
+   * works on; `sources` is a prefix of it). Never wall-clock waiting.
+   */
+  legacyEmotionTime(scope:SceneScope,sources:SceneSource[],fallbackMs:number,timeline:SceneSource[]=sources):number {
+    return this.storyClock.legacyTimeMs(scope,sources,fallbackMs,timeline);
+  }
+
+  /** @deprecated Alias of legacyEmotionTime for the callers in service.ts and address.ts; SC3b migrates them and deletes it. */
   emotionTime(scope:SceneScope,sources:SceneSource[],fallbackMs:number):number {
-    const settings=this.worldSettings(scope);
-    if(!settings){
-      const frozen=this.interactions.frozenRoleplayTime(scope);
-      if(frozen!==undefined)return frozen;
-    }
-    if(settings?.mode!=='story')return fallbackMs;
-    const folded=foldWorldState(settings,this.worldSources(sources));
-    if(folded.issues.length)throw new Error('invalid_world_'+folded.issues[0]!.code.replace(/^invalid_world_/,''));
-    return folded.state.timeMs;
+    // A private copy: the callers push to and assign into the array they pass, so it must never be an identity-cache key.
+    return this.legacyEmotionTime(scope,sources,fallbackMs,sources.slice());
   }
 
   preferences(scope: SceneScope, characterId: string, state = this.state(scope), currentReplySourceId?:string): Preference[] {
@@ -618,12 +686,23 @@ export class SceneAuthority {
   }
 
   worldSettings(scope:SceneScope):WorldSettings|null {
+    return this.legacyWorldSettings(scope).settings;
+  }
+
+  /** worldSettings(scope), with the inputs the story clock needs to rebuild a derived start in the opening's own zone. */
+  private legacyWorldSettings(scope:SceneScope):StoryClockLegacySettings {
     let settings=this.rawWorldSettings(scope);
+    const stored=settings!==null;
+    let references:StoryClockLegacySettings['references']=[],liveZone:string|null=null;
     if(!settings&&this.interactions.isTavernRoleplay(scope)){
       const state=this.state(scope);
-      if(state.version)settings=initialStorySettings(state,this.transfer.references(scope),this.interactions.get(scope,'sillytavern').timeZone);
+      if(state.version){
+        const candidates=this.transfer.references(scope),zone=this.interactions.get(scope,'sillytavern').timeZone;
+        settings=initialStorySettings(state,candidates,zone);
+        if(settings){references=candidates;liveZone=zone;}
+      }
     }
-    return settings?this.initialization.mergeAssets(scope,settings):null;
+    return {settings:settings?this.initialization.mergeAssets(scope,settings):null,stored,references,liveZone};
   }
 
   private rawWorldSettings(scope:SceneScope):WorldSettings|null {
@@ -641,7 +720,21 @@ export class SceneAuthority {
         if(Object.keys(value.actorLabels).some(id=>!known.has(id)))throw new Error('invalid_world_actor');
         foldWorldState(value,[]);
       }
-      if(JSON.stringify(this.rawWorldSettings(scope))===JSON.stringify(value))return {version:state.version};
+      // `shown` is what inspect() returns and the panel loads (merged with the initialization assets); `raw` is the stored row.
+      const raw=this.rawWorldSettings(scope),shown=this.worldSettings(scope);
+      // 1. No change: an identical save never reprocesses the chat and never writes a correction.
+      if(value?sameSettings(value,shown)||sameSettings(value,raw):raw===null)return {version:state.version,clock:'unchanged' as const};
+      // 2. Date-only edit of a story world that already has an accepted source: one origin correction on the unified
+      // clock. The stored settings row, every analysis and every processing state stay as they are.
+      if(value&&shown&&value.mode==='story'&&shown.mode==='story'&&state.sources.some(source=>source.status==='accepted')&&
+        (sameSettings(withoutStart(value),withoutStart(shown))||(raw!==null&&sameSettings(withoutStart(value),withoutStart(raw))))){
+        const edit=this.storyClock.originDateEdit(scope,state,value.startTimeMs,shown.startTimeMs);
+        if(!edit.changed)return {version:state.version,clock:'unchanged' as const};
+        if(captureCheckpoint)this.lifecycle.checkpoint(scope,'世界初始设置变更',{automatic:true});
+        this.storyClock.writeOriginCorrection(scope,edit.binding,edit.value);
+        return {version:this.state(scope).version,clock:'origin_correction' as const};
+      }
+      // 3. Everything else: today's path.
       if(captureCheckpoint)this.lifecycle.checkpoint(scope,'世界初始设置变更',{automatic:true});
       this.processing.clearScope(scope);
       if(value)this.db.prepare('INSERT OR REPLACE INTO scene_world_settings VALUES(?,?,?)').run(scopeKey(scope),JSON.stringify(value),value.startTimeMs);
@@ -649,28 +742,57 @@ export class SceneAuthority {
       this.markAllPending(scope);
       this.bump(scope);
       this.rebuildDerived(scope);
-      return {version:this.state(scope).version};
+      return {version:this.state(scope).version,clock:'reprocessed' as const};
     });
   }
 
-  world(scope:SceneScope,readerId?:string,now=Date.now(),state=this.state(scope)) {
+  world(scope:SceneScope,readerId?:string,now=Date.now(),state=this.state(scope)):
+    (WorldFoldResult&{storyClock?:StoryClockSummary})|(WorldProjection&{storyClock?:StoryClockView|null})|null {
     const settings=this.worldSettings(scope);
     if(!settings)return null;
     const row=this.db.prepare('SELECT clock_floor FROM scene_world_settings WHERE scope=?').get(scopeKey(scope)) as {clock_floor:number}|undefined;
     const folded=foldWorldState(settings,this.worldSources(state.sources),{nowMs:now,monotonicFloorMs:row?.clock_floor??settings.startTimeMs});
     if(settings.mode==='companion'&&row&&folded.state.timeMs>row.clock_floor)this.db.prepare('UPDATE scene_world_settings SET clock_floor=? WHERE scope=?').run(folded.state.timeMs,scopeKey(scope));
-    return readerId===undefined?folded:projectWorldState(folded,readerId);
+    if(settings.mode!=='story')return readerId===undefined?folded:projectWorldState(folded,readerId);
+    // A story world carries the unified clock beside the legacy one.
+    // @deprecated folded.state.timeMs and the projection's timeMs are the legacy Unix-domain clock, kept for the readers
+    // SC3b and SC4b have not migrated yet; SC3b moves them to `storyClock` and removes the legacy reading.
+    const summary=this.storyClock.summary(scope,state);
+    if(readerId===undefined)return summary?{...folded,storyClock:summary}:folded;
+    const projection=projectWorldState(folded,readerId);
+    // The same visibility rule as timeMs: the player, or everyone when the time is public.
+    return readerId==='player'||folded.state.publicTime?{...projection,storyClock:summary?.view??null}:projection;
   }
 
-  worldContext(scope:SceneScope,readerId:string,state=this.state(scope)) {
-    const world=this.world(scope,readerId,Date.now(),state);
-    return world?'\n脚本确认的当前世界状态（仅此角色可见；不得自行改算或补全未知余额）：'+JSON.stringify(world):'';
+  /**
+   * The character-facing world block and, for a story scope, the clock line. A story scope's block carries neither the
+   * legacy timeMs nor the structured clock: the line is the only time a character reads. `language` is the story
+   * language the caller renders memories in; without it the reader's own memories decide, as contextFrom does.
+   */
+  worldContext(scope:SceneScope,readerId:string,state=this.state(scope),language?:StoryLanguage) {
+    if(language!==undefined&&language!=='zh'&&language!=='en')throw new Error('invalid_story_language');
+    const world=this.world(scope,readerId,Date.now(),state) as (WorldProjection&{storyClock?:StoryClockView|null})|null;
+    const header='\n脚本确认的当前世界状态（仅此角色可见；不得自行改算或补全未知余额）：';
+    if(world&&world.mode!=='story')return header+JSON.stringify(world);
+    let worldPart='',view:StoryClockView|null;
+    if(world){
+      const {timeMs:_legacyTime,storyClock,...visible}=world;
+      worldPart=header+JSON.stringify(visible);
+      // Absent from the projection when this reader may not see the time.
+      view=storyClock??null;
+    }else view=this.storyClock.summary(scope,state)?.view??null;
+    if(!storyClockLine(view,'zh'))return worldPart;
+    const resolved=language??(state.roster.characters.some(character=>character.id===readerId)
+      ?storyLanguageOf(this.snapshot(scope,readerId,state)):'zh');
+    return worldPart+storyClockLine(view,resolved);
   }
 
   private worldSources(sources:SceneSource[]):WorldSourceEffects[] {
     return sources.filter(source=>source.status==='accepted'&&source.processing==='ready'&&source.analysis?.plan).map(source=>({
       sourceId:source.id,revision:source.revision,role:source.role,text:source.text,acceptedAtMs:source.acceptedAtMs,
       plan:source.analysis!.plan!,candidates:source.analysis!.worldEffects??[],
+      // A post-SC source: its clock candidates are still checked, never applied (the story clock owns its time).
+      ...(Object.hasOwn(source.analysis!,'storyClock')?{storyClockOwned:true}:{}),
     }));
   }
 
@@ -739,6 +861,21 @@ export class SceneAuthority {
       // a new delta. Its downstream analyses must use those new deltas too.
       changes.push({index,characters:new Set([...characters,source.envelope.targetId,...source.envelope.presentIds,...(source.speakerId?[source.speakerId]:[])])});
     }
+  }
+  /**
+   * N16: a source analysed as a non-opening (its story-clock analysis has no origin) that is now the opening source is
+   * analysed again. A legacy or failed opening never is. No transaction and no version bump of its own: both callers
+   * (reconcile and the lifecycle callback) are inside one and have already changed the version.
+   */
+  private requeueOpening(scope:SceneScope):boolean {
+    const state=this.state(scope),opening=this.storyClock.openingAwaitingOrigin(scope,state);
+    if(!opening)return false;
+    const source=state.sources.find(item=>item.id===opening.sourceId)!;
+    // Keep the old plan and candidates for a scoped retry, as invalidateCausalSuffix does.
+    this.db.prepare("UPDATE scene_sources SET processing='pending',analysis=? WHERE scope=? AND id=?")
+      .run(source.analysis?JSON.stringify(withoutEmotionStates(source.analysis)):null,scopeKey(scope),source.id);
+    this.processing.clearSources(scope,[source.id]);
+    return true;
   }
   private invalidateConfigurationChanges(scope:SceneScope,state:SceneState,roster:SceneRoster) {
     const previous=new Map(state.roster.characters.map(character=>[character.id,character]));
@@ -852,12 +989,12 @@ export class SceneAuthority {
     }
     // Replaying one role across its history avoids an all-NPC neural map.
     for(const character of state.roster.characters.filter(item=>!onlyCharacterId||item.id===onlyCharacterId)) {
-      let emotion=createEmotion(this.emotionTime(scope,[],state.createdAtMs),character.emotion,emotionIdentitySeed(scope,character.id));
+      let emotion=createEmotion(this.legacyEmotionTime(scope,[],state.createdAtMs,state.sources),character.emotion,emotionIdentitySeed(scope,character.id));
       for(const [index,source] of state.sources.entries()) {
         if(source.status!=='accepted'||source.processing!=='ready'||!source.analysis?.plan)continue;
         const candidate=source.analysis.characters[character.id];
         if(!candidate||source.analysis.emotionPendingIds?.includes(character.id))continue;
-        emotion=advanceEmotion(emotion,candidate.emotion,this.emotionTime(scope,state.sources.slice(0,index+1),source.acceptedAtMs),character.emotion);
+        emotion=advanceEmotion(emotion,candidate.emotion,this.legacyEmotionTime(scope,state.sources.slice(0,index+1),source.acceptedAtMs,state.sources),character.emotion);
         const body=JSON.stringify(validateEmotionState(emotion));
         const previous=this.db.prepare("SELECT j.value AS body FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j WHERE s.scope=? AND s.id=? AND j.key=?")
           .get(key,source.id,character.id) as {body:string}|undefined;
@@ -879,6 +1016,16 @@ export class SceneAuthority {
   }
 }
 
+/** Equality of two world settings as key-sorted JSON; array order counts. */
+function sameSettings(left:unknown,right:unknown):boolean {
+  const sorted=(value:unknown)=>JSON.stringify(value,(_key,item)=>item&&typeof item==='object'&&!Array.isArray(item)
+    ?Object.fromEntries(Object.entries(item).sort(([a],[b])=>a<b?-1:a>b?1:0)):item);
+  return left!==null&&right!==null&&sorted(left)===sorted(right);
+}
+function withoutStart(settings:WorldSettings):Omit<WorldSettings,'startTimeMs'> {
+  const {startTimeMs:_start,...rest}=settings;
+  return rest;
+}
 function sameContent(left: SceneMessage, right: SceneMessage) {
   return left.text === right.text && left.role === right.role && left.automatic === right.automatic && left.speakerId === right.speakerId &&
     JSON.stringify(left.envelope) === JSON.stringify(right.envelope) &&
@@ -898,7 +1045,13 @@ function preferenceControlId(sourceId:string,preference:{category:string;quote:s
 function preferenceSourceId(id:string) { return id.slice(0,id.lastIndexOf(':pref:@')); }
 function localAnalysis(value:SceneAnalysis,source:SceneSource,
   decodeUserModelCandidates:SceneAuthorityHooks['decodeUserModelCandidates']):SceneAnalysis {
-  const input=value as SceneAnalysis&{emotionStates?:unknown};
+  const input=value as SceneAnalysis&{emotionStates?:unknown;storyClock?:unknown};
+  // The world stage's story-clock output (SC2) passes through unvalidated; SC0 treats a malformed stored value as degraded.
+  // A value JSON cannot hold counts as absent, so a source without the key stores byte-identical rows.
+  const storyClock=Object.hasOwn(input,'storyClock')?input.storyClock:undefined;
+  // Stored as its own JSON copy: the fold input never aliases a caller-owned object and always equals the stored row.
+  const clockText=storyClock===undefined||typeof storyClock==='function'||typeof storyClock==='symbol'?undefined:JSON.stringify(storyClock);
+  const clockAbsent=clockText===undefined;
   const expectation=input.contactResponseExpectation;
   if(expectation!==undefined&&(typeof expectation!=='object'||expectation===null||
     ![true,false,null].includes(expectation.expected)||
@@ -922,7 +1075,8 @@ function localAnalysis(value:SceneAnalysis,source:SceneSource,
     ...(input.commitmentOperations===undefined?{}:{commitmentOperations:input.commitmentOperations}),
     ...(input.physiologyOperations===undefined?{}:{physiologyOperations:input.physiologyOperations}),
     ...(input.geographyOperations===undefined?{}:{geographyOperations:input.geographyOperations}),
-    ...userModelCandidatesOf(input.userModelCandidates,source.text,decodeUserModelCandidates)};
+    ...userModelCandidatesOf(input.userModelCandidates,source.text,decodeUserModelCandidates),
+    ...(clockAbsent?{}:{storyClock:JSON.parse(clockText) as unknown})};
 }
 /** Without a decoder (no companion extension) candidates are dropped, never rejected. */
 function userModelCandidatesOf(value:unknown,sourceText:string,
