@@ -1,6 +1,6 @@
 /**
  * Unified story clock: frozen type contract (slice SCT; DESIGN-behaviour-layer.md section 17; rulings 24, 24a, 42;
- * semantics finalized 2026-09-30 in .local/review/sct-semantics-20260930/SEMANTICS.md r2, authoritative where this
+ * semantics finalized 2026-09-30 in the SCT semantics note r2, authoritative where this
  * summary is brief). Types and constants only, no logic. Implemented by SC0 (fold), SC1 (parser), SC2 (extraction),
  * SC3a (authority wiring), SC4 (corrections). Changing this file after SCT lands must be announced to the SC0, SC1,
  * SC2 and SC3a implementers and recorded in the slice note.

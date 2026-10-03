@@ -1,6 +1,6 @@
 # OpenHer 情緒與神經學習採用說明
 
-上游固定於 `ef5b2145c9c15582499ecc5fb9d10376d82eccdf`, 本地只讀來源在 `.local/references/OpenHer`. 許可證為 Apache-2.0, 安裝包保留 `shared/third-party/OpenHer-LICENSE`. 產品以 TypeScript 執行, 不依賴 Python.
+上游固定於 `ef5b2145c9c15582499ecc5fb9d10376d82eccdf`, 原始碼不隨倉庫發佈, 需要時自上游倉庫取得該提交. 許可證為 Apache-2.0, 安裝包保留 `shared/third-party/OpenHer-LICENSE`. 產品以 TypeScript 執行, 不依賴 Python.
 
 使用者已要求完整神經學習作為 NPC/伴侶情緒更新依據. 原先固定公式投影僅是歷史版本; 當前移植程式碼位於 `shared/src/emotion/neural.ts`, 事件與代謝接入位於 `shared/src/emotion/openher.ts`. 實現與實機驗收狀態分別見原始碼工作區 `PROJECT_STATUS.md`.
 
@@ -8,7 +8,7 @@
 
 ## 2026-09-29 保真度核驗: 當前程式碼與上游的差異
 
-本節依 `.local/review/openher-fidelity-20260929/` 的審計和 `shared/tests/fixtures/openher-golden/deviations.json` 寫成, 陳述當前程式碼今天做什麼. 下文的"計劃"指設計中的切片(OH1-OH9, 見該目錄 `DESIGN.md` §4)與使用者裁定 21-24a, 只是路線: OH1(K1, R1)已完成, 其餘切片仍是計劃. 神經核心(`neuralForward`, `neuralLearn`, `neuralStep`, `neuralThermodynamic` 與代謝公式)由 OH0 一致性測試(`shared/tests/openher-conformance.test.mjs`)逐步鎖定為上游 `ef5b214`; 夾具另含 `reads.json`, 由 `generate_golden.py --reads` 生成, 共 75 個讀取點, 對照上游 `time_metabolism` + `sync_to_agent`, 容差 1e-12, 測試時不執行 Python. 下列差異都發生在核心之外的編排, 輸入和讀取層, 而這些層決定了核心實際收到什麼.
+本節依 2026-09-29 的保真度審計和 `shared/tests/fixtures/openher-golden/deviations.json` 寫成, 陳述當前程式碼今天做什麼. 下文的"計劃"指設計中的切片(OH1-OH9)與使用者裁定 21-24a, 只是路線: OH1(K1, R1)已完成, 其餘切片仍是計劃. 神經核心(`neuralForward`, `neuralLearn`, `neuralStep`, `neuralThermodynamic` 與代謝公式)由 OH0 一致性測試(`shared/tests/openher-conformance.test.mjs`)逐步鎖定為上游 `ef5b214`; 夾具另含 `reads.json`, 由 `generate_golden.py --reads` 生成, 共 75 個讀取點, 對照上游 `time_metabolism` + `sync_to_agent`, 容差 1e-12, 測試時不執行 Python. 下列差異都發生在核心之外的編排, 輸入和讀取層, 而這些層決定了核心實際收到什麼.
 
 - **關係輸入恆為 0 (K4)**: 場景, 酒館和伴侶路徑在 `shared/src/core/models.ts:344` 與 `shared/src/scene/service.ts:1193, 1217` 清空 `stableRelationDelta`, 12維神經上下文中的關係深度, 信任和情感基調在這些路徑恆為 0; 只有舊核心路徑(`shared/src/core/store.ts:298`)會餵入. 計劃於 OH3 改為上游式 EMA, 以 XLDB 的關係先驗為先驗.
 - **種子含聊天 ID (K6)**: 情緒身份種子為 `xldb-emotion-v2` 加世界, 會話(酒館中即 chatId), 角色和 NPC(`shared/src/core/store.ts:342`, `shared/src/scene/types.ts:153`), 所以同一張角色卡在每個新聊天都得到另一副基因組, 並非"穩定角色身份". 計劃於 OH2 改為卡片身份加 NPC 正名的卡片級基因組(裁定 22, 22a), 既有聊天保留原基因組.

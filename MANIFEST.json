@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "b1d3d827cf852f63d04cacfd3683d56aa7d752c60f64315ecadaacf85863669f",
+  "sourceManifestSha256": "53f59b06ee7bc1dab8bebf53085740d9b4f74d492691ba15537d9a5cfe8d815d",
   "files": [
     {
       "file": ".gitattributes",
@@ -54,8 +54,8 @@
     },
     {
       "file": "shared/docs/OPENHER_ADOPTION.md",
-      "sha256": "2b9e0c864739f94f898e6b1ecf43ca61eb5f9b132884bc29a7a3736126d8caea",
-      "bytes": 17515
+      "sha256": "e4955c2b939597ba4c7246ca21b532fc4dd86f24c4c75bc6a080868e5807a1a3",
+      "bytes": 17481
     },
     {
       "file": "shared/src/agentjev/client.ts",
@@ -404,8 +404,8 @@
     },
     {
       "file": "shared/src/scene/story-clock-types.ts",
-      "sha256": "e4d18483804c0b67a7f29b04c73c1de0639d8485237310820b7cba92fc9d178f",
-      "bytes": 57668
+      "sha256": "3538597a39375d218b9456c5842c943f7cd8758da8bbfefda7d3e8052c77dfc1",
+      "bytes": 57641
     },
     {
       "file": "shared/src/scene/story-clock.ts",
@@ -559,12 +559,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "afbd083e375df0ba9519a2b933ccefba6d3c352d8b75845826a0434af7cca487",
+      "sha256": "02bd2a5e86357d768a217803bc571d760ce6e61f82a39b349c98e31721a7f7ab",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "0cbddd9440ed1dd1245696e976f7d4446b2629df6874f847bdf74877920abf97",
+      "sha256": "a595ddaf9e47abb36fa7b8d52ed541addccbf314012d60ee30db7f159f163c04",
       "bytes": 355817
     }
   ]
