@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "a02af6ce90e45ff5d0bbb7b6e4b7f7452b2a7dff61a8175df0f1ca93598db8aa",
+  "sourceManifestSha256": "8c6ab443338a9dbf7d204592caa2b56377fb45c74215289234cbf8065704c85d",
   "files": [
     {
       "file": ".gitattributes",
@@ -439,8 +439,8 @@
     },
     {
       "file": "shared/src/scene/world-extraction.ts",
-      "sha256": "8683cc03d8b1e2aa1f44356a60c0b006275ad439b8fb478b9f520eb4c48ab7e4",
-      "bytes": 5068
+      "sha256": "c21a0ad63b7a574fb84f81cf70b6eb3475ed5197eab26334acb9a9ae173bddb1",
+      "bytes": 43719
     },
     {
       "file": "shared/src/scene/world-state.ts",
@@ -554,12 +554,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "063c3a6acb6c8950563bf6efb81068e866c9cda5336e2a577df79622c22f53c6",
+      "sha256": "7623730a501b639572a847eaaa9ad63fedf204c21b61d4ffcf7f82a5f3cdd721",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "29445ec86986fd979b35375bbc3eb341fa4e121036289c2a3c47f0c457bc7d7b",
+      "sha256": "1cc95d8329b0b0994115684065747fe9ea59d76581dd3228546745ce94ba2661",
       "bytes": 355817
     }
   ]
