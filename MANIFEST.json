@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "a61b0a433f70fb8315344c552c8bb9fc8687c64ceb87329a75408d6b60f32b11",
+  "sourceManifestSha256": "a02af6ce90e45ff5d0bbb7b6e4b7f7452b2a7dff61a8175df0f1ca93598db8aa",
   "files": [
     {
       "file": ".gitattributes",
@@ -144,8 +144,8 @@
     },
     {
       "file": "shared/src/core/pair-capture.ts",
-      "sha256": "eb3448716c5c196f2e660e75dfe1f7054f5f97ce430a9016d4e4206f851bfd8f",
-      "bytes": 11983
+      "sha256": "f055821330c0700040eeb2341fa8713aa84f0f188abc0ec60742bc90f0511955",
+      "bytes": 12457
     },
     {
       "file": "shared/src/core/role-observation.ts",
@@ -554,12 +554,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "3f405d4dcd9d877518d64a6f06ec98574bc186d5fc7133d9dd15f8c95423e065",
+      "sha256": "063c3a6acb6c8950563bf6efb81068e866c9cda5336e2a577df79622c22f53c6",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "419877e72f6a57633eae8a9c84599966bdc58a2cd366739d5e50943f6e007b31",
+      "sha256": "29445ec86986fd979b35375bbc3eb341fa4e121036289c2a3c47f0c457bc7d7b",
       "bytes": 355817
     }
   ]

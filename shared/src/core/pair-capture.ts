@@ -110,7 +110,10 @@ function entering(config: ModelConfig, prompts: Prompt[], json: boolean, now: ()
   const thinking = thinkingValue === 'enabled' || thinkingValue === 'disabled' ? thinkingValue : null;
   const key = string(field(config, 'key'));
   const baseUrl = string(field(config, 'baseUrl'))?.trim().replace(/\/+$/, '') ?? null;
-  const secrets = [...new Set([key, baseUrl].filter((value): value is string => value !== null && value.length >= 8))].sort((a, b) => b.length - a.length);
+  const endpoint = baseUrl?.split(/[?#]/, 1)[0]?.replace(/\/chat\/completions$/, '') ?? null;
+  const url = safely(() => new URL(baseUrl ?? ''));
+  const urlSecrets = url === null ? [] : [...url.searchParams.values(), url.username, url.password];
+  const secrets = [...new Set([key, baseUrl, endpoint, ...urlSecrets].filter((value): value is string => value !== null && value.length >= 8))].sort((a, b) => b.length - a.length);
   let redactions = 0;
   const redact = (text: string) => {
     for (const secret of secrets) {
@@ -122,7 +125,8 @@ function entering(config: ModelConfig, prompts: Prompt[], json: boolean, now: ()
   };
   const savedPrompts = safely(() => Array.isArray(prompts) ? Array.from(prompts, prompt => {
     if (typeof prompt !== 'object' || prompt === null) return { role: null, content: null };
-    const role = string(field(prompt, 'role'));
+    const roleValue = field(prompt, 'role');
+    const role = roleValue === 'system' || roleValue === 'user' || roleValue === 'assistant' ? roleValue : null;
     const content = string(field(prompt, 'content'));
     return { role, content: content === null ? null : redact(content) };
   }) : null);
@@ -176,7 +180,7 @@ export function createPairCapture(options: PairCaptureOptions | null | undefined
       const existing = fs.readFileSync(settings.file);
       if (existing.length > 0 && existing[existing.length - 1] !== 10) throw new Error('write_failed');
       bytes = existing.length;
-      records = existing.reduce((total, byte) => total + (byte === 10 ? 1 : 0), 0);
+      for (let i = existing.indexOf(10); i !== -1; i = existing.indexOf(10, i + 1)) records += 1;
     }
     prepared = true;
   };
@@ -226,7 +230,8 @@ export function createPairCapture(options: PairCaptureOptions | null | undefined
       const snapshot = entering(config, prompts, json, settings.now, settings.address);
       let result: ReturnType<ModelRunner>;
       try { result = run(config, prompts, json); } catch (cause) { result = Promise.reject(cause); }
-      return result.then(value => { settle(snapshot, 'ok', value); return value; },
+      if (typeof result?.then !== 'function') return result;
+      return Promise.resolve(result).then(value => { settle(snapshot, 'ok', value); return value; },
         cause => { settle(snapshot, 'error', cause); throw cause; });
     },
     status: () => ({ enabled: true, state, runId: settings.runId,
