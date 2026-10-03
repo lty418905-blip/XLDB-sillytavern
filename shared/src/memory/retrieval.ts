@@ -11,7 +11,10 @@ import { scopeKey } from '../core/types.ts';
 import {traceModel,withModelAddress,recordModelDispatch,recordModelResponse,recordModelUsage,recordRetrievalFallback} from '../core/runtime-log.ts';
 import {MemoryTokenizer} from './tokenizer.ts';
 import type {ChineseTokenizer} from './tokenizer.ts';
-import {compareSalience} from './vector-forgetting.ts';
+import {compareSalience,memoryClockTimeMs} from './vector-forgetting.ts';
+import {RERANK_FLOOR,COSINE_RESCUE,SALIENCE_MINIMUM,INTENT_WORDS,gate,salienceFill} from './relevance.ts';
+import type {AdmissionReason,Admitted,GateCandidate,SalienceTrigger} from './relevance.ts';
+import type {EmotionalReactionKey} from './retention.ts';
 
 const CANDIDATE_LIMIT = 20;
 const DEFAULT_EXTERNAL_TIMEOUT_MS = 15_000;
@@ -20,14 +23,19 @@ const EMBEDDING_BATCH = 32;
 // Cosine distance is smaller for a closer match. This is a routing heuristic,
 // not a confidence score; callers can tune it for their provider/data.
 const DEFAULT_RERANK_COSINE_GAP = 0.08;
-const RERANK_POLICY_VERSION = 1;
+const RERANK_POLICY_VERSION = 2;
 // Every stored vector is the provider's exact embedding of the row's visible semantic text (ruling 19).
 const EXACT_VECTORS = 'float32-exact';
 
 export type RetrievalConfig = { embedding: ModelConfig; reranker: ModelConfig };
 type IndexedRow = { id: string; text: string; semantic: string; kind: string; lexical?: string; vector?: number[] };
 type RerankResult = { index: number; score: number };
-export interface RetrievalOptions {tokenizer?:ChineseTokenizer|'default';minimumRerankScore?:number;rerankCosineGap?:number;externalTimeoutMs?:number;vectorIndex?:'auto'|'flat'}
+/**
+ * minimumRerankScore (default RERANK_FLOOR), cosineRescueDistance (default COSINE_RESCUE) and salienceMinimum (default
+ * SALIENCE_MINIMUM) exist so MR7a can sweep the gate through the product code; product callers pass none of them.
+ */
+export interface RetrievalOptions {tokenizer?:ChineseTokenizer|'default';minimumRerankScore?:number;rerankCosineGap?:number;externalTimeoutMs?:number;vectorIndex?:'auto'|'flat';
+  cosineRescueDistance?:number;salienceMinimum?:number}
 /**
  * Why an embedding or reranker call failed. credentials_rejected (401/403), model_not_found (404, or a 400/422
  * naming the model) and endpoint_redirected need the user to fix the configuration; the rest are transient.
@@ -40,7 +48,11 @@ export interface RetrievalResult {ids:string[];mode:string;tokenizer:ChineseToke
   // A transient provider failure keeps the ordinary *_request_failed reason; a credential or configuration failure never does.
   fallbackReason?:ProviderFallbackReason|'pq_index_build_failed';degraded?:RetrievalDegradation;semanticCues?:SemanticCue[];vectorIndex?:'ivf-pq'|'flat'|'none';
   // rerankUsed records an attempted provider call, including an attempted call that failed.
-  rerankUsed:boolean;rerankReason:'not_configured'|'no_candidates'|'clear_cosine_gap'|'near_cosine_gap'|'relevant_anchor'|'bm25_no_embedding'|'provider_fallback'}
+  rerankUsed:boolean;rerankReason:'not_configured'|'no_candidates'|'clear_cosine_gap'|'near_cosine_gap'|'relevant_anchor'|'bm25_no_embedding'|'provider_fallback';
+  // One entry per id, in the same order: why the id is there. Empty on the early returns (the explicit recent view is not an admission).
+  admission:{id:string;by:AdmissionReason}[];
+  // Present only when the salience path ran, also when it added nothing.
+  salience?:{trigger:SalienceTrigger;reactions:EmotionalReactionKey[]}}
 type Provider = {url:string;key:string;model:string};
 type Projection = {fingerprint:string;table:any;index:'ivf-pq'|'flat'|'none';indexFailure?:true;results:Map<string,RetrievalResult>};
 
@@ -56,7 +68,9 @@ export class Retrieval {
   private readonly queryVectors = new Map<string,number[]>();
   private readonly directory: string;
   private readonly tokenizer:MemoryTokenizer;
-  private readonly minimumRerankScore:number|undefined;
+  private readonly minimumRerankScore:number;
+  private readonly cosineRescueDistance:number;
+  private readonly salienceMinimum:number;
   private readonly rerankCosineGap:number;
   private readonly externalTimeoutMs:number;
   private readonly vectorIndex:'auto'|'flat';
@@ -67,7 +81,13 @@ export class Retrieval {
     if(options.minimumRerankScore!==undefined&&!Number.isFinite(options.minimumRerankScore))throw new Error('invalid_rerank_threshold');
     if(options.rerankCosineGap!==undefined&&(!Number.isFinite(options.rerankCosineGap)||options.rerankCosineGap<0||options.rerankCosineGap>2))throw new Error('invalid_rerank_cosine_gap');
     if(options.externalTimeoutMs!==undefined&&(!Number.isSafeInteger(options.externalTimeoutMs)||options.externalTimeoutMs<1||options.externalTimeoutMs>30_000))throw new Error('invalid_external_timeout');
-    this.minimumRerankScore=options.minimumRerankScore;
+    if(options.cosineRescueDistance!==undefined&&(typeof options.cosineRescueDistance!=='number'||!Number.isFinite(options.cosineRescueDistance)||
+      options.cosineRescueDistance<0||options.cosineRescueDistance>2))throw new Error('invalid_cosine_rescue');
+    if(options.salienceMinimum!==undefined&&(!Number.isSafeInteger(options.salienceMinimum)||options.salienceMinimum<0||options.salienceMinimum>20))
+      throw new Error('invalid_salience_minimum');
+    this.minimumRerankScore=options.minimumRerankScore??RERANK_FLOOR;
+    this.cosineRescueDistance=options.cosineRescueDistance??COSINE_RESCUE;
+    this.salienceMinimum=options.salienceMinimum??SALIENCE_MINIMUM;
     this.rerankCosineGap=options.rerankCosineGap??DEFAULT_RERANK_COSINE_GAP;
     this.externalTimeoutMs=options.externalTimeoutMs??DEFAULT_EXTERNAL_TIMEOUT_MS;
     this.vectorIndex=options.vectorIndex??'auto';
@@ -104,7 +124,10 @@ export class Retrieval {
       const mode = embedding ? 'hybrid' : 'bm25';
       const intent=queryIntent(query);
       const result=(resultMode:string,ids:string[],extra:Partial<RetrievalResult>={}):RetrievalResult=>({ids,mode:resultMode,tokenizer:this.tokenizer.name,intent,cacheHit:false,
-        rerankUsed:false,rerankReason:reranker?'no_candidates':'not_configured',...extra});
+        rerankUsed:false,rerankReason:reranker?'no_candidates':'not_configured',admission:[],...extra});
+      // The one "reminded" predicate (an exact retention cue in the query today; MR1 widens it to the recall trace).
+      const reminded=(id:string)=>snapshot.memories.get(id)?.reactivated===true;
+      const limits={floor:this.minimumRerankScore,rescue:this.cosineRescueDistance};
       if (rows.length === 0) {
         await this.clearProjection(key);
         return result(mode,[]);
@@ -122,17 +145,18 @@ export class Retrieval {
         }));
         const projection=await this.table(key,fingerprint,rows,activeEmbedding,deadline);
         const table=projection.table;
+        // The salience order decides ids, so its inputs (memory-clock time, reaction keys) are part of the key.
         const policyRows=views.map(view=>[view.id,view.access,view.anchor,view.protectedFacts,
           snapshot.memories.get(view.id)?.retention?.kind,snapshot.memories.get(view.id)?.accessOverride,
-          snapshot.memories.get(view.id)?.source.reference]);
+          snapshot.memories.get(view.id)?.source.reference,memoryClockTimeMs(snapshot.memories.get(view.id)!),view.emotionalReaction?.reactions]);
         const cacheKey=digest(JSON.stringify([RERANK_POLICY_VERSION,query,nowMs,snapshot.version,policyRows,
           identity(activeReranker),activeReranker?digest(activeReranker.key):'',activeEmbedding?digest(activeEmbedding.key):'',
-          this.minimumRerankScore,this.rerankCosineGap,fallbackReason,providerDegradation?.failure,providerDegradation?.httpStatus]));
+          this.minimumRerankScore,this.cosineRescueDistance,this.salienceMinimum,this.rerankCosineGap,fallbackReason,providerDegradation?.failure,providerDegradation?.httpStatus]));
         const cached=projection.results.get(cacheKey);
         if(cached){
           // Every degraded search is logged, including one answered from the local fallback cache.
           if(cached.degraded)recordRetrievalFallback(cached.fallbackReason!,cached.degraded);
-          return {...cached,ids:[...cached.ids],cacheHit:true,...(cached.degraded?{degraded:{...cached.degraded}}:{})};
+          return {...detached(cached),cacheHit:true};
         }
         const rowById=new Map(rows.map(row=>[row.id,row]));
         const queries=queryParts(query);
@@ -156,23 +180,42 @@ export class Retrieval {
           const candidates=[...ranked.entries()].filter(([id])=>rowById.has(id)).map(([id,score])=>({id,score:score*(intent!=='balanced'&&rowById.get(id)!.kind===intent?1.15:1)}))
             .sort((a,b)=>b.score-a.score||bySalience(a.id,b.id)).slice(0,CANDIDATE_LIMIT).map(item=>item.id);
           const rerankReason=await this.rerankDecision(part,candidates,semantic,activeEmbedding,activeReranker,rowById,viewsById);
+          // The relevance gate: the cosine distance of each candidate in this part's vector list, if any. A flat scan
+          // returns LanceDB's float32 value, which can be a hair below 0 for an exact match; like the exact IVF-PQ
+          // distances (cosineDistance), it is read on the provider-independent [0, 2] scale.
+          const distances=new Map<string,number>();
+          for(const item of semantic){
+            const row=record(item);
+            if(typeof row.id==='string'&&typeof row._distance==='number'&&Number.isFinite(row._distance)&&!distances.has(row.id))
+              distances.set(row.id,Math.min(2,Math.max(0,row._distance)));
+          }
+          const gated=(scores?:Map<string,number>):Admitted[]=>gate(scores?'reranked':activeEmbedding?'cosine':'lexical',
+            candidates.map(id=>({id,...(scores?.has(id)?{score:scores.get(id)}:{}),...(distances.has(id)?{distance:distances.get(id)}:{}),reminded:reminded(id)}) as GateCandidate),
+            limits,bySalience);
           if(rerankReason==='not_configured'||rerankReason==='no_candidates'||rerankReason==='clear_cosine_gap')
-            return {ids:candidates,topScore:undefined,semantic,rerankUsed:false,rerankReason};
+            return {admitted:gated(),topScore:undefined,semantic,rerankUsed:false,rerankReason};
           let reranked:RerankResult[];
           try{reranked=await rerank(activeReranker!,part,candidates.map(id=>rowById.get(id)!.text),deadline);}
           catch(error){
             const rerankFailed=providerFailure(error);
             if(rerankFailed?.stage!=='reranker')throw error;
-            return {ids:candidates,topScore:undefined,rerankFailed,semantic,rerankUsed:true,rerankReason};
+            return {admitted:gated(),topScore:undefined,rerankFailed,semantic,rerankUsed:true,rerankReason};
           }
-          // A provider score is an ordering signal, not a calibrated probability.
-          const floor=this.minimumRerankScore??-Infinity;
-          return {ids:reranked.filter(item=>item.score>=floor).map(item=>candidates[item.index]),topScore:reranked[0]?.score,semantic,rerankUsed:true,rerankReason};
+          // A provider score is an ordering signal; the floor is a reference value for bge-reranker-v2-m3 (MR7a).
+          return {admitted:gated(new Map(reranked.map(item=>[candidates[item.index],item.score]))),topScore:reranked[0]?.score,semantic,rerankUsed:true,rerankReason};
         }));
-        const ids:string[]=[];
+        const ids:string[]=[],admission:Admitted[]=[];
         for(let rank=0;rank<CANDIDATE_LIMIT&&ids.length<CANDIDATE_LIMIT;rank++)for(const list of lists){
-          const id=list.ids[rank];if(id&&!ids.includes(id)&&ids.length<CANDIDATE_LIMIT)ids.push(id);
+          const entry=list.admitted[rank];
+          if(entry&&!ids.includes(entry.id)&&ids.length<CANDIDATE_LIMIT){ids.push(entry.id);admission.push({id:entry.id,by:entry.by});}
         }
+        // The salience path runs after the merge, on healthy and degraded results alike. Reference rows are never salient memories.
+        const terms=await this.tokenizer.terms(query),contentTerms=await this.tokenizer.contentTerms(query);
+        const merged=new Set(ids);
+        const pool=rows.filter(row=>!merged.has(row.id)&&!snapshot.memories.get(row.id)?.source.reference)
+          .map(row=>({memory:snapshot.memories.get(row.id)!,view:viewsById.get(row.id)!}));
+        const filled=salienceFill({ids,query,terms,contentTermCount:contentTerms.length,minimum:this.salienceMinimum,pool});
+        for(const entry of filled?.added??[]){ids.push(entry.id);admission.push(entry);}
         // With several query parts, a configuration failure outranks a transient one so it is never hidden.
         const rerankFailed=lists.map(list=>'rerankFailed' in list?list.rerankFailed:undefined)
           .filter((item):item is RetrievalDegradation=>!!item).sort((a,b)=>failureRank(a)-failureRank(b))[0];
@@ -183,11 +226,15 @@ export class Retrieval {
           lists.find(list=>list.rerankReason==='bm25_no_embedding')?.rerankReason??lists[0]?.rerankReason??'no_candidates';
         const semanticCues=activeEmbedding?semanticReactivations(lists[0]?.semantic??[],rowById,viewsById,snapshot,query):[];
         const output=result(rerankFailed?(activeEmbedding?'hybrid-fallback':'bm25-fallback'):rerankUsed?`${resultMode}+rerank`:resultMode,ids,
-          {topScore:lists[0]?.topScore,semanticCues,vectorIndex:projection.index,rerankUsed,rerankReason,
+          {topScore:lists[0]?.topScore,semanticCues,vectorIndex:projection.index,rerankUsed,rerankReason,admission,
+            ...(filled?{salience:{trigger:filled.trigger,reactions:filled.reactions}}:{}),
             ...(degraded?{fallbackReason:fallbackReasonOf(degraded),degraded:{...degraded}}:projection.indexFailure?{fallbackReason:'pq_index_build_failed' as const}:{})});
         if(!rerankFailed)cache(projection.results,cacheKey,output,64);
         if(output.degraded)recordRetrievalFallback(output.fallbackReason!,output.degraded);
-        return {...output,ids:[...output.ids],...(output.degraded?{degraded:{...output.degraded}}:{})};
+        // Not a provider failure: `degraded` stays absent and the event is visible in the exported runtime log only.
+        else if(output.fallbackReason==='pq_index_build_failed')
+          recordRetrievalFallback('pq_index_build_failed',{stage:'index',failure:'index_build_failed',attention:'transient'});
+        return detached(output);
       };
       try{return await run(embedding,reranker,mode);}
       catch(error){
@@ -317,7 +364,8 @@ export class Retrieval {
     if(!reranker)return 'not_configured';
     if(!candidates.length)return 'no_candidates';
     if(!embedding)return 'bm25_no_embedding';
-    const terms=new Set((await this.tokenizer.terms(part)).filter(term=>term.length>=2));
+    // Content terms on both sides: a shared filler (我们, the) no longer forces a rerank call.
+    const terms=new Set((await this.tokenizer.contentTerms(part)).filter(term=>term.length>=2));
     for(const id of candidates){
       const view=views.get(id);
       if(!view)continue;
@@ -325,7 +373,7 @@ export class Retrieval {
       if(!evidence.length)continue;
       for(const phrase of evidence){
         if(phrase.length>=2&&(part.includes(phrase)||phrase.includes(part)))return 'relevant_anchor';
-        const evidenceTerms=await this.tokenizer.terms(phrase);
+        const evidenceTerms=await this.tokenizer.contentTerms(phrase);
         if(evidenceTerms.some(term=>terms.has(term)))return 'relevant_anchor';
       }
     }
@@ -442,10 +490,21 @@ function addRanks(ranked: Map<string, number>, results: readonly unknown[]): voi
   }
 }
 
+// Appendix B2: English expressions, case-insensitive, at word boundaries; no stemming.
+const englishIntent=(words:readonly string[])=>new RegExp(`(?<![\\p{L}\\p{N}])(?:${words.map(word=>word.replace(/ +/g,'\\s+')).join('|')})(?![\\p{L}\\p{N}])`,'iu');
+const EPISODE_EN=englishIntent(INTENT_WORDS.episode),FACT_EN=englishIntent(INTENT_WORDS.fact);
 function queryIntent(query:string):RetrievalResult['intent']{
-  if(/感受|感觉|想起|回忆|为何|为什么|怎么想|安心|紧张|害怕|失望|高兴|敬佩|看法|安全感|和解|理解|怎样|如何/.test(query))return 'episode';
-  if(/多少|几点|编号|号码|金额|口令|约定|承诺|身份|日期|库存|由谁|是谁|哪位|哪页|颜色/.test(query))return 'fact';
+  if(/感受|感觉|想起|回忆|为何|为什么|怎么想|安心|紧张|害怕|失望|高兴|敬佩|看法|安全感|和解|理解|怎样|如何/.test(query)||EPISODE_EN.test(query))return 'episode';
+  if(/多少|几点|编号|号码|金额|口令|约定|承诺|身份|日期|库存|由谁|是谁|哪位|哪页|颜色/.test(query)||FACT_EN.test(query))return 'fact';
   return 'balanced';
+}
+
+/** A fresh copy of every array and object a caller can reach, so a mutation never reaches the cache or a later result. */
+function detached(value:RetrievalResult):RetrievalResult{
+  return {...value,ids:[...value.ids],admission:value.admission.map(entry=>({...entry})),
+    ...(value.salience?{salience:{...value.salience,reactions:[...value.salience.reactions]}}:{}),
+    ...(value.degraded?{degraded:{...value.degraded}}:{}),
+    ...(value.semanticCues?{semanticCues:value.semanticCues.map(cue=>({...cue}))}:{})};
 }
 
 /** Split explicit lists, not inferred topics; an ordinary sentence stays intact. */

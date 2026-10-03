@@ -90,6 +90,24 @@ export function reactionPhrase(language:StoryLanguage,reactions:readonly unknown
   return table[key];
 }
 
+/**
+ * Appendix A of MR3 (FINAL): the absence sentence, worded for remembered contact (印象里, "since we last spoke"), in
+ * the voice of the markers. Context text only; never stored, indexed or rewritten.
+ */
+export const absenceSentences:{readonly [L in StoryLanguage]:Readonly<Record<'days'|'months'|'years',string>>}={
+  zh:{days:'印象里，上次和对方说话已经是{N}天前的事了。',months:'印象里，上次和对方说话已经是{N}个月前的事了。',years:'印象里，上次和对方说话已经是{N}年前的事了。'},
+  en:{days:"It's been {N} days since we last spoke.",months:"It's been {N} months since we last spoke.",years:"It's been {N} years since we last spoke."},
+};
+
+/** Under 60 days in days; 60 to 729 in months (days / 30); from 730 in years (days / 365). None for a value that is not a safe integer >= 1. */
+export function absenceSentence(language:StoryLanguage,elapsedDays:unknown):string|undefined {
+  if(typeof elapsedDays!=='number'||!Number.isSafeInteger(elapsedDays)||elapsedDays<1)return undefined;
+  const table=language==='zh'||language==='en'?absenceSentences[language]:undefined;
+  if(!table)return undefined;
+  const [unit,count]=elapsedDays<60?['days' as const,elapsedDays]:elapsedDays<730?['months' as const,Math.floor(elapsedDays/30)]:['years' as const,Math.floor(elapsedDays/365)];
+  return table[unit].replace('{N}',String(count));
+}
+
 export type RenderedMemory=Omit<MemoryView,'forgottenMarker'|'emotionalReaction'>&{forgotten?:string};
 
 const blank=(value:unknown):boolean=>typeof value!=='string'||!value.trim();

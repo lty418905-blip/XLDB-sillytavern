@@ -1,10 +1,10 @@
 import { Authority } from './store.ts';
 import { ModelTasks } from './models.ts';
 import { Retrieval } from '../memory/retrieval.ts';
-import {contextMemories} from '../memory/context.ts';
+import {contextMemories,checkCurrentSource,type CurrentSource} from '../memory/context.ts';
 import {retentionSnapshot} from '../memory/retention.ts';
 import {reactivateSnapshot} from '../memory/access.ts';
-import {renderContextMemory} from '../memory/render.ts';
+import {renderContextMemory,absenceSentence} from '../memory/render.ts';
 import {storyLanguageOf,type StoryLanguage} from '../memory/text-units.ts';
 import { emotionSummary } from '../emotion/openher.ts';
 import {buildEmotionExpression,renderEmotionExpression,type EmotionExpressionInput} from '../emotion/expression.ts';
@@ -75,7 +75,9 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
   async contextFrom(snapshot: MemorySnapshot, query: string, configs: Configurations, emotion: EmotionState,
     allPreferences: Preference[], assertCurrent:()=>void, now = Date.now(),
     expression?:Partial<Pick<EmotionExpressionInput,'actorId'|'addresseeId'|'timeZone'|'clockKind'|'clockTimeMs'|'hideStoryTime'|'relationBasis'|'waiting'|'address'>>,
-    options:{reactivationOrigin?:'reply';language?:StoryLanguage}={}) {
+    options:{reactivationOrigin?:'reply';language?:StoryLanguage;currentSource?:CurrentSource}={}) {
+    // The user source a reply path is answering (scene/service.ts passes it); its own memories are not "last contact".
+    checkCurrentSource(options.currentSource);
     if(options.language!==undefined&&options.language!=='zh'&&options.language!=='en')throw new Error('invalid_story_language');
     // One story language per context, never switched by a single player line.
     const language=options.language??storyLanguageOf(snapshot);
@@ -89,7 +91,7 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
     snapshot=reactivateSnapshot(snapshot,now,result.semanticCues??[]);
     // Protection controls retention, not unconditional injection. Relevant facts
     // compete alongside episodes; every returned ID is checked against authority.
-    const projected = contextMemories(snapshot,result.ids,now);
+    const projected = contextMemories(snapshot,result.ids,now,{currentSource:options.currentSource});
     const blurred=projected.memories.filter(memory=>memory.access!=='clear');
     const rewriteKey=createHash('sha256').update(JSON.stringify([scopeKey(scope),blurred,configs.rewrite])).digest('hex');
     let clauses=this.rewriteCache.get(rewriteKey);
@@ -121,7 +123,9 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
         relevant:render(projected.relevant.filter(memory=>!memory.source.reference)),
         recent:render([...projected.recent].sort((a,b)=>a.source.knownAtMs-b.source.knownAtMs||
           (a.source.occurredAtMs??0)-(b.source.occurredAtMs??0)||
-          (sourceOrder.get(a.source.messageId)??0)-(sourceOrder.get(b.source.messageId)??0)))}),
+          (sourceOrder.get(a.source.messageId)??0)-(sourceOrder.get(b.source.messageId)??0))),
+        ...(()=>{const sentence=projected.absence&&absenceSentence(language,projected.absence.elapsedDays);return sentence?{sinceLastContact:sentence,
+          ...(projected.lastContact?.length?{lastContact:[...projected.lastContact].reverse().map(row=>({...renderContextMemory(row.memory,language),daysAgo:row.daysAgo}))}:{})}:{};})()}),
       clauses.length ? `模糊回忆表达：${JSON.stringify(clauses)}` : '',
       renderEmotionExpression(buildEmotionExpression({scope,actorId:expression?.actorId??scope.characterId,
         addresseeId:expression?.addresseeId??'user',sourceVersion:snapshot.version,nowMs:now,

@@ -515,7 +515,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     if(regenerateId&&expression.clockKind==='story')expression.clockTimeMs=this.authority.emotionTime(scope,state.sources,decisionNowMs);
     const context=await this.core.contextFrom(this.authority.snapshot(scope,character.id,state),current,configs,
       affect.emotion,this.authority.preferences(scope,character.id,state,source.id),assertCurrent,decisionNowMs,
-      expression);
+      expression,{currentSource:{id:source.id,revision:source.revision}});
     context.context+=this.authority.worldContext(scope,character.id,state);
     context.context+=this.authority.physiology.context(scope,character.id,decisionNowMs,view,this.generationClock(scope,view,decisionNowMs));
     context.context+=this.authority.geography.context(scope,character.id,view);
@@ -588,7 +588,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       if(regenerating&&expression.clockKind==='story')expression.clockTimeMs=this.authority.emotionTime(scope,state.sources,decisionNowMs);
       const context=await this.core.contextFrom(this.authority.snapshot(scope,actor.id,state),current,configs,
         batch[0]!.group,this.authority.preferences(scope,actor.id,state,source.id),assertCurrent,decisionNowMs,
-        expression);
+        expression,{currentSource:{id:source.id,revision:source.revision}});
       context.context+=this.authority.worldContext(scope,actor.id,state);
       context.context+=this.authority.physiology.context(scope,actor.id,decisionNowMs,view,this.generationClock(scope,view,decisionNowMs));
       context.context+=this.authority.geography.context(scope,actor.id,view);
@@ -612,7 +612,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       if(regenerating&&expression.clockKind==='story')expression.clockTimeMs=this.authority.emotionTime(scope,state.sources,decisionNowMs);
       const context=await this.core.contextFrom(this.authority.snapshot(scope,actor.id,state),current,configs,
         emotion,this.authority.preferences(scope,actor.id,state,source.id),assertCurrent,decisionNowMs,
-        expression);
+        expression,{currentSource:{id:source.id,revision:source.revision}});
       context.context+=this.authority.worldContext(scope,actor.id,state);
       context.context+=this.authority.physiology.context(scope,actor.id,decisionNowMs,view,this.generationClock(scope,view,decisionNowMs));
       context.context+=this.authority.geography.context(scope,actor.id,view);
@@ -732,7 +732,9 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       affect.emotion,this.authority.preferences(scope,character.id,state,userMessage.id),assertCurrent,decisionNowMs,
       sceneExpressionOptions(this.authority,scope,character.id,envelope,state,affect.emotion,decisionNowMs,affect.affect),
       // Only an Agent companion reply records reactivated memories (a recall seed); her proactive path never passes this.
-      this.authority.subject(scope)?.host==='agent'&&this.authority.interactions.modeOf(scope)==='companion'?{reactivationOrigin:'reply'}:{});
+      this.authority.subject(scope)?.host==='agent'&&this.authority.interactions.modeOf(scope)==='companion'
+        ?{reactivationOrigin:'reply',currentSource:{id:userMessage.id,revision:userMessage.revision}}
+        :{currentSource:{id:userMessage.id,revision:userMessage.revision}});
     context.context+=this.authority.worldContext(scope,character.id,state);
     context.context+=this.authority.physiology.context(scope,character.id);
     context.context+=this.authority.geography.context(scope,character.id);

@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "8c6ab443338a9dbf7d204592caa2b56377fb45c74215289234cbf8065704c85d",
+  "sourceManifestSha256": "b1d3d827cf852f63d04cacfd3683d56aa7d752c60f64315ecadaacf85863669f",
   "files": [
     {
       "file": ".gitattributes",
@@ -164,8 +164,8 @@
     },
     {
       "file": "shared/src/core/service.ts",
-      "sha256": "d5f68af25872b41d02f18a498d280b56efdb5c631554bcb7c0207b0e07a40d19",
-      "bytes": 18421
+      "sha256": "fe5b9680c27c4da6702169449d8ca32953b08f394b3ab8c8bd2e8ab5a39b613d",
+      "bytes": 19047
     },
     {
       "file": "shared/src/core/store.ts",
@@ -249,8 +249,8 @@
     },
     {
       "file": "shared/src/memory/context.ts",
-      "sha256": "19571c6e4b3df1e98896a37e05098cd1ca304a850fb17a5494d4b5a7817a2637",
-      "bytes": 4137
+      "sha256": "bf678aaea9e39f7a7a4a9ea88f1cd2eacf5bd56de46ad48226ed24d983ae5ac1",
+      "bytes": 9054
     },
     {
       "file": "shared/src/memory/extraction-lint.ts",
@@ -258,9 +258,14 @@
       "bytes": 9583
     },
     {
+      "file": "shared/src/memory/relevance.ts",
+      "sha256": "5387f9d72ac94783742c9aae5720df495aa817b2aedc68ead96367f6f71077c0",
+      "bytes": 17124
+    },
+    {
       "file": "shared/src/memory/render.ts",
-      "sha256": "e1f32aa7e537aba58ba3743401f6994a06ba64469b6f1c5dc0602294ff8c9395",
-      "bytes": 5330
+      "sha256": "e6b0e054c5ef1e812bf96b2f328f7083caaa33f99ff9065ff7db2144b2177ee2",
+      "bytes": 6732
     },
     {
       "file": "shared/src/memory/retention.ts",
@@ -269,8 +274,8 @@
     },
     {
       "file": "shared/src/memory/retrieval.ts",
-      "sha256": "da392c945741848731737a664ae058e1cc6d58044885d7e73ec901df98288f04",
-      "bytes": 38186
+      "sha256": "cadbd3fd3b6d5e002a70b7080181a67ac03621d39d0d7b152ca9e81b384ca98a",
+      "bytes": 43408
     },
     {
       "file": "shared/src/memory/text-units.ts",
@@ -279,8 +284,8 @@
     },
     {
       "file": "shared/src/memory/tokenizer.ts",
-      "sha256": "04b4bbca6b6e101d597d3c6ac89a5b4af5cbbcaa1d0eba6a1fb1d32dd0595f13",
-      "bytes": 2668
+      "sha256": "87729a1449682ef9505ce6905966f823dcb2e9eed9099c87cb3eb7c5cf6ab896",
+      "bytes": 3934
     },
     {
       "file": "shared/src/memory/vector-forgetting.ts",
@@ -384,8 +389,8 @@
     },
     {
       "file": "shared/src/scene/service.ts",
-      "sha256": "090522ff25c197443203941472f524d87a0f22132ff5051584cd5b8edb4965e7",
-      "bytes": 117446
+      "sha256": "de9ae5963d4b61f4d1ad51e8053fc6cdd1b9043940d693da38f7c475dfac9b9a",
+      "bytes": 117759
     },
     {
       "file": "shared/src/scene/store.ts",
@@ -554,12 +559,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "7623730a501b639572a847eaaa9ad63fedf204c21b61d4ffcf7f82a5f3cdd721",
+      "sha256": "afbd083e375df0ba9519a2b933ccefba6d3c352d8b75845826a0434af7cca487",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "1cc95d8329b0b0994115684065747fe9ea59d76581dd3228546745ce94ba2661",
+      "sha256": "0cbddd9440ed1dd1245696e976f7d4446b2629df6874f847bdf74877920abf97",
       "bytes": 355817
     }
   ]

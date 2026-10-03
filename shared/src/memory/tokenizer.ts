@@ -29,8 +29,12 @@ export class MemoryTokenizer {
     // FTS below reconstructs bounded sequential positions from token TEXT.
     return tokens.map(token=>token.text.toLowerCase()).filter(token=>/[\p{L}\p{N}]/u.test(token));
   }
+  /** The query's terms without the fillers (list and clitic rule), duplicates kept. Documents keep every term. */
+  async contentTerms(text:string):Promise<string[]>{
+    return (await this.terms(text)).filter(term=>!filler(term));
+  }
   async query(text:string):Promise<string>{
-    const terms=(await this.terms(text)).filter(term=>!QUERY_FILLERS.has(term));
+    const terms=await this.contentTerms(text);
     // A small language-level equivalence for commitments keeps exact BM25
     // useful without inventing any person, event, or factual answer.
     if(terms.some(term=>['约定','承诺','答应'].includes(term)))terms.push('约定','承诺','答应');
@@ -40,5 +44,18 @@ export class MemoryTokenizer {
 }
 
 // These are question particles, not aliases or invented memories. Meaningful
-// names, negatives, numbers and feeling words stay in the query.
-const QUERY_FILLERS=new Set(['的','了','呢','吗','是','在','和','与','有','被','对','给','我','你','他','她','它','我们','他们','这个','那个','这次','那次','当时','什么','为什么','为何','怎么','怎样','如何','哪个','哪里','多少','是否','还是','再','又','会','让','后','时']);
+// names, negatives, numbers and feeling words stay in the query. English: will,
+// may and can stay out (lower-cased they are also the names Will and May).
+export const QUERY_FILLERS:ReadonlySet<string>=new Set(['的','了','呢','吗','是','在','和','与','有','被','对','给','我','你','他','她','它','我们','他们','这个','那个','这次','那次','当时','什么','为什么','为何','怎么','怎样','如何','哪个','哪里','多少','是否','还是','再','又','会','让','后','时',
+  'a','an','the','is','are','was','were','be','been','am','do','does','did','to','of','in','on','at','for','with','by','from','about','as','and','or','but','if','so',
+  'i','me','my','mine','you','your','yours','he','him','his','she','her','hers','it','its','we','us','our','ours','they','them','their','theirs',
+  'this','that','these','those','what','which','who','whom','whose','when','where','why','how','have','has','had','would','could','should',
+  'there','here','then','than','just','also','very','too']);
+// ICU keeps an English contraction as one term (what's, you’re). A filler base with a clitic is a filler too; a term is
+// never rewritten, and n't is not a clitic here, so don't, isn't and can't stay content.
+const CLITIC=/^(.+)['’](?:s|re|ve|ll|d|m)$/u;
+function filler(term:string):boolean {
+  if(QUERY_FILLERS.has(term))return true;
+  const base=CLITIC.exec(term)?.[1];
+  return base!==undefined&&QUERY_FILLERS.has(base);
+}
