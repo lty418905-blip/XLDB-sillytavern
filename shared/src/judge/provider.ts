@@ -131,28 +131,37 @@ export function createJudgeProvider(options: JudgeProviderOptions = {}): JudgePr
       let nextBase: string | null = null, nextModel: string | null = null, nextKey: string | null = null, limit: number | null;
       if (nextProvider !== 'none') {
         const preset = JUDGE_PROVIDER_PRESETS[nextProvider];
-        nextBase = config.baseUrl === undefined ? preset.defaultBaseUrl : validateJudgeBaseUrl(config.baseUrl);
+        const baseInput = config.baseUrl;
+        nextBase = baseInput === undefined ? preset.defaultBaseUrl : validateJudgeBaseUrl(baseInput);
         if (nextBase === null) return {ok: false, error: 'invalid_base_url'};
-        const candidate = config.model === undefined ? preset.defaultModel : config.model;
+        const modelInput = config.model;
+        const candidate = modelInput === undefined ? preset.defaultModel : modelInput;
         if (typeof candidate !== 'string' || !JUDGE_MODEL_PATTERN.test(candidate)) return {ok: false, error: 'invalid_model'};
         nextModel = candidate; nextKey = slots[preset.keySlot];
-        if (config.apiKey !== undefined) {
-          if (typeof config.apiKey !== 'string') return {ok: false, error: 'invalid_key'};
-          const key = config.apiKey.trim();
+        const keyInput = config.apiKey;
+        if (keyInput !== undefined) {
+          if (typeof keyInput !== 'string') return {ok: false, error: 'invalid_key'};
+          const key = keyInput.trim();
           if (key.length > 512 || /[\s\x00-\x1f\x7f]/.test(key)) return {ok: false, error: 'invalid_key'};
           nextKey = key === '' ? null : key;
         }
-        limit = config.dailyLimit === undefined ? Object.hasOwn(preset.freeDailyLimits, candidate) ? preset.freeDailyLimits[candidate] : null : config.dailyLimit as number | null;
-      } else limit = config.dailyLimit === undefined ? null : config.dailyLimit as number | null;
+        const limitInput = config.dailyLimit;
+        limit = limitInput === undefined ? Object.hasOwn(preset.freeDailyLimits, candidate) ? preset.freeDailyLimits[candidate] : null : limitInput as number | null;
+      } else {
+        const limitInput = config.dailyLimit;
+        limit = limitInput === undefined ? null : limitInput as number | null;
+      }
       if (limit !== null && (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000000)) return {ok: false, error: 'invalid_daily_limit'};
-      const updates = config.sites === undefined ? {} : config.sites;
-      if (!record(updates) || Object.entries(updates).some(([id, v]) => !Object.hasOwn(enabled, id) || typeof v !== 'boolean' || (JUDGE_CALL_SITE_SPECS[id as JudgeCallSite].locked && v))) return {ok: false, error: 'invalid_sites'};
+      const sitesInput = config.sites;
+      const updates = sitesInput === undefined ? {} : sitesInput;
+      const updateEntries = record(updates) ? Object.entries(updates) : null;
+      if (updateEntries === null || updateEntries.some(([id, v]) => !Object.hasOwn(enabled, id) || typeof v !== 'boolean' || (JUDGE_CALL_SITE_SPECS[id as JudgeCallSite].locked && v))) return {ok: false, error: 'invalid_sites'};
       const oldKey = provider === 'none' ? null : slots[JUDGE_PROVIDER_PRESETS[provider].keySlot];
       if (provider !== nextProvider || baseUrl !== nextBase || model !== nextModel || oldKey !== nextKey) {needsUser = null; configEpoch++;}
       if (nextProvider === 'none') {slots['opencode-zen'] = null; slots.typesafe = null;}
       else slots[JUDGE_PROVIDER_PRESETS[nextProvider].keySlot] = nextKey;
       provider = nextProvider; baseUrl = nextBase; model = nextModel; dailyLimit = limit;
-      for (const [id, v] of Object.entries(updates)) enabled[id as JudgeCallSite] = v as boolean;
+      for (const [id, v] of updateEntries) enabled[id as JudgeCallSite] = v as boolean;
       return {ok: true};
     } catch {return {ok: false, error: 'invalid_config'};}
   }

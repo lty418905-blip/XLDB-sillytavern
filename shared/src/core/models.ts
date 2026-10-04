@@ -17,6 +17,7 @@ import { buildViewInput } from '../scene/views.ts';
 import { buildMemoryInput } from './memory-extraction.ts';
 import { buildWorldExtractionPrompts, decodeWorldExtraction } from '../scene/world-extraction.ts';
 import { recordModelDispatch,recordModelResponse,recordModelUsage,traceModel,withModelAddress } from './runtime-log.ts';
+import { activePairCapture, capturingRunner } from './pair-capture.ts';
 
 export type Prompt = { role: 'system' | 'user' | 'assistant'; content: string };
 export type ModelRunner = (config: ModelConfig, prompts: Prompt[], json: boolean) => Promise<string>;
@@ -35,7 +36,7 @@ export interface SceneEmotionInput {
 export interface SceneEmotionResult { emotion: EmotionDelta; relationships: DirectionalRelationship[] }
 export type SceneObservationPart='memory'|'emotion'|'preference';
 
-export const runModel: ModelRunner = (config, messages, json) => traceModel({...config,
+const rawRunModel: ModelRunner = (config, messages, json) => traceModel({...config,
   baseUrl:config.baseUrl.endsWith('/chat/completions')?config.baseUrl:config.baseUrl+'/chat/completions'},messages,async () => {
   if (!config.baseUrl || !config.model) throw new Error('model_not_configured');
   const endpoint = config.baseUrl.endsWith('/chat/completions') ? config.baseUrl : config.baseUrl + '/chat/completions';
@@ -64,6 +65,8 @@ export const runModel: ModelRunner = (config, messages, json) => traceModel({...
   if (typeof content !== 'string' || !content.trim() || content.length > 50000) throw new Error('model_invalid_response');
   return content;
 });
+// Opt-in pair capture (a test and evaluation aid, off by default). With no capture installed this calls rawRunModel and returns its result unchanged.
+export const runModel: ModelRunner = capturingRunner(rawRunModel, activePairCapture);
 
 async function readModelStream(response:Response):Promise<string>{
   if(!response.body)throw new Error('model_invalid_response');

@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "0bef5d51c454483da3d0a92401d6eb557088ffa2f81175dcbfd6b6e09f82acc6",
+  "sourceManifestSha256": "a2e86d7348276c4ee5b0286fbf421d9c1b6a92646b26053a2943efbd64e173c1",
   "files": [
     {
       "file": ".gitattributes",
@@ -139,13 +139,18 @@
     },
     {
       "file": "shared/src/core/models.ts",
-      "sha256": "74da4d5035a3cfb0804a4406ba6b441ec8c77ac83dbd687765ddc02dc9e516d7",
-      "bytes": 57386
+      "sha256": "6a7b08947ad1a7f319c9b224152d164c01a808183d661d23b7df5ff40845aab1",
+      "bytes": 57691
+    },
+    {
+      "file": "shared/src/core/pair-capture-switch.ts",
+      "sha256": "5ec4b2795f7ff3b1fd7c98b159b3210a3da881f604c54feb0af59e93c675800d",
+      "bytes": 1272
     },
     {
       "file": "shared/src/core/pair-capture.ts",
-      "sha256": "f055821330c0700040eeb2341fa8713aa84f0f188abc0ec60742bc90f0511955",
-      "bytes": 12457
+      "sha256": "2ca3468ed33d7c9ed65a0ce34e1450306c48c7edb371375ef0415969b4ec3408",
+      "bytes": 13473
     },
     {
       "file": "shared/src/core/role-observation.ts",
@@ -154,8 +159,8 @@
     },
     {
       "file": "shared/src/core/runtime-log.ts",
-      "sha256": "33176afd01d34d8032e49714e275e771b3f80adaaa14c9c84c6b1503f7e7847d",
-      "bytes": 10666
+      "sha256": "be614afaa2d44543787c1c2d8499380c4602cb39fe19d4dacd2e72e4ebc45e68",
+      "bytes": 11174
     },
     {
       "file": "shared/src/core/scene-observation.ts",
@@ -219,8 +224,8 @@
     },
     {
       "file": "shared/src/judge/provider.ts",
-      "sha256": "6c4a97b770df34e952a239b82e793c8250317ab999db8000e359dbe57126845c",
-      "bytes": 24025
+      "sha256": "d9519cfd56d426ef753d3b79240af34f548cad96ee4cfbb804a4de62a3b45fd7",
+      "bytes": 24300
     },
     {
       "file": "shared/src/judge/providers.ts",
@@ -239,8 +244,8 @@
     },
     {
       "file": "shared/src/judge/systemone.ts",
-      "sha256": "37a1b08a9e2753aa5351da2dc344d42b36c97664ea62a250da080697062b631f",
-      "bytes": 9639
+      "sha256": "1db201b77f143728c81539d2863cdf6490f5e36af4d0c40c59c083cb1cca9db5",
+      "bytes": 9822
     },
     {
       "file": "shared/src/memory/access.ts",
@@ -269,13 +274,13 @@
     },
     {
       "file": "shared/src/memory/retention.ts",
-      "sha256": "2eb64ff4f34e8c22d6dfe4f7ed0a1a8e212bb97c962106bb50b136124e2767ca",
-      "bytes": 30686
+      "sha256": "73a908c7b77b4374babddbf170d8958817d1fa3a19a3edad9be394b364786e33",
+      "bytes": 31680
     },
     {
       "file": "shared/src/memory/retrieval.ts",
-      "sha256": "cadbd3fd3b6d5e002a70b7080181a67ac03621d39d0d7b152ca9e81b384ca98a",
-      "bytes": 43408
+      "sha256": "f42b60af20a831c0144e9044c1eef6833a8323a301b166984fe66465eceb7bc3",
+      "bytes": 43664
     },
     {
       "file": "shared/src/memory/text-units.ts",
@@ -424,8 +429,8 @@
     },
     {
       "file": "shared/src/scene/time-expressions.ts",
-      "sha256": "6a5501e6ecf98aa8f5c8b70dc5cd3e1c84ff2ebe927226af5951ed1ae4a309fa",
-      "bytes": 45754
+      "sha256": "4d69d0e305d3b2e205ac70339a25b3806a029fbbda9722d080b98bb7362f93c6",
+      "bytes": 55103
     },
     {
       "file": "shared/src/scene/transfer.ts",
@@ -504,8 +509,8 @@
     },
     {
       "file": "sillytavern/src/server.ts",
-      "sha256": "d0452b0ad5ae91024d7dbbf2d3f2fcb5433732a974fef95651c9969290c7381b",
-      "bytes": 39519
+      "sha256": "150641081a55b08c7ab4d0322e571569a2a249f3a3750431bfe4f031d46bc2c8",
+      "bytes": 39868
     },
     {
       "file": "START-XLDB.cmd",
@@ -564,12 +569,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "ff622a6817b09105ee881b67b4831c8fdeb1a91b40da9653723d60f8c324951a",
+      "sha256": "7bb9752f91ab6a385bf38092395f4433e1384bf235e1adaeba5c45f3d454d67b",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "d4999027f4e952e454e9553e103d8343ce7e8081fa7029d933fd6d4f5ab5b6f5",
+      "sha256": "b1dd66ba8285936fcdcd09d87249fbc6b479b49a947c58eb7b7ac6c44b2c4f96",
       "bytes": 355817
     }
   ]

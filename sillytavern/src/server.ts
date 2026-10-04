@@ -14,6 +14,7 @@ import {sceneDashboard} from './dashboard.ts';
 import {listModels, ModelCatalogError} from './model-catalog.ts';
 import {RuntimeLog} from '../../shared/src/core/runtime-log.ts';
 import {closeEmotionRanker,emotionRankerStatus} from '../../shared/src/scene/emotion-scheduler.ts';
+import {startPairCapture} from '../../shared/src/core/pair-capture-switch.ts';
 
 export function loadConfigProfile(filename: string): ConfigProfile {
   if (!fs.existsSync(filename)) return {version:2,revision:0,defaultText:{baseUrl:'',key:'',model:''},overrides:{},
@@ -511,6 +512,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const dataDirectory=process.env.XLDB_DATA_DIR??path.join(root,'.local/data');
   const authority = new Authority(path.join(dataDirectory,'authority/xldb.sqlite'));
   const retrieval = new Retrieval(path.join(dataDirectory,'indexes'));
+  // Pair capture is a test and evaluation aid, off by default: the switch is read once here, never per model call.
+  const pairCapture = startPairCapture(process.env.XLDB_PAIR_CAPTURE, installRoot);
+  if (pairCapture.notice !== null) console.error(pairCapture.notice);
   const core = new Core(authority, retrieval);
   await core.scene.clearPendingIndexes();
   const origins = (process.env.XLDB_ALLOWED_ORIGINS ?? 'http://localhost:11451,http://127.0.0.1:11451,http://localhost:8000,http://127.0.0.1:8000').split(',');

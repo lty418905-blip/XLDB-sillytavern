@@ -110,6 +110,13 @@ export function recordRetrievalFallback(fallbackReason:string,degraded:{stage:st
 export function withModelAddress<T>(address:Address,work:()=>Promise<T>):Promise<T>{
   const active=context.getStore();return active?context.run({...active,...address},work):work();
 }
+/** The active request's local ids (the keys opt-in pair capture may record); never the log, a credential or an endpoint. */
+export function currentModelAddress():unknown{
+  const active=context.getStore();
+  return active?{operation:active.operation,requestId:active.requestId,bindingId:active.bindingId,scope:active.scope,
+    sourceId:active.sourceId,revision:active.revision,stage:active.stage,characterId:active.characterId,
+    roundId:active.roundId,parts:active.parts,attempt:active.attempt}:null;
+}
 export function traceStage<T>(address:Address,attempt:number,work:()=>Promise<T>|T):Promise<T>{
   const active=context.getStore();
   const run=async()=>{const start=performance.now();record('stage','running',{attempt});

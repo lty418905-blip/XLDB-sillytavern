@@ -8,7 +8,7 @@ export const emotionalReactions = {
   jealousy:'嫉妒', longing:'思念', loneliness:'孤独', disgust:'厌恶', awe:'震撼',
 } as const;
 export type EmotionalReactionKey=keyof typeof emotionalReactions;
-/** Story-language labels for the stored reaction keys (Appendix C; final strings in MR2-final-strings.md for approval). */
+/** Story-language labels for the stored reaction keys (final wording). */
 export const emotionalReactionLabels:{readonly zh:Readonly<Record<EmotionalReactionKey,string>>;readonly en:Readonly<Record<EmotionalReactionKey,string>>}={
   zh:emotionalReactions,
   en:{
@@ -244,9 +244,9 @@ type DetailEntry={compact:string;tokens:readonly CodeToken[];results:Map<string,
 /**
  * Records are immutable and the guard is pure, so results are memoised by content: detail, then protectedFacts and
  * layer. Every context pass projects each faded memory several times; only the first pass pays for the guard. The
- * cache holds at most GUARD_CACHE_DETAILS details and drops the oldest insertion first. Review R3-3: the bound is a
+ * cache holds at most GUARD_CACHE_DETAILS details and drops the oldest insertion first. The bound is a
  * count, not bytes, and entries leave only by eviction; 5,000 details still covers the 2,000-faded-memory scale that
- * R2-2 targeted; the review measured 33 MB at 20,000 audit-length details, so about a quarter of that is expected here.
+ * the performance check targeted; that check measured 33 MB at 20,000 audit-length details, so about a quarter of that is expected here.
  */
 export const GUARD_CACHE_DETAILS=5_000;
 const guardCache=new Map<string,DetailEntry>();
@@ -295,21 +295,26 @@ function computeMask(entry:DetailEntry,layer:string,protectedFacts:readonly stri
   const compactLayer=compact(layer),compactDetail=entry.compact;
   if(compactLayer===compactDetail||(compactDetail.length>=6&&compactLayer.includes(compactDetail)))return BLOCKED;
   const spans:[number,number][]=[],factSpans:[number,number][]=[];
-  const facts=protectedFacts.map(fact=>({fact,compactFact:compact(fact)})).filter(item=>item.compactFact.length>=2);
+  const facts=protectedFacts.map(fact=>{const compactFact=compact(fact),mapped=mappedText(fact,{dropPunctuation:true}).text;
+    return {fact,compactFact,needles:mapped===compactFact?[mapped]:[mapped,compactFact]};})
+    .filter(item=>item.compactFact.length>=2&&item.needles[0]!.length>=2);
   if(facts.length){
     const loose=mappedText(layer,{dropPunctuation:true});
     const markLoose=(from:number,to:number)=>factSpans.push([loose.start[from]!,loose.end[to-1]!]);
-    for(const {fact,compactFact} of facts){
+    // Two needles when the two foldings differ: the fact read with the layer's own mapping (per cluster) and
+    // compact(fact) (whole-string lowercase and composition). Either form found in the layer is masked, so a fact
+    // written in one form never escapes a layer written in the other (final sigma, decomposed Hangul, half-width kana).
+    for(const {fact,needles} of facts){
       const zhFact=scriptOf(fact)==='zh';
-      for(let at=loose.text.indexOf(compactFact);at>=0;at=loose.text.indexOf(compactFact,at+1)){
+      for(const needle of needles)for(let at=loose.text.indexOf(needle);at>=0;at=loose.text.indexOf(needle,at+1)){
         // An English fact such as "No." matches whole words only, never the inside of "knows nothing".
-        if(!zhFact&&!onWordBoundaries(layer,loose.start[at]!,loose.end[at+compactFact.length-1]!))continue;
-        markLoose(at,at+compactFact.length);
+        if(!zhFact&&!onWordBoundaries(layer,loose.start[at]!,loose.end[at+needle.length-1]!))continue;
+        markLoose(at,at+needle.length);
       }
       // Exact-only mode: a run shared with a protected fact is ordinary wording, not a copy of the value.
       if(mode==='exact')continue;
       if(zhFact){
-        for(const [from,to] of sharedRuns([...compactFact],[...loose.text],ZH_FACT_RUN,true))markLoose(from,to);
+        for(const needle of needles)for(const [from,to] of sharedRuns([...needle],[...loose.text],ZH_FACT_RUN,true))markLoose(from,to);
       }else{
         const layerWords=wordsOf(layer);
         for(const [from,to] of sharedRuns(wordsOf(fact).map(word=>fold(word.word)),layerWords.map(word=>fold(word.word)),EN_FACT_WORDS,false))
@@ -319,7 +324,7 @@ function computeMask(entry:DetailEntry,layer:string,protectedFacts:readonly stri
   }
   const tokens=[...entry.tokens,...protectedFacts.flatMap(tokensOf)];
   // Digit-bearing codes (letter-digit mixes, digit runs): every case-insensitive occurrence, even inside A4729 or
-  // Rm4729. Known limit (review R2-4, recorded, not changed): the code must appear as written, so a reformatted code
+  // Rm4729. Known limit (recorded, not changed): the code must appear as written, so a reformatted code
   // (B12 for B-12, HX7 for HX-7, 4-7-2-9 for 4729) is not found.
   const digitCodes=new Set(tokens.filter(token=>token.kind!=='caps').map(token=>token.token.toLowerCase()));
   if(digitCodes.size){
@@ -353,7 +358,10 @@ function fold(value:string):string {return value.normalize('NFKC').toLowerCase()
 
 /**
  * Ranges of `right` covered by a common run with `left` of at least `minimum` items. With `offsets` the ranges
- * are UTF-16 offsets into the joined right text; otherwise item indexes.
+ * are UTF-16 offsets into the joined right text; otherwise item indexes. One range per maximal run: a cell reports its
+ * run only when the next cell on the diagonal does not continue it. A shorter range of the same run starts at the same
+ * item and lies inside the maximal one, so the covered items are the same as with one range per cell. Time is
+ * O(left*right) for the table; every cell lies in at most one maximal run, so the ranges together are at most left*right items long.
  */
 export function sharedRuns(left:readonly string[],right:readonly string[],minimum:number,offsets:boolean):[number,number][] {
   const runs:[number,number][]=[];
@@ -362,7 +370,8 @@ export function sharedRuns(left:readonly string[],right:readonly string[],minimu
     const current=new Array<number>(right.length+1).fill(0);
     for(let j=1;j<=right.length;j++)if(left[i-1]===right[j-1]){
       current[j]=previous[j-1]!+1;
-      if(current[j]!>=minimum)runs.push([j-current[j]!,j]);
+      // Maximal: the next cell on this diagonal (left[i], right[j]) does not continue the run, or one side has ended.
+      if(current[j]!>=minimum&&(i===left.length||j===right.length||left[i]!==right[j]))runs.push([j-current[j]!,j]);
     }
     previous=current;
   }
@@ -375,7 +384,7 @@ const SEPARATORS=new Set(['，',',','、',';','；',':','：']);
 const OPENING=new Set(['“','‘','「','『','（','(','【','《','[','{']);
 const CLOSING=new Set(['”','’','」','』','）',')','】','》',']','}','"']);
 const SENTENCE_FINAL=new Set(['。','．','.','!','！','?','？','…']);
-/** The sentence-final marks that state; the only ones restored after a drop (review R4-3). */
+/** The sentence-final marks that state; the only ones restored after a drop. */
 const FULL_STOPS=new Set(['。','．','.']);
 const PAIRS=new Map([['“','”'],['‘','’'],['「','」'],['『','』'],['（','）'],['(',')'],['【','】'],['《','》'],['[',']'],['"','"'],['\'','\'']]);
 /** Bracket pairs whose removal leaves an aside, not a hole in the clause (quotes usually carry an object). */
@@ -424,7 +433,7 @@ function removeAndTidy(layer:string,codeSpans:readonly [number,number][],factSpa
         if(open===undefined||close===undefined||PAIRS.get(open)!==close)continue;
         const fact=pieces.slice(left,right+1).some(piece=>'cut' in piece&&piece.fact);
         const piece:Piece=ASIDES.has(open)?{cut:true,aside:true}:fact?{cut:true,fact:true}:{cut:true};
-        // Review R4-1: an emptied aside keeps its protected fact, so a fact that filled the brackets starts the drop too.
+        // An emptied aside keeps its protected fact, so a fact that filled the brackets starts the drop too.
         if(fact&&'aside' in piece)piece.fact=true;
         pieces.splice(left,right-left+1,piece);changed=true;
       }
@@ -435,12 +444,12 @@ function removeAndTidy(layer:string,codeSpans:readonly [number,number][],factSpa
   // one goes too: the dropped clause often carried the subject, the request verb, the quote opener or the condition,
   // and a subjectless continuation (然后很快地走出了灯塔, then wait by the ferry) would read as the character's own
   // action. Only the intact prefix survives. A clause that was nothing but a removed code leaves no words behind and
-  // is not a dropped clause. A clause emptied by a protected fact does start the drop (review R3-1): the fact often
+  // is not a dropped clause. A clause emptied by a protected fact does start the drop: the fact often
   // carried the subject and the request verb (Nell asked me to leave the parcel in locker B12, then wait by the ferry).
-  // A bracket aside emptied by a protected fact starts the drop as well (review R4-1).
+  // A bracket aside emptied by a protected fact starts the drop as well.
   // Once dropping, the boundaries after the drop go too; only a sentence-final mark that ends the layer comes back,
   // after a kept separator and as a full stop, so 那天风很大，[dropped]。[dropped]。 reads 那天风很大。 and never
-  // 那天风很大。。, and 那天风很大，[dropped]？ reads 那天风很大。 (review R4-3).
+  // 那天风很大。。, and 那天风很大，[dropped]？ reads 那天风很大。
   const kept:Piece[]=[];
   let dropping=false,lastBoundary:string|undefined;
   for(let start=0;start<pieces.length;){
@@ -459,7 +468,7 @@ function removeAndTidy(layer:string,codeSpans:readonly [number,number][],factSpa
   }
   if(dropping&&lastBoundary!==undefined&&SENTENCE_FINAL.has(lastBoundary)){
     const previous=kept.findLast(piece=>'char' in piece&&!/^\s$/u.test(piece.char));
-    // Review R4-3: only a full stop comes back. The dropped text's ？！… would turn the kept statement into a question
+    // Only a full stop comes back. The dropped text's ？！… would turn the kept statement into a question
     // or an exclamation, so they become the full stop of the kept text's script.
     if(!FULL_STOPS.has(lastBoundary))lastBoundary=scriptOf(kept.map(piece=>'char' in piece?piece.char:'').join(''))==='zh'?'。':'.';
     if(previous&&'char' in previous&&SEPARATORS.has(previous.char))kept.push({char:lastBoundary});

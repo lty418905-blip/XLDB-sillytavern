@@ -110,11 +110,20 @@ function entering(config: ModelConfig, prompts: Prompt[], json: boolean, now: ()
   const thinking = thinkingValue === 'enabled' || thinkingValue === 'disabled' ? thinkingValue : null;
   const key = string(field(config, 'key'));
   const baseUrl = string(field(config, 'baseUrl'))?.trim().replace(/\/+$/, '') ?? null;
-  const endpoint = baseUrl?.split(/[?#]/, 1)[0]?.replace(/\/chat\/completions$/, '') ?? null;
+  const endpoint = baseUrl?.split(/[?#]/, 1)[0]?.replace(/\/+$/, '').replace(/\/chat\/completions$/, '') ?? null;
   const url = safely(() => new URL(baseUrl ?? ''));
-  const urlSecrets = url === null ? [] : [...url.searchParams.values(), url.username, url.password];
-  const secrets = [...new Set([key, baseUrl, endpoint, ...urlSecrets].filter((value): value is string => value !== null && value.length >= 8))].sort((a, b) => b.length - a.length);
+  const urlSecrets = url === null ? [] : [...Array.from(url.searchParams, ([name, value]) => value === '' ? name : value), url.username, url.password];
+  const hashAt = baseUrl === null ? -1 : baseUrl.indexOf('#');
+  const beforeHash = baseUrl === null ? '' : hashAt < 0 ? baseUrl : baseUrl.slice(0, hashAt);
+  const queryAt = beforeHash.indexOf('?');
+  const rawQuery = queryAt < 0 ? [] : beforeHash.slice(queryAt + 1).split('&').map(part => {
+    const at = part.indexOf('=');
+    return at < 0 ? part : at === part.length - 1 ? part.slice(0, at) : part.slice(at + 1);
+  });
+  const rawFragment = hashAt < 0 || baseUrl === null ? [] : [baseUrl.slice(hashAt + 1)];
+  const secrets = [...new Set([key, key?.trim() ?? null, baseUrl, endpoint, ...urlSecrets, ...rawQuery, ...rawFragment].filter((value): value is string => value !== null && value.length >= 8))].sort((a, b) => b.length - a.length);
   let redactions = 0;
+  // redact is O(k*n): k secrets from the config, n the text length.
   const redact = (text: string) => {
     for (const secret of secrets) {
       const pieces = text.split(secret);
@@ -230,9 +239,13 @@ export function createPairCapture(options: PairCaptureOptions | null | undefined
       const snapshot = entering(config, prompts, json, settings.now, settings.address);
       let result: ReturnType<ModelRunner>;
       try { result = run(config, prompts, json); } catch (cause) { result = Promise.reject(cause); }
-      if (typeof result?.then !== 'function') return result;
-      return Promise.resolve(result).then(value => { settle(snapshot, 'ok', value); return value; },
-        cause => { settle(snapshot, 'error', cause); throw cause; });
+      let then: unknown;
+      try { then = (result as { then?: unknown } | null | undefined)?.then; } catch { return result; }
+      if (typeof then !== 'function') return result;
+      const call = then as (this: unknown, resolve: (value: string) => void, reject: (cause: unknown) => void) => unknown;
+      return new Promise<string>((resolve, reject) => { call.call(result, resolve, reject); })
+        .then(value => { settle(snapshot, 'ok', value); return value; },
+          cause => { settle(snapshot, 'error', cause); throw cause; });
     },
     status: () => ({ enabled: true, state, runId: settings.runId,
       file: `.local/evidence/behaviour/${settings.runId}/pairs.jsonl`, records, bytes, written, dropped, error }),

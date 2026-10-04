@@ -413,7 +413,9 @@ export class Retrieval {
 }
 
 function allowedText(view: MemoryView): string {
-  // Remembered fragments are lexical only: semanticText below does not carry them.
+  // Remembered fragments are lexical only: semanticText below does not carry them. A faded row whose gist, feeling and
+  // anchor are all absent has no semantic text; the index then embeds this lexical text (fragments included), and such a
+  // row yields no semantic cue, because semanticReactivations skips a row without semantic text.
   const texts=[view.detail, view.gist, view.feeling, view.anchor, ...(view.rememberedFragments??[]), ...view.protectedFacts,view.episode?.scene,
     ...(view.episode?.participants??[]),...(view.episode?.sensoryCues??[]),view.episode?.appraisal]
     .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)

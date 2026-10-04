@@ -48,7 +48,7 @@ function unique<T>(hits: Hit<T>[]): T | null {
   const first = JSON.stringify(values[0]);
   return values.every(v => JSON.stringify(v) === first) ? values[0]! : null;
 }
-function words<T>(s: string, table: readonly (readonly [string, T])[], startOnly = false, normalized = false): Hit<T>[] {
+function words<T>(s: string, table: readonly (readonly [string, T])[], startOnly = false, normalized = false, suppressOverlap = true): Hit<T>[] {
   const hits: Hit<T>[] = [];
   for (const [raw, value] of table) {
     const word = normalized ? raw : normal(raw);
@@ -58,7 +58,7 @@ function words<T>(s: string, table: readonly (readonly [string, T])[], startOnly
       at = startOnly ? -1 : s.indexOf(word, at + word.length);
     }
   }
-  return ordered(hits);
+  return suppressOverlap ? ordered(hits) : hits;
 }
 const todRows: readonly [StoryClockTimeOfDay, string][] = [
   ['dawn', '黎明|拂曉|破曉|天亮|天剛亮|天刚亮|日出|清晨|五更|dawn|daybreak|first light|sunrise|break of day'],
@@ -119,8 +119,51 @@ const unitRows: readonly [string, number | 'months' | 'years'][] = [
 ];
 const units = unitRows.flatMap(([terms, factor]) => terms.split('|').map(term => [normal(term), factor] as const));
 const unitPattern = units.map(([term]) => term).sort((a, b) => b.length - a.length).join('|');
-const modifier = '(?:大約|大约|約莫|约莫|差不多|將近|将近|近|整整|足足|about|around|roughly|nearly|almost|some|a good|a full|just over|just under)';
-type DurationValue = { parsed: ParsedDuration | null; night: boolean; amount: number; fuzzy: boolean };
+const modifierTerms = ['大約', '大约', '約莫', '约莫', '差不多', '將近', '将近', '近', '整整', '足足', 'about', 'around', 'roughly', 'nearly', 'almost', 'some', 'a good', 'a full', 'just over', 'just under'];
+const modifier = '(?:' + modifierTerms.join('|') + ')';
+const waitedModifiers = [...modifierTerms].sort((a, b) => b.length - a.length);
+// Character loops consume at least one trailing character per step: O(n), n <= 500.
+function endsWithWaited(before: string): boolean {
+  let end = before.length;
+  for (;;) {
+    while (end > 0 && before[end - 1]!.trim() === '') end--;
+    const term = waitedModifiers.find(word => before.endsWith(word, end) && (word[0]! < 'a' || word[0]! > 'z' || !latinDigit.test(before[end - word.length - 1] ?? '')));
+    if (term) { end -= term.length; continue; }
+    if (before[end - 1] === '个' || before[end - 1] === '個') { end--; continue; }
+    return before.endsWith('等了', end);
+  }
+}
+const bareNumerals = new Set([...enNumbers.slice(1), ...tens, 'hundred', 'thousand', 'dozen', 'dozens', 'couple']);
+const bareQuantities = new Set([...bareNumerals, 'a', 'an', 'half', 'several']);
+const bareRanges = new Set(['many', 'countless', 'long', 'endless', 'untold', 'numerous']);
+const bareDeterminers = new Set(['the', 'these', 'those', 'its', 'his', 'her', 'their', 'my', 'our', 'your', 'of']);
+const bareNouns = new Set(['office', 'visiting', 'opening', 'working', 'business', 'school', 'meeting', 'small', 'wee', 'early', 'late', 'peak', 'rush']);
+function asciiDigit(c: string): boolean { return c >= '0' && c <= '9'; }
+function bareTokenChar(c: string): boolean { return c >= 'a' && c <= 'z' || asciiDigit(c) || c === "'" || c === '-'; }
+// Shared inline whitespace: \s minus LF, CR, VT, FF, NEL, LS and PS; O(1) per character.
+const inlineSpace = /[^\S\n\r\v\f\u0085\u2028\u2029]/u;
+// At most four preceding tokens, separated only by inline whitespace. Every character
+// is visited at most four times across bare hits: O(n) total, bounded-entry use only.
+function bareBlocked(s: string, unitIndex: number): boolean {
+  let end = unitIndex;
+  for (let position = 0; position < 4; position++) {
+    while (end > 0 && inlineSpace.test(s[end - 1]!)) end--;
+    let start = end;
+    while (start > 0 && bareTokenChar(s[start - 1]!)) start--;
+    if (start === end) return false;
+    const token = s.slice(start, end);
+    if (token.split('-').filter(part => part.length > 0).some(part => [...part].every(asciiDigit) || bareNumerals.has(part) || position === 0 && (bareQuantities.has(part) || bareRanges.has(part) || bareDeterminers.has(part) || bareNouns.has(part)))) return true;
+    end = start;
+  }
+  return false;
+}
+// Ranks are years, months, weeks, days, hours, minutes, seconds; other units have no rank.
+const compoundRanks = new Map([10, 9, 7, 5, 2, 1, 0].flatMap((row, rank) => unitRows[row]![0].split('|').map(term => [normal(term), rank] as const)));
+type DurationValue = {
+  parsed: ParsedDuration | null; night: boolean; amount: number; fuzzy: boolean;
+  rank?: number; factor?: number | 'months' | 'years'; whole?: boolean;
+  modified?: boolean; approximateTail?: boolean; zeroConnector?: boolean;
+};
 function durationValue(amount: number, factor: number | 'months' | 'years', fuzzy: boolean, night: boolean): DurationValue {
   const rounded = Math.round((typeof factor === 'number' ? amount * factor : amount) * 2) / 2;
   const cap = factor === 'months' ? 120 : factor === 'years' ? 10 : 5_256_000;
@@ -128,21 +171,83 @@ function durationValue(amount: number, factor: number | 'months' | 'years', fuzz
   if (rounded > 0 && rounded <= cap) parsed = typeof factor === 'number' ? { kind: 'minutes', minutes: rounded, fuzzy } : { kind: 'calendar', calendarUnit: factor, calendarAmount: rounded, fuzzy };
   return { parsed, night, amount, fuzzy };
 }
+type DurationGap = 'adjacent' | 'comma' | 'none';
+function compoundGap(s: string, start: number, end: number): DurationGap {
+  let left = start, right = end;
+  const space = (c: string) => c === ' ' || c === '　';
+  while (left < right && space(s[left]!)) left++;
+  while (right > left && space(s[right - 1]!)) right--;
+  if (left === right) return 'adjacent';
+  const connector = s.slice(left, right);
+  if (connector === '又' || connector === '零' || connector === '〇') return 'adjacent';
+  if (connector === 'and' && left > start && right < end) return 'adjacent';
+  if (connector === ',' || connector === '，' || connector === '、') return 'comma';
+  return 'none';
+}
+function compoundValue(a: DurationValue, b: DurationValue): DurationValue {
+  const invalid = durationValue(0, 1, false, false);
+  if (a.rank === undefined || b.rank === undefined || a.rank >= b.rank) return invalid;
+  if (!a.whole || !b.whole || b.modified || a.approximateTail) return invalid;
+  if (a.rank === 0 && b.rank === 1) return durationValue(12 * a.amount + b.amount, 'months', false, false);
+  if (a.rank < 2 || b.rank < 2) return invalid;
+  return durationValue(a.amount * (a.factor as number) + b.amount * (b.factor as number), 1, false, false);
+}
+// One left-to-right pass after ordering. Each disjoint gap is scanned once, every hit flushed
+// once: O(n + hits), n <= 500. Comma-only runs stay separate; a comma neighbor of a compound
+// invalidates the whole connected run, including when that neighbor is itself a compound.
+function mergeDurations(s: string, hits: Hit<DurationValue>[]): Hit<DurationValue>[] {
+  const out: Hit<DurationValue>[] = [];
+  let chain: Hit<DurationValue>[] = [], adjacent = false;
+  let previous: Hit<DurationValue> | undefined;
+  const flush = () => {
+    if (!chain.length) return;
+    if (!adjacent) out.push(...chain);
+    else {
+      const value = chain.length === 2 ? compoundValue(chain[0]!.value, chain[1]!.value) : durationValue(0, 1, false, false);
+      out.push({ start: chain[0]!.start, end: chain[chain.length - 1]!.end, value });
+    }
+    chain = []; adjacent = false;
+  };
+  for (const h of hits) {
+    const gap = previous ? compoundGap(s, previous.end, h.start) : 'none';
+    if (h.value.zeroConnector && (gap !== 'adjacent' || !chain.length)) { flush(); previous = undefined; continue; }
+    if (gap === 'none') flush();
+    if (chain.length) adjacent ||= gap === 'adjacent';
+    chain.push(h); previous = h;
+  }
+  flush();
+  return out;
+}
 function durationHits(s: string): Hit<DurationValue>[] {
   const hits: Hit<DurationValue>[] = [];
   // 此正規式在長空白上為平方級，只能由有長度上限的呼叫者使用。
-  const re = new RegExp('(?:' + modifier + '\\s*)?(' + num + ')\\s*[个個]?\\s*(' + unitPattern + ')(?:\\s*and a half|半)?(?:左右|上下)?', 'gu');
+  // Capturing the existing half suffix adds no quantifier or scanning work.
+  // The number-to-unit gap (including an optional classifier) stays on one line.
+  // Sharing the inline class adds no quantifier; the inherited bound remains O(n²), n <= 500.
+  const re = new RegExp('(?:' + modifier + '\\s*)?(' + num + ')' + inlineSpace.source + '*[个個]?' + inlineSpace.source + '*(' + unitPattern + ')(\\s*and a half|半)?(?:左右|上下)?', 'gu');
   for (const m of s.matchAll(re)) {
     const a = m.index, end = a + m[0].length;
     const before = s.slice(Math.max(0, a - 30), a), after = s.slice(end, end + 8);
     if (/[a-z]/u.test(m[0]) && !boundary(s, a, end)) continue;
     if (/\d/u.test(m[1]![0] ?? '') && /[\p{Script=Latin}\d:/.,-]$/u.test(before)) continue;
     if (/^[\d:/-]/u.test(after) || /第\s*$/u.test(before) || /月\s*$/u.test(before) || /(?:hundred|thousand|dozen|long)\s+$/u.test(before)) continue;
-    if (m[0] === '半天' || /大$/u.test(before) && m[0].startsWith('半天')) continue;
-    const value = numberOf(m[1]!); if (!value) continue;
+    if (m[1] === '半' && m[2] === '天') continue;
+    if (m[2] === '晚' && s[end] === '上') continue;
+    // Only the fixed two-character form can lend its leading zero to a preceding connector.
+    const zeroConnector = /^[零〇][一二三四五六七八九兩两]$/u.test(m[1]!);
+    const leadingModifier = modifierTerms.find(term => m[0].startsWith(term));
+    const quantityAt = m[0].indexOf(m[1]!, leadingModifier?.length ?? 0);
+    const value = numberOf(zeroConnector ? m[1]![1]! : m[1]!); if (!value) continue;
     if (m[1]!.startsWith('half') && m[2] === 'year') continue;
-    const n = value.n + (/and a half$/u.test(m[0]) && !m[1]!.endsWith('and a half') || /半$/u.test(m[0]) && !m[1]!.endsWith('半') ? 0.5 : 0);
-    hits.push({ start: a, end, value: durationValue(n, units.find(([term]) => term === m[2])![1], value.fuzzy, /^(?:夜|晚|宿|nights?)$/u.test(m[2]!)) });
+    const halfSuffix = m[3]?.trim();
+    const n = value.n + (halfSuffix && !m[1]!.endsWith(halfSuffix) ? 0.5 : 0);
+    const factor = units.find(([term]) => term === m[2])![1];
+    hits.push({ start: zeroConnector ? a + quantityAt + 1 : a, end, value: {
+      ...durationValue(n, factor, value.fuzzy, /^(?:夜|晚|宿|nights?)$/u.test(m[2]!)),
+      rank: compoundRanks.get(m[2]!), factor,
+      whole: !value.fuzzy && Number.isInteger(n) && n >= 1 && !m[1]!.includes('.') && !m[1]!.includes('半') && !m[1]!.includes('half') && !halfSuffix,
+      modified: leadingModifier !== undefined, approximateTail: m[0].endsWith('左右') || m[0].endsWith('上下'), zeroConnector,
+    } });
   }
   const fixed: readonly [string, number][] = [['一會兒', 15], ['一会儿', 15], ['一會', 15], ['一会', 15], ['一下', 15], ['片刻', 10], ['少頃', 10], ['少顷', 10], ['須臾', 10], ['须臾', 10], ['半晌', 30], ['一炷香', 30], ['一盞茶', 15], ['一盏茶', 15], ['a short while', 15], ['a little while', 15], ['a while', 30], ['some time', 30], ['a moment', 5], ['moments', 5]];
   for (const h of words(s, fixed)) {
@@ -152,13 +257,12 @@ function durationHits(s: string): Hit<DurationValue>[] {
     hits.push({ start: h.start, end: h.end, value: durationValue(h.value, 1, true, false) });
   }
   for (const m of s.matchAll(/\b(minutes|hours|days|weeks)\s+later\b/gu)) {
-    const before = s.slice(Math.max(0, m.index - 35), m.index);
-    if (/[a-z0-9-]\s+$/u.test(before)) continue;
+    if (bareBlocked(s, m.index)) continue;
     hits.push({ start: m.index, end: m.index + m[1]!.length, value: durationValue(m[1] === 'minutes' ? 5 : 3, units.find(([term]) => term === m[1])![1], true, false) });
   }
   for (const m of s.matchAll(/(?:一整夜|整晚|一整天)/gu)) hits.push({ start: m.index, end: m.index + m[0].length, value: durationValue(1, 1440, false, m[0] !== '一整天') });
   for (const h of words(s, [['quarter of an hour', 15], ['quarter hour', 15]])) hits.push({ ...h, value: durationValue(h.value, 1, false, false) });
-  return ordered(hits);
+  return mergeDurations(s, ordered(hits));
 }
 export function parseDuration(text: string): ParsedDuration | null { return input(text) ? unique(durationHits(normal(text)).map(h => ({ ...h, value: h.value.parsed }))) : null; }
 
@@ -175,12 +279,13 @@ function guard(s: string): ClockGuardClass | null {
   const ds = durationHits(s);
   for (const m of s.matchAll(/过去(?!了)/gu)) {
     const prefix = s.slice(0, m.index);
-    if (!ds.some(h => h.end <= m.index && /^\s*$/u.test(s.slice(h.end, m.index))) && !/(?:許久|许久|良久|很久|好久|半天)\s*$/u.test(prefix)) found.add('recall');
+    // Fixed alternatives plus one trailing whitespace run: O(prefix length), n <= 500.
+    if (!ds.some(h => h.end <= m.index && /^\s*$/u.test(s.slice(h.end, m.index))) && !/(?:許久|许久|良久|很久|好久|半天(?:左右|上下)?)\s*$/u.test(prefix)) found.add('recall');
   }
   for (const h of ds) {
     const before = s.slice(0, h.start), after = s.slice(h.end);
     if (/^\s*(?:之前|以前|前|before\b|earlier\b|prior\b|previously\b)/u.test(after)) found.add('recall');
-    if (/^\s*了/u.test(after) && (/(?:已经|来了)[\s\S]*$/u.test(before) || /等了\s*$/u.test(before)) && s.slice(h.start, h.end) !== '一下') found.add('reported');
+    if (/^\s*了/u.test(after) && (/(?:已经|来了)[\s\S]*$/u.test(before) || endsWithWaited(before)) && s.slice(h.start, h.end) !== '一下') found.add('reported');
   }
   if (/'ll\b/u.test(s)) found.add('plan');
   for (const m of s.matchAll(/\blater\b/gu)) {
@@ -197,6 +302,11 @@ export function excludedReasonForGuard(guard: ClockGuardClass): StoryClockExclud
 }
 
 const conversion = '清晨|早上|早晨|上午|凌晨|中午|下午|傍晚|晚上|黃昏|黄昏|深夜|半夜|午夜|正午';
+// Clock tokens have fixed lexical bounds, including the two-character minute form: O(1).
+function clockNumber(raw: string): number {
+  const value = numberOf(raw);
+  return !value || value.fuzzy ? NaN : value.n;
+}
 function localClock(hour: number, minute: number, period: string): ParsedClockTime | null {
   let nextDay = false;
   if (period === 'am') { if (hour < 1 || hour > 12) return null; hour %= 12; }
@@ -209,7 +319,7 @@ function localClock(hour: number, minute: number, period: string): ParsedClockTi
   else if (period === '下午') { if (!hour) return null; if (hour < 12) hour += 12; }
   else if (period === '午夜') { if (hour !== 12 && hour !== 0) return null; hour = 0; nextDay = true; }
   else if (/^(?:深夜|半夜)$/u.test(period)) { if (hour > 3 && hour < 21) return null; nextDay = hour < 3; }
-  if (!Number.isInteger(hour) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
   return { hour, minute, nextDay };
 }
 function isoBefore(before: string): boolean {
@@ -229,9 +339,14 @@ function rawClockHits(s: string, use: Use, isoStart = false, startOnly = false):
     const period = m[1] ?? (m[10] ?? '').replace(/\./gu, '').trim();
     let hour = 0, minute = 0, bare = false;
     if (m[2]) { hour = Number(m[2]); minute = Number(m[4]); const iso = isoStart && start === 0 || isoBefore(before); bare = !period && !iso && hour !== 0 && hour <= 12 && !m[2].startsWith('0'); if (m[3] === '.' && !period) { candidates.push({ start, end, value: null }); continue; } }
-    else if (m[5]) { hour = numberOf(m[5])?.n ?? -1; const tail = m[6] ?? ''; minute = tail === '半' ? 30 : tail === '一刻' ? 15 : tail === '三刻' ? 45 : /^(?:整|鐘|钟)?$/u.test(tail) ? 0 : numberOf(tail.replace(/分$/u, ''))?.n ?? -1; bare = !period; }
-    else if (m[7]) { hour = numberOf(m[8]!)?.n ?? -1; minute = m[7] === 'half past' ? 30 : m[7] === 'quarter past' ? 15 : 45; if (m[7] === 'quarter to') hour = (hour + 23) % 24; bare = !period; }
-    else { hour = numberOf(m[9]!)?.n ?? -1; bare = !period; }
+    else if (m[5]) {
+      hour = clockNumber(m[5]);
+      const tail = m[6] ?? '', minuteToken = tail.replace(/分$/u, '');
+      minute = tail === '半' ? 30 : tail === '一刻' ? 15 : tail === '三刻' ? 45 : /^(?:整|鐘|钟)?$/u.test(tail) ? 0 : /^[零〇][一二三四五六七八九]$/u.test(minuteToken) ? cnDigits.indexOf(minuteToken[1]!) : clockNumber(minuteToken);
+      bare = !period;
+    }
+    else if (m[7]) { hour = clockNumber(m[8]!); minute = m[7] === 'half past' ? 30 : m[7] === 'quarter past' ? 15 : 45; if (m[7] === 'quarter to') hour = (hour + 23) % 24; bare = !period; }
+    else { hour = clockNumber(m[9]!); bare = !period; }
     const english = /[a-z]/u.test(m[0]);
     const invalidBoundary = english ? !boundary(s, start, end) || /[a-z]-$/u.test(before) : /[\d:/.-]$/u.test(before) || /^\d/u.test(after);
     const blocked = /差(?:一刻|三刻|[零一二三四五六七八九十百千\d]{1,12}分(?:钟|鐘)?)?\s*$/u.test(before) || /(?:今晚|今夜|明晚|明夜|今早|今晨|明早|明晨|tonight|tomorrow night|this morning|tomorrow morning)\s*(?:at\s*)?$/u.test(before) || (english && new RegExp('^[\\s-]*(?:' + enNum + '|' + unitPattern + ')(?![a-z])', 'u').test(after));
@@ -246,10 +361,10 @@ export function parseClockTime(text: string, use: Use): ParsedClockTime | null {
 const months = ['january|jan', 'february|feb', 'march|mar', 'april|apr', 'may', 'june|jun', 'july|jul', 'august|aug', 'september|sept|sep', 'october|oct', 'november|nov', 'december|dec'];
 const monthPattern = '(?:' + months.join('|') + ')\\.?';
 const ordinals = 'first second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth thirteenth fourteenth fifteenth sixteenth seventeenth eighteenth nineteenth twentieth'.split(' ');
-const ordinal = '(?:thirty-first|thirtieth|twenty[- ](?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth)|' + ordinals.join('|') + '|\\d{1,2}(?:st|nd|rd|th)?)';
+const ordinal = '(?:thirty[- ]first|thirtieth|twenty[- ](?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth)|' + ordinals.join('|') + '|\\d{1,2}(?:st|nd|rd|th)?)';
 function dayNumber(s: string): number {
   if (/^\d/u.test(s)) return Number(s.replace(/(?:st|nd|rd|th)$/u, ''));
-  if (s === 'thirtieth') return 30; if (s === 'thirty-first') return 31;
+  if (s === 'thirtieth') return 30; if (s === 'thirty-first' || s === 'thirty first') return 31;
   if (/^twenty[- ]/u.test(s)) return 20 + ordinals.indexOf(s.slice(7)) + 1;
   return ordinals.indexOf(s) + 1;
 }
@@ -259,17 +374,34 @@ function validDay(year: number | null, month: number, day: number): boolean {
   return day <= [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]!;
 }
 type BaseDay = { date: StoryClockDate; english: boolean };
+// Each backward scan consumes only the preceding token/whitespace run: O(n) over matches.
+function precedingTens(s: string, start: number): boolean {
+  let end = start;
+  while (end > 0 && (s[end - 1]!.trim() === '' || s[end - 1] === '-')) end--;
+  let at = end;
+  while (at > 0 && s[at - 1]! >= 'a' && s[at - 1]! <= 'z') at--;
+  return tens.includes(s.slice(at, end));
+}
+function precededByOn(s: string, start: number): boolean {
+  const floor = prefixStart(s, start);
+  let end = start;
+  while (end > floor && s[end - 1]!.trim() === '') end--;
+  return end - floor >= 2 && s.slice(end - 2, end) === 'on' && !latinDigit.test(s[end - 3] ?? '');
+}
 function baseDates(s: string): Hit<BaseDay | null>[] {
   const out: Hit<BaseDay | null>[] = [];
   const push = (m: RegExpMatchArray, year: number | null, month: number, day: number, english = false) => {
     const start = m.index!, end = start + m[0].length, before = s.slice(Math.max(0, start - 35), start), after = s.slice(end);
-    const bad = /(?:民國|民国|光緒|光绪|西元前|bc|bce)\s*$/u.test(before) || /^\s*(?:bc|bce)\b/u.test(after) || /[\d零〇一二三四五六七八九十百千:/.-]$/u.test(before) || english && !boundary(s, start, end);
+    // Anchored test scans at most two whitespace runs separated by a comma;
+    // following runs are disjoint between date hits: O(n) total, including unlimited input.
+    const bad = /(?:民國|民国|光緒|光绪|西元前|bc|bce)\s*$/u.test(before) || /^\s*(?:bc|bce)\b/u.test(after) || /[\d零〇一二三四五六七八九十百千:/.-]$/u.test(before) || english && (!boundary(s, start, end) || /^\s*(?:,\s*)?['‘]\d\d(?!\d)/u.test(after));
     out.push({ start, end, value: !bad && validDay(year, month, day) ? { date: { year, month, day }, english } : null });
   };
   for (const m of s.matchAll(/(\d{4})\s*([-/.])\s*(\d{1,2})\s*\2\s*(\d{1,2})/gu)) push(m, Number(m[1]), Number(m[3]), Number(m[4]));
   const digitYear = '[零〇一二三四五六七八九]{4}';
   const md = '(?:\\d{1,2}|[一二三四五六七八九十]{1,3}|兩|两)';
-  const re = new RegExp('(?:(\\d{2,5}|' + digitYear + '|[零〇一二三四五六七八九十百千]{3,12})\\s*年\\s*)?(' + md + ')\\s*月\\s*(' + md + ')\\s*[日号]', 'gu');
+  // At most 12 numeral characters/backtracks per start; whitespace runs have bounded starts: O(n).
+  const re = new RegExp('(?:(\\d{1,5}|' + digitYear + '|[零〇一二三四五六七八九十百千]{1,12})\\s*年\\s*)?(' + md + ')\\s*月\\s*(' + md + ')\\s*[日号]', 'gu');
   for (const m of s.matchAll(re)) {
     const yr = m[1]; let y: number | null = null;
     if (yr) y = /^\d{4}$/u.test(yr) ? Number(yr) : new RegExp('^' + digitYear + '$', 'u').test(yr) ? Number([...yr].map(c => c === '〇' ? 0 : cnDigits.indexOf(c)).join('')) : -1;
@@ -277,12 +409,28 @@ function baseDates(s: string): Hit<BaseDay | null>[] {
     push(m, y, cnMd(m[2]!), cnMd(m[3]!));
   }
   const weekday = '(?:(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\\s*(?:,\\s*)?)?';
-  const enRe = new RegExp(weekday + '(?:(' + monthPattern + ')\\s+(?:the\\s+)?(' + ordinal + ')|(?:the\\s+)?(' + ordinal + ')\\s+(?:of\\s+)?(' + monthPattern + '))(?:(?:\\s*,\\s+|\\s+)(\\d{2,5}))?', 'gu');
+  // Captures retain the quantifier structure. Only a two-digit year tests the fixed lookahead
+  // branches; each branch scans one disjoint whitespace run per match, for O(n) total work.
+  const yearClock = "\\d|:|\\.\\d|\\s*(?:a\\.?m\\.?|p\\.?m\\.?)(?![a-z])|\\s*o'clock|\\s+in the (?:morning|afternoon|evening)|\\s+at night";
+  const englishYear = '\\d{3,5}|\\d{2}(?!' + yearClock + ')';
+  const enRe = new RegExp(weekday + '(?:(' + monthPattern + ')\\s+(the\\s+)?(' + ordinal + ')|(the\\s+)?(' + ordinal + ')\\s+(of\\s+)?(' + monthPattern + '))(?:(?:\\s*,\\s+|\\s+)(' + englishYear + '))?', 'gu');
   for (const m of s.matchAll(enRe)) {
-    const monthName = (m[1] ?? m[4]!).replace(/\.$/u, '');
+    const monthToken = m[1] ?? m[7]!, ordinalToken = m[3] ?? m[5]!;
+    const monthName = monthToken.replace(/\.$/u, '');
     const month = months.findIndex(names => names.split('|').includes(monthName)) + 1;
-    const y = m[5] ? m[5].length === 4 ? Number(m[5]) : -1 : null;
-    push(m, y, month, dayNumber(m[2] ?? m[3]!), true);
+    const spelled = !/^\d/u.test(ordinalToken);
+    if (spelled) {
+      if (precedingTens(s, m.index + m[0].indexOf(ordinalToken))) continue;
+      if (m[1]) {
+        if (!m[2]) {
+          if (monthToken !== months[month - 1]!.split('|')[0]) continue;
+        }
+        // Both month-first spelled shapes reuse the bounded-prefix scan: O(n) total.
+        if ((monthName === 'may' || monthName === 'march') && !(precededByOn(s, m.index) || m[8]?.length === 4)) continue;
+      } else if (!m[6]) continue;
+    }
+    const y = m[8] ? m[8].length === 4 ? Number(m[8]) : -1 : null;
+    push(m, y, month, dayNumber(ordinalToken), true);
   }
   return ordered(out);
 }
@@ -340,7 +488,8 @@ function dateHits(s: string, use: Use = 'narrative'): Hit<ParsedDate>[] {
 export function parseStoryDate(text: string): ParsedDate | null { return input(text) ? unique(dateHits(normal(text))) : null; }
 const narrativeTerms = ['今天是', '今日是', '这天是', '此时已是', '轉眼已是', '转眼已是', '这一天是', '现在是', '此刻是', '已经是', '日子来到', '时间来到', 'today is', 'today was', 'it is now', 'it was now', 'it was the morning of', 'it was the evening of', 'it was the afternoon of', 'it was the night of', 'the date was', 'the day was', 'it was now the', 'by now it was'];
 function narrativeDate(s: string): boolean {
-  const dates = dateHits(s), bases = baseDates(s), markers = words(s, narrativeTerms.map(w => [w, true] as const));
+  // Fixed vocabulary collection is O(n); preserve overlapping markers only for this caller.
+  const dates = dateHits(s), bases = baseDates(s), markers = words(s, narrativeTerms.map(w => [w, true] as const), false, false, false);
   for (const h of dates) {
     const before = s.slice(0, h.start), after = s.slice(h.end);
     const base = bases.find(b => b.value && b.start >= h.start && b.end <= h.end)!;
@@ -368,16 +517,23 @@ const setRows: readonly [StoryClockTimeOfDay, string][] = [
 ];
 function nextHits(s: string, use: Use): Hit<Extract<NarrativeCueParse, { kind: 'next_day_at' }>>[] {
   const terms = '第二天|次日|翌日|隔天|隔日|the next day|next day|the following day|the day after|the morrow|the next morning|next morning|the following morning|the morning after|next afternoon|next evening|next night'.split('|');
-  return words(s, terms.map(w => [w, 1] as const)).map(h => { const a = attach(s, h.end, use); const term = s.slice(h.start, h.end); const slot = unique(todHits(term)); return { start: h.start, end: a.end, value: { kind: 'next_day_at', days: 1, time: plainTime(a.time), timeOfDay: a.slot ?? slot ?? 'morning', nextDay: a.time?.nextDay ?? false } }; });
+  const hits: Hit<Extract<NarrativeCueParse, { kind: 'next_day_at' }>>[] = [];
+  for (const h of words(s, terms.map(w => [w, 1] as const))) {
+    const a = attach(s, h.end, use);
+    if (a.invalid && use !== 'narrative') continue;
+    const term = s.slice(h.start, h.end), slot = unique(todHits(term));
+    hits.push({ start: h.start, end: a.end, value: { kind: 'next_day_at', days: 1, time: plainTime(a.time), timeOfDay: a.slot ?? slot ?? (a.time ? null : 'morning'), nextDay: a.time?.nextDay ?? false } });
+  }
+  return hits;
 }
 function advances(s: string): Hit<NarrativeCueParse>[] {
   const out: Hit<NarrativeCueParse>[] = [];
   for (const h of durationHits(s)) {
     const before = s.slice(0, h.start), after = s.slice(h.end);
-    const pre = /(?:又过了|过了|经过|再过|轉眼|转眼|一晃|等了)(?:\s*)$/u.exec(before) ?? /(?:within the next|after)\s+$/u.exec(before);
+    const pre = /(?:又过了|过了|经过|再过|轉眼|转眼|一晃|等了)(?:\s*)$/u.exec(before) ?? /after\s+$/u.exec(before);
     const post = /^(?:\s*)(?:之后|过后|以后|过去了|过去|后|了|later\b|after that\b|afterwards\b|had passed\b|passed\b|had gone by\b|went by\b|elapsed\b|on\b)/u.exec(after);
     if (!pre && !post || pre?.[0].trim() === '等了' && s.slice(h.start, h.end) !== '一下' && !post) continue;
-    if (/(?:\bin|\bfor|\bwithin)\s+$/u.test(before) && !/within the next\s+$/u.test(before)) continue;
+    if (/(?:\bin|\bfor|\bwithin)\s+$/u.test(before)) continue;
     const d = h.value.parsed; if (!d) continue;
     const start = pre ? h.start - pre[0].length : h.start, end = h.end + (post?.[0].length ?? 0);
     if (h.value.night) { if (h.value.fuzzy || !Number.isInteger(h.value.amount) || h.value.amount < 1) continue; out.push({ start, end, value: { kind: 'next_day_at', days: h.value.amount, time: null, timeOfDay: 'morning', nextDay: false } }); }
@@ -401,6 +557,7 @@ export function parseNarrativeCue(quote: string): NarrativeCueResult {
 
 function fullAttachment(s: string, end: number, fallback: StoryClockTimeOfDay | null = null): Attached | null {
   const a = attach(s, end, 'commitment');
+  if (a.invalid) return null;
   if (s.slice(a.end).trim()) return null;
   return { ...a, slot: a.slot ?? fallback };
 }
@@ -414,7 +571,8 @@ export function parseRelativeFuture(text: string): RelativeFutureParse | null {
   if (!input(text)) return null;
   const s = normal(text).trim();
   if (guard(s) === 'recall') return null;
-  const reschedule = /^(今天|明天)([\s\S]+?)(?:改为|改到|改成|調整为|调整为|調整到|调整到|換成|换成)([\s\S]+)$/u.exec(s);
+  // Character-class substitutions add no quantifiers; these entry points remain capped at 500.
+  const reschedule = /^(今天|明天)([\s\S]+?)(?:改[为為]|改到|改成|[調调]整[为為]|[調调]整到|換成|换成)([\s\S]+)$/u.exec(s);
   if (reschedule) {
     const old = fullAttachment(reschedule[2]!, 0); if (!old?.time) return null;
     let tail = reschedule[3]!;
@@ -439,7 +597,7 @@ export function parseRelativeFuture(text: string): RelativeFutureParse | null {
   const ds = durationHits(s); const h = ds.length === 1 ? ds[0] : null;
   if (h?.value.parsed?.kind === 'minutes' && !h.value.fuzzy && !h.value.night) {
     const before = s.slice(0, h.start), after = s.slice(h.end);
-    if (/^(?:in|within)\s+$/u.test(before) && !after.trim() || !before.trim() && /^(?:后|内|之内|以内|\s+from now)$/u.test(after)) return { kind: 'after', minutes: h.value.parsed.minutes };
+    if (/^(?:in|within)\s+$/u.test(before) && !after.trim() || !before.trim() && /^(?:后|[内內]|之[内內]|以[内內]|\s+from now)$/u.test(after)) return { kind: 'after', minutes: h.value.parsed.minutes };
   }
   return null;
 }
@@ -493,7 +651,11 @@ function windowText(text: string, firstDate?: Hit<ParsedDate>): string {
 export function scanOriginCandidates(opening: string | null, entries: readonly OriginScanEntry[]): readonly OriginCandidate[] {
   const sites: { text: string; site: StoryClockQuoteSite }[] = [];
   if (typeof opening === 'string') sites.push({ text: opening, site: { location: 'opening', table: null } });
-  if (Array.isArray(entries)) for (const entry of entries) if (entry && typeof entry.table === 'string' && typeof entry.text === 'string' && !/^initialization\/(example_dialogue|future_idea)(\/|$)/u.test(entry.table)) sites.push({ text: entry.text, site: { location: 'initialization', table: entry.table } });
+  if (Array.isArray(entries)) for (const entry of entries) {
+    if (!entry) continue;
+    const table = entry.table, text = entry.text;
+    if (typeof table === 'string' && typeof text === 'string' && !/^initialization\/(example_dialogue|future_idea)(\/|$)/u.test(table)) sites.push({ text, site: { location: 'initialization', table } });
+  }
   const out: OriginCandidate[] = [];
   for (const item of sites) {
     const s = normal(item.text), englishDates = baseDates(s).filter(h => h.value?.english);
@@ -506,7 +668,7 @@ export function scanOriginCandidates(opening: string | null, entries: readonly O
       const ns = normal(segment), dates = dateHits(ns);
       if (!dates.length && !clockHits(ns, 'narrative').length && !todHits(ns).length) continue;
       const text = windowText(segment, dates[0]), norm = normal(text);
-      out.push({ site: item.site, text, hasDate: dateHits(norm).length > 0, hasTime: clockHits(norm, 'narrative').length > 0, hasTimeOfDay: todHits(norm).length > 0 });
+      out.push({ site: { location: item.site.location, table: item.site.table }, text, hasDate: dateHits(norm).length > 0, hasTime: clockHits(norm, 'narrative').length > 0, hasTimeOfDay: todHits(norm).length > 0 });
       if (out.length >= 20) return out;
     }
   }

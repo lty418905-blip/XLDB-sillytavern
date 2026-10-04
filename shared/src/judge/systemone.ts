@@ -30,35 +30,43 @@ export function validateJudgeRequest(input: unknown): {ok: true; request: JudgeR
   const fail = (detail: JudgeRequestIssue): {ok: false; detail: JudgeRequestIssue} => ({ok: false, detail});
   try {
     if (!object(input)) return fail('request_not_object');
-    if (!JUDGE_CALL_SITES.includes(input.callSite as JudgeCallSite)) return fail('unknown_call_site');
-    if (typeof input.state !== 'string') return fail('state_not_string');
-    if (input.state.length === 0) return fail('state_empty');
-    if (input.state.length > JUDGE_LIMITS.maxStateChars) return fail('state_too_long');
-    if (!judgeStateIsWrapped(input.state)) return fail('state_not_wrapped');
-    if (!Array.isArray(input.questions)) return fail('questions_not_array');
-    if (input.questions.length === 0) return fail('questions_empty');
-    if (input.questions.length > JUDGE_LIMITS.maxQuestions) return fail('too_many_questions');
+    const callSite = input.callSite;
+    if (!JUDGE_CALL_SITES.includes(callSite as JudgeCallSite)) return fail('unknown_call_site');
+    const state = input.state;
+    if (typeof state !== 'string') return fail('state_not_string');
+    if (state.length === 0) return fail('state_empty');
+    if (state.length > JUDGE_LIMITS.maxStateChars) return fail('state_too_long');
+    if (!judgeStateIsWrapped(state)) return fail('state_not_wrapped');
+    const questionList = input.questions;
+    if (!Array.isArray(questionList)) return fail('questions_not_array');
+    if (questionList.length === 0) return fail('questions_empty');
+    if (questionList.length > JUDGE_LIMITS.maxQuestions) return fail('too_many_questions');
     const questions: JudgeQuestion[] = [], ids = new Set<string>();
-    for (const q of input.questions) {
+    for (const q of questionList) {
       if (!object(q)) return fail('question_not_object');
-      const spec = judgeQuestionSpec(input.callSite, q.id);
-      if (typeof q.id !== 'string' || spec === null) return fail('question_id_not_allowed');
-      if (ids.has(q.id)) return fail('duplicate_question_id');
-      ids.add(q.id);
-      if (q.type !== spec.type) return fail('question_type_mismatch');
-      if (typeof q.version !== 'string' || !JUDGE_QUESTION_VERSION_PATTERN.test(q.version)) return fail('question_version_invalid');
-      if (typeof q.instructions !== 'string' || q.instructions.length === 0 || q.instructions.length > JUDGE_LIMITS.maxInstructionsChars) return fail('instructions_invalid');
+      const id = q.id;
+      const spec = judgeQuestionSpec(callSite, id);
+      if (typeof id !== 'string' || spec === null) return fail('question_id_not_allowed');
+      if (ids.has(id)) return fail('duplicate_question_id');
+      ids.add(id);
+      const type = q.type;
+      if (type !== spec.type) return fail('question_type_mismatch');
+      const version = q.version;
+      if (typeof version !== 'string' || !JUDGE_QUESTION_VERSION_PATTERN.test(version)) return fail('question_version_invalid');
+      const instructions = q.instructions;
+      if (typeof instructions !== 'string' || instructions.length === 0 || instructions.length > JUDGE_LIMITS.maxInstructionsChars) return fail('instructions_invalid');
       const keys = spec.type === 'noul' ? ['true', 'false'] : spec.options;
-      if (!record(q.criteria) || Object.keys(q.criteria).length !== keys.length || !keys.every(k => Object.hasOwn(q.criteria as object, k))) return fail('criteria_keys_mismatch');
+      const criteriaInput = q.criteria;
+      if (!record(criteriaInput) || Object.keys(criteriaInput).length !== keys.length || !keys.every(k => Object.hasOwn(criteriaInput, k))) return fail('criteria_keys_mismatch');
       const criteria: Record<string, string> = {};
       for (const k of keys) {
-        const v = q.criteria[k];
+        const v = criteriaInput[k];
         if (typeof v !== 'string' || v.length === 0 || v.length > JUDGE_LIMITS.maxCriterionChars) return fail('criterion_invalid');
         criteria[k] = v;
       }
-      questions.push({id: q.id, type: spec.type, version: q.version, instructions: q.instructions, criteria});
+      questions.push({id, type: spec.type, version, instructions, criteria});
     }
-    return {ok: true, request: {callSite: input.callSite as JudgeCallSite, state: input.state, questions}};
+    return {ok: true, request: {callSite: callSite as JudgeCallSite, state, questions}};
   } catch { return fail('request_not_object'); }
 }
 export function buildSystemoneQuestion(spec: JudgeQuestionSpec, question: JudgeQuestion, support: unknown): {type: JudgeWireType; instructions: string; criteria: Record<string, string>} {
@@ -88,7 +96,7 @@ export function parseSystemoneAnswer(spec: JudgeQuestionSpec, question: JudgeQue
     const values = spec.options.map(k => Object.hasOwn(probabilities, k) ? probabilities[k] : 0);
     if (values.some(v => typeof v !== 'number' || !Number.isFinite(v) || v < 0)) return {ok: false, detail: 'bad_probabilities'};
     const sum = (values as number[]).reduce((a, b) => a + b, 0);
-    if (!(sum > 0)) return {ok: false, detail: 'bad_probabilities'};
+    if (!(sum > 0) || !Number.isFinite(sum)) return {ok: false, detail: 'bad_probabilities'};
     const distribution = Object.fromEntries(spec.options.map((k, i) => [k, (values[i] as number) / sum]));
     let value = spec.options[0];
     for (const k of spec.options) if (distribution[k] > distribution[value]) value = k;
