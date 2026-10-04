@@ -2,9 +2,11 @@ import type { DatabaseSync } from 'node:sqlite';
 import { scopeKey } from '../core/types.ts';
 import type { SceneScope } from '../scene/types.ts';
 import { requiredConsent } from './codec.ts';
+import {resolveStoryDeadline,type StoryDeadlineClock} from './time.ts';
+import {STORY_CLOCK_MAX_MS} from '../scene/story-clock-types.ts';
 import type {
   CommitmentQuery, CommitmentRecord, CommitmentSource, CommitmentStatus, CommitmentTodo,
-  PersistentProjection, ValidatedCommitmentOperation,
+  PersistentProjection, ValidatedCommitmentOperation, CommitmentStoryClock, CommitmentTerm, CommitmentFoldTerm,
 } from './types.ts';
 
 interface StoredRecordRow {
@@ -60,9 +62,9 @@ export class Commitments {
    * Rebuilds only derived rows. Call with the scope's ordered SceneSource list.
    * A nested savepoint keeps this atomic with SceneAuthority's outer transaction.
    */
-  replaceProjection(scope: SceneScope, orderedSources: readonly CommitmentSource[]): CommitmentRecord[] {
+  replaceProjection(scope: SceneScope, orderedSources: readonly CommitmentSource[], clock?:CommitmentStoryClock): CommitmentRecord[] {
     return this.transaction(() => {
-      const folded = fold(scope, orderedSources);
+      const folded = fold(scope, orderedSources, clock);
       const key = scopeKey(scope);
       this.db.prepare('DELETE FROM commitment_todos WHERE scope=?').run(key);
       this.db.prepare('DELETE FROM commitment_parties WHERE scope=?').run(key);
@@ -95,11 +97,11 @@ export class Commitments {
     });
   }
 
-  list(scope: SceneScope, query: CommitmentQuery = {}, orderedSources?: readonly CommitmentSource[]): CommitmentRecord[] {
+  list(scope: SceneScope, query: CommitmentQuery = {}, orderedSources?: readonly CommitmentSource[], clock?:CommitmentStoryClock): CommitmentRecord[] {
     const records = orderedSources===undefined
       ? (this.db.prepare('SELECT body FROM commitment_records WHERE scope=? ORDER BY rowid')
         .all(scopeKey(scope)) as unknown as StoredRecordRow[]).map(row => JSON.parse(row.body) as CommitmentRecord)
-      : foldCommitments(scope,orderedSources);
+      : foldCommitments(scope,orderedSources,clock);
     const needle = query.text?.toLocaleLowerCase();
     return records.filter(record =>
       (query.mode === undefined || record.mode === query.mode) &&
@@ -154,12 +156,13 @@ export class Commitments {
     clocks: { realNowMs: number; storyNowMs: number },
     mode: 'roleplay' | 'companion',
     orderedSources?: readonly CommitmentSource[],
+    clock?:CommitmentStoryClock,
   ): CommitmentTodo[] {
     assertClock(clocks.realNowMs); assertClock(clocks.storyNowMs);
     const rows = orderedSources===undefined?this.db.prepare(`SELECT commitment_id,revision,mode,clock,due_at,remind_at,obligor
       FROM commitment_todos WHERE scope=? AND mode=? ORDER BY due_at,commitment_id,obligor`).all(scopeKey(scope),mode) as unknown as Array<{
         commitment_id: string; revision: number; mode: 'roleplay' | 'companion'; clock: 'real' | 'story'; due_at: number; remind_at: number; obligor: string;
-      }>:foldCommitments(scope,orderedSources).flatMap(record=>{
+      }>:foldCommitments(scope,orderedSources,clock).flatMap(record=>{
         const term=record.term;
         return record.mode===mode&&record.status==='active'&&term.kind==='deadline'
           ?record.obligors.map(obligor=>({commitment_id:record.id,revision:record.revision,mode,clock:term.clock,
@@ -194,11 +197,11 @@ export class Commitments {
   }
 }
 
-export function foldCommitments(scope: SceneScope, orderedSources: readonly CommitmentSource[]): CommitmentRecord[] {
-  return [...fold(scope, orderedSources).records.values()];
+export function foldCommitments(scope: SceneScope, orderedSources: readonly CommitmentSource[], clock?:CommitmentStoryClock): CommitmentRecord[] {
+  return [...fold(scope, orderedSources, clock).records.values()];
 }
 
-function fold(scope: SceneScope, orderedSources: readonly CommitmentSource[]): Folded {
+function fold(scope: SceneScope, orderedSources: readonly CommitmentSource[], clock?:CommitmentStoryClock): Folded {
   const records = new Map<string, CommitmentRecord>();
   const events: Folded['events'] = [];
   const seenSources = new Set<string>();
@@ -217,7 +220,7 @@ function fold(scope: SceneScope, orderedSources: readonly CommitmentSource[]): F
       // later accepted source is awaiting Scene dependency re-analysis. Such
       // a dangling operation must project nothing; it must not resurrect the
       // removed target or block deletion/restore/fork rebuilding.
-      applyOperation(scope, records, operation);
+      applyOperation(scope, records, operation, source, clock);
       events.push({sourceId: source.id, sourceRevision: source.revision, eventIndex, operation});
     }
   }
@@ -226,6 +229,7 @@ function fold(scope: SceneScope, orderedSources: readonly CommitmentSource[]): F
 
 function applyOperation(
   scope: SceneScope, records: Map<string, CommitmentRecord>, operation: ValidatedCommitmentOperation,
+  source:CommitmentSource, clock?:CommitmentStoryClock,
 ): void {
   if(operation.action==='confirm'){
     const target=records.get(operation.targetId!);
@@ -297,7 +301,7 @@ function applyOperation(
       participants: [...operation.participants!],
       obligors: [...operation.obligors!],
       readers: [...operation.readers!],
-      term: operation.term!,
+      term: derivedTerm(operation.term!,source,clock),
       ...(restriction?{contactRestriction:restriction}:{}),
       createdSourceId: existing?.createdSourceId ?? operation.sourceId,
       createdSourceRevision: existing?.createdSourceRevision ?? operation.sourceRevision,
@@ -333,6 +337,45 @@ function applyOperation(
   target.revision += 1;
   target.latestSourceId = operation.sourceId;
   target.latestSourceRevision = operation.sourceRevision;
+}
+
+/** Each creating deadline reads its source clock once; quote parsing is bounded at 200 UTF-16 units. */
+function derivedTerm(term:CommitmentTerm|CommitmentFoldTerm,source:CommitmentSource,clock?:CommitmentStoryClock):CommitmentTerm {
+  if(term.kind!=='deadline'||term.clock==='real')return term as CommitmentTerm;
+  const quotes={deadlineQuote:term.deadlineQuote,...(term.reminderQuote===undefined?{}:{reminderQuote:term.reminderQuote})};
+  const unresolved:CommitmentTerm={kind:'unknown',...quotes};
+  if(clock===undefined)return 'dueAtMs' in term?term:unresolved;
+  const state=deadlineClockAt(clock,source);
+  if(state===null)return unresolved;
+  if('dueAtMs' in term){
+    let legacy:number|null;
+    try{legacy=clock.legacyAt(source);}catch{return unresolved;}
+    if(typeof legacy!=='number'||!Number.isFinite(legacy))return unresolved;
+    const dueAtMs=state.atMs+(term.dueAtMs-legacy);
+    const remindAtMs=term.remindAtMs===undefined?undefined:state.atMs+(term.remindAtMs-legacy);
+    if(!derivedStoryValue(dueAtMs))return unresolved;
+    if(remindAtMs!==undefined&&!derivedStoryValue(remindAtMs))return unresolved;
+    return {kind:'deadline',clock:'story',...quotes,dueAtMs,...(remindAtMs===undefined?{}:{remindAtMs}),
+      domain:'story_clock',fromStoredValue:true};
+  }
+  const dueAtMs=resolveStoryDeadline(term.deadlineQuote,state);
+  if(dueAtMs===null)return unresolved;
+  const remindAtMs=term.reminderQuote===undefined?null:resolveStoryDeadline(term.reminderQuote,state);
+  return {kind:'deadline',clock:'story',...quotes,dueAtMs,
+    ...(remindAtMs!==null&&remindAtMs<=dueAtMs?{remindAtMs}:{}),domain:'story_clock'};
+}
+
+function deadlineClockAt(clock:CommitmentStoryClock,source:CommitmentSource):StoryDeadlineClock|null {
+  try{
+    const value=clock.at(source);
+    if(value===null||typeof value!=='object')return null;
+    const atMs=value.atMs;
+    if(!derivedStoryValue(atMs))return null;
+    return {atMs,dateKnown:value.dateKnown===true,yearKnown:value.yearKnown===true,timeOfDayKnown:value.timeOfDayKnown===true};
+  }catch{return null;}
+}
+function derivedStoryValue(value:unknown):value is number {
+  return Number.isSafeInteger(value)&&(value as number)>=0&&(value as number)<=STORY_CLOCK_MAX_MS;
 }
 
 function supersedeReplaced(records:Map<string,CommitmentRecord>,proposal:CommitmentRecord,operation:ValidatedCommitmentOperation):void{

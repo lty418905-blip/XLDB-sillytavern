@@ -6,7 +6,8 @@ export {
   validateCommitmentOperations,
   withoutInheritance,
 } from './codec.ts';
-export {resolveCommitmentTime} from './time.ts';
+export {resolveCommitmentTime,resolveStoryDeadline} from './time.ts';
+export type {StoryDeadlineClock} from './time.ts';
 export {contactLiftRequest,contactRestrictionWindow,noContactRequest,resolveContactRestriction} from './contact.ts';
 export {commitmentDisplayText} from './display.ts';
 export type * from './types.ts';

@@ -3,6 +3,7 @@ import type {CommitmentRecord} from '../commitments/types.ts';
 import {commitmentDisplayText} from '../commitments/display.ts';
 import type {SceneReference} from './transfer.ts';
 import type {SceneState} from './types.ts';
+import {storyClockParts} from './story-clock.ts';
 
 export type CalendarViewer = 'player' | 'admin' | 'character';
 export interface CalendarSource {
@@ -121,7 +122,7 @@ export function decodeCalendarCandidate(raw:unknown,sources:readonly CalendarSou
 
 export function projectSceneCalendar(input:{sources:readonly CalendarSource[];commitments:readonly CommitmentRecord[];
   candidate:CalendarCandidate;year:number;month:number;timeZone:string;view:CalendarViewer;characterId?:string;
-  mode?:'roleplay'|'companion'}){
+  mode?:'roleplay'|'companion';storyDated?:boolean}){
   const {sources,commitments,candidate,year,month,timeZone,view,characterId,mode}=input;
   if(!Number.isInteger(year)||year<1||year>9999||!Number.isInteger(month)||month<1||month>12)
     throw new Error('invalid_calendar_month');
@@ -173,6 +174,14 @@ export function projectSceneCalendar(input:{sources:readonly CalendarSource[];co
         revision:record.latestSourceRevision,quote:record.content},termKind:record.term.kind};
     if(record.term.kind==='unknown'||record.term.kind==='persistent'){
       undated.push({id:`commitment:${record.id}:${record.revision}`,date:null,...base});continue;
+    }
+    if(record.term.domain==='story_clock'){
+      const parts=input.storyDated===true?storyClockParts(record.term.dueAtMs):null;
+      if(parts===null){undated.push({id:`commitment:${record.id}:${record.revision}`,date:null,...base});continue;}
+      const date=`${String(parts.date.year).padStart(4,'0')}-${String(parts.date.month).padStart(2,'0')}-${String(parts.date.day).padStart(2,'0')}`;
+      if(date.startsWith(prefix))items.push({id:`commitment:${record.id}:${record.revision}`,date,clock:record.term.clock,...base,
+        startTime:`${String(parts.time.hour).padStart(2,'0')}:${String(parts.time.minute).padStart(2,'0')}`});
+      continue;
     }
     // Story-clock deadlines remain explicitly marked; the viewer chooses its clock semantics.
     const local=new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit',

@@ -1,4 +1,5 @@
 import type {CommitmentRecord} from './types.ts';
+import {storyClockParts} from '../scene/story-clock.ts';
 
 /** Reader-scoped wording for a replacement; authority keeps each source-literal content unchanged. */
 export function commitmentDisplayText(record:CommitmentRecord,records:readonly CommitmentRecord[],
@@ -6,7 +7,9 @@ export function commitmentDisplayText(record:CommitmentRecord,records:readonly C
   if(!viewer.admin&&(!viewer.readerId||!record.readers.includes(viewer.readerId)))return '';
   const deadline=record.term.kind==='deadline'?record.term.deadlineQuote:'';
   const clock=record.term.kind==='deadline'&&timeZone
-    ?new Intl.DateTimeFormat('en-GB',{timeZone,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(record.term.dueAtMs)
+    ?record.term.domain==='story_clock'
+      ?record.term.fromStoredValue!==true?storyDeadlineClockText(record.term.dueAtMs):''
+      :new Intl.DateTimeFormat('en-GB',{timeZone,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(record.term.dueAtMs)
     :'';
   const currentTerm=deadline?`；当前期限：${deadline}${clock?`（${clock}）`:''}`:'';
   if(!record.replaces||!record.scope)return record.content+currentTerm;
@@ -22,6 +25,11 @@ export function commitmentDisplayText(record:CommitmentRecord,records:readonly C
   }
   if(!history.length)return record.content+currentTerm;
   return `本次修订：${record.content}${currentTerm}；关联历史（已被替代、旧期限无效）：${history.reverse().map(item=>item.content).join(' → ')}`;
+}
+
+function storyDeadlineClockText(atMs:number):string {
+  const parts=storyClockParts(atMs);
+  return parts?`${String(parts.time.hour).padStart(2,'0')}:${String(parts.time.minute).padStart(2,'0')}`:'';
 }
 
 function sameScope(left:CommitmentRecord['scope'],right:CommitmentRecord['scope']):boolean{

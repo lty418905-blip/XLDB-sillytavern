@@ -1,6 +1,6 @@
 import type {
   CommitmentCandidate, CommitmentCandidateTerm, CommitmentPrompt, CommitmentRecord, CommitmentTargetCandidate,
-  CommitmentTerm, CommitmentValidationInput, ValidatedCommitmentOperation, ContactRestrictionCandidate, ContactRestriction, CommitmentMode,
+  CommitmentTerm, CommitmentFoldTerm, CommitmentValidationInput, ValidatedCommitmentOperation, ContactRestrictionCandidate, ContactRestriction, CommitmentMode,
 } from './types.ts';
 import {resolveCommitmentTime} from './time.ts';
 import {contactLiftRequest,contactWindowContains,noContactRequest,resolveContactRestriction,storedContactRestriction,userRangeMatches} from './contact.ts';
@@ -62,6 +62,7 @@ export function validateCommitmentOperations(
   input: CommitmentValidationInput,
   raw: unknown,
 ): ValidatedCommitmentOperation[] {
+  if(input.storyDeadlines==='fold'&&input.mode!=='roleplay')throw new Error('invalid_commitment_deadline_mode');
   assertTimeContext(input);
   const root = exactObject(raw, ['operations'], 'invalid_commitment_output');
   if (!Array.isArray(root.operations) || root.operations.length > MAX_OPERATIONS) throw new Error('invalid_commitment_operations');
@@ -144,7 +145,11 @@ export function commitmentTransitionTargets(
     return [{
       id:record.id,revision:record.revision,status:record.status,agreement:record.agreement,content:record.content,
       ...(record.status==='proposed'&&record.replaces?{replaces:record.replaces}:{}),
-      participants:[...record.participants],obligors:[...record.obligors],term:record.term,
+      participants:[...record.participants],obligors:[...record.obligors],term:
+        record.term.kind==='unknown'&&record.term.deadlineQuote!==undefined||
+        record.term.kind==='deadline'&&record.term.domain==='story_clock'
+          ?{kind:'deadline',clock:'story',deadlineQuote:record.term.deadlineQuote!,
+            ...(record.term.reminderQuote===undefined?{}:{reminderQuote:record.term.reminderQuote})}:record.term,
       // The host's inheritance mark stays out of the model's view: the model copying it back must not matter.
       ...(record.contactRestriction?{contactRestriction:withoutInheritance(record.contactRestriction)}:{}),
       targetSourceId:record.createdSourceId,targetSourceRevision:record.createdSourceRevision,
@@ -269,7 +274,7 @@ function candidateOf(value: unknown): CommitmentCandidate {
   return base;
 }
 
-type GroundedCandidate=Omit<CommitmentCandidate,'term'|'contactRestriction'>&{term?:CommitmentTerm;contactRestriction?:ContactRestriction|null};
+type GroundedCandidate=Omit<CommitmentCandidate,'term'|'contactRestriction'>&{term?:CommitmentTerm|CommitmentFoldTerm;contactRestriction?:ContactRestriction|null};
 function groundCandidate(input: CommitmentValidationInput, actors: Set<string>, candidate: CommitmentCandidate): GroundedCandidate {
   if (!input.source.text.includes(candidate.quote)) throw new Error('invalid_commitment_quote');
   if (candidate.content !== undefined && !input.source.text.includes(candidate.content)) throw new Error('invalid_commitment_content');
@@ -375,6 +380,9 @@ function groundCandidate(input: CommitmentValidationInput, actors: Set<string>, 
     throw new Error('invalid_commitment_deadline_quote');
   if(candidate.term.reminderQuote!==undefined&&(!candidate.quote.includes(candidate.term.reminderQuote)||!input.source.text.includes(candidate.term.reminderQuote)))
     throw new Error('invalid_commitment_reminder_quote');
+  if(input.mode==='roleplay'&&(input.revalidate===true?candidate.term.dueAtMs===undefined:input.storyDeadlines==='fold'))
+    return {...baseCandidate,...restricted,term:{kind:'deadline',clock:'story',deadlineQuote:candidate.term.deadlineQuote,
+      ...(candidate.term.reminderQuote===undefined?{}:{reminderQuote:candidate.term.reminderQuote})}};
   const dueAtMs=resolveCommitmentTime(candidate.term.deadlineQuote,{clockTimeMs:input.clockTimeMs,timeZone:input.timeZone});
   if(dueAtMs===null)return {...baseCandidate,...restricted,term:{kind:'unknown'}};
   if(candidate.term.dueAtMs!==undefined&&candidate.term.dueAtMs!==dueAtMs)throw new Error('invalid_commitment_deadline');

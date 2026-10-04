@@ -1,3 +1,60 @@
+import {parseRelativeFuture,type RelativeFutureParse} from '../scene/time-expressions.ts';
+import {storyClockParts,storyClockFromParts,STORY_CLOCK_RULE_V1} from '../scene/story-clock.ts';
+import {STORY_CLOCK_MAX_MS} from '../scene/story-clock-types.ts';
+
+export interface StoryDeadlineClock {atMs:number;dateKnown:boolean;yearKnown:boolean;timeOfDayKnown:boolean}
+
+/** SC1 parses each bounded quote once; O(n) for at most 200 UTF-16 units, then O(1) arithmetic. */
+export function resolveStoryDeadline(quote:string,clock:StoryDeadlineClock):number|null {
+  try{
+    if(typeof quote!=='string'||quote.length>200||!quote.trim())return null;
+    if(clock===null||typeof clock!=='object')return null;
+    const atMs=clock.atMs;
+    if(!storyDeadlineValue(atMs))return null;
+    const dateKnown=clock.dateKnown===true,yearKnown=clock.yearKnown===true,timeOfDayKnown=clock.timeOfDayKnown===true;
+    const parsed=parseRelativeFuture(quote);
+    if(parsed===null)return null;
+    const parts=storyClockParts(atMs)!;
+    const day0=atMs-parts.msOfDay,day=86_400_000;
+    let result:number|null;
+    if(parsed.kind==='after')result=atMs+parsed.minutes*60_000;
+    else if(parsed.kind==='day'){
+      if(parsed.time!==null)result=day0+parsed.dayOffset*day+deadlineTimeOffset(parsed.time);
+      else if(parsed.timeOfDay!==null)result=timeOfDayKnown
+        ?day0+parsed.dayOffset*day+deadlineTimeOffset(STORY_CLOCK_RULE_V1.timeOfDayRepresentativeTimes[parsed.timeOfDay]):null;
+      else result=parsed.dayOffset>=1?atMs+parsed.dayOffset*day:null;
+    }else{
+      if(!dateKnown||!yearKnown)return null;
+      if(parsed.kind==='weekday'){
+        const today=Math.floor(atMs/day)%7,wanted=parsed.weekday-1;
+        let offset=parsed.qualifier==='next'?7-today+wanted:wanted-today;
+        if(parsed.qualifier==='this'&&offset<0)return null;
+        if(parsed.qualifier==='none'){
+          if(offset===0)return null;
+          if(offset<0)offset+=7;
+        }
+        if(parsed.time!==null)result=day0+offset*day+deadlineTimeOffset(parsed.time);
+        else result=parsed.timeOfDay!==null&&timeOfDayKnown
+          ?day0+offset*day+deadlineTimeOffset(STORY_CLOCK_RULE_V1.timeOfDayRepresentativeTimes[parsed.timeOfDay]):null;
+      }else{
+        if(parsed.time!==null){
+          result=storyClockFromParts(parsed.date,parsed.time);
+          if(result!==null&&parsed.time.nextDay)result+=day;
+        }else result=parsed.timeOfDay!==null
+          ?storyClockFromParts(parsed.date,STORY_CLOCK_RULE_V1.timeOfDayRepresentativeTimes[parsed.timeOfDay]):null;
+      }
+    }
+    return storyDeadlineValue(result)?result:null;
+  }catch{return null;}
+}
+
+function storyDeadlineValue(value:unknown):value is number {
+  return Number.isSafeInteger(value)&&(value as number)>=0&&(value as number)<=STORY_CLOCK_MAX_MS;
+}
+function deadlineTimeOffset(time:Pick<NonNullable<Extract<RelativeFutureParse,{kind:'day'}>['time']>,'hour'|'minute'>&{nextDay?:boolean}):number {
+  return (time.hour*60+time.minute)*60_000+(time.nextDay?86_400_000:0);
+}
+
 interface DeadlineTimeContext {clockTimeMs?:number;timeZone?:string}
 interface DateParts {year:number;month:number;day:number;hour:number;minute:number}
 

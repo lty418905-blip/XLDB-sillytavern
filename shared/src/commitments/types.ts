@@ -1,12 +1,21 @@
 import type { SceneMessage, SceneScope, PerspectivePlan } from '../scene/types.ts';
+import type {StoryDeadlineClock} from './time.ts';
 
 export type CommitmentMode = 'roleplay' | 'companion';
 export type CommitmentAction = 'propose' | 'confirm' | 'establish' | 'revise' | 'fulfill' | 'cancel' | 'harden';
 export type CommitmentAgreement = 'unilateral' | 'mutual';
 export type CommitmentTerm =
-  | { kind: 'unknown' }
+  | { kind: 'unknown'; deadlineQuote?:string; reminderQuote?:string }
   | { kind: 'persistent' }
-  | { kind: 'deadline'; clock: 'real' | 'story'; deadlineQuote:string; reminderQuote?:string; dueAtMs: number; remindAtMs?: number };
+  | { kind: 'deadline'; clock: 'real' | 'story'; deadlineQuote:string; reminderQuote?:string; dueAtMs: number; remindAtMs?: number;
+      domain?:'story_clock'; fromStoredValue?:true };
+export type CommitmentFoldTerm = {kind:'deadline';clock:'story';deadlineQuote:string;reminderQuote?:string};
+export interface CommitmentStoryClock {
+  /** Unified state after this accepted source revision on the timeline being folded. */
+  at(source:CommitmentSource):StoryDeadlineClock|null;
+  /** Legacy Unix-domain time against which a stored story deadline was computed. */
+  legacyAt(source:CommitmentSource):number|null;
+}
 export type CommitmentCandidateTerm =
   | { kind: 'unknown' }
   | { kind: 'persistent' }
@@ -63,7 +72,7 @@ export interface CommitmentCandidate {
 }
 
 export interface ValidatedCommitmentOperation extends Omit<CommitmentCandidate,'term'|'contactRestriction'> {
-  term?:CommitmentTerm;
+  term?:CommitmentTerm|CommitmentFoldTerm;
   contactRestriction?:ContactRestriction|null;
   commitmentId?: string;
   targetId?: string;
@@ -89,6 +98,7 @@ export interface CommitmentValidationInput {
   mode: CommitmentMode;
   /** Clock at this accepted source, never current wall time during replay. */
   clockTimeMs?:number;
+  storyDeadlines?:'fold';
   /** IANA zone used only for explicit 今天/明天 local-clock phrases. */
   timeZone?:string;
   /** Current host contract; omitted when old saved operations are checked. */
@@ -142,7 +152,7 @@ export interface CommitmentTargetCandidate {
   content:string;
   participants:string[];
   obligors:string[];
-  term:CommitmentTerm;
+  term:CommitmentTerm|CommitmentFoldTerm;
   targetSourceId:string;
   targetSourceRevision:number;
   latestSourceId:string;

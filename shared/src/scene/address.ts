@@ -52,10 +52,16 @@ export function sceneExpressionOptions(authority:SceneAuthority,scope:SceneScope
   const clock=mode?authority.interactions.clock(scope,nowMs):null;
   const story=clock?.kind==='story'||!clock&&authority.worldSettings(scope)?.mode==='story';
   const zone=clock?.timeZone??(story?'UTC':null);
-  const hideStoryTime=Boolean(story&&(authority.worldSettings(scope)?.publicTime===false||
-    clock?.kind==='story'&&!clock.known));
-  const clockTimeMs=clock?.kind==='story'?(typeof clock.timeMs==='number'?clock.timeMs:null):
-    story?authority.emotionTime(scope,state.sources,nowMs):nowMs;
+  const hideStoryTime=Boolean(story&&(authority.worldSettings(scope)===null||
+    authority.worldSettings(scope)!.publicTime===false));
+  let clockTimeMs:number|null=nowMs;
+  if(story){
+    try{clockTimeMs=authority.legacyEmotionTime(scope,state.sources,nowMs);}
+    catch(error){
+      if(error instanceof Error&&error.message.startsWith('invalid_world_'))clockTimeMs=null;
+      else throw error;
+    }
+  }
   return {actorId:speakerId,addresseeId:'player',timeZone:zone,clockKind:story?'story' as const:'realtime' as const,
     clockTimeMs,hideStoryTime,
     relationBasis:directional?'current_directional_projection' as const:'core_state_unspecified_target' as const,waiting,
