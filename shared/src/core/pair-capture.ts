@@ -113,6 +113,10 @@ function entering(config: ModelConfig, prompts: Prompt[], json: boolean, now: ()
   const endpoint = baseUrl?.split(/[?#]/, 1)[0]?.replace(/\/+$/, '').replace(/\/chat\/completions$/, '') ?? null;
   const url = safely(() => new URL(baseUrl ?? ''));
   const urlSecrets = url === null ? [] : [...Array.from(url.searchParams, ([name, value]) => value === '' ? name : value), url.username, url.password];
+  const canonicalSources = url === null || url.origin === 'null' ? [] : [
+    url.href.replace(/\/+$/, ''),
+    (url.origin + url.pathname).replace(/\/+$/, '').replace(/\/chat\/completions$/, ''),
+  ];
   const hashAt = baseUrl === null ? -1 : baseUrl.indexOf('#');
   const beforeHash = baseUrl === null ? '' : hashAt < 0 ? baseUrl : baseUrl.slice(0, hashAt);
   const queryAt = beforeHash.indexOf('?');
@@ -121,7 +125,7 @@ function entering(config: ModelConfig, prompts: Prompt[], json: boolean, now: ()
     return at < 0 ? part : at === part.length - 1 ? part.slice(0, at) : part.slice(at + 1);
   });
   const rawFragment = hashAt < 0 || baseUrl === null ? [] : [baseUrl.slice(hashAt + 1)];
-  const secrets = [...new Set([key, key?.trim() ?? null, baseUrl, endpoint, ...urlSecrets, ...rawQuery, ...rawFragment].filter((value): value is string => value !== null && value.length >= 8))].sort((a, b) => b.length - a.length);
+  const secrets = [...new Set([key, key?.trim() ?? null, baseUrl, endpoint, ...urlSecrets, ...canonicalSources, ...rawQuery, ...rawFragment].filter((value): value is string => value !== null && value.length >= 8))].sort((a, b) => b.length - a.length);
   let redactions = 0;
   // redact is O(k*n): k secrets from the config, n the text length.
   const redact = (text: string) => {
