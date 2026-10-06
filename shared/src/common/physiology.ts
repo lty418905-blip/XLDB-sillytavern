@@ -57,6 +57,8 @@ interface PhysiologyDependencies {
   modeOf:(scope:SceneScope)=>'roleplay'|'companion'|undefined;
   fullRoleplay:(scope:SceneScope)=>boolean;
   clock:(scope:SceneScope,now:number)=>{kind:'story'|'realtime';known:boolean;timeMs:number|null;timeZone:string};
+  /** Story scopes only (null elsewhere): the unified clock of `state`. `at` is the clock after an accepted source, null when the reading has no such source. */
+  storyTime?:(scope:SceneScope,state:ReturnType<PhysiologyDependencies['state']>)=>{nowMs:number;originMs:number;at:(sourceId:string,revision?:number)=>number|null}|null;
   transaction:<T>(action:()=>T)=>T;
   checkpoint:(scope:SceneScope,reason:string)=>void;
   bump:(scope:SceneScope)=>void;
@@ -156,16 +158,33 @@ export class PhysiologyStore {
     const projected=new Map(config.trackedCharacterIds.map(id=>[id,emptyCharacter(id,names.get(id)!) ]));
     this.applyInitialization(scope,state.roster as FullSceneRoster,projected,readerId,inspectId);
     const corrections=this.corrections(scope).filter(item=>!options.generationView?.excludedSourceIds.has(item.afterSourceId??''));
+    // A story scope computes on the unified clock of `state`: an operation at its source, a correction at the source
+    // it follows. The stored atMs values are then only shown (need anchors), never computed with. O(sources x corrections).
+    const story=this.storyTimeOf(scope,state);
+    const sourceIds=state.sources.map(source=>source.id);
+    const operationAt=(operation:PhysiologyOperation)=>story===null?undefined:story.at(operation.sourceId,operation.sourceRevision);
+    const correctionAt=(correction:StoredCorrection)=>{
+      if(story===null)return undefined;
+      if(correction.afterSourceId===null)return story.originMs;
+      const index=sourceIds.indexOf(correction.afterSourceId);
+      // Its source has no clock entry (deleted, or no longer accepted): the nearest earlier source that has one.
+      // Its source is not in the state at all: the correction is applied after every source, so the last one that has one.
+      for(let position=index<0?sourceIds.length-1:index;position>=0;position--){
+        const at=story.at(sourceIds[position]!);
+        if(at!==null)return at;
+      }
+      return story.originMs;
+    };
     const before=corrections.filter(item=>item.afterSourceId===null);
-    for(const correction of before)this.applyCorrection(projected,correction,readerId,inspectId===correction.characterId);
+    for(const correction of before)this.applyCorrection(projected,correction,readerId,inspectId===correction.characterId,correctionAt(correction));
     for(const source of state.sources){
       if(source.status==='accepted'&&source.processing==='ready')for(const operation of source.analysis?.physiologyOperations??[])
-        this.applyOperation(projected,operation,readerId,inspectId===operation.characterId);
-      for(const correction of corrections.filter(item=>item.afterSourceId===source.id))this.applyCorrection(projected,correction,readerId,inspectId===correction.characterId);
+        this.applyOperation(projected,operation,readerId,inspectId===operation.characterId,operationAt(operation));
+      for(const correction of corrections.filter(item=>item.afterSourceId===source.id))this.applyCorrection(projected,correction,readerId,inspectId===correction.characterId,correctionAt(correction));
     }
     const knownSourceIds=new Set(state.sources.map(source=>source.id));
-    for(const correction of corrections.filter(item=>item.afterSourceId!==null&&!knownSourceIds.has(item.afterSourceId)))this.applyCorrection(projected,correction,readerId,inspectId===correction.characterId);
-    const characters=[...projected.values()].filter(character=>inspectId===undefined||character.characterId===inspectId).map(character=>projectCharacter(character,config,clock.timeMs));
+    for(const correction of corrections.filter(item=>item.afterSourceId!==null&&!knownSourceIds.has(item.afterSourceId)))this.applyCorrection(projected,correction,readerId,inspectId===correction.characterId,correctionAt(correction));
+    const characters=[...projected.values()].filter(character=>inspectId===undefined||character.characterId===inspectId).map(character=>projectCharacter(character,config,story===null?clock.timeMs:story.nowMs));
     return {schema:'xldb-physiology-v1' as const,revision:stored.revision,sceneVersion:state.version,config,mode:this.dependencies.modeOf(scope)??null,clock,characters};
   }
 
@@ -176,7 +195,14 @@ export class PhysiologyStore {
     const character=status.characters.find(item=>item.characterId===characterId);
     if(!character||!character.known)return '';
     const {sources:_sources,correctionIds:_correctionIds,...promptState}=character;
-    return `\n[XLDB 虚拟角色生理状态] 仅用于扮演角色 ${character.name}，不是现实用户身体资料。basis=default 的日常需求是未观察到特殊情况时的角色默认基线，不是已发生事实；其余是已接受来源或用户纠正后的可知状态。unknown 不得补写。${JSON.stringify(promptState)}`;
+    // A story scope prints no stored millisecond value: the character perceives the stage, computed on the unified clock.
+    const story=this.storyTimeOf(scope,generationView?.state??this.dependencies.state(scope));
+    const shown=story===null?promptState:{...promptState,
+      needs:Object.fromEntries(Object.entries(promptState.needs).map(([need,{anchorTimeMs:_anchorTimeMs,...value}])=>[need,value])),
+      effects:promptState.effects.map(({atMs:_atMs,...effect})=>effect),
+      ...(promptState.reproductive?{reproductive:(({atMs:_atMs,...value})=>value)(promptState.reproductive)}:{}),
+      ...(promptState.sexualArousal?{sexualArousal:(({atMs:_atMs,...value})=>value)(promptState.sexualArousal)}:{})};
+    return `\n[XLDB 虚拟角色生理状态] 仅用于扮演角色 ${character.name}，不是现实用户身体资料。basis=default 的日常需求是未观察到特殊情况时的角色默认基线，不是已发生事实；其余是已接受来源或用户纠正后的可知状态。unknown 不得补写。${JSON.stringify(shown)}`;
   }
 
   async extract(source:SceneMessage,plan:PerspectivePlan,roster:SceneRoster,config:PhysiologyConfiguration,atMs:number|null,
@@ -239,10 +265,10 @@ export class PhysiologyStore {
     }
   }
 
-  private applyOperation(characters:Map<string,MutableCharacter>,operation:PhysiologyOperation,readerId:string,inspect=false){
+  private applyOperation(characters:Map<string,MutableCharacter>,operation:PhysiologyOperation,readerId:string,inspect=false,storyAtMs?:number|null){
     const character=characters.get(operation.characterId);if(!character||(!inspect&&!operation.readers.includes(readerId)))return;
     character.sources.set(`${operation.sourceId}:${operation.sourceRevision}`,{id:operation.sourceId,revision:operation.sourceRevision});
-    if(operation.kind==='need')applyNeed(character,operation.need,operation.action,operation.atMs,false);
+    if(operation.kind==='need')applyNeed(character,operation.need,operation.action,storyAtMs===undefined?operation.atMs:storyAtMs,false,storyAtMs===undefined?undefined:operation.atMs);
     else if(operation.kind==='effect'){
       if(operation.action==='end')character.effects.delete(operation.effect);
       else character.effects.set(operation.effect,{kind:operation.effect,severity:operation.severity??'moderate',detail:operation.evidence,atMs:operation.atMs,corrected:false});
@@ -250,12 +276,13 @@ export class PhysiologyStore {
     else character.sexualArousal=operation.action==='clear'?undefined:{level:operation.level!,atMs:operation.atMs,corrected:false};
   }
 
-  private applyCorrection(characters:Map<string,MutableCharacter>,correction:StoredCorrection,readerId:string,inspect=false){
+  private applyCorrection(characters:Map<string,MutableCharacter>,correction:StoredCorrection,readerId:string,inspect=false,storyAtMs?:number|null){
     const character=characters.get(correction.characterId);if(!character||(!inspect&&!correction.readers.includes(readerId)))return;
     character.corrections.add(correction.id);const patch=correction.patch;
     if(patch.kind==='need'){
       if(patch.state==='unknown')character.needs.delete(patch.need);
-      else character.needs.set(patch.need,{stage:patch.state,atMs:correction.atMs,sleeping:patch.sleeping===true,corrected:true});
+      else character.needs.set(patch.need,{stage:patch.state,atMs:storyAtMs===undefined?correction.atMs:storyAtMs,sleeping:patch.sleeping===true,corrected:true,
+        ...(storyAtMs===undefined?{}:{shownAtMs:correction.atMs})});
     }else if(patch.kind==='effect'){
       if(patch.action==='clear')character.effects.delete(patch.effect);
       else character.effects.set(patch.effect,{kind:patch.effect,severity:patch.severity??'moderate',detail:patch.detail??correction.reason,atMs:correction.atMs,corrected:true});
@@ -274,10 +301,18 @@ export class PhysiologyStore {
   private clock(scope:SceneScope,now:number){
     try{return this.dependencies.clock(scope,now);}catch{return {kind:'story' as const,known:false,timeMs:null,timeZone:Intl.DateTimeFormat().resolvedOptions().timeZone};}
   }
+  /**
+   * The unified clock of a story scope; null for any other scope. A reading that throws (unreadable or rejected world
+   * settings, a storage fault) is a story scope whose time is unknown: every computing time is null, so no stage
+   * progresses. Only this one call is guarded: an error thrown anywhere else propagates.
+   */
+  private storyTimeOf(scope:SceneScope,state:ReturnType<PhysiologyDependencies['state']>):{nowMs:number|null;originMs:number|null;at:(sourceId:string,revision?:number)=>number|null}|null{
+    try{return this.dependencies.storyTime?.(scope,state)??null;}catch{return {nowMs:null,originMs:null,at:()=>null};}
+  }
 }
 
 interface MutableCharacter {
-  characterId:string;name:string;needs:Map<PhysiologyNeed,{stage:typeof needStages[number];atMs:number|null;sleeping:boolean;corrected:boolean;basis?:'default'|'source'}>;
+  characterId:string;name:string;needs:Map<PhysiologyNeed,{stage:typeof needStages[number];atMs:number|null;sleeping:boolean;corrected:boolean;basis?:'default'|'source';shownAtMs?:number|null}>;
   effects:Map<EffectKind,{kind:EffectKind;severity:EffectSeverity|'unknown';detail:string;atMs:number|null;corrected:boolean}>;
   reproductive?:{status:ReproductiveStatus;detail:string;atMs:number|null;corrected:boolean};
   sexualArousal?:{level:ArousalLevel;atMs:number|null;corrected:boolean};sources:Map<string,{id:string;revision:number}>;corrections:Set<string>;
@@ -286,7 +321,7 @@ function emptyCharacter(characterId:string,name:string):MutableCharacter{return 
 function projectCharacter(character:MutableCharacter,config:PhysiologyConfiguration,timeMs:number|null){
   const needs=Object.fromEntries([...character.needs].filter(([need])=>config.dailyNeeds.includes(need)).map(([need,value])=>{
     const stage=needStageAt(need,value,timeMs);
-    return [need,{stage,sleeping:value.sleeping,anchorTimeMs:value.atMs,corrected:value.corrected,...(value.basis?{basis:value.basis}:{})}];
+    return [need,{stage,sleeping:value.sleeping,anchorTimeMs:value.shownAtMs===undefined?value.atMs:value.shownAtMs,corrected:value.corrected,...(value.basis?{basis:value.basis}:{})}];
   }));
   const effects=config.sustainedEffects?[...character.effects.values()].map(({detail:_detail,...effect})=>effect):[];
   const reproductive=config.reproductive&&character.reproductive?((({detail:_detail,...value})=>value)(character.reproductive)):undefined;
@@ -295,11 +330,12 @@ function projectCharacter(character:MutableCharacter,config:PhysiologyConfigurat
   return {characterId:character.characterId,name:character.name,known,needs,effects,...(reproductive?{reproductive}:{}),...(sexualArousal?{sexualArousal}:{}),
     sources:[...character.sources.values()],correctionIds:[...character.corrections]};
 }
-function applyNeed(character:MutableCharacter,need:PhysiologyNeed,action:NeedAction,atMs:number|null,corrected:boolean){
+function applyNeed(character:MutableCharacter,need:PhysiologyNeed,action:NeedAction,atMs:number|null,corrected:boolean,shownAtMs?:number|null){
   const previous=character.needs.get(need);let rank=previous?needStages.indexOf(needStageAt(need,previous,atMs)):0;
   if(action==='worsen')rank=Math.min(3,rank+1);else if(action==='improve')rank=Math.max(0,rank-1);else rank=0;
   character.needs.set(need,{stage:needStages[rank]!,atMs,
-    sleeping:action==='sleep'?true:action==='wake'?false:(previous?.sleeping??false),corrected});
+    sleeping:action==='sleep'?true:action==='wake'?false:(previous?.sleeping??false),corrected,
+    ...(shownAtMs===undefined?{}:{shownAtMs})});
 }
 function needStageAt(need:PhysiologyNeed,value:{stage:typeof needStages[number];atMs:number|null;sleeping:boolean},timeMs:number|null){
   let stage=value.stage;

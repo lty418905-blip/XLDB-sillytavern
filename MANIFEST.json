@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "08b133015fd8fe48970315ff7fcceefe56dce459fa86d2c6eecdcdcb085cc54d",
+  "sourceManifestSha256": "4d17f58309ff48b86bc116d637f74df2fa17ee242a4bf21608ddb8625115af5e",
   "files": [
     {
       "file": ".gitattributes",
@@ -109,8 +109,8 @@
     },
     {
       "file": "shared/src/common/physiology.ts",
-      "sha256": "e436c0908efab954530a6c8018c72639ea4485e61f1b64ed69167104124f704e",
-      "bytes": 36426
+      "sha256": "ca1bde17f54c468a79b47b66b14f3cbcbc10f283960894bda31192c7bdf04e83",
+      "bytes": 39744
     },
     {
       "file": "shared/src/common/state-types.ts",
@@ -309,8 +309,8 @@
     },
     {
       "file": "shared/src/scene/calendar-store.ts",
-      "sha256": "cd5fa1920d5880b5e646105db8e28a5b71d9d5db013ae7a77bf222c726e82416",
-      "bytes": 15769
+      "sha256": "f4d1a333248491a4187568b64dd88fdcb870677d4306646a5822c5638abd762c",
+      "bytes": 19143
     },
     {
       "file": "shared/src/scene/calendar.ts",
@@ -399,8 +399,8 @@
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "8c102d7b1bc3a652d705c8de19a60190557a60e2c0e1b111864912559806dae7",
-      "bytes": 79358
+      "sha256": "68c73777d4f4c90331a5c68a4963e87454f5386d0aa1bc4d9d2f15d31021811f",
+      "bytes": 80137
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
@@ -569,12 +569,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "bc6d2c834a419dd083d98801950b282ab6af863edea0b65b647f708fbf260c7b",
+      "sha256": "eccb3d835a2b14fdd893f08e544974b740804011977ad1bdc5297566f0c56d3a",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "42aa3ec4b7af8c285221012008c00f6733e2698634642f5827ec777ba4c5c1b6",
+      "sha256": "1be010888505af4bc13c4ed052b0f267708ae4735f109b996c5d70f4ed7e1ee1",
       "bytes": 355817
     }
   ]

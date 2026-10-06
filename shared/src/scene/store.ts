@@ -30,6 +30,7 @@ import {StoryClockStore,storyClockLine} from './story-clock-store.ts';
 import type {StoryClockLegacySettings,StoryClockSummary} from './story-clock-store.ts';
 import {STORY_CLOCK_DEGRADE_REASONS} from './story-clock-types.ts';
 import type {StoryClockDegradeReason,StoryClockIssue,StoryClockSourceRef,StoryClockView} from './story-clock-types.ts';
+import {storyNow} from './story-clock-consumers.ts';
 import {storyLanguageOf} from '../memory/text-units.ts';
 import type {StoryLanguage} from '../memory/text-units.ts';
 import {defaultSceneHooks} from './extension.ts';
@@ -108,6 +109,17 @@ export class SceneAuthority {
     this.physiology=new PhysiologyStore(db,{
       state:scope=>this.state(scope),modeOf:scope=>this.interactions.modeOf(scope),fullRoleplay:scope=>this.interactions.isTavernRoleplay(scope),
       clock:(scope,now)=>{const clock=this.interactions.clock(scope,now);return {...clock,timeMs:typeof clock.timeMs==='number'?clock.timeMs:null};},
+      // Physiology keeps its own state type; both callers of status pass a full SceneState (the stored one or a generation view's).
+      storyTime:(scope,state)=>{
+        const now=storyNow(this,scope,state as unknown as SceneState);
+        if(now===null)return null;
+        let entries:Map<string,{revision:number;atMs:number}>|undefined;
+        return {nowMs:now.atMs,originMs:now.originAtMs,at:(sourceId,revision)=>{
+          entries??=new Map(now.sources.map(entry=>[entry.sourceId,{revision:entry.revision,atMs:entry.state.atMs}]));
+          const entry=entries.get(sourceId);
+          return entry!==undefined&&(revision===undefined||entry.revision===revision)?entry.atMs:null;
+        }};
+      },
       transaction:action=>this.transaction(action),
       checkpoint:(scope,reason)=>{this.lifecycle.checkpoint(scope,reason,{automatic:true});},
       bump:scope=>this.bump(scope),
