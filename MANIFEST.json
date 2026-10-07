@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "4d17f58309ff48b86bc116d637f74df2fa17ee242a4bf21608ddb8625115af5e",
+  "sourceManifestSha256": "ef31782a46e8c3f6549236c16301c0246ba2e6759c0d7fc4fd57d35bca80c919",
   "files": [
     {
       "file": ".gitattributes",
@@ -59,8 +59,8 @@
     },
     {
       "file": "shared/src/agentjev/client.ts",
-      "sha256": "9f913883a39f884f0bf000481b16b3dc66caf76533c00a42c6a28a3c1e2d41cd",
-      "bytes": 23996
+      "sha256": "1f062a2e7d9d04faad8a527105626f1c133a6c940235bfcdc23284280fe153db",
+      "bytes": 24150
     },
     {
       "file": "shared/src/commitments/codec.ts",
@@ -293,9 +293,19 @@
       "bytes": 3934
     },
     {
+      "file": "shared/src/memory/trace.ts",
+      "sha256": "a8d2790164e1811077d18dfcf89dc29e3db0a61542680b42a05598c4d7631a0e",
+      "bytes": 7316
+    },
+    {
       "file": "shared/src/memory/vector-forgetting.ts",
       "sha256": "a8066eb1ce1c7a84144d6704c61c17c9cca8accf1c778d6105b142b6c6dbfc99",
       "bytes": 1444
+    },
+    {
+      "file": "shared/src/process/spawner.ts",
+      "sha256": "8997f21e562fd53fdb0563fda92c6fe509d6694e9b74f20268ba843841312734",
+      "bytes": 7864
     },
     {
       "file": "shared/src/scene/address.ts",
@@ -399,18 +409,18 @@
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "68c73777d4f4c90331a5c68a4963e87454f5386d0aa1bc4d9d2f15d31021811f",
-      "bytes": 80137
+      "sha256": "acbc5a8d0f170588f7c4841c43bc62256102efc54aeb53c8a97edea1d9274ce0",
+      "bytes": 84563
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
-      "sha256": "ae00cc328ff432695b25f6a82dc2a4031724b0e9728d2c3116642afef9c414d5",
-      "bytes": 4690
+      "sha256": "bb0d4aa5465569fabb55dc070bc12183b0e0ac5f2b4102f7456a87152f7e02a4",
+      "bytes": 5154
     },
     {
       "file": "shared/src/scene/story-clock-store.ts",
-      "sha256": "7201197d1407ed03b5599d81d2bf2b6af6b2cb1b495f0b58a661230fa0abc39e",
-      "bytes": 26404
+      "sha256": "dd45bfdbfe20d372a24bee68e1f27311692cec4fd2d230ffa6e7a6284e870d3b",
+      "bytes": 30486
     },
     {
       "file": "shared/src/scene/story-clock-types.ts",
@@ -434,8 +444,8 @@
     },
     {
       "file": "shared/src/scene/transfer.ts",
-      "sha256": "1c3635b9795b1be2502b1909e46346fefd116cdb209296def5453fcefe992a08",
-      "bytes": 28239
+      "sha256": "bfc7607372b05eeb6ee391e369f24f8c22e00792dffa2d4bc10c53053edb6a2e",
+      "bytes": 28778
     },
     {
       "file": "shared/src/scene/types.ts",
@@ -459,8 +469,8 @@
     },
     {
       "file": "shared/src/scene/world-state.ts",
-      "sha256": "a5fe466c5419b950f1b72dc339693e532331f05521a32e6189eb5a97229ed8ff",
-      "bytes": 39603
+      "sha256": "f8216854ab94b4e0981ccff09bd67c84f5a79a8f4c1d7c9f4e52230c20c698a0",
+      "bytes": 42527
     },
     {
       "file": "shared/third-party/agentjev/agentjev/model.py",
@@ -569,12 +579,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "eccb3d835a2b14fdd893f08e544974b740804011977ad1bdc5297566f0c56d3a",
+      "sha256": "b3ea542ae5fde7ed17644fd1db9a5ae8929ede871dd9cf523853189f3593768f",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "1be010888505af4bc13c4ed052b0f267708ae4735f109b996c5d70f4ed7e1ee1",
+      "sha256": "18879935a47bb623ef2d128e3d70e12060bb50ca83de3be17a47ca36c98b0c6b",
       "bytes": 355817
     }
   ]

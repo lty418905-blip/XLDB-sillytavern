@@ -249,6 +249,61 @@ export function foldWorldState(
   return { state: serializeState(settings, state), receipts, issues };
 }
 
+/** One prefix of foldWorldStateRunning: what foldWorldState gives for sources.slice(0, i + 1). */
+export interface WorldRunningStep {
+  /** state.timeMs of that fold. */
+  timeMs: number;
+  /** issues[0].code of that fold, or null when it has no issue. */
+  issue: string | null;
+}
+
+/**
+ * The legacy time and the first issue code of foldWorldState(settings, sources.slice(0, i + 1)) for every i, as one
+ * array aligned with `sources`. A story world whose list repeats no source revision is folded in one pass, at the
+ * cost of one foldWorldState over the whole list: each source is canonicalised, checked and applied once, including
+ * the copies of the running state and purchase index per valid source. A source's effects apply to the state the
+ * valid sources before it left, a source with an issue
+ * changes nothing, and an invalid source marks its own prefix and every later one. Any other input (a companion world,
+ * a repeated source revision) is folded once per prefix. Throws invalid_world_settings as foldWorldState does.
+ */
+export function foldWorldStateRunning(settings: WorldSettings, sources: readonly WorldSourceEffects[]): WorldRunningStep[] {
+  const validated = validateSettings(settings);
+  const perPrefix = (): WorldRunningStep[] => sources.map((_source, index) => {
+    const folded = foldWorldState(settings, sources.slice(0, index + 1));
+    return {timeMs: folded.state.timeMs, issue: folded.issues[0]?.code ?? null};
+  });
+  if (settings.mode !== 'story') return perPrefix();
+  const seen = new Set<string>();
+  for (const source of sources) {
+    const sourceId = isRecord(source) && typeof source.sourceId === 'string' ? source.sourceId : '';
+    const revision = isRecord(source) && Number.isSafeInteger(source.revision) ? source.revision : 0;
+    const key = pairKey(sourceId, String(revision));
+    if (seen.has(key)) return perPrefix();
+    seen.add(key);
+  }
+  const steps: WorldRunningStep[] = [];
+  let state = cloneState(validated.initial);
+  let purchases = new Map<string, PurchaseIndexEntry>();
+  let invalidSource = false, firstIssue: string | null = null;
+  for (const source of sources) {
+    let valid = true;
+    try { canonical(source); } catch { valid = false; }
+    if (valid && validateSource(source).length) valid = false;
+    if (!valid) invalidSource = true;
+    else {
+      const trial = cloneState(state), trialPurchases = clonePurchaseIndex(purchases), localIssues: WorldIssue[] = [];
+      for (const raw of uniqueCandidates(source, localIssues)) {
+        const result = applyCandidate(validated, trial, trialPurchases, source, raw);
+        if ('issue' in result) localIssues.push(result.issue);
+      }
+      if (localIssues.length) firstIssue ??= localIssues[0]!.code;
+      else { state = trial; purchases = trialPurchases; }
+    }
+    steps.push({timeMs: state.timeMs, issue: invalidSource ? 'invalid_world_source' : firstIssue});
+  }
+  return steps;
+}
+
 /** Project only state whose complete baseline-and-mutation history is visible to this reader. */
 export function projectWorldState(result: WorldFoldResult, readerId: string): WorldProjection {
   const known = readerId === WORLD_PLAYER_ID

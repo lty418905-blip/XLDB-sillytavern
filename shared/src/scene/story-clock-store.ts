@@ -4,7 +4,7 @@ import {scopeKey} from '../core/types.ts';
 import type {StoryLanguage} from '../memory/text-units.ts';
 import type {SceneScope,SceneSource,SceneState} from './types.ts';
 import type {SceneReference} from './transfer.ts';
-import type {WorldEffectReceipt,WorldFoldResult,WorldSettings} from './world-state.ts';
+import type {WorldEffectReceipt,WorldFoldResult,WorldRunningStep,WorldSettings} from './world-state.ts';
 import {initialStoryAnchor} from './story-initial-clock.ts';
 import {STORY_CLOCK_RULE_V1,foldStoryClock,legacyStoryClockShiftMs,storyClockFromParts,storyClockParts,storyClockView} from './story-clock.ts';
 import {STORY_CLOCK_CORRECTION_KINDS,STORY_CLOCK_DEGRADE_REASONS,STORY_CLOCK_RULE_VERSION,STORY_CLOCK_TIMES_OF_DAY,
@@ -57,11 +57,24 @@ export interface StoryClockDependencies {
   tavernRoleplay: (scope: SceneScope) => boolean;
   /** The world fold over `sources` with exactly the given (merged, live-zone) settings. */
   worldFold: (scope: SceneScope, sources: SceneSource[], settings: WorldSettings) => WorldFoldResult;
+  /**
+   * Aligned with `sources`: entry i is the legacy world time and the first issue code (null without one) of
+   * worldFold(scope, sources.slice(0, i + 1), settings), from one pass. Throws what worldFold throws for the settings.
+   */
+  worldRunning: (scope: SceneScope, sources: SceneSource[], settings: WorldSettings) => readonly WorldRunningStep[];
   legacySettings: (scope: SceneScope) => StoryClockLegacySettings;
   /** Creation time of a roleplay scope without world settings (today's frozen time), else undefined. */
   frozenRoleplayTime: (scope: SceneScope) => number | undefined;
   /** Runs after every correction write, delete or restore: OpenHer snapshots, version, derived projections. */
   afterCorrection: (scope: SceneScope) => void;
+}
+
+/** The legacy emotion times of the prefixes of one timeline; made by StoryClockStore.legacyTimeline. */
+export interface StoryClockLegacyTimeline {
+  /** legacyTimeMs(scope, [], fallbackMs, timeline). */
+  initial: (fallbackMs: number) => number;
+  /** legacyTimeMs(scope, timeline.slice(0, index + 1), fallbackMs, timeline); a RangeError for an index outside the timeline. */
+  at: (index: number, fallbackMs: number) => number;
 }
 
 export interface PersistedStoryClockCorrectionRow {
@@ -318,6 +331,62 @@ export class StoryClockStore {
   legacyTimeMs(scope: SceneScope, sources: SceneSource[], fallbackMs: number, timeline: SceneSource[] = sources): number {
     const legacy = this.deps.legacySettings(scope);
     return this.legacyBaseMs(scope, sources, fallbackMs, legacy.settings) + this.explicitMs(scope, sources, timeline, legacy);
+  }
+
+  /**
+   * The legacy emotion time of every prefix of one timeline, for one synchronous caller. `at(index, fallbackMs)` is
+   * legacyTimeMs(scope, timeline.slice(0, index + 1), fallbackMs, timeline) and `initial(fallbackMs)` is
+   * legacyTimeMs(scope, [], fallbackMs, timeline): the same number, or the same error at the same call. The settings
+   * are derived once, the legacy world is folded once over the whole timeline and the clock reading is taken once,
+   * each on first need. List bookkeeping is O(timeline.length), in addition to deriving settings, the running fold
+   * (including state and purchase-index copies), and the clock reading. Later at calls use O(1) lookups; initial
+   * still computes the empty-prefix base, and a scope without settings still reads its frozen time on each call.
+   * Nothing is kept on this store. The returned object
+   * keeps what it has read, so its caller uses it inside one synchronous call, with `timeline` unchanged, and drops it.
+   */
+  legacyTimeline(scope: SceneScope, timeline: SceneSource[]): StoryClockLegacyTimeline {
+    const length = timeline.length;
+    let legacy: StoryClockLegacySettings | undefined;
+    let running: readonly WorldRunningStep[] | undefined;
+    let firstAnalysis: number | undefined;
+    let explicit: number[] | null | undefined;
+    const settings = (): StoryClockLegacySettings => legacy ??= this.deps.legacySettings(scope);
+    const analysed = (source: SceneSource): boolean => source.status === 'accepted' && storyClockSourceKind(source) === 'analysis';
+    // E0 of the prefix that ends at `index`: legacyBaseMs, with the running fold in place of one fold per prefix.
+    const base = (index: number, fallbackMs: number): number => {
+      const world = settings().settings;
+      if (!world) {
+        const frozen = this.deps.frozenRoleplayTime(scope);
+        if (frozen !== undefined) return frozen;
+      }
+      if (world?.mode !== 'story') return fallbackMs;
+      running ??= this.deps.worldRunning(scope, timeline, world);
+      const step = running[index]!;
+      if (step.issue !== null) throw new Error('invalid_world_' + step.issue.replace(/^invalid_world_/, ''));
+      return step.timeMs;
+    };
+    // X of the same prefix: explicitMs, from the one reading; nothing is read before a prefix holds an analysed source.
+    const moved = (index: number): number => {
+      firstAnalysis ??= timeline.findIndex(analysed);
+      if (firstAnalysis < 0 || index < firstAnalysis) return 0;
+      if (explicit === undefined) {
+        const reading = this.fold(scope, timeline, settings());
+        if (!reading) explicit = null;
+        else {
+          const cues = this.indexOf(reading).explicit;
+          let total = 0;
+          explicit = timeline.map(source => analysed(source) ? total += cues.get(refKey(source.id, source.revision)) ?? 0 : total);
+        }
+      }
+      return explicit === null ? 0 : explicit[index]!;
+    };
+    return {
+      initial: fallbackMs => this.legacyBaseMs(scope, [], fallbackMs, settings().settings),
+      at: (index, fallbackMs) => {
+        if (!Number.isInteger(index) || index < 0 || index >= length) throw new RangeError('invalid_story_clock_index');
+        return base(index, fallbackMs) + moved(index);
+      },
+    };
   }
 
   /** Stored rows of the scope in seq order, decoded; malformed rows are passed through for the fold to reject. */

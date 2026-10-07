@@ -1,9 +1,10 @@
-import {spawn, type ChildProcessWithoutNullStreams} from 'node:child_process';
+import type {ChildProcessWithoutNullStreams} from 'node:child_process';
 import {randomUUID,createHash} from 'node:crypto';
 import {existsSync,mkdirSync,readFileSync,openSync,readSync,closeSync,statSync,writeFileSync,renameSync,unlinkSync} from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {Worker} from 'node:worker_threads';
+import {spawnManaged,trackThread} from '../process/spawner.ts';
 
 /**
  * The host-neutral AgentJev client: install detection, the off-loop identity, the single local worker with bounded
@@ -87,6 +88,7 @@ import(workerData.module).then(({AgentJevClient})=>{const client=new AgentJevCli
   parentPort.postMessage({identity:client.identity()});client.close();})
   .catch(error=>parentPort.postMessage({error:String(error&&error.message||error)}));`,
     {eval:true,workerData:{module:import.meta.url,options:paths}});
+    trackThread('agentjev-identity',worker);
     worker.unref();
     // Settles exactly once: on the answer, a worker error, an exit without an answer, the time limit or an abort.
     // Every failure goes through the caller's retry path instead of leaving the warm-up pending.
@@ -265,8 +267,8 @@ export class AgentJevClient {
     this.opening=new Promise<void>((resolve,reject)=>{
       this.startupResolve=resolve;this.startupReject=reject;
       this.startupTimer=setTimeout(()=>this.fail(new Error('agentjev_startup_timeout')),this.startupTimeoutMs);
-      const worker=spawn(this.files.executable,[this.files.runner,'--model',this.files.modelDir,'--threads',String(this.threads)],
-        {cwd:this.files.root,windowsHide:true,stdio:['pipe','pipe','pipe'],env:environment});
+      const worker=spawnManaged('agentjev',this.files.executable,[this.files.runner,'--model',this.files.modelDir,'--threads',String(this.threads)],
+        {cwd:this.files.root,windowsHide:true,stdio:['pipe','pipe','pipe'],env:environment}) as ChildProcessWithoutNullStreams;
       this.process=worker;
       // A replaced worker may still deliver late output, errors or its exit; only the current worker counts.
       worker.stdout.setEncoding('utf8');

@@ -11,8 +11,8 @@ import { projectMemories } from '../memory/access.ts';
 import {retentionSnapshot} from '../memory/retention.ts';
 import { emotionIdentitySeed, npcScope } from './types.ts';
 import type { SceneScope, SceneRoster, SceneMessage, SceneSource, SceneState, SceneAnalysis, SceneWriteGuard, SceneProfileCandidate } from './types.ts';
-import {foldWorldState,projectWorldState} from './world-state.ts';
-import type {WorldFoldResult,WorldProjection,WorldSettings,WorldSourceEffects} from './world-state.ts';
+import {foldWorldState,foldWorldStateRunning,projectWorldState} from './world-state.ts';
+import type {WorldFoldResult,WorldProjection,WorldRunningStep,WorldSettings,WorldSourceEffects} from './world-state.ts';
 import {SceneLifecycle} from './lifecycle.ts';
 import {Processing} from './processing.ts';
 import {SceneTransfer} from './transfer.ts';
@@ -89,6 +89,16 @@ export class SceneAuthority {
       isStoryScope:scope=>this.isStoryScope(scope),
       tavernRoleplay:scope=>this.interactions.isTavernRoleplay(scope),
       worldFold:(_scope,sources,settings)=>foldWorldState(settings,this.worldSources(sources)),
+      // One running fold over the sources the world fold reads (the condition of worldSources); a source it does not
+      // read repeats the entry before it, and before the first one stands the fold of no source.
+      worldRunning:(_scope,sources,settings)=>{
+        const steps=foldWorldStateRunning(settings,this.worldSources(sources));
+        let position=-1,last:WorldRunningStep={timeMs:settings.startTimeMs,issue:null};
+        return sources.map(source=>{
+          if(source.status==='accepted'&&source.processing==='ready'&&source.analysis?.plan)last=steps[++position]!;
+          return last;
+        });
+      },
       legacySettings:scope=>this.legacyWorldSettings(scope),
       frozenRoleplayTime:scope=>this.interactions.frozenRoleplayTime(scope),
       afterCorrection:scope=>{this.rebuildEmotionStates(scope);this.bump(scope);this.rebuildDerived(scope);},
@@ -218,6 +228,8 @@ export class SceneAuthority {
       const changing=messages.some(message=>guard?.reconfirmIds?.includes(message.id)||!state.sources.some(source=>source.id===message.id&&sameContent(source,message)))
         || (replace&&state.sources.some(source=>source.status!=='deleted'&&!incoming.has(source.id)));
       if(changing)this.lifecycle.checkpoint(scope,'正文接受、编辑或删除',{automatic:true});
+      // The zone of the new sources of this call: read on first use, at most once, and never kept beyond the call.
+      let newSourceTimeZone:string|undefined;
       for (const message of messages) {
         const previous = state.sources.find(source => source.id === message.id);
         if (previous?.status === 'deleted') throw new Error('invalid_scene_deleted_source');
@@ -228,8 +240,9 @@ export class SceneAuthority {
         const acceptedAtMs = previous?.acceptedAtMs ?? Math.min(message.acceptedAtMs,now);
         // Editing an existing source is an explicit user correction, not a replay of its old derivation.
         const replyTo=message.replyTo??previous?.replyTo;
-        const acceptedTimeZone=previous?previous.acceptedTimeZone:(this.interactions.modeOf(scope)
-          ?this.interactions.clock(scope).timeZone??'UTC':'UTC');
+        const acceptedTimeZone=previous?previous.acceptedTimeZone:(newSourceTimeZone??=this.interactions.isTavernRoleplay(scope)
+          ?this.interactions.get(scope,'sillytavern').timeZone
+          :this.interactions.modeOf(scope)?this.interactions.clock(scope).timeZone??'UTC':'UTC');
         const next: SceneMessage = {...message,revision,acceptedAtMs,acceptedTimeZone,
           dependencies:message.dependencies??previous?.dependencies??[],...(replyTo?{replyTo}:{})};
         if(replyTo){
@@ -273,7 +286,10 @@ export class SceneAuthority {
         const dependentChanges=this.invalidateDependents(scope);
         this.invalidateCausalSuffix(scope,[...causalChanges,...dependentChanges]);
         // N16 after the two invalidations (they decide which source is now the opening), before the single bump.
-        this.requeueOpening(scope);
+        // Then the OpenHer snapshots, only when this call edited, reconfirmed, deleted or invalidated a source or re-queued
+        // the opening: a call whose new sources all stay valid only adds pending sources, which change no snapshot.
+        const openingRequeued=this.requeueOpening(scope);
+        if(causalChanges.length>0||dependentChanges.length>0||openingRequeued)this.rebuildEmotionStatesGuarded(scope);
         this.bump(scope);
         if(userActivityChanged)this.hooks.onUserActivity(scope,now);
         this.rebuildDerived(scope);
@@ -401,13 +417,16 @@ export class SceneAuthority {
         const result=prepared.find(item=>item.id===source.id);
         return result?{...source,processing:'ready' as const,analysis:result.analysis}:source;
       });
+      // The legacy times of this commit come from one object over the final timeline: a prefix of `effective` and the
+      // same prefix of `timeline` hold the same world effects and the same clock analyses.
+      const commitTimes=this.storyClock.legacyTimeline(scope,timeline);
       for(const [index,source] of state.sources.entries()){
         const result=prepared.find(item=>item.id===source.id);if(!result)continue;
         effective[index]={...source,processing:'ready',analysis:result.analysis};
         result.analysis=validateCommitmentAnalysis(source,result.analysis,state.roster,{
           realClockTimeMs:source.acceptedAtMs,
           // Replay this source's accepted story effects; never consult current time.
-          storyClockTimeMs:settings?.mode==='story'?this.legacyEmotionTime(scope,effective.slice(0,index+1),source.acceptedAtMs,timeline):undefined,
+          storyClockTimeMs:settings?.mode==='story'?commitTimes.at(index,source.acceptedAtMs):undefined,
           timeZone:source.acceptedTimeZone,
         });
         effective[index]={...source,processing:'ready',analysis:result.analysis};
@@ -498,6 +517,8 @@ export class SceneAuthority {
           WHERE scope=? AND id=? AND status='accepted' AND processing='pending'`);
         const ids=sourceIds?.length?new Set(sourceIds):new Set(this.state(scope).sources.map(source=>source.id));
         for(const sourceId of ids)fail.run(marker,scopeKey(scope),sourceId);
+        // A marked source changes the clock fold (its turn counts with the fallback), so later snapshots may be stale. No version bump.
+        this.rebuildEmotionStatesGuarded(scope);
         return;
       }
       if(sourceIds?.length){
@@ -579,7 +600,9 @@ export class SceneAuthority {
     const rows=this.db.prepare("SELECT s.id,s.revision,j.value AS body FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j WHERE s.scope=? AND s.status='accepted' AND s.processing='ready' AND j.key=?")
       .all(scopeKey(scope),characterId) as {id:string;revision:number;body:string}[];
     const storedBySource=new Map(rows.map(row=>[JSON.stringify([row.id,row.revision]),row.body]));
-    const initialTime=this.legacyEmotionTime(scope,[],state.createdAtMs,state.sources);
+    // One object for this call: at most one settings derivation, one legacy world fold and one clock reading.
+    const replayTimes=this.storyClock.legacyTimeline(scope,state.sources);
+    const initialTime=replayTimes.initial(state.createdAtMs);
     const events: {stored:EmotionState|undefined;body:string|undefined;delta:import('../emotion/openher.ts').EmotionDelta;at:number|undefined}[]=[];
     for(const [index,source] of state.sources.entries()){
       if(source.status!=='accepted'||source.processing!=='ready')continue;
@@ -588,7 +611,7 @@ export class SceneAuthority {
       const stored=source.analysis?.emotionStates?.[characterId];
       const body=stored?JSON.stringify(stored):storedBySource.get(JSON.stringify([source.id,source.revision]));
       events.push({stored,body,delta:analysis.emotion,
-        at:body===undefined?this.legacyEmotionTime(scope,state.sources.slice(0,index+1),source.acceptedAtMs,state.sources):undefined});
+        at:body===undefined?replayTimes.at(index,source.acceptedAtMs):undefined});
     }
     const replayKey=createHash('sha256').update(JSON.stringify([scopeKey(scope),characterId,character.emotion,
       initialTime,events.map(event=>[event.body,event.body===undefined?event.delta:undefined,event.at])])).digest('hex');
@@ -707,14 +730,30 @@ export class SceneAuthority {
     const stored=settings!==null;
     let references:StoryClockLegacySettings['references']=[],liveZone:string|null=null;
     if(!settings&&this.interactions.isTavernRoleplay(scope)){
-      const state=this.state(scope);
+      const state=this.settingsHead(scope);
       if(state.version){
-        const candidates=this.transfer.references(scope),zone=this.interactions.get(scope,'sillytavern').timeZone;
+        const candidates=this.transfer.acceptedReferences(scope),zone=this.interactions.get(scope,'sillytavern').timeZone;
         settings=initialStorySettings(state,candidates,zone);
         if(settings){references=candidates;liveZone=zone;}
       }
     }
     return {settings:settings?this.initialization.mergeAssets(scope,settings):null,stored,references,liveZone};
+  }
+
+  /**
+   * What the derivation of the settings reads of the scene: the scene row and the first source row in rowid order (the
+   * fixed opening position), never a later source. The one source carries no analysis. Two rows are returned; the
+   * subquery walks the scope's primary-key index entries: O(sources of the scope), without reading their payloads.
+   */
+  private settingsHead(scope:SceneScope):SceneState {
+    const key=scopeKey(scope);
+    const row=this.db.prepare('SELECT roster,version,created FROM scene_worlds WHERE key=?').get(key) as
+      {roster:string;version:number;created:number}|undefined;
+    if(!row)return {scope,version:0,createdAtMs:0,roster:{characters:[]},sources:[]};
+    const first=this.db.prepare('SELECT message,revision,observed,status,processing FROM scene_sources WHERE scope=? AND rowid=(SELECT MIN(rowid) FROM scene_sources WHERE scope=?)')
+      .get(key,key) as {message:string;revision:number;observed:number;status:SceneSource['status'];processing:SceneSource['processing']}|undefined;
+    return {scope,version:row.version,createdAtMs:row.created,roster:JSON.parse(row.roster),sources:first?[{...JSON.parse(first.message),
+      revision:first.revision,observedAtMs:first.observed,status:first.status,processing:first.processing,analysis:null}]:[]};
   }
 
   private rawWorldSettings(scope:SceneScope):WorldSettings|null {
@@ -972,7 +1011,11 @@ export class SceneAuthority {
       const worlds=this.db.prepare('SELECT scope FROM scene_worlds').all() as {scope:string}[];
       for(const row of worlds) {
         const scope=JSON.parse(row.scope) as SceneScope;
-        if(this.rebuildEmotionStates(scope))this.bump(scope);
+        // N16 first: a restore can leave an analysed non-opening as the opening. Both calls always run (never a()||b()):
+        // a re-queued opening leaves the 'ready' set, so the snapshots after it are rebuilt in the same open.
+        const requeued=this.requeueOpening(scope);
+        const rebuilt=this.rebuildEmotionStates(scope);
+        if(requeued||rebuilt)this.bump(scope);
         this.rebuildDerived(scope);
       }
     });
@@ -1000,13 +1043,15 @@ export class SceneAuthority {
       }
     }
     // Replaying one role across its history avoids an all-NPC neural map.
+    // One object for the whole rebuild, every role: one settings derivation and one pass over the sources, on first use.
+    const snapshotTimes=this.storyClock.legacyTimeline(scope,state.sources);
     for(const character of state.roster.characters.filter(item=>!onlyCharacterId||item.id===onlyCharacterId)) {
-      let emotion=createEmotion(this.legacyEmotionTime(scope,[],state.createdAtMs,state.sources),character.emotion,emotionIdentitySeed(scope,character.id));
+      let emotion=createEmotion(snapshotTimes.initial(state.createdAtMs),character.emotion,emotionIdentitySeed(scope,character.id));
       for(const [index,source] of state.sources.entries()) {
         if(source.status!=='accepted'||source.processing!=='ready'||!source.analysis?.plan)continue;
         const candidate=source.analysis.characters[character.id];
         if(!candidate||source.analysis.emotionPendingIds?.includes(character.id))continue;
-        emotion=advanceEmotion(emotion,candidate.emotion,this.legacyEmotionTime(scope,state.sources.slice(0,index+1),source.acceptedAtMs,state.sources),character.emotion);
+        emotion=advanceEmotion(emotion,candidate.emotion,snapshotTimes.at(index,source.acceptedAtMs),character.emotion);
         const body=JSON.stringify(validateEmotionState(emotion));
         const previous=this.db.prepare("SELECT j.value AS body FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j WHERE s.scope=? AND s.id=? AND j.key=?")
           .get(key,source.id,character.id) as {body:string}|undefined;
@@ -1018,6 +1063,19 @@ export class SceneAuthority {
       }
     }
     return changed;
+  }
+  /**
+   * rebuildEmotionStates for reconcile and the marked fail, which a world issue already in the stored state must not
+   * undo: the rebuild runs in its own savepoint; an invalid_world_<code> error rolls that savepoint back (no partial
+   * snapshot write survives) and gives false, so the caller goes on and the snapshots keep their values until a path
+   * that rebuilds them runs on a repaired world. Any other error is rethrown unchanged.
+   */
+  private rebuildEmotionStatesGuarded(scope:SceneScope):boolean {
+    try{return this.transaction(()=>this.rebuildEmotionStates(scope));}
+    catch(error){
+      if(error instanceof Error&&error.message.startsWith('invalid_world_'))return false;
+      throw error;
+    }
   }
   transaction<T>(action:()=>T):T {
     const savepoint=`scene_authority_${++this.savepointSequence}`;

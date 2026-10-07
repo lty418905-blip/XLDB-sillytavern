@@ -1,7 +1,7 @@
 import type {SceneAuthority} from './store.ts';
 import type {SceneScope,SceneState,SceneSource} from './types.ts';
 import type {SceneReference} from './transfer.ts';
-import type {StoryClockReading} from './story-clock-store.ts';
+import type {StoryClockLegacyTimeline,StoryClockReading} from './story-clock-store.ts';
 import type {StoryClockMs,StoryClockState,StoryClockView,StoryClockSourceClock} from './story-clock-types.ts';
 import type {CommitmentStoryClock} from '../commitments/types.ts';
 import type {StoryDeadlineClock} from '../commitments/time.ts';
@@ -29,10 +29,17 @@ export function storyTimelineOf(processed:readonly SceneSource[],accepted:readon
   return [...processed,...accepted.slice(processed.length)];
 }
 
-/** One reading per immutable timeline; O(n) to index it, then O(1) per at lookup. */
+/**
+ * One reading and one set of legacy times per immutable timeline; O(n) to index it, then O(1) per lookup. Whether the
+ * world is a story world is read once, here. The object belongs to the synchronous call that builds it: it keeps what
+ * it has read, so it is never stored and never used after an await or after a write to the scene.
+ */
 export function commitmentStoryClock(authority:SceneAuthority,scope:SceneScope,timeline:SceneSource[]):CommitmentStoryClock|undefined {
-  if(!isStoryScope(authority,scope))return undefined;
+  const story=authority.worldSettings(scope)?.mode==='story';
+  // The story-scope test, with the mode already in hand.
+  if(!story&&authority.interactions.frozenRoleplayTime(scope)===undefined)return undefined;
   let reading:StoryClockReading|null|undefined;
+  let legacyTimes:StoryClockLegacyTimeline|undefined;
   const states=new Map<string,StoryDeadlineClock>();
   const key=(id:string,revision:number)=>JSON.stringify([id,revision]);
   const indices=new Map(timeline.map((source,index)=>[key(source.id,source.revision),index]));
@@ -49,10 +56,10 @@ export function commitmentStoryClock(authority:SceneAuthority,scope:SceneScope,t
       return states.get(key(source.id,source.revision))??null;
     },
     legacyAt(source){
-      if(authority.worldSettings(scope)?.mode!=='story')return null;
+      if(!story)return null;
       const i=indices.get(key(source.id,source.revision))??-1;
       if(i<0)return null;
-      try{return authority.legacyEmotionTime(scope,timeline.slice(0,i+1),source.acceptedAtMs,timeline);}
+      try{return (legacyTimes??=authority.storyClock.legacyTimeline(scope,timeline)).at(i,source.acceptedAtMs);}
       catch(error){
         if(error instanceof Error&&error.message.startsWith('invalid_world_'))return null;
         throw error;

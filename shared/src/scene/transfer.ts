@@ -207,6 +207,16 @@ export class SceneTransfer {
     });
   }
 
+  /**
+   * Every active reference claim of the scope, in the order references(scope) returns them. It reads no scene state and
+   * makes no check: the caller has established that the scene is configured.
+   */
+  acceptedReferences(scope: SceneScope): SceneReference[] {
+    const rows = this.db.prepare("SELECT id,body FROM scene_import_references WHERE scope=? AND status='accepted' ORDER BY rowid")
+      .all(scopeKey(scope)) as {id:string; body:string}[];
+    return rows.map(row => ({id: row.id, ...parseReference(row.body)}));
+  }
+
   /** Admin sees all active reference claims; a role sees only explicit grants. */
   references(scope: SceneScope, characterId?: string): SceneReference[] {
     const state = this.authority.state(scope);
