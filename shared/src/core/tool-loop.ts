@@ -300,6 +300,7 @@ export function createToolLoop<C>(options: ToolLoopOptions<C>): ToolLoopRun {
       let deadline: number | undefined, lastNow = -Infinity;
       let badFormats = 0, transportFailures = 0, correction: string | null = null;
       let previousCall: string | null = null, previousProposal: string | null = null;
+      let needsProposalRefresh = false, fallbackJson = false;
       const clock = () => {
         failure = 'clock_failed';
         const time = now();
@@ -316,7 +317,7 @@ export function createToolLoop<C>(options: ToolLoopOptions<C>): ToolLoopRun {
         failure = 'transport_failed';
         const messages = transport.messages(conversation, correction);
         failure = 'json_mode_memory_failed';
-        const json = !memory.has(providerKey);
+        const json = !memory.has(providerKey) && !fallbackJson;
         // Include liveness callback time in the dispatch budget.
         if (checkCancelled()) break;
         const time = clock();
@@ -334,8 +335,7 @@ export function createToolLoop<C>(options: ToolLoopOptions<C>): ToolLoopRun {
         if (modelError !== null) {
           error = modelError;
           if (modelError === 'model_http_400' && json) {
-            failure = 'json_mode_memory_failed';
-            memory.add(providerKey);
+            fallbackJson = true;
             // A complete HTTP rejection interrupts a transport-failure streak, not a format streak.
             transportFailures = 0;
             continue;
@@ -353,6 +353,11 @@ export function createToolLoop<C>(options: ToolLoopOptions<C>): ToolLoopRun {
             continue;
           }
           if (!['model_invalid_response', 'model_output_truncated', 'model_invalid_json'].includes(modelError)) { stop = 'http'; break; }
+        }
+        if (modelError === null && fallbackJson) {
+          failure = 'json_mode_memory_failed';
+          memory.add(providerKey);
+          fallbackJson = false;
         }
         transportFailures = 0;
         failure = 'transport_failed';
@@ -379,6 +384,15 @@ export function createToolLoop<C>(options: ToolLoopOptions<C>): ToolLoopRun {
             issue = { path: issue.path, expected: issue.expected };
           }
         }
+        let args: ToolObject = {}, canonical = '';
+        if (issue === null) {
+          // Validate the JSON envelope before execution; native serialization may reject deep trees.
+          try {
+            args = snapshotObject(value.args);
+            canonical = canonicalToolArgs(args).json;
+            JSON.stringify({ tool: tool!.name, args });
+          } catch { issue = { path: 'args', expected: 'serializable_object' }; }
+        }
         if (issue !== null) {
           previousCall = null;
           calls.push({ tool: tool?.name ?? null, argsSha256: null, status: 'call_malformed' });
@@ -387,12 +401,11 @@ export function createToolLoop<C>(options: ToolLoopOptions<C>): ToolLoopRun {
           continue;
         }
         failure = 'tool_failed';
-        const args = snapshotObject(value.args), canonical = canonicalToolArgs(args).json;
         const call: ToolCall = { tool: tool!.name, args };
         const callKey = JSON.stringify(tool!.name) + ':' + canonical;
         const row = { tool: tool!.name, argsSha256: createHash('sha256').update(canonical).digest('hex'), status: 'ok' };
         calls.push(row);
-        if (tool!.proposal && previousProposal === canonical) {
+        if (tool!.proposal && previousProposal === canonical && !needsProposalRefresh) {
           confirm(); row.status = 'kept'; stop = 'kept'; break;
         }
         if (!tool!.proposal && previousCall === callKey) {
@@ -425,6 +438,7 @@ export function createToolLoop<C>(options: ToolLoopOptions<C>): ToolLoopRun {
           lastProposal = { args, result, items, settled: reply.settled };
           proposals++;
           previousProposal = canonical;
+          needsProposalRefresh = false;
           result = { ...result };
           delete result.withdrawn;
           delete result.confirmation;
@@ -436,6 +450,7 @@ export function createToolLoop<C>(options: ToolLoopOptions<C>): ToolLoopRun {
           } else finish = reply.settled;
         } else result = snapshotObject(output);
         row.status = resultCode(result);
+        if (!tool!.proposal && result.ok !== false) needsProposalRefresh = true;
         activeCall = null;
         failure = 'transport_failed';
         transport.answer(conversation, call, result);

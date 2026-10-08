@@ -192,7 +192,6 @@ const emotionalProtectionPrompt='当且仅当本段对当前角色有强烈情�
 export class ModelTasks {
   private run: ModelRunner;
   private timers: ModelTimers;
-  private timerCleanupFailed = false;
   constructor(run: ModelRunner = runModel, timers: ModelTimers = modelTimers) { this.run = run; this.timers = timers; }
   ledgerTurn(config: ModelConfig, prompts: Prompt[], json: boolean, timeoutMs: number): Promise<string> {
     validateModelTimeout(timeoutMs);
@@ -200,7 +199,7 @@ export class ModelTasks {
     return new Promise<string>((resolve, reject) => {
       let settled = false, installed = false;
       let handle: unknown;
-      const clear = () => { if (installed) { try { this.timers.clearTimeout(handle); } catch { this.timerCleanupFailed = true; /* Preserve the winning result. */ } } };
+      const clear = () => { if (installed) { try { this.timers.clearTimeout(handle); } catch { /* Preserve the winning result. */ } } };
       const finish = (ok: boolean, value: unknown) => {
         if (settled) return;
         settled = true;
