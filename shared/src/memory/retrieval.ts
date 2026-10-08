@@ -2,10 +2,14 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { connect, Index } from '../../../.local/runtime/node_modules/@lancedb/lancedb/dist/index.js';
-import { projectMemories } from './access.ts';
-import {retentionSnapshot} from './retention.ts';
-import type {SemanticCue} from './retention.ts';
-import type { MemorySnapshot, MemoryView, Scope } from './access.ts';
+import { currentMemory, projectMemories } from './access.ts';
+import {retainedAccess,retentionSnapshot,traceEligible} from './retention.ts';
+import {TRACE_POLICY_VERSION,TRACE_CANDIDATE_CEILING,TRACE_CANDIDATE_LIMIT,
+  clampDistance,clearKeyText,eventKey,traceCandidates,cosineDistance as keyDistance} from './trace.ts';
+import type {TraceCandidate,TraceHolder,TraceKeyDistance,TraceTier} from './trace.ts';
+import {checkCurrentSource} from './context.ts';
+import type {CurrentSource} from './context.ts';
+import type { Memory, MemorySnapshot, MemoryView, Scope } from './access.ts';
 import type { ModelConfig } from '../core/types.ts';
 import { scopeKey } from '../core/types.ts';
 import {traceModel,withModelAddress,recordModelDispatch,recordModelResponse,recordModelUsage,recordRetrievalFallback} from '../core/runtime-log.ts';
@@ -23,9 +27,30 @@ const EMBEDDING_BATCH = 32;
 // Cosine distance is smaller for a closer match. This is a routing heuristic,
 // not a confidence score; callers can tune it for their provider/data.
 const DEFAULT_RERANK_COSINE_GAP = 0.08;
-const RERANK_POLICY_VERSION = 2;
+const RERANK_POLICY_VERSION = 3;
 // Every stored vector is the provider's exact embedding of the row's visible semantic text (ruling 19).
 const EXACT_VECTORS = 'float32-exact';
+// Recall trace: the key texts embedded per search at most, and the scopes whose key vectors stay in memory.
+const TRACE_BUILD_TEXTS = 128;
+const TRACE_CACHE_SCOPES = 8;
+// The candidates serve a judging step outside the search. Until a caller switches the trace on, no key is embedded.
+const TRACE_ENABLED_DEFAULT = false;
+const TRACE_OPTION_KEYS:readonly string[]=['enabled','ceiling','limit'];
+
+/** Switch and bounds of the recall trace's candidates; product callers pass none of them. */
+export interface RecallTraceOptions {enabled?:boolean;ceiling?:number;limit?:number}
+type TraceSettings=Required<RecallTraceOptions>;
+/**
+ * One NPC scope's key vectors in memory: the SHA-256 of a key text to its float32 embedding. unsaved is true while the
+ * last persist of the scope has failed: the vectors are valid, and the next build writes the table again.
+ */
+type TraceScope={embedding:string;dimension:number;vectors:Map<string,Float32Array>;unsaved:boolean};
+/**
+ * What the decision leaves for the build that follows the main result. decide computes the candidates from the vectors
+ * in memory; it is called once per search, when every needed key has a vector: at the decision, or after the build.
+ */
+type TracePlan={scope:TraceScope;needed:Map<string,string>;live:Set<string>;candidates:TraceCandidate[];status:'building'|'ready';decide:()=>TraceCandidate[]};
+type TraceFailure={failure:string;attention:'configuration'|'transient'};
 
 export type RetrievalConfig = { embedding: ModelConfig; reranker: ModelConfig };
 type IndexedRow = { id: string; text: string; semantic: string; kind: string; lexical?: string; vector?: number[] };
@@ -35,7 +60,7 @@ type RerankResult = { index: number; score: number };
  * SALIENCE_MINIMUM) exist so MR7a can sweep the gate through the product code; product callers pass none of them.
  */
 export interface RetrievalOptions {tokenizer?:ChineseTokenizer|'default';minimumRerankScore?:number;rerankCosineGap?:number;externalTimeoutMs?:number;vectorIndex?:'auto'|'flat';
-  cosineRescueDistance?:number;salienceMinimum?:number}
+  cosineRescueDistance?:number;salienceMinimum?:number;recallTrace?:RecallTraceOptions}
 /**
  * Why an embedding or reranker call failed. credentials_rejected (401/403), model_not_found (404, or a 400/422
  * naming the model) and endpoint_redirected need the user to fix the configuration; the rest are transient.
@@ -46,11 +71,17 @@ export interface RetrievalDegradation {stage:'embedding'|'reranker';failure:Retr
 type ProviderFallbackReason=`${'embedding'|'rerank'}_${'request_failed'|'credentials_rejected'|'model_not_found'|'endpoint_redirected'}`;
 export interface RetrievalResult {ids:string[];mode:string;tokenizer:ChineseTokenizer;intent:'fact'|'episode'|'balanced';cacheHit:boolean;topScore?:number;
   // A transient provider failure keeps the ordinary *_request_failed reason; a credential or configuration failure never does.
-  fallbackReason?:ProviderFallbackReason|'pq_index_build_failed';degraded?:RetrievalDegradation;semanticCues?:SemanticCue[];vectorIndex?:'ivf-pq'|'flat'|'none';
+  fallbackReason?:ProviderFallbackReason|'pq_index_build_failed';degraded?:RetrievalDegradation;vectorIndex?:'ivf-pq'|'flat'|'none';
   // rerankUsed records an attempted provider call, including an attempted call that failed.
   rerankUsed:boolean;rerankReason:'not_configured'|'no_candidates'|'clear_cosine_gap'|'near_cosine_gap'|'relevant_anchor'|'bm25_no_embedding'|'provider_fallback';
   // One entry per id, in the same order: why the id is there. Empty on the early returns (the explicit recent view is not an admission).
   admission:{id:string;by:AdmissionReason}[];
+  // Candidates of the recall trace: the faded events nearest to the query by their clear-text keys, nearest first, each
+  // with its restorable records and its distance; the event is a digest, never a text. Whether one is recalled is
+  // decided outside the search. Empty whenever the trace did not decide.
+  traceCandidates:TraceCandidate[];
+  // What the recall trace did in this search; never a text, a distance or a key id.
+  trace:{status:'off'|'idle'|'building'|'ready'|'failed';keys:number;missing:number;failure?:string};
   // Present only when the salience path ran, also when it added nothing.
   salience?:{trigger:SalienceTrigger;reactions:EmotionalReactionKey[]}}
 type Provider = {url:string;key:string;model:string};
@@ -74,6 +105,10 @@ export class Retrieval {
   private readonly rerankCosineGap:number;
   private readonly externalTimeoutMs:number;
   private readonly vectorIndex:'auto'|'flat';
+  private readonly traces = new Map<string,TraceScope>();
+  private readonly traceEnabled:boolean;
+  private readonly traceCeiling:number;
+  private readonly traceLimit:number;
 
   constructor(directory: string,options:RetrievalOptions={}) {
     this.directory = directory;
@@ -85,12 +120,14 @@ export class Retrieval {
       options.cosineRescueDistance<0||options.cosineRescueDistance>2))throw new Error('invalid_cosine_rescue');
     if(options.salienceMinimum!==undefined&&(!Number.isSafeInteger(options.salienceMinimum)||options.salienceMinimum<0||options.salienceMinimum>20))
       throw new Error('invalid_salience_minimum');
+    const trace=recallTraceOf(options.recallTrace);
     this.minimumRerankScore=options.minimumRerankScore??RERANK_FLOOR;
     this.cosineRescueDistance=options.cosineRescueDistance??COSINE_RESCUE;
     this.salienceMinimum=options.salienceMinimum??SALIENCE_MINIMUM;
     this.rerankCosineGap=options.rerankCosineGap??DEFAULT_RERANK_COSINE_GAP;
     this.externalTimeoutMs=options.externalTimeoutMs??DEFAULT_EXTERNAL_TIMEOUT_MS;
     this.vectorIndex=options.vectorIndex??'auto';
+    this.traceEnabled=trace.enabled;this.traceCeiling=trace.ceiling;this.traceLimit=trace.limit;
   }
 
   async search(
@@ -98,10 +135,16 @@ export class Retrieval {
     query: string,
     config: RetrievalConfig,
     nowMs: number,
+    options:{currentSource?:CurrentSource}={},
   ): Promise<RetrievalResult> {
     if (typeof query !== 'string' || query.length > 20_000) throw new Error('invalid_query');
     if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new Error('invalid_time');
-    snapshot=retentionSnapshot(snapshot,nowMs,query);
+    const currentSource=options.currentSource;
+    checkCurrentSource(currentSource);
+    // The index and the ranking read the stages without any cue. The cue recalls only feed the gate.
+    const raw=snapshot;
+    snapshot=retentionSnapshot(raw,nowMs);
+    const cued=retentionSnapshot(raw,nowMs,query);
 
     const key=scopeKey(snapshot.scope);
     return this.serialized(key,async () => {
@@ -124,9 +167,11 @@ export class Retrieval {
       const mode = embedding ? 'hybrid' : 'bm25';
       const intent=queryIntent(query);
       const result=(resultMode:string,ids:string[],extra:Partial<RetrievalResult>={}):RetrievalResult=>({ids,mode:resultMode,tokenizer:this.tokenizer.name,intent,cacheHit:false,
-        rerankUsed:false,rerankReason:reranker?'no_candidates':'not_configured',admission:[],...extra});
-      // The one "reminded" predicate (an exact retention cue in the query today; MR1 widens it to the recall trace).
-      const reminded=(id:string)=>snapshot.memories.get(id)?.reactivated===true;
+        rerankUsed:false,rerankReason:reranker?'no_candidates':'not_configured',admission:[],traceCandidates:[],
+        trace:{status:this.traceEnabled?'idle':'off',keys:0,missing:0},...extra});
+      // The one "reminded" predicate: a cue of the memory's event stands in the query. A candidate of the recall trace
+      // is not reminded: whether it is recalled is decided after the search.
+      const reminded=(id:string)=>cued.memories.get(id)?.reactivated===true;
       const limits={floor:this.minimumRerankScore,rescue:this.cosineRescueDistance};
       if (rows.length === 0) {
         await this.clearProjection(key);
@@ -151,7 +196,9 @@ export class Retrieval {
           snapshot.memories.get(view.id)?.source.reference,memoryClockTimeMs(snapshot.memories.get(view.id)!),view.emotionalReaction?.reactions]);
         const cacheKey=digest(JSON.stringify([RERANK_POLICY_VERSION,query,nowMs,snapshot.version,policyRows,
           identity(activeReranker),activeReranker?digest(activeReranker.key):'',activeEmbedding?digest(activeEmbedding.key):'',
-          this.minimumRerankScore,this.cosineRescueDistance,this.salienceMinimum,this.rerankCosineGap,fallbackReason,providerDegradation?.failure,providerDegradation?.httpStatus]));
+          this.minimumRerankScore,this.cosineRescueDistance,this.salienceMinimum,this.rerankCosineGap,fallbackReason,providerDegradation?.failure,providerDegradation?.httpStatus,
+          // The candidates depend on the answered source; a search with the trace switched off does not.
+          TRACE_POLICY_VERSION,this.traceEnabled,this.traceCeiling,this.traceLimit,...(this.traceEnabled?[currentSource?.id,currentSource?.revision]:[])]));
         const cached=projection.results.get(cacheKey);
         if(cached){
           // Every degraded search is logged, including one answered from the local fallback cache.
@@ -162,6 +209,27 @@ export class Retrieval {
         const queries=queryParts(query);
         // Batch the aspect vectors and share the same bounded external deadline.
         if(activeEmbedding)await this.prepareQueryVectors(key,queries,activeEmbedding,deadline);
+        // Recall trace, decision: hashing, loading and distances, no provider call. A failure stays inside.
+        let trace:RetrievalResult['trace']={status:this.traceEnabled?'idle':'off',keys:0,missing:0};
+        let traceFound:TraceCandidate[]=[],tracePlan:TracePlan|undefined,traceCacheable=true;
+        if(this.traceEnabled&&activeEmbedding){
+          try{
+            tracePlan=await this.traceDecision(key,raw,cued,nowMs,currentSource,activeEmbedding,
+              ()=>this.queryVector(key,queries[0],activeEmbedding,deadline));
+            if(tracePlan){
+              traceFound=tracePlan.candidates;
+              trace={status:tracePlan.status,keys:tracePlan.needed.size,missing:0};
+            }
+          }catch(error){
+            const provider=providerFailure(error);
+            const failed:TraceFailure=provider?{failure:provider.failure,attention:provider.attention}:{failure:'trace_store_failed',attention:'transient'};
+            this.traces.delete(key);
+            // A projection that could not be read is no longer trusted: without its metadata the next search rebuilds it.
+            if(!provider){try{fs.rmSync(path.join(this.directory,`${traceName(key)}.trace.json`),{force:true});}catch{/* The next persist removes it. */}}
+            recordRetrievalFallback('trace_keys_failed',{stage:'trace',...failed});
+            trace={status:'failed',keys:0,missing:0,failure:failed.failure};traceCacheable=false;
+          }
+        }
         const lists=await Promise.all(queries.map(async part=>{
           const lexicalQuery=await this.tokenizer.query(part);
           const [lexical,semantic]=await Promise.all([
@@ -224,12 +292,18 @@ export class Retrieval {
         const rerankReason=fallbackReason?'provider_fallback':lists.find(list=>list.rerankReason==='relevant_anchor')?.rerankReason??
           lists.find(list=>list.rerankReason==='near_cosine_gap')?.rerankReason??
           lists.find(list=>list.rerankReason==='bm25_no_embedding')?.rerankReason??lists[0]?.rerankReason??'no_candidates';
-        const semanticCues=activeEmbedding?semanticReactivations(lists[0]?.semantic??[],rowById,viewsById,snapshot,query):[];
+        // Recall trace, build: after the main result is assembled, so a key call never takes the rerank call's time.
+        // A search that had a missing key decides here when its build completed the projection.
+        if(tracePlan&&activeEmbedding){
+          const built=await this.traceBuild(key,tracePlan,activeEmbedding,deadline);
+          trace=built.trace;traceCacheable=built.cacheable;
+          if(built.candidates)traceFound=built.candidates;
+        }
         const output=result(rerankFailed?(activeEmbedding?'hybrid-fallback':'bm25-fallback'):rerankUsed?`${resultMode}+rerank`:resultMode,ids,
-          {topScore:lists[0]?.topScore,semanticCues,vectorIndex:projection.index,rerankUsed,rerankReason,admission,
+          {topScore:lists[0]?.topScore,traceCandidates:traceFound,trace,vectorIndex:projection.index,rerankUsed,rerankReason,admission,
             ...(filled?{salience:{trigger:filled.trigger,reactions:filled.reactions}}:{}),
             ...(degraded?{fallbackReason:fallbackReasonOf(degraded),degraded:{...degraded}}:projection.indexFailure?{fallbackReason:'pq_index_build_failed' as const}:{})});
-        if(!rerankFailed)cache(projection.results,cacheKey,output,64);
+        if(!rerankFailed&&traceCacheable)cache(projection.results,cacheKey,output,64);
         if(output.degraded)recordRetrievalFallback(output.fallbackReason!,output.degraded);
         // Not a provider failure: `degraded` stays absent and the event is visible in the exported runtime log only.
         else if(output.fallbackReason==='pq_index_build_failed')
@@ -252,6 +326,7 @@ export class Retrieval {
     this.connection?.close();
     this.connection = undefined;
     this.tables.clear();
+    this.traces.clear();
     this.queryVectors.clear();
   }
 
@@ -359,6 +434,149 @@ export class Retrieval {
     missing.forEach((item,index)=>cache(this.queryVectors,item.id,vectors[index],64));
   }
 
+  /**
+   * The decision of the recall trace for one search; no provider call unless the query vector has left its cache.
+   * Undefined when no record is a target at this clock: no key is hashed, no file is read and the query vector is not
+   * asked for. Work: one pass over the records, one SHA-256 per key text and, on a complete projection, one exact
+   * distance per target. On an incomplete projection the plan carries decide for the build.
+   */
+  private async traceDecision(key:string,raw:MemorySnapshot,cued:MemorySnapshot,nowMs:number,currentSource:CurrentSource|undefined,
+    embedding:Provider,query:()=>Promise<readonly number[]>):Promise<TracePlan|undefined>{
+    const clock=raw.memoryTimeMs??nowMs;
+    const records:Memory[]=[],holders:TraceHolder[]=[];
+    for(const id of raw.memories.keys()){
+      const memory=currentMemory(raw,id,nowMs);
+      if(!memory)continue;
+      records.push(memory);
+      if(!traceEligible(memory,clock))continue;
+      if(currentSource&&memory.source.messageId===currentSource.id&&memory.source.revision===currentSource.revision)continue;
+      const tier=retainedAccess(memory,clock).access;
+      // The event travels as a digest: the event key itself holds the detail.
+      holders.push({id,event:digest(eventKey(memory)),tier:tier as TraceTier});
+    }
+    if(!holders.length)return undefined;
+    // The query vector is asked for only now: a chat without a target never reaches the vector cache.
+    const vector=await query();
+    // Only targets need embeddings. A vector stays live while any current record still owns its key text, including
+    // a record temporarily clear or of the answered source. One pass hashes O(total key-text length) bytes.
+    const needed=new Map<string,string>(),live=new Set<string>(),references:{id:string;hash:string}[]=[];
+    const targets=new Set(holders.map(holder=>holder.id));
+    records.forEach(memory=>{
+      const text=clearKeyText(memory);
+      if(!text)return;
+      const hash=digest(text);
+      live.add(hash);
+      if(!targets.has(memory.id))return;
+      if(!needed.has(hash))needed.set(hash,text);
+      references.push({id:memory.id,hash});
+    });
+    const provider=identity(embedding),held=this.traces.get(key);
+    const scope=held&&held.embedding===provider&&held.dimension===vector.length?held:await this.loadTrace(key,provider,vector.length);
+    cache(this.traces,key,scope,TRACE_CACHE_SCOPES);
+    // An event a cue in the query has already recalled takes no place among the candidates.
+    const exclude=new Set<string>();
+    for(const memory of cued.memories.values())if(memory.reactivated===true)exclude.add(digest(eventKey(memory)));
+    // The candidates from the vectors in memory: one distance per distinct key text of a target. Called only when
+    // every needed key has a vector.
+    const decide=():TraceCandidate[]=>{
+      const distances=new Map<string,number|undefined>(),keys:TraceKeyDistance[]=[];
+      for(const reference of references){
+        if(!distances.has(reference.hash))distances.set(reference.hash,keyDistance(scope.vectors.get(reference.hash)!,vector));
+        const distance=distances.get(reference.hash);
+        if(distance!==undefined)keys.push({id:reference.id,distance});
+      }
+      return traceCandidates(holders,keys,{ceiling:this.traceCeiling,limit:this.traceLimit,exclude});
+    };
+    // A missing key: no decision yet. The build calls decide when it has completed the projection.
+    if([...needed.keys()].some(hash=>!scope.vectors.has(hash)))return {scope,needed,live,candidates:[],status:'building',decide};
+    return {scope,needed,live,candidates:decide(),status:'ready',decide};
+  }
+
+  /**
+   * Reads one scope's key vectors, once. A projection of another format, policy, provider or dimension is
+   * not trusted and yields nothing; so does a missing or unreadable metadata file. It writes nothing.
+   */
+  private async loadTrace(key:string,embedding:string,dimension:number):Promise<TraceScope>{
+    const scope:TraceScope={embedding,dimension,vectors:new Map<string,Float32Array>(),unsaved:false};
+    const name=traceName(key);
+    let metadata:{format?:unknown;policy?:unknown;embedding?:unknown;dimension?:unknown}|null=null;
+    try{metadata=JSON.parse(fs.readFileSync(path.join(this.directory,`${name}.trace.json`),'utf8'));}catch{/* No projection yet, or an unreadable one. */}
+    if(!metadata||typeof metadata!=='object'||metadata.format!==1||metadata.policy!==TRACE_POLICY_VERSION||
+      metadata.embedding!==embedding||metadata.dimension!==dimension)return scope;
+    const database=this.connection??=await connect(this.directory);
+    if(!(await database.tableNames()).includes(name))return scope;
+    const rows=await (await database.openTable(name)).query().select(['id','vector']).toArray();
+    for(const row of rows){
+      const stored=row.vector as ArrayLike<number>|null|undefined;
+      if(typeof row.id!=='string'||!stored||stored.length!==dimension)continue;
+      const values=Float32Array.from(stored);
+      // A damaged row (a non-finite component) is left out and embedded again.
+      if(values.every(value=>Number.isFinite(value)))scope.vectors.set(row.id,values);
+    }
+    return scope;
+  }
+
+  /**
+   * Rewrites one scope's trace table from memory. The order leaves, after an interruption, either no
+   * metadata or a table that matches its metadata. One call rewrites every row: O(K * dimension).
+   */
+  private async persistTrace(key:string,scope:TraceScope,live:ReadonlySet<string>):Promise<void>{
+    for(const hash of [...scope.vectors.keys()])if(!live.has(hash))scope.vectors.delete(hash);
+    const name=traceName(key),metadataPath=path.join(this.directory,`${name}.trace.json`);
+    const database=this.connection??=await connect(this.directory);
+    fs.rmSync(metadataPath,{force:true});
+    if((await database.tableNames()).includes(name))await database.dropTable(name);
+    if(!scope.vectors.size)return;
+    await database.createTable(name,[...scope.vectors].map(([id,values])=>({id,vector:Array.from(values)})),{mode:'overwrite'});
+    fs.mkdirSync(this.directory,{recursive:true});
+    const temporary=metadataPath+'.tmp';
+    fs.writeFileSync(temporary,JSON.stringify({format:1,policy:TRACE_POLICY_VERSION,embedding:scope.embedding,dimension:scope.dimension}));
+    fs.renameSync(temporary,metadataPath);
+  }
+
+  /**
+   * The build of one search, after the main result: embeds at most TRACE_BUILD_TEXTS
+   * missing key texts in batches of EMBEDDING_BATCH, keeps each batch as soon as it returns, then persists. A failed
+   * persist keeps the vectors and marks the scope unsaved. A plan that was building and is complete afterwards, with
+   * no failure, decides here (the late decision). It never throws.
+   */
+  private async traceBuild(key:string,plan:TracePlan,embedding:Provider,deadline:number):Promise<{trace:RetrievalResult['trace'];cacheable:boolean;candidates?:TraceCandidate[]}>{
+    const {scope,needed,live}=plan,keys=needed.size;
+    const absent=()=>[...needed.keys()].filter(hash=>!scope.vectors.has(hash)).length;
+    const pending=[...needed].filter(([hash])=>!scope.vectors.has(hash)).slice(0,TRACE_BUILD_TEXTS);
+    // A scope whose last persist failed is written again, also when this search embeds nothing.
+    let changed=scope.unsaved||[...scope.vectors.keys()].some(hash=>!live.has(hash));
+    let failure:TraceFailure|undefined,forget=false;
+    for(let offset=0;offset<pending.length;offset+=EMBEDDING_BATCH){
+      const batch=pending.slice(offset,offset+EMBEDDING_BATCH);
+      let vectors:number[][];
+      try{vectors=await embed(embedding,batch.map(([,text])=>text),deadline);}
+      catch(error){
+        const provider=providerFailure(error);
+        failure={failure:provider?.failure??'provider_error',attention:provider?.attention??'transient'};
+        break;
+      }
+      if(vectors.some(vector=>vector.length!==scope.dimension)){failure={failure:'provider_error',attention:'transient'};forget=true;break;}
+      const values=vectors.map(vector=>Float32Array.from(vector));
+      if(values.some(vector=>!vector.every(value=>Number.isFinite(value)))){failure={failure:'provider_error',attention:'transient'};forget=true;break;}
+      // Each batch that returns is kept before the next one starts, so a later failure never repeats it.
+      batch.forEach(([hash],index)=>scope.vectors.set(hash,values[index]));
+      changed=true;
+    }
+    if(changed&&!forget){
+      // A failed persist keeps the vectors: they are valid, only the copy on disk is missing.
+      try{await this.persistTrace(key,scope,live);scope.unsaved=false;}
+      catch{failure={failure:'trace_store_failed',attention:'transient'};scope.unsaved=true;}
+    }
+    if(forget)this.traces.delete(key);
+    if(failure)recordRetrievalFallback('trace_keys_failed',{stage:'trace',...failure});
+    if(failure&&plan.status==='building')return {trace:{status:'failed',keys,missing:forget?keys:absent(),failure:failure.failure},cacheable:false};
+    // A completed, successful build decides now and caches the same ready result as an earlier decision.
+    if(plan.status==='building'&&absent()===0)return {trace:{status:'ready',keys,missing:0},candidates:plan.decide(),cacheable:true};
+    // A failed persist of a ready search cannot take back its decision: the status stays ready.
+    return {trace:{status:plan.status,keys,missing:plan.status==='ready'?0:absent()},cacheable:plan.status==='ready'&&!failure};
+  }
+
   private async rerankDecision(part:string,candidates:string[],semantic:readonly unknown[],embedding:Provider|undefined,
     reranker:Provider|undefined,rows:Map<string,IndexedRow>,views:Map<string,MemoryView>):Promise<RetrievalResult['rerankReason']>{
     if(!reranker)return 'not_configured';
@@ -377,14 +595,13 @@ export class Retrieval {
         if(evidenceTerms.some(term=>terms.has(term)))return 'relevant_anchor';
       }
     }
-    const distances=semantic.map(item=>record(item)).filter(item=>typeof item.id==='string'&&rows.has(item.id)&&
-      typeof item._distance==='number'&&Number.isFinite(item._distance)&&item._distance>=0)
-      .map(item=>item._distance as number).sort((a,b)=>a-b);
+    const distances=sortedDistances(semantic,id=>rows.has(id));
     return distances.length>=2&&distances[1]-distances[0]<=this.rerankCosineGap?'near_cosine_gap':'clear_cosine_gap';
   }
 
   private async clearProjection(key:string):Promise<void>{
     this.tables.delete(key);
+    this.traces.delete(key);
     this.queryVectors.clear();
     if(!fs.existsSync(this.directory))return;
     const name=projectionName(key);
@@ -393,6 +610,10 @@ export class Retrieval {
       const database=this.connection??=await connect(this.directory);
       if((await database.tableNames()).includes(name))await database.dropTable(name);
       fs.rmSync(metadataPath,{force:true});
+      const trace=traceName(key);
+      if((await database.tableNames()).includes(trace))await database.dropTable(trace);
+      fs.rmSync(path.join(this.directory,`${trace}.trace.json`),{force:true});
+      fs.rmSync(path.join(this.directory,`${trace}.trace.json.tmp`),{force:true});
     } catch {
       throw new Error('retrieval_cleanup_failed');
     }
@@ -412,10 +633,40 @@ export class Retrieval {
   }
 }
 
+/**
+ * The cosine distances of the listed rows on the [0, 2] scale, ascending. A row the predicate rejects, an entry that is
+ * not an object and a distance that is not a finite number are left out; it never throws. O(n log n) in the entries.
+ */
+export function sortedDistances(semantic:readonly unknown[],has:(id:string)=>boolean):number[] {
+  const distances:number[]=[];
+  for(const item of semantic){
+    if(!item||typeof item!=='object'||Array.isArray(item))continue;
+    const row=item as Record<string,unknown>,distance=clampDistance(row._distance);
+    if(typeof row.id==='string'&&has(row.id)&&distance!==undefined)distances.push(distance);
+  }
+  return distances.sort((a,b)=>a-b);
+}
+
+function traceName(key:string):string {
+  return `trace_${digest(key).slice(0,40)}`;
+}
+/** The recallTrace option: absent, or an object with at most the three keys; each property is read once, in the order of TRACE_OPTION_KEYS. */
+function recallTraceOf(value:unknown):TraceSettings {
+  const settings:TraceSettings={enabled:TRACE_ENABLED_DEFAULT,ceiling:TRACE_CANDIDATE_CEILING,limit:TRACE_CANDIDATE_LIMIT};
+  if(value===undefined)return settings;
+  if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!TRACE_OPTION_KEYS.includes(key)))throw new Error('invalid_recall_trace');
+  const input=value as Record<string,unknown>;
+  const enabled=input.enabled,ceiling=input.ceiling,limit=input.limit;
+  const flag=(item:unknown):item is boolean|undefined=>item===undefined||typeof item==='boolean';
+  const bound=(item:unknown):item is number|undefined=>item===undefined||(typeof item==='number'&&Number.isFinite(item)&&item>0&&item<=2);
+  const count=(item:unknown):item is number|undefined=>item===undefined||(typeof item==='number'&&Number.isSafeInteger(item)&&item>=1&&item<=8);
+  if(!flag(enabled)||!bound(ceiling)||!count(limit))throw new Error('invalid_recall_trace');
+  return {enabled:enabled??settings.enabled,ceiling:ceiling??settings.ceiling,limit:limit??settings.limit};
+}
+
 function allowedText(view: MemoryView): string {
   // Remembered fragments are lexical only: semanticText below does not carry them. A faded row whose gist, feeling and
-  // anchor are all absent has no semantic text; the index then embeds this lexical text (fragments included), and such a
-  // row yields no semantic cue, because semanticReactivations skips a row without semantic text.
+  // anchor are all absent has no semantic text; the index then embeds this lexical text (fragments included).
   const texts=[view.detail, view.gist, view.feeling, view.anchor, ...(view.rememberedFragments??[]), ...view.protectedFacts,view.episode?.scene,
     ...(view.episode?.participants??[]),...(view.episode?.sensoryCues??[]),view.episode?.appraisal]
     .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
@@ -423,33 +674,11 @@ function allowedText(view: MemoryView): string {
 }
 
 function semanticText(view:MemoryView):string {
-  // The reactivation vector is built from the current projection, never from
+  // The index vector of a faded row is built from the current projection, never from
   // faded detail, hidden protected facts, or a source quote kept for audit.
   if(view.access==='gist'||view.access==='feeling'||view.access==='anchor')
     return unique([view.gist,view.feeling,view.anchor].filter((value):value is string=>!!value?.trim())).join('\n');
   return allowedText(view);
-}
-
-function semanticReactivations(results:readonly unknown[],rows:Map<string,IndexedRow>,views:Map<string,MemoryView>,
-  snapshot:MemorySnapshot,query:string):SemanticCue[] {
-  const visible=results.map(item=>record(item)).filter(item=>typeof item.id==='string'&&typeof item._distance==='number'&&
-    Number.isFinite(item._distance)&&item._distance>=0).map(item=>({id:item.id as string,distance:item._distance as number}))
-    .filter(item=>{
-      return !!snapshot.memories.get(item.id)&&!!views.get(item.id)&&!!rows.get(item.id)?.semantic;
-    }).sort((a,b)=>a.distance-b.distance);
-  const candidates=visible.filter(item=>{
-      const memory=snapshot.memories.get(item.id)!,view=views.get(item.id)!;
-      return memory.retention?.kind==='peripheral'&&!memory.accessOverride&&
-        !memory.source.reference&&(view.access==='gist'||view.access==='feeling');
-    });
-  if(!candidates.length||candidates[0].distance>0.14)return [];
-  const best=candidates[0];
-  // Every other visible memory competes for event identity, including a clear
-  // or protected memory and a different event extracted from the same source.
-  const next=visible.find(item=>item.id!==best.id);
-  const margin=next?next.distance-best.distance:2;
-  if(margin<0.05)return [];
-  return [{id:best.id,cue:query.slice(0,160),basis:rows.get(best.id)!.semantic,distance:best.distance,margin}];
 }
 
 /** Cosine distance on the stored float32 values, clamped to the provider-independent [0, 2] range. */
@@ -506,7 +735,7 @@ function detached(value:RetrievalResult):RetrievalResult{
   return {...value,ids:[...value.ids],admission:value.admission.map(entry=>({...entry})),
     ...(value.salience?{salience:{...value.salience,reactions:[...value.salience.reactions]}}:{}),
     ...(value.degraded?{degraded:{...value.degraded}}:{}),
-    ...(value.semanticCues?{semanticCues:value.semanticCues.map(cue=>({...cue}))}:{})};
+    traceCandidates:value.traceCandidates.map(candidate=>({...candidate,ids:[...candidate.ids]})),trace:{...value.trace}};
 }
 
 /** Split explicit lists, not inferred topics; an ordinary sentence stays intact. */

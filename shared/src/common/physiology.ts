@@ -1,3 +1,4 @@
+import {foldForMatch} from './script-fold.ts';
 import type {DatabaseSync} from 'node:sqlite';
 import {randomUUID} from 'node:crypto';
 import {scopeKey} from '../core/types.ts';
@@ -73,7 +74,7 @@ const arousalLevels=new Set<ArousalLevel>(['low','medium','high']);
 const needThresholdHours:Record<PhysiologyNeed,[number,number,number]>={
   hydration:[2,6,12],nutrition:[4,12,24],bladder:[2,5,9],bowel:[18,36,72],sleep:[12,18,24],energy:[6,12,20],
 };
-const nonHumanPhysiology=/(?:机器人|机械生命|无实体|幽灵|鬼魂|亡灵|人工智能|非人类|非生物|\brobot\b|\bandroid\b|\bghost\b|\bundead\b|\bnonhuman\b)/iu;
+const nonHumanPhysiology=/(?:机器人|机械生命|无实体|幽灵|鬼魂|亡灵|人工智能|人工智慧|非人类|非生物|\brobot\b|\bandroid\b|\bghost\b|\bundead\b|\bnonhuman\b)/iu;
 
 /** Source-backed virtual-character physiology; it never models the real user's body. */
 export class PhysiologyStore {
@@ -238,7 +239,7 @@ export class PhysiologyStore {
     for(const actor of roster.characters){
       const character=characters.get(actor.id);
       if(!character||(readerId!=='player'&&readerId!==actor.id&&inspectId!==actor.id)
-        ||nonHumanPhysiology.test(actor.persona))continue;
+        ||nonHumanPhysiology.test(foldForMatch(actor.persona)))continue;
       const identity=actor.identitySource;
       if(identity?.kind==='automatic'&&identity.evidence.some(item=>managedSourceIds.has(item.sourceId)
         &&sourceHashes.get(item.sourceId)!==item.documentHash))continue;
@@ -248,7 +249,7 @@ export class PhysiologyStore {
       const character=characters.get(row.artifact_id);
       if(!character||(readerId!=='player'&&readerId!==row.artifact_id&&inspectId!==row.artifact_id))continue;
       const imported=JSON.parse(row.body) as InitializationCharacter;
-      if(nonHumanPhysiology.test(imported.persona))continue;
+      if(nonHumanPhysiology.test(foldForMatch(imported.persona)))continue;
       for(const need of physiologyNeeds)character.needs.set(need,{stage:'settled',atMs:null,sleeping:false,corrected:false,basis:'default'});
     }
     for(const row of rows.filter(item=>item.artifact_type==='entry'&&item.status==='active'&&item.reference_id
@@ -471,5 +472,5 @@ function exactKeys(value:Record<string,unknown>,allowed:string[],code:string){if
 function currentPhysiologyEvidence(source:SceneMessage,observation:PerspectivePlan['observations'][number],characterId:string):boolean{
   const factSource=observation.kind==='observed'||(source.role==='assistant'&&source.speakerId===characterId);
   if(!factSource)return false;
-  return !/(?:明天|以后|将来|将会|打算|计划|如果|假如|要是|可能会|去年|前年|曾经|回忆|当时|过去|小时候|梦见|想象|tomorrow|yesterday|last\s+year|used\s+to|plan\s+to|if\s+.+\b(?:would|will)\b)/iu.test(observation.quote);
+  return !/(?:明天|以后|将来|将会|打算|计划|如果|假如|要是|可能会|去年|前年|曾经|回忆|当时|过去|小时候|梦见|想象|tomorrow|yesterday|last\s+year|used\s+to|plan\s+to|if\s+.+\b(?:would|will)\b)/iu.test(foldForMatch(observation.quote));
 }

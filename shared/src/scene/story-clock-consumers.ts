@@ -6,6 +6,7 @@ import type {StoryClockMs,StoryClockState,StoryClockView,StoryClockSourceClock} 
 import type {CommitmentStoryClock} from '../commitments/types.ts';
 import type {StoryDeadlineClock} from '../commitments/time.ts';
 import type {OriginScanEntry} from './time-expressions.ts';
+import type {DirectorClock} from './director.ts';
 import type {MemorySnapshot} from '../memory/access.ts';
 import {storyLanguageOf,type StoryLanguage} from '../memory/text-units.ts';
 
@@ -66,6 +67,16 @@ export function commitmentStoryClock(authority:SceneAuthority,scope:SceneScope,t
       }
     },
   };
+}
+
+/** The director speaks only in calendar dates: known iff the unified clock is dated; `time` is null while the time of day is unknown. */
+export function directorClockOf(now:StoryNow|null):DirectorClock {
+  const known=now?.view?.kind==='dated';
+  const date=known?now!.view!.date:null,time=known?now!.view!.time:null;
+  const pad=(value:number,length=2)=>String(value).padStart(length,'0');
+  return {kind:'story',known,
+    date:date===null||date.year===null?null:`${pad(date.year,4)}-${pad(date.month)}-${pad(date.day)}`,
+    time:time===null?null:`${pad(time.hour)}:${pad(time.minute)}`};
 }
 
 /** O(n + total table length); only the four public initialization kinds are offered, in input order. */

@@ -2,9 +2,10 @@ import { Authority } from './store.ts';
 import { ModelTasks } from './models.ts';
 import { Retrieval } from '../memory/retrieval.ts';
 import {contextMemories,checkCurrentSource,type CurrentSource} from '../memory/context.ts';
-import {retentionSnapshot} from '../memory/retention.ts';
-import {reactivateSnapshot} from '../memory/access.ts';
-import {renderContextMemory,absenceSentence} from '../memory/render.ts';
+import {cueRecalls,restoredSnapshot} from '../memory/retention.ts';
+import {limitRecalls,recallSnapshot} from '../memory/access.ts';
+import {recallOrder,RECALL_EVENT_LIMIT,type TraceHit} from '../memory/trace.ts';
+import {renderContextMemory,absenceSentence,recallShown} from '../memory/render.ts';
 import {storyLanguageOf,type StoryLanguage} from '../memory/text-units.ts';
 import { emotionSummary } from '../emotion/openher.ts';
 import {buildEmotionExpression,renderEmotionExpression,type EmotionExpressionInput} from '../emotion/expression.ts';
@@ -75,7 +76,9 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
   async contextFrom(snapshot: MemorySnapshot, query: string, configs: Configurations, emotion: EmotionState,
     allPreferences: Preference[], assertCurrent:()=>void, now = Date.now(),
     expression?:Partial<Pick<EmotionExpressionInput,'actorId'|'addresseeId'|'timeZone'|'clockKind'|'clockTimeMs'|'hideStoryTime'|'relationBasis'|'waiting'|'address'>>,
-    options:{reactivationOrigin?:'reply';language?:StoryLanguage;currentSource?:CurrentSource}={}) {
+    options:{reactivationOrigin?:'reply';language?:StoryLanguage;currentSource?:CurrentSource;
+      /** Recalls decided outside the search (a judging step): the records to restore, each event strong or not. */
+      recallHits?:readonly TraceHit[]}={}) {
     // The user source a reply path is answering (scene/service.ts passes it); its own memories are not "last contact".
     checkCurrentSource(options.currentSource);
     if(options.language!==undefined&&options.language!=='zh'&&options.language!=='en')throw new Error('invalid_story_language');
@@ -84,14 +87,21 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
     const render=(memories:readonly MemoryView[])=>memories.map(memory=>renderContextMemory(memory,language));
     await this.scene.clearPendingIndexes();
     assertCurrent();
-    snapshot=retentionSnapshot(snapshot,now,query);
+    const cues=cueRecalls(snapshot,now,query);
     const scope = snapshot.scope;
-    const result = await this.retrieval.search(snapshot, query, configs, now);
+    const result = await this.retrieval.search(snapshot, query, configs, now,{currentSource:options.currentSource});
     try { assertCurrent(); } catch(error) { await this.clearProjection(scope);throw error; }
-    snapshot=reactivateSnapshot(snapshot,now,result.semanticCues??[]);
+    // One context recalls at most RECALL_EVENT_LIMIT events: the cue recalls first, then the hits decided outside the
+    // search. An event beyond the limit stays at its stage: no mark, no seed and no place in front.
+    const recalls=limitRecalls(snapshot,now,cues,options.recallHits??[],result.ids,RECALL_EVENT_LIMIT);
+    snapshot=recallSnapshot(snapshot,restoredSnapshot(snapshot,now,recalls.cues),now,recalls.hits);
+    // A row the search admitted only because a cue reminded of it takes no place when its event is beyond the limit.
+    const beyond=new Set(cues.filter(recall=>!recalls.cues.includes(recall)).flatMap(recall=>recall.ids));
+    const ranked=beyond.size?result.ids.filter((id,index)=>!(beyond.has(id)&&result.admission?.[index]?.id===id&&result.admission[index]!.by==='reminded')):result.ids;
     // Protection controls retention, not unconditional injection. Relevant facts
     // compete alongside episodes; every returned ID is checked against authority.
-    const projected = contextMemories(snapshot,result.ids,now,{currentSource:options.currentSource});
+    const recalled=recallOrder([...snapshot.memories.values()].filter(memory=>memory.reactivated===true));
+    const projected = contextMemories(snapshot,recalled.length?[...recalled,...ranked]:ranked,now,{currentSource:options.currentSource});
     const blurred=projected.memories.filter(memory=>memory.access!=='clear');
     const rewriteKey=createHash('sha256').update(JSON.stringify([scopeKey(scope),blurred,configs.rewrite])).digest('hex');
     let clauses=this.rewriteCache.get(rewriteKey);
@@ -140,7 +150,7 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
     // Only a reply context records what it brought back, and only once the whole context is known current. Without the
     // option (her own proactive contact, tavern, recall) nothing is written, so her outreach never feeds its own pressure.
     if (options.reactivationOrigin === 'reply') {
-      const reactivated = projected.memories.flatMap(memory => memory.reactivated && (memory.access === 'clear' || memory.access === 'gist')
+      const reactivated = projected.memories.flatMap(memory => recallShown(memory) && (memory.access === 'clear' || memory.access === 'gist')
         ? [{memoryId:memory.id,messageId:memory.source.messageId,messageRevision:memory.source.revision,access:memory.access,
           kind:memory.reactivation?.kind === 'semantic' ? 'semantic' as const : 'cue' as const}] : []);
       if (reactivated.length) this.authority.recordMemoryReactivations(scope,reactivated,'reply',Math.trunc(now));

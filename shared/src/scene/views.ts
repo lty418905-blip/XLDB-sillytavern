@@ -1,3 +1,4 @@
+import {foldForMatch,includesForMatch} from '../common/script-fold.ts';
 import { segmentOutward } from './outward.ts';
 import { envelopeOf } from './perspective.ts';
 import type { KnowledgeKind, Observation, PerspectivePlan, SceneCharacter, SceneMessage, SceneRoster } from './types.ts';
@@ -229,18 +230,24 @@ function mentionsIdentity(text: string, character: SceneCharacter, roster: Scene
 }
 
 function identityLiteral(text: string, character: SceneCharacter, roster: SceneRoster): string | undefined {
-  if (mentions(text, character.id)) return character.id;
+  const idQuote=mentionedQuote(text,character.id,false);
+  if(idQuote!==undefined)return idQuote;
   for (const label of [character.name, ...character.aliases]) {
-    if (!mentions(text, label)) continue;
-    const owners = roster.characters.filter(item => item.name === label || item.aliases.includes(label));
-    if (owners.length === 1 && owners[0]?.id === character.id) return label;
+    const quote=mentionedQuote(text,label);
+    if (quote===undefined) continue;
+    const exact=roster.characters.filter(item=>[item.name,...item.aliases].includes(quote));
+    const owners=exact.length?exact:roster.characters.filter(item=>[item.name,...item.aliases].some(name=>foldForMatch(name)===foldForMatch(quote)));
+    if (owners.length === 1 && owners[0]?.id === character.id) return quote;
   }
   return undefined;
 }
 
-function mentions(text: string, label: string): boolean {
+function mentionedQuote(text: string, label: string, fold=true): string|undefined {
+  const source=text;
+  if(fold){const exact=mentionedQuote(text,label,false);if(exact!==undefined)return exact;text=foldForMatch(text);label=foldForMatch(label);}
   const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`${/^[A-Za-z0-9_]/.test(label) ? '(?<![A-Za-z0-9_-])' : ''}${escaped}${/[A-Za-z0-9_]$/.test(label) ? '(?![A-Za-z0-9_-])' : ''}`, 'u').test(text);
+  const match=new RegExp(`${/^[A-Za-z0-9_]/.test(label) ? '(?<![A-Za-z0-9_-])' : ''}${escaped}${/[A-Za-z0-9_]$/.test(label) ? '(?![A-Za-z0-9_-])' : ''}`, 'u').exec(text);
+  return match?source.slice(match.index,match.index+match[0].length):undefined;
 }
 
 function quoteOf(source: string, fragments: BoundFragment[]): string {
@@ -248,8 +255,8 @@ function quoteOf(source: string, fragments: BoundFragment[]): string {
 }
 
 function playerAnchored(quote: string, role: SceneMessage['role'], playerName: string | undefined): boolean {
-  return (role === 'user' ? /你|您|玩家|我/u : /你|您|玩家/u).test(quote)
-    || Boolean(playerName && quote.includes(playerName));
+  return (role === 'user' ? /你|您|玩家|我/u : /你|您|玩家/u).test(foldForMatch(quote))
+    || Boolean(playerName && includesForMatch(quote,playerName));
 }
 
 function validateHistory(source: SceneMessage): void {

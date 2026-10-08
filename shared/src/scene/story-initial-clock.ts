@@ -1,3 +1,4 @@
+import {foldForMatch} from '../common/script-fold.ts';
 import type {SceneReference} from './transfer.ts';
 import type {SceneState} from './types.ts';
 import type {WorldSettings} from './world-state.ts';
@@ -54,7 +55,8 @@ export function initialStoryAnchor(state:SceneState,references:readonly SceneRef
 function clues(texts:readonly string[]):{dates:DateClue[];years:number[]}{
   const dates:DateClue[]=[],years:number[]=[];
   for(const text of texts){
-    for(const segment of text.split(/[。！？\n；;，,]/)){
+    // Folding and fixed date/cue scans are O(n); labels and source bodies stay untouched.
+    for(const segment of foldForMatch(text).split(/[。！？\n；;，,]/)){
       if(!openingCue.test(segment))continue;
       for(const match of segment.matchAll(datePattern)){
         const year=Number(match[1]),month=Number(match[2]??match[4]),day=Number(match[3]??match[5]);

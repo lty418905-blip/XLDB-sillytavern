@@ -1,3 +1,4 @@
+import {foldForMatch,scriptQuoteSearch,sourceQuote,type ScriptQuoteMatch} from '../common/script-fold.ts';
 import type { Prompt } from '../core/models.ts';
 import type { SceneMessage } from './types.ts';
 import type { WorldSettings } from './world-state.ts';
@@ -216,12 +217,12 @@ export function legacyTimeClassificationOf(reason:StoryClockExcludedReason):'rec
 const overlaps=(a:Span,b:Span):boolean=>a[0]<b[1]&&b[0]<a[1];
 const usableQuote=(quote:unknown):quote is string=>typeof quote==='string'&&quote.trim()!==''&&codePoints(quote)<=WORLD_STAGE_MAX_QUOTE_CODE_POINTS;
 
-/** First verbatim occurrence of `quote` in `text` whose span overlaps no span of `taken`. */
-function bind(text:string,quote:unknown,taken:readonly Span[]):number|null {
+/** First script-equivalent source span not already taken. O(n + m), with at most 20 taken spans. */
+function bind(text:string,quote:unknown,taken:readonly Span[]):ScriptQuoteMatch|null {
   if(!usableQuote(quote))return null;
-  for(let at=text.indexOf(quote);at>=0;at=text.indexOf(quote,at+1)) {
-    const span:Span=[at,at+quote.length];
-    if(!taken.some(other=>overlaps(span,other)))return at;
+  for(const match of scriptQuoteSearch(text,quote,text.length+1).matches) {
+    const span:Span=[match.start,match.end];
+    if(!taken.some(other=>overlaps(span,other)))return match;
   }
   return null;
 }
@@ -303,23 +304,28 @@ function storedCue(quote:string,parsed:NarrativeCueParse):StoryClockCue|null {
 /** §2.4: the origin of the opening source; never null. */
 function decodeOrigin(raw:unknown,text:string,candidates:readonly OriginCandidate[],issue:IssueOf,issues:StoryClockIssue[]):StoryClockOrigin {
   const value:Fields=isRecord(raw)?raw:{};
-  const site=(quote:unknown):StoryClockQuoteSite|null=>{
+  const site=(quote:unknown):{site:StoryClockQuoteSite;quote:string}|null=>{
     if(!usableQuote(quote))return null;
-    if(text.includes(quote))return {location:'opening',table:null};
-    const found=candidates.find(candidate=>candidate.site.location==='initialization'&&candidate.text.includes(quote));
-    return found?{location:'initialization',table:found.site.table}:null;
+    const openingQuote=sourceQuote(text,quote);
+    if(openingQuote!==null)return {site:{location:'opening',table:null},quote:openingQuote};
+    for(const candidate of candidates){
+      if(candidate.site.location!=='initialization')continue;
+      const original=sourceQuote(candidate.text,quote);
+      if(original!==null)return {site:{location:'initialization',table:candidate.site.table},quote:original};
+    }
+    return null;
   };
   const dates:{item:StoryClockOriginItem<StoryClockDate>;parsed:ParsedDate}[]=[];
   for(const entry of Array.isArray(value.dates)?value.dates.slice(0,3):[]) {
     const rawDate:Fields=isRecord(entry)?entry:{};
     const at=site(rawDate.quote);
     if(at===null){issues.push(issue('quote_not_found',null,rawDate.quote));continue;}
-    const quote=rawDate.quote as string,parsed=parseStoryDate(quote);
+    const quote=at.quote,parsed=parseStoryDate(quote);
     if(parsed===null){issues.push(issue('value_unresolved',null,quote));continue;}
     if(!dateMatches(rawDate.date,dateTargets(parsed))){issues.push(issue('value_mismatch',null,quote));continue;}
     const date=parsed.nextDay?nextDate(parsed.date):copyDate(parsed.date);
     if(date===null){issues.push(issue('value_out_of_range',null,quote));continue;}
-    dates.push({item:{value:date,basis:'explicit',quote,site:at},parsed});
+    dates.push({item:{value:date,basis:'explicit',quote,site:at.site},parsed});
   }
   const conflict=dates.some((a,i)=>dates.some((b,j)=>j>i&&!sameDay(a.item.value,b.item.value)));
   if(conflict)issues.push(issue('origin_conflict',null,null));
@@ -332,13 +338,13 @@ function decodeOrigin(raw:unknown,text:string,candidates:readonly OriginCandidat
     const at=site(rawTime.quote);
     if(at===null)issues.push(issue('quote_not_found',null,rawTime.quote));
     else {
-      const quote=rawTime.quote as string;
+      const quote=at.quote;
       timeDated=parseStoryDate(quote);
       const parsed=timeDated!==null&&timeDated.time!==null?{...timeDated.time,nextDay:timeDated.nextDay}:parseClockTime(quote,'narrative');
       if(parsed===null)issues.push(issue('value_unresolved',null,quote));
       else if(!timeMatches(rawTime.value,parsed))issues.push(issue('value_mismatch',null,quote));
       else {
-        const item:StoryClockOriginItem<StoryClockTime>={value:{hour:parsed.hour,minute:parsed.minute},basis:'explicit',quote,site:at};
+        const item:StoryClockOriginItem<StoryClockTime>={value:{hour:parsed.hour,minute:parsed.minute},basis:'explicit',quote,site:at.site};
         // R8: the nextDay of a separate time quote moves the date item once, unless the date quote folded a day itself.
         if(parsed.nextDay&&dateItem!==null&&chosen!==null&&!chosen.parsed.nextDay) {
           const moved=nextDate(dateItem.value);
@@ -355,11 +361,11 @@ function decodeOrigin(raw:unknown,text:string,candidates:readonly OriginCandidat
     const at=site(rawSlot.quote);
     if(at===null)issues.push(issue('quote_not_found',null,rawSlot.quote));
     else {
-      const quote=rawSlot.quote as string;
+      const quote=at.quote;
       slotDated=parseStoryDate(quote);
       const word=slotDated?.timeOfDay??parseTimeOfDayWord(quote),claimed=rawSlot.value;
-      if(word!==null)slotItem={value:word,basis:'explicit',quote,site:at};
-      else if(member(STORY_CLOCK_TIMES_OF_DAY,claimed))slotItem={value:claimed,basis:'inferred',quote,site:at};
+      if(word!==null)slotItem={value:word,basis:'explicit',quote,site:at.site};
+      else if(member(STORY_CLOCK_TIMES_OF_DAY,claimed))slotItem={value:claimed,basis:'inferred',quote,site:at.site};
       else issues.push(issue('value_unresolved',null,quote));
     }
   }
@@ -406,7 +412,7 @@ function decodeStoryClock(raw:unknown,request:WorldStageRequest):StoredStoryCloc
     if(!isRecord(cue)||!member(STORY_CLOCK_CUE_KINDS,cue.kind)){cueIssues.push(issue('value_unresolved',index,isRecord(cue)?cue.quote:null));return;}
     const at=bind(text,cue.quote,taken);
     if(at===null){cueIssues.push(issue('quote_not_found',index,cue.quote));return;}
-    const quote=cue.quote as string,span:Span=[at,at+quote.length];
+    const quote=at.quote,span:Span=[at.start,at.end];
     taken.push(span);
     const parsed=parseNarrativeCue(quote);
     if(!parsed.ok) {
@@ -420,7 +426,7 @@ function decodeStoryClock(raw:unknown,request:WorldStageRequest):StoredStoryCloc
     if(parsed.cue.kind!==cue.kind||!cueMatches(cue,parsed.cue)){cueIssues.push(issue('value_mismatch',index,quote));return;}
     const stored=storedCue(quote,parsed.cue);
     if(stored===null){cueIssues.push(issue('value_out_of_range',index,quote));return;}
-    bound.push({at,cue:stored});
+    bound.push({at:at.start,cue:stored});
   });
   bound.sort((a,b)=>a.at-b.at);
 
@@ -430,7 +436,7 @@ function decodeStoryClock(raw:unknown,request:WorldStageRequest):StoredStoryCloc
     if(!isRecord(item)){excludedIssues.push(issue('quote_not_found',null,null));continue;}
     const at=bind(text,item.quote,[]);
     if(at===null){excludedIssues.push(issue('quote_not_found',null,item.quote));continue;}
-    const quote=item.quote as string;
+    const quote=at.quote;
     let reason:StoryClockExcludedReason;
     if(member(STORY_CLOCK_EXCLUDED_REASONS,item.reason))reason=item.reason;
     else {
@@ -448,7 +454,7 @@ function decodeStoryClock(raw:unknown,request:WorldStageRequest):StoredStoryCloc
       }
     }
     excluded.push(stored);
-    guarded.push([at,at+quote.length]);
+    guarded.push([at.start,at.end]);
   }
   for(const item of moved)if(!excluded.some(other=>other.quote===item.quote))excluded.push(item);
 
@@ -459,8 +465,8 @@ function decodeStoryClock(raw:unknown,request:WorldStageRequest):StoredStoryCloc
     const at=bind(text,rawQuote,[]);
     if(at===null)elapsedIssues.push(issue('quote_not_found',null,rawQuote));
     else {
-      const span:Span=[at,at+rawQuote.length];
-      if(clockGuardClass(rawQuote)===null&&!guarded.some(other=>overlaps(span,other)))quote=rawQuote;
+      const span:Span=[at.start,at.end];
+      if(clockGuardClass(at.quote)===null&&!guarded.some(other=>overlaps(span,other)))quote=at.quote;
     }
   }
 
@@ -474,7 +480,39 @@ function worldStageEffects(result:Fields,request:WorldStageRequest):unknown[] {
   if(request.settings===null||cappedOpening(request))return [];
   const effects=result.effects;
   if(!Array.isArray(effects)||effects.length>WORLD_STAGE_MAX_ITEMS)throw new Error('invalid_world_effects');
-  return effects.filter(effect=>!(effect!==null&&typeof effect==='object'&&((effect as Fields).kind==='clock_absolute'||(effect as Fields).kind==='clock_advance')));
+  return effects.filter(effect=>!(effect!==null&&typeof effect==='object'&&((effect as Fields).kind==='clock_absolute'||(effect as Fields).kind==='clock_advance')))
+    .map(effect=>restoreEffectQuotes(effect,request.source.text));
+}
+
+const effectQuoteFields=['quote','ownerQuote','itemQuote','timestampQuote'] as const;
+const effectAmountFields=['amount','unitPrice','quantity'] as const;
+/** Fixed field count: O(n + total quote length). Unchanged objects keep their original identity. */
+function restoreEffectQuotes(value:unknown,source:string):unknown {
+  if(!isRecord(value))return value;
+  if(typeof value.quote==='string'&&scriptQuoteSearch(source,value.quote,2).matches.length>1)return value;
+  let result=value;
+  const effectQuote=typeof value.quote==='string'?sourceQuote(source,value.quote):null;
+  for(const field of effectQuoteFields){
+    const modelQuote=value[field];
+    if(typeof modelQuote!=='string')continue;
+    const quote=sourceQuote(field==='quote'?source:effectQuote??'',modelQuote);
+    if(quote!==null&&quote!==modelQuote)result={...result,[field]:quote};
+  }
+  for(const field of effectAmountFields){
+    const amount=value[field];
+    if(!isRecord(amount)||typeof amount.quote!=='string')continue;
+    const quote=sourceQuote(effectQuote??'',amount.quote);
+    if(quote!==null&&quote!==amount.quote)result={...result,[field]:{...amount,quote}};
+  }
+  if(effectQuote!==null){
+    if(typeof value.item==='string'&&typeof result.itemQuote==='string'&&foldForMatch(value.item)===foldForMatch(result.itemQuote)&&effectQuote.includes(result.itemQuote)&&value.item!==result.itemQuote)
+      result={...result,item:result.itemQuote};
+    if(typeof value.unit==='string'&&isRecord(result.unitPrice)&&typeof result.unitPrice.quote==='string'){
+      const unit=sourceQuote(result.unitPrice.quote,value.unit);
+      if(unit!==null&&effectQuote.includes(result.unitPrice.quote)&&unit!==value.unit)result={...result,unit};
+    }
+  }
+  return result;
 }
 
 /** Decodes the parsed world-stage JSON for `request` (the same object the prompts were built from). */

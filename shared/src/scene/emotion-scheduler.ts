@@ -1,3 +1,4 @@
+import {foldForMatch} from '../common/script-fold.ts';
 import {AgentJevClient,DEFAULT_BACKOFF_MS,agentJevIdentityOffLoop,available as agentJevAvailable} from '../agentjev/client.ts';
 import type {AgentJevClientOptions} from '../agentjev/client.ts';
 import type {SceneState} from './types.ts';
@@ -221,7 +222,10 @@ function currentImpactBand(item:EmotionRankCandidate):number {
   // This is a conservative salience gate, not an emotion diagnosis. The source
   // quotations are already scoped to this NPC by the scene service.
   let band=0;
-  for(const source of item.evidenceQuotes){
+  const name=foldForMatch(item.name);
+  for(const original of item.evidenceQuotes){
+    // Fixed scans of a matching copy: O(n); the ranker never rewrites stored evidence.
+    const source=foldForMatch(original);
     const outsideQuotes=source.replace(/[“‘「『]([^”’」』]*)[”’」』]/gu,(_whole,spoken:string,offset:number)=>{
       const lead=source.slice(Math.max(0,offset-16),offset);
       return /(?:说|喊|表示|回答|承认|坦白|叫道|喊道)\s*[:：]?$/u.test(lead)?spoken:'';
@@ -234,7 +238,7 @@ function currentImpactBand(item:EmotionRankCandidate):number {
       const other=/(?:别人|另一个人|旁人|其他人|他人|隔壁有人)/u.exec(clause);
       if(other){
         const after=clause.slice(other.index+other[0].length);
-        const own=[after.indexOf('自己'),after.indexOf('本人'),after.indexOf(item.name)]
+        const own=[after.indexOf('自己'),after.indexOf('本人'),after.indexOf(name)]
           .filter(index=>index>=0).sort((a,b)=>a-b)[0];
         if(own===undefined)continue;
         clause=after.slice(own);
@@ -243,7 +247,7 @@ function currentImpactBand(item:EmotionRankCandidate):number {
         .replace(/(?:没有|并未|未曾|不再|不|没|无)(?:再)?(?:感到|觉得|会)?(?:受伤|害怕|恐惧|愤怒|悲伤|痛哭|哭泣|惊恐|绝望|发抖|颤抖|流泪|掉泪|掉眼泪|僵住|僵在原地)/gu,'')
         .replace(/(?:双手|手|身体|身子|浑身|全身)(?:已经)?(?:没有|不再|不|没)(?:再)?抖/gu,'');
       if(/(?:失声痛哭|痛哭|惊恐|恐惧|害怕|绝望|愤怒|背叛|去世|死亡|死了|失踪|遇险|重逢|失而复得|心碎|panic|terrified|betray|crying|grief|reunited)/iu.test(positive))band=Math.max(band,3);
-      else if(/(?:发抖|颤抖|(?:双手|手|身体|身子|浑身|全身)(?:还|一直|不停|止不住)?抖|僵(?:住|在原地)|眼泪(?:止不住地)?(?:掉|流|落)|(?:泪水|泪珠)(?:掉|流|落)|手心(?:全|都)?是汗|嘴唇发白|脸色发白|喘不过气|发不出声音|说不出话|站不住|脚下一软|眼眶发红|哭了|哭泣|摔下|冲上去拥抱|握紧拳头|反复确认|紧紧抓住)/u.test(positive))band=Math.max(band,2);
+      else if(/(?:发抖|颤抖|(?:双手|手|身体|身子|浑身|全身)(?:还|一直|不停|止不住)?抖|僵(?:住|在原地)|眼泪(?:止不住地)?(?:掉|流|落)|(?:泪水|泪珠)(?:掉|流|落)|手心(?:全|都)?是汗|嘴唇发白|脸色发白|喘不过气|发不出声音|说不出话|站不住|脚下一软|眼眶发红|哭了|哭泣|摔下|冲上去拥抱|握紧拳头|反[复覆]确认|紧紧抓住)/u.test(positive))band=Math.max(band,2);
       else if(/(?:道歉|失落|担心|不安|惊讶|笑了|点了点头|怀疑|期待已久|质问)/u.test(positive))band=Math.max(band,1);
     }
   }
@@ -252,9 +256,9 @@ function currentImpactBand(item:EmotionRankCandidate):number {
 
 function deterministicScore(item:EmotionRankCandidate):number {
   // Stable fallback priority; this is an operational estimate, not measured emotion quality.
-  const evidence=item.evidenceQuotes.join('\n');
+  const evidence=foldForMatch(item.evidenceQuotes.join('\n'));
   const signal=(evidence.match(/!|！|哭|怒|怕|爱|恨|担心|害怕|惊|救|死|伤|失去|拥抱|争吵|道歉|高兴|悲伤/gu)??[]).length;
-  const mentioned=item.name.trim()!==''&&evidence.includes(item.name);
+  const mentioned=item.name.trim()!==''&&evidence.includes(foldForMatch(item.name));
   return Math.min(signal,12)*10+Math.min(item.deferredEvents,8)*4+
     (item.currentTarget?6:0)+(mentioned?4:0)+(item.present?2:0)+unmetDrive(item.currentEmotion)*2+Math.min(evidence.length,500)/500;
 }

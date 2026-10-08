@@ -1,5 +1,7 @@
 import type {Access,Memory,MemorySnapshot} from './access.ts';
+import {currentMemory} from './current-record.ts';
 import {codeTokenRanges,compact,mappedText,numericRanges,scriptOf,units,wordsOf,type CodeToken} from './text-units.ts';
+import {foldCue,visibleCueHits,restoredAccess,eventKey,TRACE_STRONG_CUES,type TraceTier} from './trace.ts';
 
 export const emotionalReactions = {
   joy:'喜悦', gratitude:'感激', affection:'爱意', relief:'如释重负', pride:'自豪',
@@ -519,22 +521,69 @@ export function retainedAccess(memory:Memory,nowMs:number,cueText=''): {access:A
   // facts survive every stage, and absence of a safe classification retains.
   const first=memory.kind==='episode'?30*DAY:60*DAY;
   if(age<first)return {access:'clear'};
-  // A forgotten detail is never a hidden lookup key.  Exact cues may only
-  // reactivate when the cue is also present in a currently accessible layer.
-  const layers:('gist'|'feeling'|'anchor')[]=age<180*DAY?['gist','feeling','anchor']:['feeling','anchor'];
-  const visible=layers.map(layer=>visibleLayer(memory,layer).text);
-  if(cueText&&memory.retention.cues.some(cue=>cueText.includes(cue)&&visible.some(layer=>layer.includes(cue))))
-    return {access:age<180*DAY?'clear':'gist',reactivated:true};
-  return {access:age<180*DAY?'gist':'feeling'};
+  const tier:Access=age<180*DAY?'gist':'feeling';
+  // A cue of the memory in the text restores one stage; two or more restore to clear. The cue need not be in a
+  // visible layer: the trace is a reminder key, never text shown to anyone.
+  if(cueText&&restorableStage(memory,nowMs,tier)){
+    const hits=visibleCueHits(memory.retention.cues,foldCue(cueText));
+    if(hits>0)return {access:restoredAccess(tier,hits>=TRACE_STRONG_CUES),reactivated:true};
+  }
+  return {access:tier};
 }
 
-export interface SemanticCue {id:string;cue:string;basis:string;distance:number;margin:number}
+function restorableStage(_memory:Memory,_nowMs:number,tier:Access):tier is TraceTier {
+  if(tier==='clear')return false;
+  // No automatic hidden stage exists yet; when one is added, this branch takes its trace window.
+  if(tier==='hidden')return false;
+  return true;
+}
+/** Whether the recall trace may restore this record at this clock. The raw authority record goes in. */
+export function traceEligible(memory:Memory,nowMs:number):boolean {
+  if(memory.accessOverride||memory.access!=='clear'||memory.source.reference||memory.retention?.kind!=='peripheral'||memory.reactivated)return false;
+  return restorableStage(memory,nowMs,retainedAccess(memory,nowMs).access);
+}
+
+/** One event a cue of the text recalls: its restorable records, and whether the recall jumps to clear. */
+export interface CueRecall {event:string;strong:boolean;ids:string[]}
+
+/**
+ * The events a cue in the text recalls, in the order of the snapshot. Twins are restored together: a cue of any
+ * restorable record of an event recalls all of them. The jump to clear needs two cues of one record (cues are counted
+ * per memory); every twin then follows. One fold for the text and one per cue of a restorable record; none without a text.
+ */
+export function cueRecalls(snapshot:MemorySnapshot,nowMs:number,cueText:string):CueRecall[] {
+  const clock=snapshot.memoryTimeMs??nowMs;
+  const folded=cueText?foldCue(cueText):'';
+  const events=new Map<string,{hit:boolean;strong:boolean;members:string[]}>();
+  if(folded)for(const [id,memory] of snapshot.memories){
+    if(!currentMemory(snapshot,id,nowMs)||!traceEligible(memory,clock))continue;
+    const key=eventKey(memory),group=events.get(key)??{hit:false,strong:false,members:[]};
+    const hits=visibleCueHits(memory.retention!.cues,folded);
+    if(hits>0)group.hit=true;
+    if(hits>=TRACE_STRONG_CUES)group.strong=true;
+    group.members.push(id);events.set(key,group);
+  }
+  const recalls:CueRecall[]=[];
+  for(const [event,group] of events)if(group.hit)recalls.push({event,strong:group.strong,ids:group.members});
+  return recalls;
+}
+
+/**
+ * The staged snapshot with the given recalls applied: each of their records moves one stage back from its own stage,
+ * or to clear for a strong recall. An id that names no restorable record is left at its stage.
+ */
+export function restoredSnapshot(snapshot:MemorySnapshot,nowMs:number,recalls:readonly Pick<CueRecall,'strong'|'ids'>[]):MemorySnapshot {
+  const clock=snapshot.memoryTimeMs??nowMs;
+  const recalled=new Map<string,boolean>();
+  for(const recall of recalls)for(const id of recall.ids)recalled.set(id,recall.strong);
+  return {...snapshot,memories:new Map([...snapshot.memories].map(([id,memory])=>{
+    const result=retainedAccess(memory,clock);
+    if(!recalled.has(id)||memory.status!=='accepted'||!traceEligible(memory,clock))return [id,{...memory,access:result.access,...(result.reactivated?{reactivated:true}:{})}];
+    return [id,{...memory,access:restoredAccess(result.access as TraceTier,recalled.get(id)!),reactivated:true}];
+  }))};
+}
 
 /** Use the same effective granularity for retrieval and foreground context. */
 export function retentionSnapshot(snapshot:MemorySnapshot,nowMs:number,cueText=''):MemorySnapshot {
-  const clock=snapshot.memoryTimeMs??nowMs;
-  return {...snapshot,memories:new Map([...snapshot.memories].map(([id,memory])=>{
-    const result=retainedAccess(memory,clock,cueText);
-    return [id,{...memory,access:result.access,...(result.reactivated?{reactivated:true}:{})}];
-  }))};
+  return restoredSnapshot(snapshot,nowMs,cueRecalls(snapshot,nowMs,cueText));
 }

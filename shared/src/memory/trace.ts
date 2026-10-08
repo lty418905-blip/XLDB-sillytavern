@@ -3,18 +3,15 @@ import type {Access,Memory} from './access.ts';
 
 export const TRACE_POLICY_VERSION=1;
 // This is a planned value; the calibration run sets the final one.
-export const TRACE_DISTANCE=0.34;
-export const TRACE_DISTANCE_CEILING=0.36;
+export const TRACE_CANDIDATE_CEILING=0.50;
 // This is a planned value; the calibration run sets the final one.
-export const TRACE_GAP=0.075;
-// This is a planned value; the calibration run sets the final one.
-export const TRACE_STRONG_MARGIN=0.06;
-// This is a planned value; the calibration run sets the final one.
-export const TRACE_KEY_VARIANT:TraceKeyVariant='min';
+export const TRACE_CANDIDATE_LIMIT=3;
 export const TRACE_STRONG_CUES=2;
 export const TRACE_CUE_MIN_FOLDED=2;
 export const TRACE_CUE_RAW_LIMIT=1000;
 export const TRACE_RECORD_LIMIT=32;
+/** Recalled events one context places first, at most; twins are one event. */
+export const RECALL_EVENT_LIMIT=3;
 
 // Work: O(s + u^2 * l), with s total text units, u distinct entries and l the longest entry.
 export function clearKeyText(memory:Pick<Memory,'detail'|'episode'>):string {
@@ -74,11 +71,10 @@ export function recallOrder(memories:readonly Pick<Memory,'id'|'source'>[]):stri
     (a.id<b.id?-1:a.id>b.id?1:0)).map(memory=>memory.id);
 }
 
-export type TraceKeyVariant='min'|'cue_target_clear_competitor';
-export type TraceKeyKind='clear'|'cue';
 export interface TraceHolder {id:string;event:string;tier?:TraceTier}
-export interface TraceKeyDistance {id:string;kind:TraceKeyKind;distance:number}
-export interface TraceLimits {distance:number;gap:number;strongMargin:number;variant:TraceKeyVariant}
+export interface TraceKeyDistance {id:string;distance:number}
+export interface TraceCandidateLimits {ceiling:number;limit:number;exclude:ReadonlySet<string>}
+export interface TraceCandidate {event:string;ids:string[];distance:number}
 export interface TraceHit {id:string;strong:boolean}
 
 // Work: O(1); validates and clamps one number.
@@ -93,36 +89,29 @@ export function cosineDistance(left:ArrayLike<number>,right:ArrayLike<number>):n
   if(!a||!b)return 1;
   return clampDistance(1-dot/Math.sqrt(a*b));
 }
-// Work: O(h + k), with h holders and k keys; distances are read once and each target is visited twice.
-export function semanticHits(holders:readonly TraceHolder[],keys:readonly TraceKeyDistance[],limits:TraceLimits):TraceHit[] {
-  const known=new Set(holders.map(holder=>holder.id));
-  const any=new Map<string,number>(),own=new Map<string,number>();
-  for(const key of keys){
-    const id=key.id,kind=key.kind,distance=clampDistance(key.distance);
-    if(distance===undefined||!known.has(id)||(kind!=='clear'&&kind!=='cue'))continue;
-    if(distance<(any.get(id)??Infinity))any.set(id,distance);
-    if((limits.variant==='min'||kind==='cue')&&distance<(own.get(id)??Infinity))own.set(id,distance);
-  }
-  const nearest=new Map<string,number>(),targets=new Map<string,TraceHolder[]>();
+/**
+ * The faded events nearest to the query. A holder with a tier is a target; an event's distance is the smallest key
+ * distance among its targets. Events within the ceiling are kept, nearest first and by event at equal distance, and
+ * the first `limit` are returned with their targets. An event in `exclude` is left out before the limit applies. A
+ * key of an unknown id or of a holder that is no target, and a distance that is not a finite number, are ignored.
+ */
+// Work: O(h + k + e log e), with h holders, k keys and e events with a target; each distance is read once.
+export function traceCandidates(holders:readonly TraceHolder[],keys:readonly TraceKeyDistance[],limits:TraceCandidateLimits):TraceCandidate[] {
+  const ceiling=limits.ceiling,limit=limits.limit,exclude=limits.exclude;
+  const eventOf=new Map<string,string>(),members=new Map<string,string[]>();
   for(const holder of holders){
-    const distance=any.get(holder.id);
-    if(distance!==undefined&&distance<(nearest.get(holder.event)??Infinity))nearest.set(holder.event,distance);
-    if(holder.tier!==undefined){const group=targets.get(holder.event)??[];group.push(holder);targets.set(holder.event,group);}
+    const id=holder.id,event=holder.event;
+    if(holder.tier===undefined)continue;
+    eventOf.set(id,event);
+    const group=members.get(event)??[];group.push(id);members.set(event,group);
   }
-  let first:{event:string;value:number}|undefined,second=Infinity;
-  for(const [event,value] of nearest){
-    if(!first||value<first.value){if(first)second=Math.min(second,first.value);first={event,value};}
-    else second=Math.min(second,value);
+  const nearest=new Map<string,number>();
+  for(const key of keys){
+    const event=eventOf.get(key.id),distance=clampDistance(key.distance);
+    if(event===undefined||distance===undefined)continue;
+    if(distance<(nearest.get(event)??Infinity))nearest.set(event,distance);
   }
-  const hits:TraceHit[]=[];
-  for(const [event,members] of targets){
-    let distance=Infinity;
-    for(const member of members){const value=own.get(member.id);if(value!==undefined&&value<distance)distance=value;}
-    if(!(distance<=limits.distance))continue;
-    const competitor=first&&first.event!==event?first.value:second;
-    if(competitor!==Infinity&&!(competitor-distance>=limits.gap))continue;
-    const strong=distance<=limits.distance-limits.strongMargin;
-    for(const member of members)hits.push({id:member.id,strong});
-  }
-  return hits;
+  const found:TraceCandidate[]=[];
+  for(const [event,distance] of nearest)if(distance<=ceiling&&!exclude.has(event))found.push({event,ids:[...members.get(event)!],distance});
+  return found.sort((a,b)=>a.distance-b.distance||(a.event<b.event?-1:a.event>b.event?1:0)).slice(0,limit);
 }

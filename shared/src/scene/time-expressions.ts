@@ -1,3 +1,4 @@
+import {foldForMatch} from '../common/script-fold.ts';
 import type { StoryClockDate, StoryClockFullDate, StoryClockTime, StoryClockTimeOfDay, StoryClockStoredAdvanceUnit, StoryClockQuoteSite, StoryClockExcludedReason, StoryClockNowOp } from './story-clock-types.ts';
 
 export type ClockGuardClass = 'recall' | 'reported' | 'hypothetical' | 'plan' | 'habitual';
@@ -23,14 +24,20 @@ export type RelativeFutureParse =
 export interface OriginScanEntry { table: string; text: string }
 export interface OriginCandidate { site: StoryClockQuoteSite; text: string; hasDate: boolean; hasTime: boolean; hasTimeOfDay: boolean }
 
-export const legacyTemporalGuard = /计划|打算|准备(?:要)?|将(?:要|来)|明天(?:要|会)?|下次|如果|假如|回忆|想起|曾经|过去(?!了)|那时|当时|以前|\b(?:plan(?:ned|ning)?|will|would|tomorrow|if|remember(?:ed)?|recall(?:ed)?|ago|formerly)\b/iu;
+// Only this operation is exposed, so callers cannot bypass folding with RegExp methods.
+const temporalPattern = /计划|打算|准备(?:要)?|将(?:要|来)|明天(?:要|会)?|下次|如果|假如|回忆|想起|曾经|过去(?!了)|那时|当时|以前|\b(?:plan(?:ned|ning)?|will|would|tomorrow|if|remember(?:ed)?|recall(?:ed)?|ago|formerly)\b/iu;
+export const legacyTemporalGuard: {readonly source:string;readonly flags:string;test(text:string):boolean} = {
+  source:temporalPattern.source, flags:temporalPattern.flags,
+  test(text:string):boolean { return temporalPattern.test(foldForMatch(text)); },
+};
 
 type Hit<T> = { start: number; end: number; value: T };
 type Use = 'narrative' | 'commitment' | 'ooc';
-const traditional = '當後時曉這裡經來進過幾點麼現間號';
-const simplified = '当后时晓这里经来进过几点么现间号';
+const colons = /:/gu;
 function normal(s: string): string {
-  return s.replace(/[當後時曉這裡經來進過幾點麼現間號]/gu, c => simplified[traditional.indexOf(c)]!).replace(/’/gu, "'").replace(/İ/gu, 'i').toLowerCase();
+  const copy = foldForMatch(s);
+  // A prose colon keeps its old date-boundary meaning; numeric clock separators share ASCII syntax.
+  return copy.replace(colons, (colon, at: number) => s[at] === '：' && !(asciiDigit(copy[at - 1] ?? '') && asciiDigit(copy[at + 1] ?? '')) ? '：' : colon).replace(/’/gu, "'").replace(/İ/gu, 'i').toLowerCase();
 }
 function input(s: unknown): s is string { return typeof s === 'string' && s.length > 0 && [...s].length <= 500; }
 const latinDigit = /[\p{Script=Latin}\p{Nd}]/u;
@@ -625,7 +632,7 @@ export function parseOocTimeStatement(text: string): StoryClockNowOp | null {
   const slot = todHits(body).find(h => h.start === 0 && h.end === body.length);
   return slot ? { op: 'set_time_of_day', timeOfDay: slot.value } : null;
 }
-export function isOocTimeQuestion(text: string): boolean { return input(text) && words(normal(text), ['几点', '什么时候', '第几天', '现在时间', '现在几号', 'what time', 'what day', 'how long', "what's the date"].map(w => [w, true] as const)).length > 0; }
+export function isOocTimeQuestion(text: string): boolean { return input(text) && words(normal(text), ['几点', '什么时候', '甚么时候', '第几天', '现在时间', '现在几号', 'what time', 'what day', 'how long', "what's the date"].map(w => [w, true] as const)).length > 0; }
 
 type UnitToken = { start: number; end: number; u: number };
 function unitTokens(s: string): UnitToken[] {

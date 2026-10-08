@@ -1,5 +1,8 @@
-import type {Retention,SemanticCue} from './retention.ts';
-import {retainedAccess,visibleLayer,isLegacyTemplate,protectedEmotionalReaction,rememberedFragmentsOf} from './retention.ts';
+import {currentMemory,sameScope} from './current-record.ts';
+import type {CueRecall,Retention} from './retention.ts';
+import {retainedAccess,visibleLayer,isLegacyTemplate,protectedEmotionalReaction,rememberedFragmentsOf,traceEligible} from './retention.ts';
+import {eventKey,restoredAccess} from './trace.ts';
+import type {TraceHit,TraceTier} from './trace.ts';
 export {visibleLayer} from './retention.ts';
 
 export interface Scope {
@@ -37,8 +40,9 @@ export interface Memory {
   accessOverride?:boolean;
   retention?:Retention;
   retentionAtMs?:number;
+  rehearsalSources?:number;
   reactivated?:boolean;
-  reactivation?:{kind:'semantic';cue:string;basis:string};
+  reactivation?:{kind:'semantic'};
   detail: string;
   gist: string;
   feeling: string;
@@ -69,7 +73,7 @@ export interface MemoryView {
   /** A remembered reaction, never an assertion about current mood or objective history. */
   emotionalReaction?:NonNullable<ReturnType<typeof protectedEmotionalReaction>>;
   reactivated?:boolean;
-  reactivation?:{kind:'semantic';cue:string;basis:string};
+  reactivation?:{kind:'semantic'};
   id: string;
   source: Memory['source'];
   access: Access;
@@ -104,12 +108,8 @@ export function projectMemories(
 
   const memories: MemoryView[] = [];
   for (const id of new Set(request.ids)) {
-    let memory = snapshot.memories.get(id);
-    if (!memory || memory.id !== id || memory.status !== 'accepted') continue;
-    if (!sameScope(memory.scope, request.scope)) continue;
-    const message = snapshot.messages.get(memory.source.messageId);
-    if (!message || message.status !== 'accepted' || message.revision !== memory.source.revision) continue;
-    if (memory.source.knownAtMs > request.asOfMs || (memory.source.occurredAtMs !== null && memory.source.occurredAtMs > request.asOfMs)) continue;
+    let memory = currentMemory(snapshot, id, request.asOfMs);
+    if (!memory) continue;
     memory={...memory,access:retainedAccess(memory,snapshot.memoryTimeMs??request.asOfMs).access};
 
     // Construct an allow-listed result: spreading the record would copy hidden text.
@@ -191,20 +191,75 @@ export function projectMemories(
   };
 }
 
-/** Restore at most one layer from a source-backed, currently visible cue. */
-export function reactivateSnapshot(snapshot:MemorySnapshot,nowMs:number,cues:readonly SemanticCue[]):MemorySnapshot {
-  const views=new Map(projectMemories(snapshot,{scope:snapshot.scope,asOfMs:nowMs,ids:cues.map(cue=>cue.id)}).memories.map(view=>[view.id,view]));
-  const memories=new Map(snapshot.memories);
-  for(const cue of cues){
-    const memory=memories.get(cue.id),view=views.get(cue.id);
-    if(!memory||!view||!cue.basis.trim()||memory.accessOverride||memory.retention?.kind!=='peripheral'||memory.source.reference||
-      !Number.isFinite(cue.distance)||!Number.isFinite(cue.margin)||cue.distance>0.14||cue.margin<0.05)continue;
-    if(![view.gist,view.feeling,view.anchor].filter(Boolean).join('\n').includes(cue.basis))continue;
-    if(view.access!=='gist'&&view.access!=='feeling')continue;
-    const access:Access=view.access==='feeling'?'gist':cue.distance<=0.04&&cue.margin>=0.12?'clear':'gist';
-    memories.set(cue.id,{...memory,access,reactivated:true,reactivation:{kind:'semantic',cue:cue.cue.slice(0,160),basis:cue.basis.slice(0,240)}});
+export {currentMemory} from './current-record.ts';
+const CLARITY:readonly Access[]=['hidden','anchor','feeling','gist','clear'];
+/**
+ * The decided hits that name a restorable record, by event and in the order given: the first id that named the event,
+ * and strong when any hit of the event is. Malformed hits, hits naming no target and throwing id/strong getters are
+ * skipped. Access to the array itself (including an element getter) may throw.
+ */
+function hitEvents(raw:MemorySnapshot,nowMs:number,hits:readonly unknown[]):Map<string,TraceHit> {
+  const events=new Map<string,TraceHit>();
+  if(!Array.isArray(hits)||!hits.length)return events;
+  const clock=raw.memoryTimeMs??nowMs;
+  for(const hit of hits){
+    let id:unknown,strong:unknown;
+    try{if(!hit||typeof hit!=='object')continue;id=(hit as {id?:unknown}).id;strong=(hit as {strong?:unknown}).strong;}catch{continue;}
+    const memory=typeof id==='string'?currentMemory(raw,id,nowMs):undefined;
+    if(!memory||!traceEligible(memory,clock))continue;
+    const key=eventKey(memory),known=events.get(key);
+    events.set(key,{id:known?.id??memory.id,strong:known?.strong===true||strong===true});
   }
-  return {...snapshot,memories};
+  return events;
+}
+/** Applies decided recall hits on top of the cue-restored snapshot. Stages and text come from the authority record. */
+export function recallSnapshot(raw:MemorySnapshot,cued:MemorySnapshot,nowMs:number,hits:readonly unknown[]):MemorySnapshot {
+  const decided=hitEvents(raw,nowMs,hits);
+  if(!decided.size)return cued;
+  const clock=raw.memoryTimeMs??nowMs;
+  const memories=new Map(cued.memories);
+  for(const [id,memory] of raw.memories){
+    const current=cued.memories.get(id);
+    if(!current||memory.status!=='accepted'||!traceEligible(memory,clock))continue;
+    const strong=decided.get(eventKey(memory))?.strong;
+    if(strong===undefined)continue;
+    const restored=restoredAccess(retainedAccess(memory,clock).access as TraceTier,strong);
+    const byCue=current.reactivated===true;
+    const access=byCue&&CLARITY.indexOf(current.access)>CLARITY.indexOf(restored)?current.access:restored;
+    memories.set(id,{...current,access,reactivated:true,...(byCue?{}:{reactivation:{kind:'semantic' as const}})});
+  }
+  return {...cued,memories};
+}
+/**
+ * The recalls one context applies: at most `limit` events, twins being one event. The cue recalls come first, in this
+ * order: a strong recall (two cues of one record); then an event one of whose records the search returned, in the
+ * order of `ranked`; then the rest by source time, the newest first. The decided hits follow in the order given. An
+ * event beyond the limit is left out of both lists, so it is not restored at all; a hit on an event a cue recalled
+ * stays with that event.
+ */
+export function limitRecalls(raw:MemorySnapshot,nowMs:number,cues:readonly CueRecall[],hits:readonly unknown[],ranked:readonly unknown[],
+  limit:number):{cues:CueRecall[];hits:TraceHit[]} {
+  const decided=hitEvents(raw,nowMs,hits);
+  const cued=new Map(cues.map(recall=>[recall.event,recall]));
+  if(cued.size+[...decided.keys()].filter(event=>!cued.has(event)).length<=limit)return {cues:[...cues],hits:[...decided.values()]};
+  const place=new Map<string,number>();
+  ranked.forEach((id,index)=>{
+    const memory=typeof id==='string'?raw.memories.get(id):undefined;
+    if(!memory)return;
+    const event=eventKey(memory);
+    if(cued.has(event)&&!place.has(event))place.set(event,index);
+  });
+  const sourceOf=(recall:CueRecall)=>raw.memories.get(recall.ids[0]!)?.source;
+  const order=[...cued.values()].sort((a,b)=>{
+    if(a.strong!==b.strong)return a.strong?-1:1;
+    const left=place.get(a.event),right=place.get(b.event);
+    if(left!==right)return left===undefined?1:right===undefined?-1:left-right;
+    const x=sourceOf(a),y=sourceOf(b);
+    return (y?.knownAtMs??0)-(x?.knownAtMs??0)||(y?.occurredAtMs??0)-(x?.occurredAtMs??0)||(a.event<b.event?-1:a.event>b.event?1:0);
+  }).map(recall=>recall.event);
+  for(const event of decided.keys())if(!cued.has(event))order.push(event);
+  const kept=new Set(order.slice(0,limit));
+  return {cues:cues.filter(recall=>kept.has(recall.event)),hits:[...decided].filter(([event])=>kept.has(event)).map(([,hit])=>hit)};
 }
 
 /** Visible or masked layers only; a blocked layer is absent, never '' or a substitute sentence. */
@@ -213,9 +268,4 @@ function coarseLayers(view: MemoryView, memory: Memory, layers: readonly ('gist'
     const result = visibleLayer(memory,layer);
     if (result.state !== 'blocked') view[layer] = result.text;
   }
-}
-
-function sameScope(a: Scope, b: Scope): boolean {
-  return a.worldId === b.worldId && a.sessionId === b.sessionId
-    && a.branchId === b.branchId && a.characterId === b.characterId;
 }

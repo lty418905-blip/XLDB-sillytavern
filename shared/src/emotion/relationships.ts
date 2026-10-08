@@ -1,3 +1,4 @@
+import {foldForMatch,includesForMatch,sourceQuote} from '../common/script-fold.ts';
 import type { StableRelations } from './openher.ts';
 
 export type RelationshipDelta = Partial<Pick<StableRelations, 'depth' | 'trust' | 'valence'>>;
@@ -94,14 +95,15 @@ export function validateRelationships(value: unknown, context: SceneRelationship
     }
     const pairs = evidenceIds.map((observationId, index) => ({observation:observations.get(observationId),quote:evidenceQuotes[index]!}));
     if (pairs.some(pair => !pair.observation || !pair.observation.readers.includes(checked.subjectId) ||
-      !pair.observation.quote.includes(pair.quote))) throw new Error('invalid_relationship_evidence');
+      !includesForMatch(pair.observation.quote,pair.quote))) throw new Error('invalid_relationship_evidence');
     if (!pairs.every(pair => targetHasGroundedParticipation(pair.observation!, pair.quote, targetId, checked))) {
       throw new Error('invalid_relationship_target');
     }
     const delta = relationshipDelta(input.delta,options.ignoreValidatedZeroDelta===true);
     ids.add(id); targets.add(targetId);
     if(options.ignoreValidatedZeroDelta===true&&Object.values(delta).every(value=>value===0))continue;
-    result.push({id,subjectId,targetId,evidenceObservationIds:evidenceIds,evidenceQuotes,delta});
+    result.push({id,subjectId,targetId,evidenceObservationIds:evidenceIds,
+      evidenceQuotes:pairs.map(pair=>sourceQuote(pair.observation!.quote,pair.quote)!),delta});
   }
   return result;
 }
@@ -172,12 +174,12 @@ function targetHasGroundedParticipation(observation: RelationshipObservation, qu
   // participation; require a literal player reference outside quoted speech.
   if (targetId === context.userActorId) {
     if(context.messageRole==='assistant')return observation.playerVisible===true&&Boolean(observation.playerEvidence);
-    const narrative=quote.replace(/“[^”]*”|「[^」]*」|『[^』]*』|"[^"]*"/g,'');
-    return /你|您|我|玩家|用户/.test(narrative);
+    const narrative=foldForMatch(quote).replace(/“[^”]*”|「[^」]*」|『[^』]*』|"[^"]*"/g,'');
+    return /你|您|我|玩家|用户|使用者/.test(narrative);
   }
   if (observation.actorId !== targetId && !observation.recipients?.includes(targetId)) return false;
   const target = context.actors.get(targetId)!;
-  return [target.name,...target.aliases].some(label => quote.includes(label));
+  return [target.name,...target.aliases].some(label => includesForMatch(quote,label));
 }
 
 function relationshipDelta(value: unknown,allowZero=false): RelationshipDelta {

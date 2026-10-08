@@ -26,6 +26,8 @@ export interface OverlapDistribution {count:number;mean:number|null;p50:number|n
 export interface LintSummary {
   calls:number;
   memories:number;
+  episodeDemoted:number;
+  emotionalProtectionDropped:number;
   cues:{
     supplied:number;kept:number;dropped:Record<CueDropReason,number>;droppedTotal:number;dropRate:number|null;
     peripheral:number;peripheralWithCues:number;
@@ -42,7 +44,7 @@ export interface LintSummary {
 
 function summary():LintSummary {
   const layer=():LayerCounts=>({supplied:0,visible:0,masked:0,blocked:0,empty:0});
-  return {calls:0,memories:0,
+  return {calls:0,memories:0,episodeDemoted:0,emotionalProtectionDropped:0,
     cues:{supplied:0,kept:0,dropped:cueReport().dropped,droppedTotal:0,dropRate:null,peripheral:0,peripheralWithCues:0,
       missingShortCue:{total:0,noneSupplied:0,allDropped:0},missingShortCueRate:null,retentionInvalid:0},
     guard:{gist:layer(),feeling:layer(),anchor:layer(),gistBlockedRate:null,
@@ -121,10 +123,15 @@ export function extractionLint(calls:unknown):{zh:LintSummary;en:LintSummary} {
       const row=decoded[index];
       const detail=row?.detail??call.detail;
       const retention=item&&typeof item==='object'?(item as Record<string,unknown>).retention:undefined;
+      // Count successful raw-to-decoded transitions; O(1) extra work per row, no text rescan.
+      const demoted=row?.kind==='fact' && item!==null && typeof item==='object' &&
+        (item as Record<string,unknown>).kind==='episode';
+      if(demoted)out.episodeDemoted++;
       if(retention===undefined)continue;
       const report=cueReport();
       let parsed;
       try{parsed=retentionOf(retention,detail,report);}catch{out.cues.retentionInvalid++;continue;}
+      if(demoted && parsed?.emotionalProtection)out.emotionalProtectionDropped++;
       out.cues.supplied+=report.supplied;out.cues.kept+=report.kept;
       for(const reason of cueDropReasons)out.cues.dropped[reason]+=report.dropped[reason];
       if(parsed?.kind!=='peripheral')continue;

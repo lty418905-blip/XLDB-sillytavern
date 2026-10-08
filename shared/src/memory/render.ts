@@ -108,9 +108,27 @@ export function absenceSentence(language:StoryLanguage,elapsedDays:unknown):stri
   return table[unit].replace('{N}',String(count));
 }
 
-export type RenderedMemory=Omit<MemoryView,'forgottenMarker'|'emotionalReaction'>&{forgotten?:string};
+export const RECALLED_KEY='justRemembered';
+export const recalledMark:Readonly<Record<StoryLanguage,string>>={
+  zh:'被刚才的事勾起来了。',
+  en:'Something just now brought it back.',
+};
+export type RenderedMemory=Omit<MemoryView,'forgottenMarker'|'emotionalReaction'|'reactivation'>&{forgotten?:string}&Partial<Record<typeof RECALLED_KEY,string>>;
 
 const blank=(value:unknown):boolean=>typeof value!=='string'||!value.trim();
+
+/**
+ * Whether a recalled row shows something it did not show before the recall. A recall restores one stage, or everything
+ * at clear, and the layer of the restored stage bears the name of the row's access. When that layer is blocked or empty
+ * the row shows what it showed before: it carries no mark and leaves no recall seed. The remembered reaction comes
+ * back with the feeling stage, so a row restored to feeling with a reaction shows something new.
+ */
+export function recallShown(view:MemoryView):boolean {
+  if(view.reactivated!==true)return false;
+  if(view.access==='clear')return true;
+  if(view.access==='hidden')return false;
+  return !blank(view[view.access])||(view.access==='feeling'&&view.emotionalReaction!==undefined);
+}
 
 /**
  * A shallow copy for the context string only: the marker code becomes `forgotten` in the story language, the
@@ -118,7 +136,7 @@ const blank=(value:unknown):boolean=>typeof value!=='string'||!value.trim();
  * reaction. The API views keep their codes and their reaction.
  */
 export function renderContextMemory(view:MemoryView,language:StoryLanguage):RenderedMemory {
-  const {forgottenMarker,emotionalReaction,...rest}=view;
+  const {forgottenMarker,emotionalReaction,reactivation:_reactivation,...rest}=view;
   const rendered:RenderedMemory={...rest};
   if(emotionalReaction&&blank(rendered.feeling)){
     const phrase=reactionPhrase(language,emotionalReaction.reactions);
@@ -128,5 +146,7 @@ export function renderContextMemory(view:MemoryView,language:StoryLanguage):Rend
     blank(rendered.feeling)?gistFadedWithoutFeeling[language]:
     Array.isArray(view.rememberedFragments)&&view.rememberedFragments.length>0?gistFadedWithFragments[language]:
     markerSentences[language].gist_faded;
+  // The "just remembered" mark: in the context copy only, as its last key, and only when the recall shows something new.
+  if(recallShown(view))rendered[RECALLED_KEY]=recalledMark[language];
   return rendered;
 }

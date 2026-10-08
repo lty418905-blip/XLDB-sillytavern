@@ -1,3 +1,4 @@
+import {foldForMatch} from '../common/script-fold.ts';
 import {createHash} from 'node:crypto';
 import {available as agentJevAvailable} from '../agentjev/client.ts';
 import {emotionRankModelIdentity,evaluateSceneAgentJev} from './emotion-scheduler.ts';
@@ -159,6 +160,8 @@ function evidencePriority(existing:ScheduleSlot,proposed:ScheduleSlot,context:Co
 
 /** Closed vocabulary only: no raw names, requester labels, source text or ids reach the ranker. */
 export function neutralScheduleNature(text:string):ScheduleNature {
+  // Fixed matcher set over one disposable copy: O(n).
+  text=foldForMatch(text);
   if(/照顾|照料|探病|救助|看护|care|rescue/iu.test(text))return 'care';
   if(/见面|会面|赴约|约定|约会|拜访|meet|visit/iu.test(text))return 'meeting';
   if(/观察|查看|看见|调查|搜寻|监视|watch|investigat/iu.test(text))return 'observation';
@@ -168,6 +171,7 @@ export function neutralScheduleNature(text:string):ScheduleNature {
   return 'other';
 }
 export function neutralScheduleMotive(text:string):ScheduleMotive {
+  text=foldForMatch(text);
   if(/害怕|恐惧|担忧|畏惧|fear|afraid/iu.test(text))return 'fear';
   if(/忠诚|守护|保护|不愿辜负|loyal|protect/iu.test(text))return 'loyalty';
   if(/悲伤|哀悼|失去|grief|mourn/iu.test(text))return 'grief';

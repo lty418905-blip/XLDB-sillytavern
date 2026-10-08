@@ -1,3 +1,4 @@
+import {foldForMatch} from '../common/script-fold.ts';
 import {suggestAddress,type AddressPreference} from '../emotion/address.ts';
 import type {EmotionState} from '../emotion/openher.ts';
 import {relationshipContext} from '../emotion/relationships.ts';
@@ -10,18 +11,19 @@ export function addressConversation(messages:readonly {role:string;text:string}[
   let preference:AddressPreference|undefined,nicknameAsked=false;
   for(const message of messages){
     if(message.role==='assistant'){
-      if(/(?:怎么称呼你|叫你什么|喜欢.{0,8}(?:叫|称呼)|可以叫你|你的昵称|what.{0,12}call you|nickname)/i.test(message.text))nicknameAsked=true;
+      if(/(?:怎么称呼你|叫你(?:什么|甚么)|喜欢.{0,8}(?:叫|称呼)|可以叫你|你的昵称|what.{0,12}call you|nickname)/i.test(foldForMatch(message.text)))nicknameAsked=true;
       continue;
     }
-    const text=message.text.trim();
+    // Match a length-preserving copy; capture indices still point into the original nickname.
+    const source=message.text.trim(),text=foldForMatch(source);
     const scope:AddressPreference['scope']=/(?:只在|仅在|只限|仅限)\s*(?:私下|私聊|两个人)|私下.{0,8}(?:叫|称呼)/.test(text)?'private':
       /(?:只在|仅在|只限|仅限)\s*(?:公开|公共|正式|有其他人)/.test(text)?'public':'all';
     if(scope!=='all'&&scope!==visibility)continue;
     if(/^(?:请|以后|你)?(?:别|不要|不许).{0,5}(?:亲昵|昵称|小名|宝贝|叫我|称呼我)/.test(text)){
       preference={status:'accepted',scope,kind:'reject-intimate'};nicknameAsked=true;continue;
     }
-    const match=text.match(/^(?:(?:请|以后|你可以|就|还是)\s*)?(?:叫我|称呼我(?:为)?|我的昵称是)\s*[“"「]?([^，。！？!?\n”"」]{1,24})[”"」]?(?:[，。！？!?]|$)/);
-    if(match){preference={status:'accepted',scope,kind:'use',address:match[1].trim()};nicknameAsked=true;}
+    const match=text.match(/^(?:(?:请|以后|你可以|就|还是)\s*)?(?:叫我|称呼我(?:为)?|我的昵称是)\s*[“"「]?([^，。！？!?\n”"」]{1,24})[”"」]?(?:[，。！？!?]|$)/d);
+    if(match){preference={status:'accepted',scope,kind:'use',address:source.slice(...match.indices![1]!).trim()};nicknameAsked=true;}
   }
   return {preferences:preference?[preference]:[],nicknameAsked};
 }

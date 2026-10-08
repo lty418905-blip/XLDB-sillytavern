@@ -1,3 +1,4 @@
+import {foldForMatch,includesForMatch,sourceQuote} from '../common/script-fold.ts';
 import type {
   CommitmentCandidate, CommitmentCandidateTerm, CommitmentPrompt, CommitmentRecord, CommitmentTargetCandidate,
   CommitmentTerm, CommitmentFoldTerm, CommitmentValidationInput, ValidatedCommitmentOperation, ContactRestrictionCandidate, ContactRestriction, CommitmentMode,
@@ -70,7 +71,7 @@ export function validateCommitmentOperations(
   const operationIds = new Set<string>();
   const result:ValidatedCommitmentOperation[]=[];
   for(const value of roleplayOperations(input,root.operations)) {
-    const candidate = copiedUserWindow(input,candidateOf(value));
+    const candidate = copiedUserWindow(input,sourceCandidateQuotes(input,candidateOf(value)));
     if (operationIds.has(candidate.operationId)) throw new Error('invalid_commitment_operation_id');
     operationIds.add(candidate.operationId);
     const grounded=groundCandidate(input, actors, candidate);
@@ -171,16 +172,16 @@ function copiedUserWindow(input:CommitmentValidationInput,candidate:CommitmentCa
   if(!rule)return candidate;
   // The user's no-contact request that copies the soft target's own quotes without saying them is the promotion above.
   const soft=userPromotesTarget(input,candidate)?input.existing?.find(item=>item.id===candidate.targetId)?.contactRestriction:undefined;
-  if(soft&&rule.startQuote===soft.startQuote&&rule.endQuote===soft.endQuote&&
-    (!candidate.quote.includes(rule.startQuote)||!candidate.quote.includes(rule.endQuote))){
+  if(soft&&foldForMatch(rule.startQuote)===foldForMatch(soft.startQuote)&&foldForMatch(rule.endQuote)===foldForMatch(soft.endQuote)&&
+    (!includesForMatch(candidate.quote,rule.startQuote)||!includesForMatch(candidate.quote,rule.endQuote))){
     const {contactRestriction:_copy,...rest}=candidate;
     return rest;
   }
   const window=userHardTarget(input,candidate);
   // The user's own new times stand even when her reply does not repeat them (「好的，听你的」).
   if(!window||userWordedRange(input,rule))return candidate;
-  const copied=(rule.startQuote===window.startQuote&&rule.endQuote===window.endQuote)||
-    !candidate.quote.includes(rule.startQuote)||!candidate.quote.includes(rule.endQuote);
+  const copied=(foldForMatch(rule.startQuote)===foldForMatch(window.startQuote)&&foldForMatch(rule.endQuote)===foldForMatch(window.endQuote))||
+    !includesForMatch(candidate.quote,rule.startQuote)||!includesForMatch(candidate.quote,rule.endQuote);
   if(!copied)return candidate;
   const {contactRestriction:_copy,...rest}=candidate;
   return rest;
@@ -218,7 +219,7 @@ function userPromotesTarget(input:CommitmentValidationInput,candidate:Commitment
  */
 function userWordedRange(input:CommitmentValidationInput,rule:{startQuote:string;endQuote:string}):boolean {
   const answered=input.responseContext?.role==='user'?input.responseContext.text:'';
-  return answered.includes(rule.startQuote)&&answered.includes(rule.endQuote)&&noContactRequest(answered)&&!contactLiftRequest(answered);
+  return includesForMatch(answered,rule.startQuote)&&includesForMatch(answered,rule.endQuote)&&noContactRequest(answered)&&!contactLiftRequest(answered);
 }
 
 /** A restriction without the host-only `inheritedFrom` mark, for views shown to a model. */
@@ -274,10 +275,26 @@ function candidateOf(value: unknown): CommitmentCandidate {
   return base;
 }
 
+/** Restore only cited text, never IDs or host-authored inherited windows. Each bounded field uses O(n + m) matching. */
+function sourceCandidateQuotes(input:CommitmentValidationInput,candidate:CommitmentCandidate):CommitmentCandidate {
+  const quote=sourceQuote(input.source.text,candidate.quote)??candidate.quote;
+  const inQuote=(text:string)=>sourceQuote(quote,text)??text;
+  const term=candidate.term?.kind==='deadline'?{...candidate.term,deadlineQuote:inQuote(candidate.term.deadlineQuote),
+    ...(candidate.term.reminderQuote===undefined?{}:{reminderQuote:inQuote(candidate.term.reminderQuote)})}:candidate.term;
+  const rule=candidate.contactRestriction;
+  const contactQuote=(text:string)=>sourceQuote(quote,text)??
+    (input.responseContext?.role==='user'?sourceQuote(input.responseContext.text,text):null)??text;
+  return {...candidate,quote,evidence:candidate.evidence.map(item=>({...item,quote:inQuote(item.quote)})),
+    ...(candidate.content===undefined?{}:{content:sourceQuote(input.source.text,candidate.content)??candidate.content}),
+    ...(candidate.targetExcerpt===undefined?{}:{targetExcerpt:inQuote(candidate.targetExcerpt)}),
+    ...(term===undefined?{}:{term}),
+    ...(rule&&!rule.inheritedFrom?{contactRestriction:{...rule,startQuote:contactQuote(rule.startQuote),endQuote:contactQuote(rule.endQuote)}}:{})};
+}
+
 type GroundedCandidate=Omit<CommitmentCandidate,'term'|'contactRestriction'>&{term?:CommitmentTerm|CommitmentFoldTerm;contactRestriction?:ContactRestriction|null};
 function groundCandidate(input: CommitmentValidationInput, actors: Set<string>, candidate: CommitmentCandidate): GroundedCandidate {
-  if (!input.source.text.includes(candidate.quote)) throw new Error('invalid_commitment_quote');
-  if (candidate.content !== undefined && !input.source.text.includes(candidate.content)) throw new Error('invalid_commitment_content');
+  if (!includesForMatch(input.source.text,candidate.quote)) throw new Error('invalid_commitment_quote');
+  if (candidate.content !== undefined && !includesForMatch(input.source.text,candidate.content)) throw new Error('invalid_commitment_content');
   const lists = [candidate.participants ?? [], candidate.obligors ?? [], candidate.readers ?? []];
   if (lists.some(list => list.some(actor => !actors.has(actor)))) throw new Error('invalid_commitment_actor');
   if (candidate.participants && candidate.obligors?.some(actor => !candidate.participants!.includes(actor))) throw new Error('invalid_commitment_obligor');
@@ -290,8 +307,8 @@ function groundCandidate(input: CommitmentValidationInput, actors: Set<string>, 
   if(candidate.contactRestriction&&input.mode!=='companion')throw new Error('invalid_contact_mode');
 
   const relevant = input.plan.observations.filter(observation =>
-    input.source.text.includes(observation.quote) &&
-    (candidate.quote.includes(observation.quote) || observation.quote.includes(candidate.quote)));
+    includesForMatch(input.source.text,observation.quote) &&
+    (includesForMatch(candidate.quote,observation.quote) || includesForMatch(observation.quote,candidate.quote)));
   if (!relevant.length) throw new Error('invalid_commitment_evidence');
   // Every reader must know every observation span used by the commitment
   // quote. A union would leak a private clause when the quote also contains a
@@ -305,7 +322,7 @@ function groundCandidate(input: CommitmentValidationInput, actors: Set<string>, 
   if (!candidate.evidence.length) throw new Error('invalid_commitment_evidence');
   const strict=(input.contractVersion??candidate.contractVersion)===2;
   for (const evidence of candidate.evidence) {
-    if (!actors.has(evidence.actorId) || !input.source.text.includes(evidence.quote) || !candidate.quote.includes(evidence.quote))
+    if (!actors.has(evidence.actorId) || !includesForMatch(input.source.text,evidence.quote) || !includesForMatch(candidate.quote,evidence.quote))
       throw new Error('invalid_commitment_evidence');
     if (!groundedEvidenceActor(input,relevant,evidence,strict))
       throw new Error('invalid_commitment_evidence');
@@ -341,7 +358,7 @@ function groundCandidate(input: CommitmentValidationInput, actors: Set<string>, 
     // operation being revalidated has neither the target nor the answered message; its complete stored times were checked
     // when it was extracted, so they stand (like an inherited window). A stored row without complete times still fails closed.
     const storedComplete=input.revalidate===true&&storedContactRestriction(rule,'soft')!==null;
-    if(!inherited&&!storedComplete&&(!candidate.quote.includes(rule.startQuote)||!candidate.quote.includes(rule.endQuote))&&
+    if(!inherited&&!storedComplete&&(!includesForMatch(candidate.quote,rule.startQuote)||!includesForMatch(candidate.quote,rule.endQuote))&&
       !(userHardTarget(input,candidate)&&userWordedRange(input,rule)))
       throw new Error('invalid_contact_restriction');
     // The source decides level and origin, never the model, by one rule for both sources: a range is the user's hard window
@@ -364,7 +381,7 @@ function groundCandidate(input: CommitmentValidationInput, actors: Set<string>, 
     // Her echo may word the user's times differently (十点 / 七点 answered 晚上十点 / 早上七点): the range is still the
     // user's when her quotes resolve to the same window as a range in the answered user message.
     const userAsked=noContactRequest(userText)&&!contactLiftRequest(userText)&&
-      (userText.includes(rule.startQuote)&&userText.includes(rule.endQuote)||
+      (includesForMatch(userText,rule.startQuote)&&includesForMatch(userText,rule.endQuote)||
         input.source.role!=='user'&&userRangeMatches(userText,rule,input));
     const userTimed=userWindowTarget||userAsked;
     const stored=input.revalidate===true?storedContactRestriction(rule,userTimed?'hard':'soft'):null;
@@ -376,9 +393,9 @@ function groundCandidate(input: CommitmentValidationInput, actors: Set<string>, 
   const {contactRestriction:_candidateRestriction,...baseCandidate}=candidate;
   const restricted=contactRestriction===undefined?{}:{contactRestriction};
   if(candidate.term?.kind!=='deadline')return {...baseCandidate,...restricted} as GroundedCandidate;
-  if(!candidate.quote.includes(candidate.term.deadlineQuote)||!input.source.text.includes(candidate.term.deadlineQuote))
+  if(!includesForMatch(candidate.quote,candidate.term.deadlineQuote)||!includesForMatch(input.source.text,candidate.term.deadlineQuote))
     throw new Error('invalid_commitment_deadline_quote');
-  if(candidate.term.reminderQuote!==undefined&&(!candidate.quote.includes(candidate.term.reminderQuote)||!input.source.text.includes(candidate.term.reminderQuote)))
+  if(candidate.term.reminderQuote!==undefined&&(!includesForMatch(candidate.quote,candidate.term.reminderQuote)||!includesForMatch(input.source.text,candidate.term.reminderQuote)))
     throw new Error('invalid_commitment_reminder_quote');
   if(input.mode==='roleplay'&&(input.revalidate===true?candidate.term.dueAtMs===undefined:input.storyDeadlines==='fold'))
     return {...baseCandidate,...restricted,term:{kind:'deadline',clock:'story',deadlineQuote:candidate.term.deadlineQuote,
@@ -399,8 +416,9 @@ function groundCandidate(input: CommitmentValidationInput, actors: Set<string>, 
 }
 
 function negativeContactFeedback(quote:string):boolean {
+  quote=foldForMatch(quote);
   if(/假如|假设|比如|举例|如果|引用|引述|(?:他|她|别人|朋友|同事).{0,10}(?:说|觉得|表示)/.test(quote))return false;
-  return /(?:别再?|不要|不许|停止).{0,16}(?:发|联系|消息|打扰|破例)|(?:发|联系|消息|打扰|破例).{0,24}(?:不喜欢|不舒服|难受|烦|生气|打扰|违背|违反|别|不要)|(?:不喜欢|不舒服|难受|烦|生气).{0,24}(?:发|联系|消息|打扰|破例)|\b(?:stop|bother|upset|not okay)\b/i.test(quote);
+  return /(?:别再?|不要|不许|停止).{0,16}(?:发|联系|消息|讯息|传简讯|私讯|打扰|破例)|(?:发|联系|消息|讯息|传简讯|私讯|打扰|破例).{0,24}(?:不喜欢|不舒服|难受|烦|生气|打扰|违背|违反|别|不要)|(?:不喜欢|不舒服|难受|烦|生气).{0,24}(?:发|联系|消息|讯息|传简讯|私讯|打扰|破例)|\b(?:stop|bother|upset|not okay)\b/i.test(quote);
 }
 
 function groundedEvidenceActor(
@@ -408,7 +426,7 @@ function groundedEvidenceActor(
   evidence:{actorId:string;quote:string},strict:boolean,
 ):boolean{
   const quoted=(observation:CommitmentValidationInput['plan']['observations'][number])=>
-    observation.readers.includes(evidence.actorId)&&(observation.quote.includes(evidence.quote)||evidence.quote.includes(observation.quote));
+    observation.readers.includes(evidence.actorId)&&(includesForMatch(observation.quote,evidence.quote)||includesForMatch(evidence.quote,observation.quote));
   if(!strict){
     return (input.source.role==='user'&&input.userActorId===evidence.actorId)||
       relevant.some(observation=>observation.actorId===evidence.actorId&&quoted(observation));
@@ -421,7 +439,7 @@ function groundedEvidenceActor(
   return relevant.some(observation=>observation.actorId===evidence.actorId&&quoted(observation)&&(
     Boolean(observation.identityEvidence?.length)||
     (input.source.role==='assistant'&&typeof observation.identityQuote==='string'&&
-      input.source.text.includes(observation.identityQuote)&&observation.identityQuote.includes(evidence.quote))));
+      includesForMatch(input.source.text,observation.identityQuote)&&includesForMatch(observation.identityQuote,evidence.quote))));
 }
 
 function bindTarget(input:CommitmentValidationInput,candidate:GroundedCandidate):CommitmentTargetCandidate|undefined{
@@ -455,9 +473,9 @@ function bindTarget(input:CommitmentValidationInput,candidate:GroundedCandidate)
   if(target.adjacent&&adjacentForAction.length===1)return target;
   const excerpt=candidate.targetExcerpt?.trim();
   if(!excerpt||[...excerpt].length<2||!/\p{L}|\p{N}/u.test(excerpt)||
-    !candidate.quote.includes(excerpt)||!target.content.includes(excerpt))
+    !includesForMatch(candidate.quote,excerpt)||!includesForMatch(target.content,excerpt))
     throw new Error('invalid_commitment_target_binding');
-  const matches=input.existing.filter(item=>canTake(item)&&item.content.includes(excerpt));
+  const matches=input.existing.filter(item=>canTake(item)&&includesForMatch(item.content,excerpt));
   if(matches.length!==1||matches[0]!.id!==target.id)throw new Error('invalid_commitment_target_binding');
   return target;
 }

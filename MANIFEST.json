@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "ef31782a46e8c3f6549236c16301c0246ba2e6759c0d7fc4fd57d35bca80c919",
+  "sourceManifestSha256": "bb65474d5538b5251143bbdd04206da193e030c92f8e1603f030018c28e136bb",
   "files": [
     {
       "file": ".gitattributes",
@@ -64,13 +64,13 @@
     },
     {
       "file": "shared/src/commitments/codec.ts",
-      "sha256": "dcc17dfcb67daccc0cbacc9f66304baefc44b2164407d56b71d98d61ee8cf9d1",
-      "bytes": 53611
+      "sha256": "66ae9cc6528c569fad9a0f1adef47a94e074773a18fa3b4e9d0ebee63fee1ad4",
+      "bytes": 55502
     },
     {
       "file": "shared/src/commitments/contact.ts",
-      "sha256": "112969e61e18482a22f420fef0219f9d6ff55b881811d2077207326bd1297204",
-      "bytes": 30150
+      "sha256": "2019e7b9ad3baf4cb441f27821840224c0454d78856f1f5e856e19c9cb478c73",
+      "bytes": 30214
     },
     {
       "file": "shared/src/commitments/display.ts",
@@ -89,8 +89,8 @@
     },
     {
       "file": "shared/src/commitments/time.ts",
-      "sha256": "51bf780a38c1f69c18f13f0250cf351673c14c67a1ec99927e069be9496c6ef1",
-      "bytes": 12204
+      "sha256": "4a7983394254bc19b57608b0c70895c339c4c0f6deb3c5f0c148764b51976058",
+      "bytes": 12282
     },
     {
       "file": "shared/src/commitments/types.ts",
@@ -98,19 +98,39 @@
       "bytes": 8656
     },
     {
+      "file": "shared/src/common/amount-expressions.ts",
+      "sha256": "5d75dfe443686047ff2e86c5d593d7a1c8fd9b546229013c5849e89d7dbdb703",
+      "bytes": 49691
+    },
+    {
       "file": "shared/src/common/geography-background.ts",
-      "sha256": "91381088cf106b5fd29c530aed96d2c10bef16c3b7dda9ddfb751599a2dde1be",
-      "bytes": 4118
+      "sha256": "ba976ba55820406504556dcd6d067b9cf15e9b6318f8d7f8084d13d28c6561aa",
+      "bytes": 4184
     },
     {
       "file": "shared/src/common/geography.ts",
-      "sha256": "78ef815fd5a13e2e0b29b20bbc23a96a1286c3a61bbc80f8eb82793dd31bda13",
-      "bytes": 76898
+      "sha256": "ba3e4f972c49471b4eb1a3c03bd6e6739141b74d28ad217dfd719d5a6bb1a22c",
+      "bytes": 77407
     },
     {
       "file": "shared/src/common/physiology.ts",
-      "sha256": "ca1bde17f54c468a79b47b66b14f3cbcbc10f283960894bda31192c7bdf04e83",
-      "bytes": 39744
+      "sha256": "e2e88b0ae150a28f51579b6736d7577f7a20e08cd0c0d1125f315f13342dc893",
+      "bytes": 39846
+    },
+    {
+      "file": "shared/src/common/script-fold-data.ts",
+      "sha256": "c1eebe0b7384c8171f7c0f149cfe47ab75729df7dabd53f6f42ac29c6e2fd208",
+      "bytes": 54624
+    },
+    {
+      "file": "shared/src/common/script-fold-words.ts",
+      "sha256": "8a48ad1a4364af15a5d040168e72174cefc892f91d99eab7773427f2d2fe0251",
+      "bytes": 910
+    },
+    {
+      "file": "shared/src/common/script-fold.ts",
+      "sha256": "6e2d290afc2d94ca37e96e138adac171a022f71b3b065d39ae45f643be305b9a",
+      "bytes": 5106
     },
     {
       "file": "shared/src/common/state-types.ts",
@@ -119,13 +139,18 @@
     },
     {
       "file": "shared/src/core/arithmetic.ts",
-      "sha256": "1ea43741b886a34570d83bbadb01a47e5c67da68e3eaf3a40298135179adbaf5",
-      "bytes": 17780
+      "sha256": "c4db69ec244002fe11c9fe0e0bcb398bbbd3b817cb03f95a649d0023fcbfc97a",
+      "bytes": 17815
     },
     {
       "file": "shared/src/core/calculation-intent.ts",
-      "sha256": "581db4ecf54beff8bb0a7f1415bfc72ee0396770c3d45fbbac08cbed74bc2ab6",
-      "bytes": 1947
+      "sha256": "6c6f90bec41abd40f2fe3e0d81f45ac2a1c365ff3a35525ec27eef578b8f2c39",
+      "bytes": 2089
+    },
+    {
+      "file": "shared/src/core/calculation-requests.ts",
+      "sha256": "9e9b2c467fe02083ea826fccce18edc91d256096a7d509829876fecc827ddaa4",
+      "bytes": 36691
     },
     {
       "file": "shared/src/core/controls.ts",
@@ -139,8 +164,8 @@
     },
     {
       "file": "shared/src/core/models.ts",
-      "sha256": "6a7b08947ad1a7f319c9b224152d164c01a808183d661d23b7df5ff40845aab1",
-      "bytes": 57691
+      "sha256": "89ea10097051e53753499849184b3a36696718ba25f54ec405c3fe62a59dfc3d",
+      "bytes": 61534
     },
     {
       "file": "shared/src/core/pair-capture-switch.ts",
@@ -169,13 +194,18 @@
     },
     {
       "file": "shared/src/core/service.ts",
-      "sha256": "fe5b9680c27c4da6702169449d8ca32953b08f394b3ab8c8bd2e8ab5a39b613d",
-      "bytes": 19047
+      "sha256": "0e1ce95822233e9068fc947520c24949efe666cbf54e42a004d31b107fa6120b",
+      "bytes": 20237
     },
     {
       "file": "shared/src/core/store.ts",
       "sha256": "cc370c18e6457d9fdefdfb25eee19b661b71ec626c9bcf53e0682888147cfdbf",
       "bytes": 22684
+    },
+    {
+      "file": "shared/src/core/tool-loop.ts",
+      "sha256": "949321b6992264765d57ca2617feae14a24a8b4278e504145d092f9fe409e55b",
+      "bytes": 24144
     },
     {
       "file": "shared/src/core/types.ts",
@@ -184,8 +214,8 @@
     },
     {
       "file": "shared/src/emotion/absence-explanation.ts",
-      "sha256": "315997bf5c9296458381c981e67c00dbb120c7f4ca38b92debde395a701a2327",
-      "bytes": 10996
+      "sha256": "1260a72652ae3ff584f909f1ef5fb19b345bebbc317a9ea75a8a928aadb08f5e",
+      "bytes": 11337
     },
     {
       "file": "shared/src/emotion/address.ts",
@@ -214,8 +244,8 @@
     },
     {
       "file": "shared/src/emotion/relationships.ts",
-      "sha256": "f36a30f02ba6fc3f790e174f0b2d256a67376bb405e7e8bbad83ec954c194f58",
-      "bytes": 12887
+      "sha256": "c852935283a7cb4c5be92fa8d53f3d2216c0a237b00355ee6e52a8c511df6ed5",
+      "bytes": 13084
     },
     {
       "file": "shared/src/judge/call-sites.ts",
@@ -249,8 +279,8 @@
     },
     {
       "file": "shared/src/memory/access.ts",
-      "sha256": "a09aecac44102f2c47638a70febe38be75829c61cc7003c5659c65f3cb0b5e88",
-      "bytes": 9759
+      "sha256": "dd542219abac7c31c09b05b7102337eb8d3437a8fa04a3bf8e521b4b6a6059d2",
+      "bytes": 12345
     },
     {
       "file": "shared/src/memory/context.ts",
@@ -258,9 +288,14 @@
       "bytes": 9054
     },
     {
+      "file": "shared/src/memory/current-record.ts",
+      "sha256": "f7f9a916475512bbd4d819f73d99ae3f286db84b58d414d0641a0f19b234ba15",
+      "bytes": 971
+    },
+    {
       "file": "shared/src/memory/extraction-lint.ts",
-      "sha256": "9f72569d11b63f9446844eeb9c6938451eb7f6b63dcae7eb5bf266f493e0e306",
-      "bytes": 9583
+      "sha256": "50d332b1ac8edac12b25ed71b3c042b46a1d92fe6798b6c9ba5e8a8e805b77ff",
+      "bytes": 10049
     },
     {
       "file": "shared/src/memory/relevance.ts",
@@ -269,18 +304,18 @@
     },
     {
       "file": "shared/src/memory/render.ts",
-      "sha256": "e6b0e054c5ef1e812bf96b2f328f7083caaa33f99ff9065ff7db2144b2177ee2",
-      "bytes": 6732
+      "sha256": "f457d87908074bd5356831e78cdc5a752dba4b4c58988b36e6b2ba9f10c8740b",
+      "bytes": 7952
     },
     {
       "file": "shared/src/memory/retention.ts",
-      "sha256": "73a908c7b77b4374babddbf170d8958817d1fa3a19a3edad9be394b364786e33",
-      "bytes": 31680
+      "sha256": "8206e70685b79b015c860ac3f195abc460173bc29b6fc9b7119938955be49b32",
+      "bytes": 34496
     },
     {
       "file": "shared/src/memory/retrieval.ts",
-      "sha256": "f42b60af20a831c0144e9044c1eef6833a8323a301b166984fe66465eceb7bc3",
-      "bytes": 43664
+      "sha256": "b76bcf35ff9dd2cb6c663dbced4defaba7d68dd42317deac5a4110e18e31a984",
+      "bytes": 59072
     },
     {
       "file": "shared/src/memory/text-units.ts",
@@ -294,8 +329,8 @@
     },
     {
       "file": "shared/src/memory/trace.ts",
-      "sha256": "a8d2790164e1811077d18dfcf89dc29e3db0a61542680b42a05598c4d7631a0e",
-      "bytes": 7316
+      "sha256": "365fe2d321598d5a8821fa1d0556474c57d32ff06cc43e3f06a4f48b94f16952",
+      "bytes": 6885
     },
     {
       "file": "shared/src/memory/vector-forgetting.ts",
@@ -309,8 +344,8 @@
     },
     {
       "file": "shared/src/scene/address.ts",
-      "sha256": "57c87e9c723d2a539d86dfe208980585a2f75e400664c5bf6086d2c612c5198c",
-      "bytes": 4799
+      "sha256": "279245d9a84ab32d7a51bef0823e9ae84f1fa1c8a369ed054106b94e184c8988",
+      "bytes": 5030
     },
     {
       "file": "shared/src/scene/backup.ts",
@@ -319,8 +354,8 @@
     },
     {
       "file": "shared/src/scene/calendar-store.ts",
-      "sha256": "f4d1a333248491a4187568b64dd88fdcb870677d4306646a5822c5638abd762c",
-      "bytes": 19143
+      "sha256": "f856be5f72c4c6229f38125d43bf03bb6fe2aadc70411e236da1c77f44924dba",
+      "bytes": 19554
     },
     {
       "file": "shared/src/scene/calendar.ts",
@@ -329,13 +364,13 @@
     },
     {
       "file": "shared/src/scene/director.ts",
-      "sha256": "fefab17366e42363197e32a53b1912f09c05ac59299d326e89710e861df9e56a",
-      "bytes": 31422
+      "sha256": "05b8d7cc5826fc9ee820ca6110f5c9a615135cd77a8ff9a58fb13ea48c1b86ff",
+      "bytes": 31795
     },
     {
       "file": "shared/src/scene/emotion-scheduler.ts",
-      "sha256": "af6459ada6043b74ed1570e98aadcc7fb44172615dc4ee56c41a8f4e18c24f22",
-      "bytes": 17804
+      "sha256": "4777c8a99abc054e459a1154c3c0b1ce27657a6fb2bca31eb2ecdae918bee148",
+      "bytes": 18056
     },
     {
       "file": "shared/src/scene/extension.ts",
@@ -369,8 +404,8 @@
     },
     {
       "file": "shared/src/scene/lifecycle.ts",
-      "sha256": "f058b979d1ddaf13b6f92804f9efdfced7fedf380babff8c2b8e5f1bc6952287",
-      "bytes": 26838
+      "sha256": "6a368a0ee0b7e64dd2919e49df5edd3a93bbdfd3fb3a448adcab0eb7ff04454a",
+      "bytes": 28609
     },
     {
       "file": "shared/src/scene/outward.ts",
@@ -379,8 +414,8 @@
     },
     {
       "file": "shared/src/scene/perspective.ts",
-      "sha256": "386b732f1ea14505492e09a7422e9fd3a14663e567235abc77f22e513e7c2e17",
-      "bytes": 15636
+      "sha256": "30fb3079bca8c075c7f5daca447c3381a449345fc755302b7cb9007cda149c5f",
+      "bytes": 16629
     },
     {
       "file": "shared/src/scene/processing.ts",
@@ -399,23 +434,23 @@
     },
     {
       "file": "shared/src/scene/schedule-conflicts.ts",
-      "sha256": "e8fab16e7ca241c78fa6d2e4b04fac5012c3b4fb2635485e73049fba794ffb76",
-      "bytes": 11537
+      "sha256": "37b51e61cbcf024a7e14a4c41392d10d34b2bb07c43f3de2ddcd9f85ce9e27a6",
+      "bytes": 11701
     },
     {
       "file": "shared/src/scene/service.ts",
-      "sha256": "de9ae5963d4b61f4d1ad51e8053fc6cdd1b9043940d693da38f7c475dfac9b9a",
-      "bytes": 117759
+      "sha256": "51614753f85b6a9f397264509b75aa054a04b78a2d473d2cadc8422a68ce5efa",
+      "bytes": 124207
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "acbc5a8d0f170588f7c4841c43bc62256102efc54aeb53c8a97edea1d9274ce0",
-      "bytes": 84563
+      "sha256": "05feadd8eaeb2b028b827d682c6fd0a89ae4df63ca804cad2962eee3492262b1",
+      "bytes": 84349
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
-      "sha256": "bb0d4aa5465569fabb55dc070bc12183b0e0ac5f2b4102f7456a87152f7e02a4",
-      "bytes": 5154
+      "sha256": "5a8caca168acc3d8b46ef272d772f2a2e68b10c78441f1bfe7177cfcf94e5ab5",
+      "bytes": 5800
     },
     {
       "file": "shared/src/scene/story-clock-store.ts",
@@ -434,13 +469,13 @@
     },
     {
       "file": "shared/src/scene/story-initial-clock.ts",
-      "sha256": "a5ea54989c74058440a42e5debc8f823c2af8cd5dafef2e62ea059c389ae72aa",
-      "bytes": 5853
+      "sha256": "6e6a05a07ce72f53b0d6c4db2e3660dd1829e281b7d35c7cca396dd0caac9d87",
+      "bytes": 6013
     },
     {
       "file": "shared/src/scene/time-expressions.ts",
-      "sha256": "4d69d0e305d3b2e205ac70339a25b3806a029fbbda9722d080b98bb7362f93c6",
-      "bytes": 55103
+      "sha256": "de877f8914ff2603cd980ef5dfaed6e722ed24b68b70b31f9a2da717bf4bdd74",
+      "bytes": 55562
     },
     {
       "file": "shared/src/scene/transfer.ts",
@@ -454,8 +489,8 @@
     },
     {
       "file": "shared/src/scene/views.ts",
-      "sha256": "6b13d4f451a7af67a04690b4ef9c11146ceaafc6b3cdeed3c8c0271597d1658e",
-      "bytes": 14199
+      "sha256": "0ff6d7ddc8b60e96b1edfe3644d1f4dbfa5905c5c62743c2c77cf500455b5225",
+      "bytes": 14784
     },
     {
       "file": "shared/src/scene/workbench.ts",
@@ -464,13 +499,13 @@
     },
     {
       "file": "shared/src/scene/world-extraction.ts",
-      "sha256": "c21a0ad63b7a574fb84f81cf70b6eb3475ed5197eab26334acb9a9ae173bddb1",
-      "bytes": 43719
+      "sha256": "325d9dd2fbb95f58612b97fb3590ed9572c1ccccb5b34264d03c22973fd4a963",
+      "bytes": 45797
     },
     {
       "file": "shared/src/scene/world-state.ts",
-      "sha256": "f8216854ab94b4e0981ccff09bd67c84f5a79a8f4c1d7c9f4e52230c20c698a0",
-      "bytes": 42527
+      "sha256": "9c9cb28e22ec66eea63cff372f96cd5b145e20d9558f054c52e82e227523f6aa",
+      "bytes": 46224
     },
     {
       "file": "shared/third-party/agentjev/agentjev/model.py",
@@ -509,8 +544,8 @@
     },
     {
       "file": "sillytavern/src/dashboard.ts",
-      "sha256": "5e4efaefb88e605c6a14e1d22efbe2634175bdaeb99c417a76fc94294c644d23",
-      "bytes": 3869
+      "sha256": "4bba2313c74b83a9ff5cc4889e426b77bc19bed503e2240a12665735c1f62b7b",
+      "bytes": 4036
     },
     {
       "file": "sillytavern/src/model-catalog.ts",
@@ -519,8 +554,8 @@
     },
     {
       "file": "sillytavern/src/server.ts",
-      "sha256": "150641081a55b08c7ab4d0322e571569a2a249f3a3750431bfe4f031d46bc2c8",
-      "bytes": 39868
+      "sha256": "8a0fe7c7b97bab51def0b29f355c2de45626b67cf0f9af220ce09155d79ff7c1",
+      "bytes": 40063
     },
     {
       "file": "START-XLDB.cmd",
@@ -529,8 +564,8 @@
     },
     {
       "file": "THIRD_PARTY_NOTICES.md",
-      "sha256": "97a7e91b50121bcfc10c514a92b193099cdec07792adfe01e0fde06ca5a361e3",
-      "bytes": 2008
+      "sha256": "b5cda6967e5c521ba8ddb57dab27c168e25a5249a3220bb9e1eb354db8478fe5",
+      "bytes": 11751
     },
     {
       "file": "tools/agent-assets.json",
@@ -579,12 +614,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "b3ea542ae5fde7ed17644fd1db9a5ae8929ede871dd9cf523853189f3593768f",
+      "sha256": "7b949cca32d9d6b865653ecf2ae489b7971d4dacd0c55c267e9dfd66cc39460c",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "18879935a47bb623ef2d128e3d70e12060bb50ca83de3be17a47ca36c98b0c6b",
+      "sha256": "d581613f2120b54cffc644a944457e3f17403d5a301c32297c4d87c9cf15c601",
       "bytes": 355817
     }
   ]

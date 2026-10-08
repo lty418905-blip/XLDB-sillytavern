@@ -1,3 +1,4 @@
+import {foldForMatch,includesForMatch,sourceQuote,scriptQuoteSearch} from '../common/script-fold.ts';
 import type {
   KnowledgeKind,
   Observation,
@@ -170,20 +171,23 @@ function observationOf(value: unknown, message: SceneMessage, roster: SceneRoste
 
   if (candidate.playerVisible && ['private','thought','inferred'].includes(candidate.kind)) fail('invalid_scene_readers');
   if (candidate.playerVisible) {
-    const playerEvidence=boundedText(input.playerEvidence,MAX_SOURCE_LENGTH,'invalid_scene_player_evidence');
-    if (!evidenceCovers(message.text,playerEvidence,candidate.start,candidate.end)) fail('invalid_scene_player_evidence');
-    const anchored=(message.role==='user' ? /你|您|玩家|我/ : /你|您|玩家/).test(playerEvidence)
-      || Boolean(envelope.playerName && playerEvidence.includes(envelope.playerName));
+    const playerEvidence=coveringQuote(message.text,boundedText(input.playerEvidence,MAX_SOURCE_LENGTH,'invalid_scene_player_evidence'),candidate.start,candidate.end);
+    if (playerEvidence===null) fail('invalid_scene_player_evidence');
+    const anchored=(message.role==='user' ? /你|您|玩家|我/ : /你|您|玩家/).test(foldForMatch(playerEvidence))
+      || Boolean(envelope.playerName && includesForMatch(playerEvidence,envelope.playerName));
     if(anchored) candidate.playerEvidence=playerEvidence;
     else delete candidate.playerVisible;
   }
 
   if (candidate.start >= candidate.end || candidate.end > message.text.length) fail('invalid_scene_offset');
-  if (message.text.slice(candidate.start, candidate.end) !== candidate.quote) fail('invalid_scene_quote');
-  if (!evidenceCovers(message.text, candidate.evidence, candidate.start, candidate.end)) fail('invalid_scene_evidence');
+  if (foldForMatch(message.text.slice(candidate.start, candidate.end)) !== foldForMatch(candidate.quote)) fail('invalid_scene_quote');
+  candidate.quote=message.text.slice(candidate.start,candidate.end);
+  const evidence=coveringQuote(message.text,candidate.evidence,candidate.start,candidate.end);
+  if(evidence===null) fail('invalid_scene_evidence');
+  candidate.evidence=evidence;
   if(input.identityQuote!==undefined && input.identityQuote!=='') {
-    const quote=boundedText(input.identityQuote,4000,'invalid_scene_evidence');
-    if(!message.text.includes(quote)) fail('invalid_scene_evidence');
+    const quote=sourceQuote(message.text,boundedText(input.identityQuote,4000,'invalid_scene_evidence'));
+    if(quote===null) fail('invalid_scene_evidence');
     candidate.identityQuote=quote;
   }
   if (input.identityEvidence!==undefined) {
@@ -191,9 +195,11 @@ function observationOf(value: unknown, message: SceneMessage, roster: SceneRoste
     candidate.identityEvidence=input.identityEvidence.map(value=>{
       const reference=record(value,'invalid_scene_evidence');
       const sourceId=idText(reference.sourceId,'invalid_scene_evidence');
-      const quote=boundedText(reference.quote,4000,'invalid_scene_evidence');
+      const inputQuote=boundedText(reference.quote,4000,'invalid_scene_evidence');
       const origin=history.find(item=>item.id===sourceId);
-      if(!origin || !origin.text.includes(quote)) fail('invalid_scene_evidence');
+      if(!origin) fail('invalid_scene_evidence');
+      const quote=sourceQuote(origin.text,inputQuote);
+      if(quote===null) fail('invalid_scene_evidence');
       return {sourceId,quote,revision:origin.revision};
     });
   }
@@ -246,30 +252,36 @@ function observationOf(value: unknown, message: SceneMessage, roster: SceneRoste
 }
 
 function requireIdentity(evidence: string, characterId: string, roster: SceneRoster): void {
-  if (identityMention(evidence, characterId)) return;
+  if (identityMention(evidence, characterId, false)) return;
   const character = roster.characters.find(item => item.id === characterId);
   if (!character) fail('invalid_scene_character');
   for (const label of [character.name, ...character.aliases]) {
-    if (!identityMention(evidence, label)) continue;
-    const owners = roster.characters.filter(item => item.name === label || item.aliases.includes(label));
+    const quote=identityQuote(evidence,label);
+    if(quote===undefined)continue;
+    const exact=roster.characters.filter(item=>[item.name,...item.aliases].includes(quote));
+    const owners=exact.length?exact:roster.characters.filter(item=>[item.name,...item.aliases].some(name=>foldForMatch(name)===foldForMatch(quote)));
     if (owners.length === 1 && owners[0]?.id === characterId) return;
   }
   fail('invalid_scene_identity');
 }
 
-function identityMention(evidence: string, label: string): boolean {
-  // Latin identifiers/names must be whole tokens, never substrings such as a in rain.
-  const escaped=label.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-  return new RegExp(`${/^[A-Za-z0-9_]/.test(label)?'(?<![A-Za-z0-9_-])':''}${escaped}${/[A-Za-z0-9_]$/.test(label)?'(?![A-Za-z0-9_-])':''}`,'u').test(evidence);
+function identityMention(evidence: string, label: string, fold=true): boolean {
+  return identityQuote(evidence,label,fold)!==undefined;
 }
 
-function evidenceCovers(source: string, evidence: string, quoteStart: number, quoteEnd: number): boolean {
-  let start = source.indexOf(evidence);
-  while (start >= 0) {
-    if (start <= quoteStart && start + evidence.length >= quoteEnd) return true;
-    start = source.indexOf(evidence, start + 1);
-  }
-  return false;
+function identityQuote(evidence:string,label:string,fold=true):string|undefined {
+  const source=evidence;
+  if(fold){const exact=identityQuote(evidence,label,false);if(exact!==undefined)return exact;evidence=foldForMatch(evidence);label=foldForMatch(label);}
+  // Latin identifiers/names must be whole tokens, never substrings such as a in rain.
+  const escaped=label.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const match=new RegExp(`${/^[A-Za-z0-9_]/.test(label)?'(?<![A-Za-z0-9_-])':''}${escaped}${/[A-Za-z0-9_]$/.test(label)?'(?![A-Za-z0-9_-])':''}`,'u').exec(evidence);
+  return match?source.slice(match.index,match.index+match[0].length):undefined;
+}
+
+function coveringQuote(source: string, evidence: string, quoteStart: number, quoteEnd: number): string|null {
+  // O(n + m), including repeated occurrences; bind the spelling covering this observation.
+  return scriptQuoteSearch(source,evidence,source.length+1).matches
+    .find(match=>match.start<=quoteStart&&match.end>=quoteEnd)?.quote??null;
 }
 
 function kindOf(value: unknown): KnowledgeKind {

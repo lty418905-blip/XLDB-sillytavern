@@ -1,3 +1,4 @@
+import {foldForMatch} from '../../shared/src/common/script-fold.ts';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -72,12 +73,14 @@ function checkFailure(failure: string, httpStatus?: number): RetrievalCheck {
 }
 // Same status classes as the retrieval provider errors (shared/src/memory/retrieval.ts httpFailure, M0r).
 function checkHttpFailure(status: number, body: string): string {
+  // Matching only; the provider response and configured model name are never rewritten.
+  body=foldForMatch(body);
   if (status === 401 || status === 403) return 'credentials_rejected';
   if (status === 404) return 'model_not_found';
   if (status === 429) return 'rate_limited';
   if (status === 408 || status === 504) return 'timeout';
   if ((status === 400 || status === 422) && (/model[^.\n]{0,40}?(?:not[\s_-]*(?:found|exist)|does[\s_-]*not[\s_-]*exist|unknown|unsupported|invalid)/i.test(body) ||
-    /(?:unknown|invalid|unsupported|no[\s_-]+such)[\s_-]+model/i.test(body) || /模型.{0,12}(?:不存在|无效|不支持|未找到)/.test(body))) return 'model_not_found';
+    /(?:unknown|invalid|unsupported|no[\s_-]+such)[\s_-]+model/i.test(body) || /模型.{0,12}(?:不存在|无效|不支持|不支援|未找到)/.test(body))) return 'model_not_found';
   return 'provider_error';
 }
 

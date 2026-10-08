@@ -2,6 +2,7 @@ import type { SceneAuthority } from '../../shared/src/scene/store.ts';
 import type { SceneScope } from '../../shared/src/scene/types.ts';
 import type { WorldProjection } from '../../shared/src/scene/world-state.ts';
 import {emotionSummary} from '../../shared/src/emotion/openher.ts';
+import {isStoryScope} from '../../shared/src/scene/story-clock-consumers.ts';
 
 /** Display-only inspection; it never changes the reader used by generation. */
 export function sceneDashboard(authority:SceneAuthority,scope:SceneScope,now=Date.now(),options:{characterId?:string;year?:number;month?:number}={}) {
@@ -19,6 +20,7 @@ export function sceneDashboard(authority:SceneAuthority,scope:SceneScope,now=Dat
   const settings=authority.worldSettings(scope);
   const map=authority.geography.project(scope,characterId);
   const clock=authority.interactions.clock(scope,now);
+  const story=isStoryScope(authority,scope);
   const dateParts=typeof clock.timeMs==='number'?new Intl.DateTimeFormat('en-US',{timeZone:clock.timeZone,year:'numeric',month:'numeric'}).formatToParts(clock.timeMs):[];
   const year=options.year??Number(dateParts.find(part=>part.type==='year')?.value);
   const month=options.month??Number(dateParts.find(part=>part.type==='month')?.value);
@@ -36,8 +38,9 @@ export function sceneDashboard(authority:SceneAuthority,scope:SceneScope,now=Dat
       .map(({sourceId,revision,kind,ownerId,item,unit,balanceDeltaCents,inventoryDelta,applied})=>({sourceId,revision,kind,ownerId,item,unit,balanceDeltaCents,inventoryDelta,applied})),
     physiology:authority.physiology.status(scope,{readerId:'player',nowMs:now,...(inspecting?{inspectCharacterId:characterId}:{})}),
     emotion:inspecting?emotionSummary(authority.responseEmotion(scope,characterId,now,state)):null,
-    todos:clock.kind==='story'?authority.calendar.listTodos(scope,inspecting?'admin':'player',inspecting?characterId:undefined):[],
-    reminders:clock.kind==='story'&&typeof clock.timeMs==='number'?authority.calendar.reminds(scope,clock.timeMs):[],
+    // The manual calendar exists only in a story scope; an opened binding whose scene is not configured yet has none.
+    todos:story?authority.calendar.listTodos(scope,inspecting?'admin':'player',inspecting?characterId:undefined):[],
+    reminders:story?authority.calendar.reminds(scope):[],
     calendar:hasCalendarDate?authority.calendar.month(scope,{year,month,timeZone:clock.timeZone,view:inspecting?'admin':'player',...(inspecting?{characterId}:{})}):null,
     map,
   };

@@ -10,6 +10,11 @@ import type {PersistedCalendarTodoRow,PersistedCalendarAckRow} from './calendar-
 import {captureStoryClockCorrectionRows,restoreStoryClockCorrectionRows} from './story-clock-store.ts';
 import type {PersistedStoryClockCorrectionRow} from './story-clock-store.ts';
 
+export const AUTOMATIC_CHECKPOINT_RETENTION = 10;
+export const AUTOMATIC_CHECKPOINT_PRUNE_LIMIT = 4;
+// Persisted legacy rows use this exact reason to distinguish message history from settings.
+export const MESSAGE_CHECKPOINT_REASON = '正文接受、编辑或删除';
+
 export interface SceneLifecycleCheckpoint {
   id: string;
   createdAt: string;
@@ -116,10 +121,31 @@ export class SceneLifecycle {
       const id = randomUUID();
       const createdAt = new Date().toISOString();
       const snapshot = this.capture(scope);
+      const automatic = options.automatic === true;
       this.db.prepare(`INSERT INTO scene_checkpoints
         (id,scope,created,reason,automatic,consumed_at,snapshot) VALUES(?,?,?,?,?,NULL,?)`)
-        .run(id, scopeKey(scope), createdAt, reason, options.automatic === true ? 1 : 0, JSON.stringify(snapshot));
+        .run(id, scopeKey(scope), createdAt, reason, automatic ? 1 : 0, JSON.stringify(snapshot));
+      if (automatic) this.pruneAutomaticCheckpoints(scope);
       return { id, createdAt };
+    });
+  }
+
+  /** Delete one batch of surplus automatic rows; true means another batch remains. */
+  pruneAutomaticCheckpoints(scope: SceneScope): boolean {
+    return this.transaction(() => {
+      // Rank metadata only, never load snapshot payloads. Both classes share one deletion budget.
+      const surplus = this.db.prepare(`WITH ranked AS (
+        SELECT rowid, reason, ROW_NUMBER() OVER (PARTITION BY reason=? ORDER BY rowid DESC) AS position
+        FROM scene_checkpoints WHERE scope=? AND automatic=1
+      ) SELECT rowid FROM ranked WHERE position>?
+        OR (reason<>? AND rowid < (SELECT rowid FROM ranked WHERE reason=? AND position=?))
+      ORDER BY rowid LIMIT ?`)
+        .all(MESSAGE_CHECKPOINT_REASON, scopeKey(scope), AUTOMATIC_CHECKPOINT_RETENTION,
+          MESSAGE_CHECKPOINT_REASON, MESSAGE_CHECKPOINT_REASON, AUTOMATIC_CHECKPOINT_RETENTION,
+          AUTOMATIC_CHECKPOINT_PRUNE_LIMIT + 1) as {rowid: number}[];
+      const remove = this.db.prepare('DELETE FROM scene_checkpoints WHERE rowid=?');
+      for (const row of surplus.slice(0, AUTOMATIC_CHECKPOINT_PRUNE_LIMIT)) remove.run(row.rowid);
+      return surplus.length > AUTOMATIC_CHECKPOINT_PRUNE_LIMIT;
     });
   }
 
@@ -149,7 +175,8 @@ export class SceneLifecycle {
       :this.storedCheckpoint(scope,checkpointId);
     if(!checkpoint)return {version,checkpointId:null,changes:{added:[],removed:[],changed:[]},rosterChanged:false,worldChanged:false,unchanged:true};
     const target=this.withCurrentTombstones(scope,JSON.parse(checkpoint.snapshot) as SceneCheckpointSnapshot);
-    const visible=(rows:SourceRow[])=>rows.filter(row=>row.status!=='deleted');
+    const visible=(rows:SourceRow[])=>rows.filter(row=>row.status!=='deleted')
+      .map(row=>({...row,analysis:this.withoutEmotionStates(row.analysis)}));
     const before=new Map(visible(live.sources).map(row=>[row.id,row]));
     const after=new Map(visible(target.sources).map(row=>[row.id,row]));
     const beforeReferences=(live.references??[]).filter(row=>row.status==='accepted');
@@ -226,7 +253,7 @@ export class SceneLifecycle {
     const key = scopeKey(scope);
     const world = this.db.prepare('SELECT scope,roster,created FROM scene_worlds WHERE key=?').get(key) as WorldRow | undefined;
     if (!world) throw new Error('invalid_scene_not_configured');
-    const sources = this.db.prepare(`SELECT id,revision,message,observed,status,processing,analysis
+    const sources = this.db.prepare(`SELECT id,revision,message,observed,status,processing,json_remove(analysis,'$.emotionStates') AS analysis
       FROM scene_sources WHERE scope=? ORDER BY rowid`).all(key) as unknown as SourceRow[];
     const controls = this.db.prepare(`SELECT character,id,revision,access
       FROM scene_controls WHERE scope=? ORDER BY rowid`).all(key) as unknown as ControlRow[];
@@ -450,6 +477,7 @@ export class SceneLifecycle {
     return new Set(Object.keys(value.characters ?? {}));
   }
 
+  /** O(n) in serialized analysis length; preview normalizes each visible row once per side. */
   private withoutEmotionStates(analysis: string | null): string | null {
     if (!analysis) return null;
     const value = JSON.parse(analysis) as Record<string, unknown>;

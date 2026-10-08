@@ -1,3 +1,4 @@
+import {foldForMatch} from '../common/script-fold.ts';
 import {parseRelativeFuture,type RelativeFutureParse} from '../scene/time-expressions.ts';
 import {storyClockParts,storyClockFromParts,STORY_CLOCK_RULE_V1} from '../scene/story-clock.ts';
 import {STORY_CLOCK_MAX_MS} from '../scene/story-clock-types.ts';
@@ -61,7 +62,8 @@ interface DateParts {year:number;month:number;day:number;hour:number;minute:numb
 /** Resolve only explicit, bounded forms. Null means the phrase lacks enough deterministic time information. */
 export function resolveCommitmentTime(quote:string,context:DeadlineTimeContext):number|null {
   if(typeof quote!=='string'||!quote.trim()||quote.length>200)return null;
-  let value=quote.trim();
+  // At most 200 UTF-16 units; every textual route reads the same folded copy.
+  let value=foldForMatch(quote).trim();
   // A single explicit reschedule keeps its stated day and, when omitted on
   // the new clock, its period. Never guess from an unrelated old record.
   const change=/^(今天|明天)\s*(清晨|早上|早晨|上午|中午|下午|傍晚|晚上|凌晨)?\s*([^改换调整]+?)(?:改为|改到|改成|调整为|调整到|换成)\s*(.+)$/.exec(value);
@@ -136,8 +138,8 @@ export function resolveCommitmentTime(quote:string,context:DeadlineTimeContext):
   return candidates.length===1?candidates[0]!:null;
 }
 
-/** Map the few traditional characters used in clock phrases onto the simplified forms localClock accepts. */
-function simplifiedClock(value:string):string {return value.replace(/點/g,'点').replace(/兩/g,'两');}
+/** Matching copy shared with all other time routes. */
+function simplifiedClock(value:string):string {return foldForMatch(value);}
 
 /** `nextDay`: 晚上12点 / 晚上0点 is the midnight that ends the named day. */
 function localClock(value:string):(Pick<DateParts,'hour'|'minute'>&{nextDay?:boolean})|null {
@@ -161,7 +163,7 @@ function localClock(value:string):(Pick<DateParts,'hour'|'minute'>&{nextDay?:boo
 }
 
 /** Arabic or plain Chinese numerals (零 to 万); null for anything else. */
-export function commitmentNumber(value:string):number|null {return numberOf(value);}
+export function commitmentNumber(value:string):number|null {return numberOf(foldForMatch(value));}
 function numberOf(value:string):number|null {
   if(/^\d+(?:\.\d+)?$/.test(value)){const result=Number(value);return Number.isFinite(result)?result:null;}
   const digit:Record<string,number>={零:0,'〇':0,一:1,二:2,两:2,三:3,四:4,五:5,六:6,七:7,八:8,九:9};

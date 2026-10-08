@@ -78,7 +78,8 @@ export class SceneCalendarStore {
     return {applied:candidate.items.length,sourceCount:sources.length,updatedAtMs};
   }
 
-  month(scope:SceneScope,query:CalendarMonthQuery){
+  /** `clock`: the caller's own reading of the story clock (the director's, for its generation state); omitted, it is read here from the stored state. */
+  month(scope:SceneScope,query:CalendarMonthQuery,clock?:StoryNow|null){
     const state=this.authority.state(scope);
     if(query.characterId&&!state.roster.characters.some(character=>character.id===query.characterId))
       throw new Error('invalid_calendar_character');
@@ -88,7 +89,7 @@ export class SceneCalendarStore {
     const candidate:CalendarCandidate=row?JSON.parse(row.candidate):{format:'xldb-calendar-v1',items:[]};
     const result=projectSceneCalendar({...query,sources,candidate,
       commitments:this.authority.commitments.list(scope),mode:this.authority.interactions.modeOf(scope),
-      storyDated:storyNow(this.authority,scope,state)?.view?.kind==='dated'});
+      storyDated:(clock===undefined?storyNow(this.authority,scope,state):clock)?.view?.kind==='dated'});
     if(query.view==='admin'&&!query.characterId||query.view==='player'){
       const zone=this.liveZone(scope),prefix=`${String(query.year).padStart(4,'0')}-${String(query.month).padStart(2,'0')}-`;
       for(const todo of this.todoRows(scope).filter(item=>item.status==='active')){
@@ -160,8 +161,9 @@ export class SceneCalendarStore {
     return this.todoRows(scope).flatMap(todo=>{
       if(todo.status!=='active'||acknowledged.has(`${todo.id}:${todo.revision}`))return [];
       const due=this.dueOf(todo,zone);
-      // From the midnight that begins the day before the due day, until the due time.
-      if(due===null||clock.atMs<due.midnightMs-DAY||clock.atMs>=due.dueAtMs)return [];
+      // From the midnight that begins the day before the due day, until the due time. On a floating clock (date known,
+      // time of day not) until the midnight that ends the due day: the stand-in wall time is never compared with a todo's time.
+      if(due===null||clock.atMs<due.midnightMs-DAY||clock.atMs>=(clock.state.timeOfDayKnown?due.dueAtMs:due.midnightMs+DAY))return [];
       return [{id:todo.id,revision:todo.revision,title:todo.title,dueAtMs:due.dueAtMs,date:due.date,time:due.time,ownerId:'player' as const}];
     });
   }

@@ -72,7 +72,7 @@ export interface CalculationFailure {
 
 export type CalculationResult = CalculationSuccess | CalculationFailure;
 
-interface Rational {
+export interface Rational {
   numerator: bigint;
   denominator: bigint;
 }
@@ -216,7 +216,7 @@ function readBaseOperand(value: unknown, source: string, index: number): Calcula
   return { value: value.value, quote: value.quote, unit };
 }
 
-function parseDecimal(value: string): Rational | CalculationFailure {
+export function parseDecimal(value: string): Rational | CalculationFailure {
   if (!DECIMAL_PATTERN.test(value)) return failure('invalid_decimal');
   const unsigned = value[0] === '+' || value[0] === '-' ? value.slice(1) : value;
   const digits = unsigned.replace('.', '');
@@ -296,7 +296,7 @@ function validateArity(operation: CalculationOperation, length: number): Calcula
   return null;
 }
 
-function computeRational(operation: CalculationOperation, values: Rational[]): Rational | CalculationFailure {
+export function computeRational(operation: CalculationOperation, values: Rational[]): Rational | CalculationFailure {
   if (operation === 'count') return { numerator: BigInt(values.length), denominator: 1n };
   if (operation === 'add' || operation === 'sum') return fold(values, addRational);
   if (operation === 'subtract') return addRational(values[0]!, negate(values[1]!));
@@ -339,7 +339,7 @@ function negate(value: Rational): Rational {
   return { numerator: -value.numerator, denominator: value.denominator };
 }
 
-function normalize(value: Rational): Rational {
+export function normalize(value: Rational): Rational {
   if (value.numerator === 0n) return { numerator: 0n, denominator: 1n };
   const sign = value.denominator < 0n ? -1n : 1n;
   const numerator = value.numerator * sign;
@@ -357,7 +357,7 @@ function greatestCommonDivisor(left: bigint, right: bigint): bigint {
   return left;
 }
 
-function formatRational(value: Rational, scale: number): { value: string; exact: boolean } {
+export function formatRational(value: Rational, scale: number): { value: string; exact: boolean } {
   const negative = value.numerator < 0n;
   const multiplier = 10n ** BigInt(scale);
   const scaled = abs(value.numerator) * multiplier;

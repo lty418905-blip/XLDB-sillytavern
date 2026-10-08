@@ -13,7 +13,7 @@ import { emotionIdentitySeed, npcScope } from './types.ts';
 import type { SceneScope, SceneRoster, SceneMessage, SceneSource, SceneState, SceneAnalysis, SceneWriteGuard, SceneProfileCandidate } from './types.ts';
 import {foldWorldState,foldWorldStateRunning,projectWorldState} from './world-state.ts';
 import type {WorldFoldResult,WorldProjection,WorldRunningStep,WorldSettings,WorldSourceEffects} from './world-state.ts';
-import {SceneLifecycle} from './lifecycle.ts';
+import {SceneLifecycle,MESSAGE_CHECKPOINT_REASON} from './lifecycle.ts';
 import {Processing} from './processing.ts';
 import {SceneTransfer} from './transfer.ts';
 import {SceneInteractions} from './interaction.ts';
@@ -30,7 +30,7 @@ import {StoryClockStore,storyClockLine} from './story-clock-store.ts';
 import type {StoryClockLegacySettings,StoryClockSummary} from './story-clock-store.ts';
 import {STORY_CLOCK_DEGRADE_REASONS} from './story-clock-types.ts';
 import type {StoryClockDegradeReason,StoryClockIssue,StoryClockSourceRef,StoryClockView} from './story-clock-types.ts';
-import {storyNow} from './story-clock-consumers.ts';
+import {commitmentStoryClock,storyNow} from './story-clock-consumers.ts';
 import {storyLanguageOf} from '../memory/text-units.ts';
 import type {StoryLanguage} from '../memory/text-units.ts';
 import {defaultSceneHooks} from './extension.ts';
@@ -227,7 +227,7 @@ export class SceneAuthority {
       const incoming = new Map(messages.map(message => [message.id,message]));
       const changing=messages.some(message=>guard?.reconfirmIds?.includes(message.id)||!state.sources.some(source=>source.id===message.id&&sameContent(source,message)))
         || (replace&&state.sources.some(source=>source.status!=='deleted'&&!incoming.has(source.id)));
-      if(changing)this.lifecycle.checkpoint(scope,'正文接受、编辑或删除',{automatic:true});
+      if(changing)this.lifecycle.checkpoint(scope,MESSAGE_CHECKPOINT_REASON,{automatic:true});
       // The zone of the new sources of this call: read on first use, at most once, and never kept beyond the call.
       let newSourceTimeZone:string|undefined;
       for (const message of messages) {
@@ -672,12 +672,6 @@ export class SceneAuthority {
     return this.storyClock.legacyTimeMs(scope,sources,fallbackMs,timeline);
   }
 
-  /** @deprecated Alias of legacyEmotionTime for the callers in service.ts and address.ts; SC3b migrates them and deletes it. */
-  emotionTime(scope:SceneScope,sources:SceneSource[],fallbackMs:number):number {
-    // A private copy: the callers push to and assign into the array they pass, so it must never be an identity-cache key.
-    return this.legacyEmotionTime(scope,sources,fallbackMs,sources.slice());
-  }
-
   preferences(scope: SceneScope, characterId: string, state = this.state(scope), currentReplySourceId?:string): Preference[] {
     const result = new Map<string,Preference>();
     const controls=this.db.prepare('SELECT id,body FROM scene_preference_controls WHERE scope=? AND character=?').all(scopeKey(scope),characterId) as {id:string;body:string}[];
@@ -806,8 +800,8 @@ export class SceneAuthority {
     if(settings.mode==='companion'&&row&&folded.state.timeMs>row.clock_floor)this.db.prepare('UPDATE scene_world_settings SET clock_floor=? WHERE scope=?').run(folded.state.timeMs,scopeKey(scope));
     if(settings.mode!=='story')return readerId===undefined?folded:projectWorldState(folded,readerId);
     // A story world carries the unified clock beside the legacy one.
-    // @deprecated folded.state.timeMs and the projection's timeMs are the legacy Unix-domain clock, kept for the readers
-    // SC3b and SC4b have not migrated yet; SC3b moves them to `storyClock` and removes the legacy reading.
+    // @deprecated folded.state.timeMs and the projection's timeMs remain the legacy Unix-domain clock for host displays.
+    // These compatibility values stay until the host readers move to `storyClock`.
     const summary=this.storyClock.summary(scope,state);
     if(readerId===undefined)return summary?{...folded,storyClock:summary}:folded;
     const projection=projectWorldState(folded,readerId);
@@ -894,7 +888,8 @@ export class SceneAuthority {
   }
   private rebuildDerived(scope:SceneScope,nowMs=Date.now()):void {
     const state=this.state(scope);
-    this.commitments.replaceProjection(scope,state.sources);
+    // The commitment clock: built here, once per call, on the array that is folded, and passed as returned (undefined outside a story scope).
+    this.commitments.replaceProjection(scope,state.sources,commitmentStoryClock(this,scope,state.sources));
     this.hooks.rebuildDerived(scope,state,nowMs);
   }
   private invalidateCausalSuffix(scope:SceneScope,changes:{index:number;characters:Set<string>}[]) {

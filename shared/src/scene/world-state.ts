@@ -1,3 +1,4 @@
+import {foldForMatch,includesForMatch,scriptQuoteSearch,sourceQuote} from '../common/script-fold.ts';
 import { calculate } from '../core/arithmetic.ts';
 import type { PerspectivePlan } from './types.ts';
 import {legacyTemporalGuard} from './time-expressions.ts';
@@ -346,7 +347,7 @@ function validateSettings(settings: WorldSettings): ValidatedSettings {
     if (!isRecord(value) || !knownOwner(value.ownerId, actorIds) || typeof value.unit !== 'string' || !value.unit
       || typeof value.value !== 'string' || !MONEY.test(value.value)) invalidSettings();
     const readers = baselineReaders(value.readerIds, readerIds);
-    const key = pairKey(value.ownerId, value.unit);
+    const key = assetKey(value.ownerId, value.unit);
     if (balances.has(key)) invalidSettings();
     balances.set(key, { ownerId:value.ownerId, unit:value.unit, cents:moneyToCents(value.value), readerIds:readers });
   }
@@ -356,7 +357,7 @@ function validateSettings(settings: WorldSettings): ValidatedSettings {
     if (!isRecord(value) || !knownOwner(value.ownerId, actorIds) || typeof value.item !== 'string' || !value.item
       || typeof count!=='number'||!Number.isSafeInteger(count) || count < 0) invalidSettings();
     const readers = baselineReaders(value.readerIds, readerIds);
-    const key = pairKey(value.ownerId, value.item);
+    const key = assetKey(value.ownerId, value.item);
     if (inventory.has(key)) invalidSettings();
     inventory.set(key, { ownerId:value.ownerId, item:value.item, count, readerIds:readers });
   }
@@ -381,10 +382,10 @@ function applyCandidate(validated: ValidatedSettings, state: MutableState, purch
   if (kind === 'clock_absolute') {
     if (!candidateKeys(candidate,['effectId','kind','quote','timeClassification','timestamp','timestampQuote'])
       || typeof candidate.timestamp !== 'string' || typeof candidate.timestampQuote !== 'string'
-      || candidate.timestampQuote !== candidate.timestamp || !quote.includes(candidate.timestampQuote)) {
+      || foldForMatch(candidate.timestampQuote) !== foldForMatch(candidate.timestamp) || !includesForMatch(quote,candidate.timestampQuote)) {
       return {issue:issue(source,effectId,'invalid_clock_effect')};
     }
-    const timestamp = timestampMs(candidate.timestamp);
+    const timestamp = timestampMs(foldForMatch(candidate.timestamp));
     if (timestamp === null) return {issue:issue(source,effectId,'invalid_clock_timestamp')};
     if (classification !== 'current') return {receipt:{...receipt,ignoredReason:'non_current'}};
     if (validated.settings.mode === 'companion') return {receipt:{...receipt,ignoredReason:'companion_clock'}};
@@ -402,7 +403,7 @@ function applyCandidate(validated: ValidatedSettings, state: MutableState, purch
       return {issue:issue(source,effectId,'invalid_clock_effect')};
     }
     const amountValue=amount.value,amountQuote=amount.quote,amountUnit=amount.unit;
-    const delta = safeProduct(amountValue, TIME_FACTORS.get(amountUnit)!);
+    const delta = safeProduct(foldForMatch(amountValue), TIME_FACTORS.get(amountUnit)!);
     if (delta === null) return {issue:issue(source,effectId,'invalid_clock_effect')};
     if (classification !== 'current') return {receipt:{...receipt,ignoredReason:'non_current'}};
     if (validated.settings.mode === 'companion') return {receipt:{...receipt,ignoredReason:'companion_clock'}};
@@ -415,18 +416,18 @@ function applyCandidate(validated: ValidatedSettings, state: MutableState, purch
     const purchase = validatePurchase(validated, source, candidate, quote);
     if ('code' in purchase) return {issue:issue(source,effectId,purchase.code)};
     if (classification !== 'current') return {receipt:{...receipt,ignoredReason:'non_current'}};
-    const balance=state.balances.get(pairKey(purchase.ownerId,purchase.unit));
-    const item=state.inventory.get(pairKey(purchase.ownerId,purchase.item));
+    const balance=findAsset(state.balances,purchase.ownerId,purchase.unit);
+    const item=findAsset(state.inventory,purchase.ownerId,purchase.item);
     if (!balance || !item) return {issue:issue(source,effectId,'unconfigured_world_asset')};
     if (balance.cents<purchase.costCents) return {issue:issue(source,effectId,'insufficient_funds')};
     if (!Number.isSafeInteger(item.count+purchase.quantity)) return {issue:issue(source,effectId,'inventory_overflow')};
     balance.cents-=purchase.costCents;item.count+=purchase.quantity;
     restrictReaders(balance.readerIds,readers);restrictReaders(item.readerIds,readers);
     purchases.set(purchaseKey(source.sourceId,source.revision,effectId),{
-      ownerId:purchase.ownerId,unit:purchase.unit,item:purchase.item,quantity:purchase.quantity,
+      ownerId:purchase.ownerId,unit:balance.unit,item:item.item,quantity:purchase.quantity,
       unitPriceCents:purchase.costCents/BigInt(purchase.quantity),readers:new Set(readers),refundedQuantity:0,
     });
-    return {receipt:{...receipt,applied:true,ownerId:purchase.ownerId,unit:purchase.unit,item:purchase.item,balanceDeltaCents:`-${purchase.costCents}`,inventoryDelta:purchase.quantity}};
+    return {receipt:{...receipt,applied:true,ownerId:purchase.ownerId,unit:balance.unit,item:item.item,balanceDeltaCents:`-${purchase.costCents}`,inventoryDelta:purchase.quantity}};
   }
   if (kind === 'refund') {
     const refund=validateRefund(source,candidate,quote);
@@ -436,8 +437,8 @@ function applyCandidate(validated: ValidatedSettings, state: MutableState, purch
     if (!original) return {issue:issue(source,effectId,'unknown_purchase_reference')};
     if (!readers.some(reader=>original.readers.has(reader))) return {issue:issue(source,effectId,'refund_not_authorized')};
     if (refund.quantity>original.quantity-original.refundedQuantity) return {issue:issue(source,effectId,'refund_quantity_exceeded')};
-    const balance=state.balances.get(pairKey(original.ownerId,original.unit));
-    const item=state.inventory.get(pairKey(original.ownerId,original.item));
+    const balance=state.balances.get(assetKey(original.ownerId,original.unit));
+    const item=state.inventory.get(assetKey(original.ownerId,original.item));
     if (!balance || !item) return {issue:issue(source,effectId,'unconfigured_world_asset')};
     if (item.count<refund.quantity) return {issue:issue(source,effectId,'insufficient_inventory')};
     const amount=original.unitPriceCents*BigInt(refund.quantity);
@@ -449,47 +450,54 @@ function applyCandidate(validated: ValidatedSettings, state: MutableState, purch
   const consume = validateConsume(validated, source, candidate, quote);
   if ('code' in consume) return {issue:issue(source,effectId,consume.code)};
   if (classification !== 'current') return {receipt:{...receipt,ignoredReason:'non_current'}};
-  const item=state.inventory.get(pairKey(consume.ownerId,consume.item));
+  const item=findAsset(state.inventory,consume.ownerId,consume.item);
   if (!item) return {issue:issue(source,effectId,'unconfigured_world_asset')};
   if (item.count<consume.quantity) return {issue:issue(source,effectId,'insufficient_inventory')};
   item.count-=consume.quantity;restrictReaders(item.readerIds,readers);
-  return {receipt:{...receipt,applied:true,ownerId:consume.ownerId,item:consume.item,inventoryDelta:-consume.quantity}};
+  return {receipt:{...receipt,applied:true,ownerId:consume.ownerId,item:item.item,inventoryDelta:-consume.quantity}};
 }
 
 function validatePurchase(validated:ValidatedSettings,source:WorldSourceEffects,candidate:Record<string,unknown>,quote:string):
   {ownerId:string;unit:string;item:string;quantity:number;costCents:bigint}|{code:string} {
   if (!candidateKeys(candidate,['effectId','kind','quote','timeClassification','ownerId','ownerQuote','item','itemQuote','unit','unitPrice','quantity'])
     || typeof candidate.ownerId!=='string'||typeof candidate.ownerQuote!=='string'||typeof candidate.item!=='string'
-    || typeof candidate.itemQuote!=='string'||candidate.itemQuote!==candidate.item||!quote.includes(candidate.itemQuote)
+    || typeof candidate.itemQuote!=='string'||foldForMatch(candidate.itemQuote)!==foldForMatch(candidate.item)||!includesForMatch(quote,candidate.itemQuote)
     || typeof candidate.unit!=='string'||!isRecord(candidate.unitPrice)||!isRecord(candidate.quantity)
     || !exactKeys(candidate.unitPrice,['value','quote','unit'])||!exactKeys(candidate.quantity,['value','quote'])
     || typeof candidate.unitPrice.value!=='string'||typeof candidate.unitPrice.quote!=='string'||typeof candidate.unitPrice.unit!=='string'
-    || candidate.unitPrice.unit!==candidate.unit||!MONEY.test(candidate.unitPrice.value)
+    || foldForMatch(candidate.unitPrice.unit)!==foldForMatch(candidate.unit)||!MONEY.test(foldForMatch(candidate.unitPrice.value))
     || typeof candidate.quantity.value!=='string'||typeof candidate.quantity.quote!=='string') return {code:'invalid_purchase_effect'};
   if (!ownerGrounded(validated,source,candidate.ownerId,candidate.ownerQuote,quote)) return {code:'owner_not_grounded'};
   if (!positiveInteger(candidate.quantity.value,candidate.quantity.quote,quote)) return {code:'quantity_not_grounded'};
   if (!moneyGrounded(candidate.unitPrice.value,candidate.unitPrice.quote,candidate.unit,quote)) return {code:'price_not_grounded'};
+  const calculationText=foldForMatch(quote);
+  // Fixed two operands: O(n + total quote length), using the located context's folding.
+  const calculationQuote=(text:string):string=>{
+    const span=scriptQuoteSearch(quote,text).matches[0]!;
+    return calculationText.slice(span.start,span.end);
+  };
   const calculated=calculate({operation:'multiply',operands:[
-    {value:candidate.unitPrice.value,quote:candidate.unitPrice.quote,unit:candidate.unit},
-    {value:candidate.quantity.value,quote:candidate.quantity.quote,unit:null},
-  ],scale:2},quote);
-  if (!calculated.ok||!calculated.exact||calculated.unit!==candidate.unit) return {code:'price_not_grounded'};
+    {value:foldForMatch(candidate.unitPrice.value),quote:calculationQuote(candidate.unitPrice.quote),unit:foldForMatch(candidate.unit)},
+    {value:foldForMatch(candidate.quantity.value),quote:calculationQuote(candidate.quantity.quote),unit:null},
+  ],scale:2},calculationText);
+  if (!calculated.ok||!calculated.exact||calculated.unit!==foldForMatch(candidate.unit)) return {code:'price_not_grounded'};
   const quantity=positiveSafeInteger(candidate.quantity.value);const costCents=decimalToCents(calculated.value);
   if (quantity===null||costCents===null||costCents<=0n) return {code:'invalid_purchase_effect'};
-  return {ownerId:candidate.ownerId,unit:candidate.unit,item:candidate.item,quantity,costCents};
+  const unitQuote=sourceQuote(quote,candidate.unitPrice.quote)!;
+  return {ownerId:candidate.ownerId,unit:sourceQuote(unitQuote,candidate.unit)!,item:sourceQuote(quote,candidate.itemQuote)??candidate.item,quantity,costCents};
 }
 
 function validateConsume(validated:ValidatedSettings,source:WorldSourceEffects,candidate:Record<string,unknown>,quote:string):
   {ownerId:string;item:string;quantity:number}|{code:string} {
   if (!candidateKeys(candidate,['effectId','kind','quote','timeClassification','ownerId','ownerQuote','item','itemQuote','quantity'])
     || typeof candidate.ownerId!=='string'||typeof candidate.ownerQuote!=='string'||typeof candidate.item!=='string'
-    || typeof candidate.itemQuote!=='string'||candidate.itemQuote!==candidate.item||!quote.includes(candidate.itemQuote)
+    || typeof candidate.itemQuote!=='string'||foldForMatch(candidate.itemQuote)!==foldForMatch(candidate.item)||!includesForMatch(quote,candidate.itemQuote)
     || !isRecord(candidate.quantity)||!exactKeys(candidate.quantity,['value','quote'])
     || typeof candidate.quantity.value!=='string'||typeof candidate.quantity.quote!=='string') return {code:'invalid_consume_effect'};
   if (!ownerGrounded(validated,source,candidate.ownerId,candidate.ownerQuote,quote)) return {code:'owner_not_grounded'};
   if (!positiveInteger(candidate.quantity.value,candidate.quantity.quote,quote)) return {code:'quantity_not_grounded'};
   const quantity=positiveSafeInteger(candidate.quantity.value);
-  return quantity===null?{code:'invalid_consume_effect'}:{ownerId:candidate.ownerId,item:candidate.item,quantity};
+  return quantity===null?{code:'invalid_consume_effect'}:{ownerId:candidate.ownerId,item:sourceQuote(quote,candidate.itemQuote)??candidate.item,quantity};
 }
 
 function validateRefund(source:WorldSourceEffects,candidate:Record<string,unknown>,quote:string):
@@ -520,7 +528,7 @@ function readBase(raw:unknown,source:WorldSourceEffects):
     || !isClassification(raw.timeClassification)) return {code:'invalid_world_effect',effectId};
   const evidence=resolveEffectEvidence(source.text,raw.quote,raw.evidence);
   if ('code' in evidence) return {code:evidence.code,effectId};
-  return {candidate:raw,effectId,quote:raw.quote,classification:raw.timeClassification,evidence};
+  return {candidate:raw,effectId,quote:source.text.slice(evidence.start,evidence.end),classification:raw.timeClassification,evidence};
 }
 
 function observedReaders(validated:ValidatedSettings,source:WorldSourceEffects,evidence:WorldEffectEvidence):string[] {
@@ -551,12 +559,13 @@ function playerEvidenceCovers(text:string,observationStart:number,observationEnd
 }
 
 function ownerGrounded(validated:ValidatedSettings,source:WorldSourceEffects,ownerId:string,ownerQuote:string,effectQuote:string):boolean {
-  if (!effectQuote.includes(ownerQuote)) return false;
-  if (ownerId===WORLD_PLAYER_ID) {
-    if (ownerQuote===validated.settings.playerName) return true;
-    return ownerQuote==='我'&&source.role==='user'&&source.text.startsWith('我')&&source.text.startsWith(effectQuote);
-  }
-  return validated.actorLabels.get(ownerId)?.includes(ownerQuote)===true;
+  if (!includesForMatch(effectQuote,ownerQuote)) return false;
+  if(ownerQuote==='我')return ownerId===WORLD_PLAYER_ID&&source.role==='user'&&source.text.startsWith('我')&&source.text.indexOf(effectQuote)===0;
+  const original=sourceQuote(effectQuote,ownerQuote)!;
+  const labels:[[string,readonly string[]],...[string,readonly string[]][]]=[[WORLD_PLAYER_ID,[validated.settings.playerName]],...validated.actorLabels];
+  const exact=labels.filter(([,names])=>names.includes(original));
+  const owners=exact.length?exact:labels.filter(([,names])=>names.some(label=>foldForMatch(label)===foldForMatch(original)));
+  return owners.length===1&&owners[0]![0]===ownerId;
 }
 
 function uniqueSourceRevisions(sources:readonly WorldSourceEffects[],issues:WorldIssue[]):WorldSourceEffects[] {
@@ -630,6 +639,20 @@ function baselineReaders(value:unknown,allowed:Set<string>):Set<string> {
 }
 function restrictReaders(target:Set<string>,readers:string[]):void { for(const id of [...target]) if(!readers.includes(id)) target.delete(id); }
 function knownOwner(value:unknown,actors:Set<string>):value is string { return value===WORLD_PLAYER_ID||(typeof value==='string'&&actors.has(value)); }
+// Authority keys stay literal. An absent literal key permits only one folded fallback.
+function assetKey(ownerId:string,label:string):string { return pairKey(ownerId,label); }
+/** O(number of configured assets * label length); ambiguity rejects only the current effect. */
+function findAsset<T extends MutableBalance|MutableInventory>(assets:Map<string,T>,ownerId:string,label:string):T|undefined {
+  const exact=assets.get(assetKey(ownerId,label));
+  if(exact!==undefined)return exact;
+  const folded=foldForMatch(label);let found:T|undefined;
+  for(const value of assets.values()) {
+    if(value.ownerId!==ownerId||foldForMatch('unit' in value?value.unit:value.item)!==folded)continue;
+    if(found!==undefined)return undefined;
+    found=value;
+  }
+  return found;
+}
 function pairKey(left:string,right:string):string { return JSON.stringify([left,right]); }
 function purchaseKey(sourceId:string,revision:number,effectId:string):string { return canonical({sourceId,revision,effectId}); }
 function issue(source:WorldSourceEffects,effectId:string|undefined,code:string):WorldIssue {
@@ -652,22 +675,27 @@ function decimalToCents(value:string):bigint|null {
 }
 function centsToMoney(value:bigint):string { const whole=value/100n;const fraction=(value%100n).toString().padStart(2,'0');return `${whole}.${fraction}`; }
 function positiveSafeInteger(value:string):number|null {
+  value=foldForMatch(value);
   if(!POSITIVE_INTEGER.test(value))return null;const parsed=Number(value);return Number.isSafeInteger(parsed)?parsed:null;
 }
 function positiveInteger(value:string,valueQuote:string,effectQuote:string):boolean {
   return positiveSafeInteger(value)!==null&&groundedNumeric(value,valueQuote,effectQuote);
 }
 function groundedNumeric(value:string,valueQuote:string,effectQuote:string):boolean {
-  const quoteStart=effectQuote.indexOf(valueQuote);
-  if(quoteStart<0||effectQuote.indexOf(valueQuote,quoteStart+1)>=0) return false;
+  const matches=scriptQuoteSearch(effectQuote,valueQuote,2).matches;
+  if(matches.length!==1)return false;
+  const quoteStart=matches[0]!.start;
+  value=foldForMatch(value);valueQuote=foldForMatch(matches[0]!.quote);effectQuote=foldForMatch(effectQuote);
+  const quoteCommas=fullwidthGroupingWork(valueQuote).commas,effectCommas=fullwidthGroupingWork(effectQuote).commas;
   for(let start=valueQuote.indexOf(value);start>=0;start=valueQuote.indexOf(value,start+1)) {
-    if(numericTokenAt(value,valueQuote,start)&&numericTokenAt(value,effectQuote,quoteStart+start)) return true;
+    if(numericTokenAt(value,valueQuote,start,quoteCommas)&&numericTokenAt(value,effectQuote,quoteStart+start,effectCommas)) return true;
   }
   return false;
 }
 function moneyGrounded(value:string,valueQuote:string,unit:string,effectQuote:string):boolean {
   if(!groundedNumeric(value,valueQuote,effectQuote)) return false;
-  const quoteStart=effectQuote.indexOf(valueQuote);
+  const quoteStart=scriptQuoteSearch(effectQuote,valueQuote).matches[0]!.start;
+  value=foldForMatch(value);valueQuote=foldForMatch(valueQuote);unit=foldForMatch(unit);effectQuote=foldForMatch(effectQuote);
   const valueStart=valueQuote.indexOf(value);
   if(valueStart<0||valueQuote.indexOf(value,valueStart+1)>=0) return false;
   let unitStart=valueStart+value.length;
@@ -676,11 +704,14 @@ function moneyGrounded(value:string,valueQuote:string,unit:string,effectQuote:st
   return currencyEffectTailAllowed(effectQuote.slice(quoteStart+valueQuote.length));
 }
 function timeAmountGrounded(value:string,amountQuote:string,unit:string,effectQuote:string):boolean {
+  const matches=scriptQuoteSearch(effectQuote,amountQuote,2).matches;
+  if(matches.length!==1)return false;
+  const effectStart=matches[0]!.start;
+  value=foldForMatch(value);amountQuote=foldForMatch(matches[0]!.quote);effectQuote=foldForMatch(effectQuote);
   if (positiveSafeInteger(value)===null) return false;
-  const effectStart=effectQuote.indexOf(amountQuote);
-  if(effectStart<0||effectQuote.indexOf(amountQuote,effectStart+1)>=0) return false;
+  const quoteCommas=fullwidthGroupingWork(amountQuote).commas,effectCommas=fullwidthGroupingWork(effectQuote).commas;
   for(let start=amountQuote.indexOf(value);start>=0;start=amountQuote.indexOf(value,start+1)) {
-    if (!numericTokenAt(value,amountQuote,start)||!numericTokenAt(value,effectQuote,effectStart+start)) continue;
+    if (!numericTokenAt(value,amountQuote,start,quoteCommas)||!numericTokenAt(value,effectQuote,effectStart+start,effectCommas)) continue;
     let unitStart=start+value.length;
     while(unitStart<amountQuote.length&&/\s/u.test(amountQuote[unitStart]!)) unitStart++;
     let longest=0;const units=new Set<string>();
@@ -701,10 +732,29 @@ function timeEffectTailAllowed(tail:string):boolean {
 function currencyEffectTailAllowed(tail:string):boolean {
   return tail===''||/^[\s，。！？、；：,;.!?]/u.test(tail)||/^[买购花付支给收后]/u.test(tail);
 }
-function numericTokenAt(value:string,quote:string,start:number):boolean {
+/** O(n) time and space on a folded copy. Each character and accepted comma is visited once. */
+export function fullwidthGroupingWork(text:string):{commas:ReadonlySet<number>;visited:number} {
+  const commas=new Set<number>();let visited=0;
+  for(let at=0;at<text.length;){
+    if(!/[0-9，]/u.test(text[at]!)){at++;visited++;continue;}
+    const candidates:number[]=[];let width=0,valid=true;
+    while(at<text.length&&/[0-9，]/u.test(text[at]!)){
+      visited++;
+      if(text[at]==='，'){
+        valid=valid&&(candidates.length===0?width>=1&&width<=3:width===3);
+        candidates.push(at);width=0;
+      }else width++;
+      at++;
+    }
+    if(valid&&width===3)for(const comma of candidates){commas.add(comma);visited++;}
+  }
+  return {commas,visited};
+}
+function numericTokenAt(value:string,quote:string,start:number,commas:ReadonlySet<number>):boolean {
   const before=start===0?'':quote[start-1]!;
   const after=quote[start+value.length]??'';
-  if(/[\d.A-Za-z_,:/+\-＋－−\p{Pd}]/u.test(before)||/[\d.A-Za-z_,:/+\-＋－−\p{Pd}]/u.test(after)) return false;
+  const groupedComma=commas.has(start-1)||commas.has(start+value.length);
+  if(groupedComma||/[\d.．A-Za-z_,:/+\-＋－−\p{Pd}]/u.test(before)||/[\d.．A-Za-z_,:/+\-＋－−\p{Pd}]/u.test(after)) return false;
   let previous=start-1;
   while(previous>=0&&/\s/u.test(quote[previous]!)) previous--;
   return previous<0||!/[+\-＋－−\p{Pd}]/u.test(quote[previous]!);
@@ -712,12 +762,14 @@ function numericTokenAt(value:string,quote:string,start:number):boolean {
 function resolveEffectEvidence(text:string,quote:string,raw:unknown):WorldEffectEvidence|{code:string} {
   if(raw!==undefined) {
     if(!isRecord(raw)||!exactKeys(raw,['start','end'])||!isTime(raw.start)||!isTime(raw.end)||raw.start>=raw.end||raw.end>text.length
-      ||text.slice(raw.start,raw.end)!==quote) return {code:'invalid_world_effect'};
+      ||foldForMatch(text.slice(raw.start,raw.end))!==foldForMatch(quote)) return {code:'invalid_world_effect'};
     return {start:raw.start,end:raw.end};
   }
-  let start=text.indexOf(quote);if(start<0) return {code:'invalid_world_effect'};
-  if(text.indexOf(quote,start+1)>=0) return {code:'ambiguous_effect_evidence'};
-  return {start,end:start+quote.length};
+  // O(n + m) quote lookup, preserving the existing unique-or-explicit-span policy.
+  const matches=scriptQuoteSearch(text,quote,2).matches;
+  if(!matches.length) return {code:'invalid_world_effect'};
+  if(matches.length>1) return {code:'ambiguous_effect_evidence'};
+  return {start:matches[0]!.start,end:matches[0]!.end};
 }
 function canonicalBusinessCandidate(candidate:Record<string,unknown>):string {
   const {effectId:_effectId,evidence:_evidence,quote:_quote,...business}=candidate;

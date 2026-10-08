@@ -1,3 +1,4 @@
+import {foldForMatch} from '../common/script-fold.ts';
 import {commitmentNumber,resolveCommitmentTime} from './time.ts';
 import type {CommitmentRecord, ContactRestriction, ContactRestrictionCandidate, ContactRestrictionOrigin} from './types.ts';
 
@@ -72,10 +73,10 @@ export function storedContactRestriction(value:ContactRestrictionCandidate,fallb
  * 别再忘了找我 (a prohibition followed at once by 不理/不找/不回/不联系/不联络, 再忘 or 让我等). Any other 不 after
  * the prohibition still asks for quiet: 别不停地发消息 and 不要不停给我发消息 count.
  */
-export function noContactRequest(text:string):boolean {return NO_CONTACT_REQUEST.test(text);}
-const NO_CONTACT_REQUEST=new RegExp('(?:先别|請勿|请勿|不要|不许|不許|不准|不準|不想|不希望|别|別|勿|免)(?!忘|错过|錯過|不(?:理|找|回|联系|聯繫|联络|聯絡)|再忘|让我等|讓我等)\\S{0,4}?'+
-  '(?:被?(?:打扰|打擾)|找|打搅|打攪|发|發|联系|聯繫|联络|聯絡|烦|煩|吵|理|叫|消息|信息|私信|私聊|打给|打給|打电话|打電話|@|戳|call)'+
-  '|免打扰|免打擾|勿扰|勿擾|请勿打扰|請勿打擾|不接\\S{0,2}(?:电话|電話)','i');
+export function noContactRequest(text:string):boolean {return NO_CONTACT_REQUEST.test(foldForMatch(text));}
+const NO_CONTACT_REQUEST=new RegExp(foldForMatch('(?:先别|請勿|请勿|不要|不许|不許|不准|不準|不想|不希望|别|別|勿|免)(?!忘|错过|錯過|不(?:理|找|回|联系|聯繫|联络|聯絡)|再忘|让我等|讓我等)\\S{0,4}?'+
+  '(?:被?(?:打扰|打擾)|找|打搅|打攪|发|發|联系|聯繫|联络|聯絡|烦|煩|吵|理|叫|消息|信息|私信|私聊|传讯息|传简讯|私讯|(?<![泄洩告保秘機机加解])密我|打给|打給|打电话|打電話|@|戳|call)'+
+  '|免打扰|免打擾|勿扰|勿擾|请勿打扰|請勿打擾|不接\\S{0,2}(?:电话|電話)'),'i');
 
 /**
  * Whether the user's words lift a no-contact window. Every cue is tied to contact: 可以…找/联系/发消息/打扰, 随时…找,
@@ -84,6 +85,7 @@ const NO_CONTACT_REQUEST=new RegExp('(?:先别|請勿|请勿|不要|不许|不�
  * hard window in a replacement (我不用加班了, 可以发我文件吗, 你不用回了, 把会议取消了 do not).
  */
 export function contactLiftRequest(text:string):boolean {
+  text=foldForMatch(text);
   // A 取消/解除 cue may itself name 勿扰 (解除勿扰): only that token is removed before asking whether the rest of the
   // text asks for quiet, so 「可以找我，但别发消息」 or 「不用再避开了，别找我」 never lift.
   const rest=text.replace(/(?:取消|解除)\S{0,4}?(?:勿扰|勿擾)/g,cue=>cue.replace(/勿扰|勿擾/g,''));
@@ -91,12 +93,12 @@ export function contactLiftRequest(text:string):boolean {
 }
 // 可以 is not negated (不可以, 别可以, 不太可以) and not followed by a negation (可以不找我吗, 可以别找我吗); 随时找 is not
 // forbidden (别随时找我).
-const CONTACT_LIFT_REQUEST=new RegExp([
-  '(?<!不|别|別|不太)可以(?![不别別])\\S{0,3}(?:找|联系|聯繫|聯絡|发消息|發消息|发信息|發信息|發訊息|打扰|打擾)',
+const CONTACT_LIFT_REQUEST=new RegExp(foldForMatch([
+  '(?<!不|别|別|不太)可以(?![不别別])\\S{0,3}(?:找|联系|聯繫|聯絡|发消息|發消息|发信息|發信息|發訊息|传讯息|传简讯|私讯|打扰|打擾)',
   '(?<!别|別|不要|不许|不許)(?:随时|隨時)\\S{0,2}找',
   '不用\\S{0,6}(?:勿扰|勿擾|安静|安靜|避开|避開)','取消\\S{0,4}(?:约定|約定|勿扰|勿擾|限制|时段|時段)',
   '解除\\S{0,4}(?:限制|勿扰|勿擾)','不(?:再)?限制',
-].join('|'));
+].join('|')));
 
 /**
  * Whether `text` (the user's message) states a range, two time phrases joined by 到, 至, ~ or -, that resolves under
@@ -144,13 +146,13 @@ function sameContactWindow(left:ContactRestriction,right:ContactRestriction):boo
  * word, a day word (今晚, 今夜, 明早, 明晨, 今天, 明天, 后天), a weekday or week, or a period of the day (上午, 下午,
  * 晚上, 凌晨...). 这几天 and 这两天 are the colloquial "these days" and do not count.
  */
-export function contactTimeWords(quote:string):boolean {return CONTACT_TIME_WORD.test(quote);}
-const CONTACT_TIME_WORD=new RegExp([
+export function contactTimeWords(quote:string):boolean {return CONTACT_TIME_WORD.test(foldForMatch(quote));}
+const CONTACT_TIME_WORD=new RegExp(foldForMatch([
   '\\d','[零〇一二两兩三四五六七八九十百半][个個]?(?:点|點|时|時|钟|鐘|月|号|號|日|周|週|星期|礼拜|禮拜)',
   '(?<![这這])[零〇一二两兩三四五六七八九十百半][个個]?天','小时|小時|分钟|分鐘|钟头|鐘頭',
   '今晚|今夜|今早|今晨|明早|明晚|明晨|明夜|今天|明天|后天|後天|昨天|今日|明日|今年|明年|月底|月初',
   '凌晨|清晨|早上|早晨|上午|中午|下午|傍晚|晚上|夜里|夜裡|半夜|午夜|深夜','周|週|星期|礼拜|禮拜',
-].join('|'));
+].join('|')));
 
 /**
  * An interval from dated or relative quotes (今天晚上10点 / 明天早上7点); one duration quote used as both ends
@@ -158,6 +160,8 @@ const CONTACT_TIME_WORD=new RegExp([
  * mean the local window instance containing the message time, or else the next one.
  */
 function intervalRange(startQuote:string,endQuote:string,context:{timeZone?:string;clockTimeMs?:number}):[number,number]|null {
+  // This helper returns only numbers; the caller retains both original quote fields.
+  startQuote=foldForMatch(startQuote);endQuote=foldForMatch(endQuote);
   const clock=context.clockTimeMs;
   // Said in the small hours, a 明早/明天早上 start is the morning now coming, and a 明天-anchored end moves with it
   // (01:00「明早九点到明早十一点」is 09:00-11:00 today).
@@ -315,9 +319,7 @@ function nextLocalInstant(minute:number,timeZone:string,afterMs:number):number[]
 
 /** Map the traditional characters used in clock and duration phrases onto the simplified forms parsed here. */
 function simplified(value:string):string {
-  return value.trim().replace(/鐘頭/g,'钟头').replace(/小時/g,'小时').replace(/分鐘/g,'分钟').replace(/點/g,'点').replace(/兩/g,'两')
-    .replace(/鐘/g,'钟').replace(/個/g,'个').replace(/淩/g,'凌').replace(/這/g,'这').replace(/內/g,'内').replace(/來/g,'来')
-    .replace(/夜裡/g,'夜里').replace(/為止/g,'为止').replace(/會兒/g,'会儿');
+  return foldForMatch(value).trim();
 }
 
 /**

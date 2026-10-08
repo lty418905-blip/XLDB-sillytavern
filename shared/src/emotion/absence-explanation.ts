@@ -1,3 +1,4 @@
+import {foldForMatch,includesForMatch,sourceQuote} from '../common/script-fold.ts';
 import type {SceneSource} from '../scene/types.ts';
 import {resolveCommitmentTime} from '../commitments/time.ts';
 
@@ -45,7 +46,7 @@ export function validateAbsenceExplanation(source:SceneSource,raw:unknown,input:
   if(!Number.isSafeInteger(source.acceptedAtMs)||source.acceptedAtMs<0)throw new Error('invalid_absence_source_time');
   const candidate=decode(raw);
   if(candidate.kind==='none')return null;
-  const quote=candidate.quote.trim();
+  const quote=sourceQuote(source.text,candidate.quote.trim());
   if(!quote||quote.length>500||!source.text.includes(quote)||!groundedExplanation(source.text,quote,candidate.kind==='return'))
     throw new Error('invalid_absence_evidence');
   const common={sourceId:source.id,sourceRevision:source.revision,sourceAcceptedAtMs:source.acceptedAtMs,
@@ -55,12 +56,12 @@ export function validateAbsenceExplanation(source:SceneSource,raw:unknown,input:
       throw new Error('invalid_absence_return');
     return {kind:'return',...common};
   }
-  if(/(?:我|本人)?(?:不忙|不是.{0,4}忙|没在忙|没有离线|并不忙|不会忙)/.test(quote))
+  if(/(?:我|本人)?(?:不忙|不是.{0,4}忙|没在忙|没有离线|并不忙|不会忙)/.test(foldForMatch(quote)))
     throw new Error('invalid_absence_evidence');
   let validFromMs=source.acceptedAtMs;
   let startCertainty:'bounded'|'uncertain'=candidate.assertion.timeRelation==='current'?'bounded':'uncertain';
   if(candidate.startQuote!==undefined){
-    if(!quote.includes(candidate.startQuote))throw new Error('invalid_absence_time_quote');
+    if(!includesForMatch(quote,candidate.startQuote))throw new Error('invalid_absence_time_quote');
     const start=resolveCommitmentTime(candidate.startQuote,{clockTimeMs:source.acceptedAtMs,timeZone:input.timeZone});
     if(start!==null){
       if(candidate.assertion.timeRelation==='current'&&start>source.acceptedAtMs)throw new Error('invalid_absence_future');
@@ -68,7 +69,7 @@ export function validateAbsenceExplanation(source:SceneSource,raw:unknown,input:
       startCertainty='bounded';
     }
   }
-  if(candidate.untilQuote!==undefined&&!quote.includes(candidate.untilQuote))throw new Error('invalid_absence_time_quote');
+  if(candidate.untilQuote!==undefined&&!includesForMatch(quote,candidate.untilQuote))throw new Error('invalid_absence_time_quote');
   const until=candidate.untilQuote===undefined?null:resolveCommitmentTime(candidate.untilQuote,
     {clockTimeMs:source.acceptedAtMs,timeZone:input.timeZone});
   if(until!==null&&until<=validFromMs)throw new Error('invalid_absence_past');
@@ -134,16 +135,20 @@ function assertionOf(raw:unknown):AbsenceAssertion|null {
 }
 
 function groundedExplanation(sourceText:string,quote:string,currentReturn=false):boolean {
+  // Only matching copies; prefix offsets remain valid in the equal-width source. O(n + m).
+  const start=sourceText.indexOf(quote);
+  sourceText=foldForMatch(sourceText);quote=foldForMatch(quote);
   if(!currentReturn&&/(?:以前|之前|过去|曾经|那时|昨天|上周|上个月)/.test(quote)||
     /(?:假如|假设|如果|比如|举例|例如)/.test(quote))return false;
-  const before=sourceText.slice(Math.max(0,sourceText.indexOf(quote)-16),sourceText.indexOf(quote));
+  const before=sourceText.slice(Math.max(0,start-16),start);
   if(/(?:他|她|他们|别人|朋友|同事).{0,12}(?:说|表示|告诉|发来|写道)[：:“"'\s]*$/.test(before)||
     /(?:举例|比如|假如|如果|假设|曾|说|写|提到|引用|引述)[：:“"'\s]*$/.test(before))return false;
   return true;
 }
 function reasonInQuote(reason:AbsenceReason,quote:string):boolean {
+  quote=foldForMatch(quote);
   if(reason==='unknown')return true;
-  if(reason==='busy')return /忙|没空|没时间|工作|开会|考试|出差|不能回复|无法回复/.test(quote);
+  if(reason==='busy')return /忙|没空|没时间|工作|开会|考试|出差|不能回[复覆]|无法回[复覆]/.test(quote);
   if(reason==='offline')return /离线|没网|断网|无法上网/.test(quote);
-  return /暂停|休息|不想聊|不方便聊|暂时不回复/.test(quote);
+  return /暂停|休息|不想聊|不方便聊|暂时不回[复覆]/.test(quote);
 }
