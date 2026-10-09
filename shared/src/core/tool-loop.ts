@@ -32,7 +32,7 @@ const invalid = () => new TypeError('invalid_tool_loop_options');
  * Iterative serialization also handles deeply nested JSON without recursive stack growth.
  * Work counts traversal units, emitted characters and radix probes; it is independent of wall time.
  */
-export function canonicalToolArgs(value: ToolObject): { json: string; work: number } {
+function serializeToolObject(value: ToolObject, sorted: boolean): { json: string; work: number } {
   if (!isObject(value)) throw invalid();
   let work = 0;
   const keysOf = (object: ToolObject): string[] => {
@@ -80,7 +80,7 @@ export function canonicalToolArgs(value: ToolObject): { json: string; work: numb
           if (i > 0) jobs.push({ text: ',' });
         }
       } else {
-        const keys = keysOf(item as ToolObject);
+        const keys = sorted ? keysOf(item as ToolObject) : Object.keys(item);
         parts.push('{');
         jobs.push({ text: '}' });
         for (let i = keys.length - 1; i >= 0; i--) {
@@ -92,6 +92,10 @@ export function canonicalToolArgs(value: ToolObject): { json: string; work: numb
     } else throw new TypeError('invalid_tool_json');
   }
   return { json: parts.join(''), work };
+}
+
+export function canonicalToolArgs(value: ToolObject): { json: string; work: number } {
+  return serializeToolObject(value, true);
 }
 
 /** O(min(input code points, limit)); never splits a surrogate pair. */
@@ -134,8 +138,8 @@ export function createJsonToolTransport(parse: typeof parseModelJson): ToolTrans
       } catch { return { kind: 'bad_format' }; }
     },
     answer(conversation, call, result) {
-      conversation.push({ role: 'assistant', content: JSON.stringify({ tool: call.tool, args: call.args }) },
-        { role: 'user', content: JSON.stringify({ result }) });
+      conversation.push({ role: 'assistant', content: serializeToolObject({ tool: call.tool, args: call.args }, false).json },
+        { role: 'user', content: serializeToolObject({ result }, false).json });
     },
     malformed(conversation, raw, issue, correction, maxCodePoints) {
       conversation.push({ role: 'assistant', content: toolReplayPrefix(raw, maxCodePoints).text },
@@ -221,12 +225,14 @@ function snapshotObject(value: unknown): ToolObject {
   if (!isObject(value)) throw invalid();
   const copy: ToolObject = {}, active = new Set<object>();
   type Container = ToolObject | unknown[];
-  const jobs: ({ source: Container; target: Container } | { leave: object })[] = [{ source: value, target: copy }];
-  // O(n) in the JSON tree size; iterative, each getter is read once, no toJSON callbacks.
+  const jobs: ({ source: Container; target: Container; depth: number } | { leave: object })[] = [{ source: value, target: copy, depth: 1 }];
+  // O(n) in JSON output size; iterative, one getter read, no toJSON callbacks.
+  // Each argument/result root counts as one container; objects and arrays share the limit of 64.
   while (jobs.length) {
     const job = jobs.pop()!;
     if ('leave' in job) { active.delete(job.leave); continue; }
-    const { source, target } = job;
+    const { source, target, depth } = job;
+    if (depth > 64) throw invalid();
     if (active.has(source)) throw invalid();
     const prototype = Object.getPrototypeOf(source);
     if (!Array.isArray(source) && prototype !== null && prototype !== Object.prototype) throw invalid();
@@ -237,7 +243,7 @@ function snapshotObject(value: unknown): ToolObject {
       let next: unknown = item;
       if (item !== null && typeof item === 'object') {
         next = Array.isArray(item) ? [] : {};
-        jobs.push({ source: item as Container, target: next as Container });
+        jobs.push({ source: item as Container, target: next as Container, depth: depth + 1 });
       } else if (item !== null && typeof item !== 'string' && typeof item !== 'boolean' && !(typeof item === 'number' && Number.isFinite(item))) throw invalid();
       Object.defineProperty(target, key, { value: next, writable: true, enumerable: true, configurable: true });
     }
@@ -386,11 +392,10 @@ export function createToolLoop<C>(options: ToolLoopOptions<C>): ToolLoopRun {
         }
         let args: ToolObject = {}, canonical = '';
         if (issue === null) {
-          // Validate the JSON envelope before execution; native serialization may reject deep trees.
+          // Bound and snapshot arguments before execution; all tree serialization is iterative.
           try {
             args = snapshotObject(value.args);
             canonical = canonicalToolArgs(args).json;
-            JSON.stringify({ tool: tool!.name, args });
           } catch { issue = { path: 'args', expected: 'serializable_object' }; }
         }
         if (issue !== null) {
