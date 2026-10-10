@@ -134,7 +134,7 @@ export const FRAGMENT_BANDS={zh:[2,20],en:[1,12]} as const;
 export const FRAGMENT_LIMIT=4;
 /** All kept fragments together stay under this share of the compact detail. Uncertain; MR7a measures it. */
 export const FRAGMENT_TOTAL_RATIO=0.5;
-const FRAGMENT_RAW_LIMIT=1000;
+export const FRAGMENT_RAW_LIMIT=1000;
 
 /**
  * Short verbatim scene and sensory fragments that stay with an emotionally protected episode after automatic fading.
@@ -217,14 +217,11 @@ export function isLegacyTemplate(layer:string):boolean {return LEGACY_TEMPLATES.
 export type MemoryLayer='gist'|'feeling'|'anchor';
 export type LayerState='visible'|'masked'|'blocked';
 /** Shared-run lengths that count as a copy of a protected fact. */
-const ZH_FACT_RUN=6;
-const EN_FACT_WORDS=3;
+export const ZH_FACT_RUN=6;
+export const EN_FACT_WORDS=3;
 /** A masked remainder needs one intact clause of at least one short sentence; below that it is blocked. */
 const ZH_RESIDUAL_UNITS=6;
 const EN_RESIDUAL_UNITS=4;
-/** Word boundaries for an English protected fact: Latin letters and digits only, so Han text next to it is a boundary. */
-const WORD_END=/[\p{Script=Latin}\p{N}]\p{M}*$/u;
-const WORD_START=/^[\p{Script=Latin}\p{N}]/u;
 
 /**
  * Guard modes. `exact` differs from `standard` in one point: shared runs with a protected fact are not checked; whole
@@ -290,40 +287,149 @@ export function maskLayer(detail:string,layer:string,protectedFacts:readonly str
   return result;
 }
 
+/** Deterministic cold-work charges, optionally shared with a caller's record-level counters. */
+export interface ProtectedFactWork {substring: number; protection: number; helpers: number}
+const protectedTextWork = (text: string, work: ProtectedFactWork, passes = 1) => {work.helpers += passes * 163 * text.length;};
+/**
+ * Prepare facts once in O(f), query in O(p*n + n) with p <= twice the fact count; output O(p*n).
+ * Six-code-point and three-word windows have fixed widths. No pairwise shared-run table or per-match prefix slice.
+ * Both cluster and whole-string folds are retained, including their original word-boundary semantics.
+ */
+/** KMP: at most two character comparisons per haystack unit, including failed prefixes. */
+class Pattern {
+  key: string;
+  failure: Uint32Array;
+  work: ProtectedFactWork;
+  constructor(key: string, work: ProtectedFactWork) {
+    this.key = key; this.work = work; this.failure = new Uint32Array(key.length);
+    work.substring += key.length;
+    for (let i = 1, j = 0; i < key.length; i++) {
+      while (j && key[i] !== key[j]) {work.substring++; j = this.failure[j - 1]!;}
+      work.substring++; if (key[i] === key[j]) j++;
+      this.failure[i] = j;
+    }
+  }
+  contains(text: string, boundary?: (start: number, end: number) => boolean, spans?: [number, number][]): boolean {
+    const key = this.key;
+    for (let i = 0, j = 0; i < text.length; i++) {
+      while (j && text[i] !== key[j]) {this.work.substring++; j = this.failure[j - 1]!;}
+      this.work.substring++;
+      if (text[i] === key[j]) j++;
+      if (j === key.length) {
+        if (!boundary || boundary(i + 1 - j, i + 1)) {
+          if (!spans) return true;
+          spans.push([i + 1 - j, i + 1]);
+        }
+        j = this.failure[j - 1]!;
+      }
+    }
+    return false;
+  }
+}
+
+/** Fixed six-character / three-word windows are built once per record, never per clause. */
+export class ProtectedFactDetector {
+  exact: {pattern: Pattern; han: boolean}[] = [];
+  hanRuns = new Set<string>();
+  enRuns = new Set<string>();
+  work: ProtectedFactWork;
+  constructor(facts: readonly string[], work: ProtectedFactWork = {substring: 0, protection: 0, helpers: 0}) {
+    this.work = work;
+    // map skips sparse slots, as the guard has always done; candidate pools supply validated dense arrays.
+    const prepared = facts.map(fact => {
+      protectedTextWork(fact, work, 5); // compact, mappedText, scriptOf, wordsOf and per-word folding.
+      const key = compact(fact), mapped = mappedText(fact, {dropPunctuation: true}).text;
+      work.protection += 1 + key.length + mapped.length;
+      return {fact, key, mapped};
+    });
+    for (const {fact, key, mapped} of prepared.filter(() => true)) {
+      if (key.length < 2 || mapped.length < 2) continue;
+      const han = scriptOf(fact) === 'zh', needles = mapped === key ? [mapped] : [mapped, key];
+      for (const needle of needles) {
+        this.exact.push({pattern: new Pattern(needle, work), han});
+        if (han) {
+          const chars = [...needle]; work.protection += needle.length;
+          for (let i = 0; i + ZH_FACT_RUN <= chars.length; i++) {
+            work.protection += 2 * ZH_FACT_RUN;
+            this.hanRuns.add(chars.slice(i, i + ZH_FACT_RUN).join(''));
+          }
+        }
+      }
+      if (!han) {
+        const words = wordsOf(fact).map(item => item.word.normalize('NFKC').toLowerCase());
+        for (let i = 0; i + EN_FACT_WORDS <= words.length; i++) {
+          const window = words.slice(i, i + EN_FACT_WORDS);
+          work.protection += 2 * (EN_FACT_WORDS + window.join('').length);
+          this.enRuns.add(JSON.stringify(window));
+        }
+      }
+    }
+  }
+  /** Boolean query avoids allocating match ranges; neither query populates the copy-guard caches. */
+  hits(text: string, mode: GuardMode = 'standard'): boolean {return this.scan(text, mode);}
+  /** Raw UTF-16 ranges; overlapping windows cover exactly the same units as maximal shared runs. */
+  spans(text: string, mode: GuardMode = 'standard'): [number, number][] {
+    const result: [number, number][] = [];
+    this.scan(text, mode, result);
+    return result;
+  }
+  private scan(text: string, mode: GuardMode, result?: [number, number][]): boolean {
+    const work = this.work;
+    if (!this.exact.length) return false;
+    protectedTextWork(text, work, 3); // mappedText, wordsOf and per-word folding.
+    const loose = mappedText(text, {dropPunctuation: true});
+    // A Latin/number followed by marks is still a word end, just as the copy guard's regex specifies.
+    const wordEnd = new Uint8Array(text.length + 1), wordStart = new Uint8Array(text.length + 1);
+    let last = false;
+    for (let at = 0; at < text.length;) {
+      const char = String.fromCodePoint(text.codePointAt(at)!);
+      if (!/\p{M}/u.test(char)) last = /[\p{Script=Latin}\p{N}]/u.test(char);
+      wordStart[at] = /[\p{Script=Latin}\p{N}]/u.test(char) ? 1 : 0;
+      at += char.length; wordEnd[at] = last ? 1 : 0; work.protection += 4;
+    }
+    const mark = (from: number, to: number) => {result!.push([loose.start[from]!, loose.end[to - 1]!]);};
+    for (const {pattern, han} of this.exact) {
+      work.protection++;
+      const matches: [number, number][] | undefined = result ? [] : undefined;
+      if (pattern.contains(loose.text, han ? undefined : (from, to) => {
+        work.protection += 3;
+        return !wordEnd[loose.start[from]!] && !wordStart[loose.end[to - 1]!];
+      }, matches)) return true;
+      if (matches) for (const [from, to] of matches) mark(from, to);
+    }
+    if (mode === 'exact') return false;
+    const chars = [...loose.text]; work.protection += loose.text.length;
+    const offsets = [0]; if (result) for (const char of chars) offsets.push(offsets.at(-1)! + char.length);
+    if (this.hanRuns.size) for (let i = 0; i + ZH_FACT_RUN <= chars.length; i++) {
+      work.protection += 2 * ZH_FACT_RUN;
+      if (this.hanRuns.has(chars.slice(i, i + ZH_FACT_RUN).join(''))) {
+        if (!result) return true;
+        mark(offsets[i]!, offsets[i + ZH_FACT_RUN]!);
+      }
+    }
+    if (this.enRuns.size) {
+      const sourceWords = wordsOf(text);
+      const words = sourceWords.map(item => item.word.normalize('NFKC').toLowerCase());
+      for (let i = 0; i + EN_FACT_WORDS <= words.length; i++) {
+        const window = words.slice(i, i + EN_FACT_WORDS);
+        work.protection += 2 * (EN_FACT_WORDS + window.join('').length);
+        if (this.enRuns.has(JSON.stringify(window))) {
+          if (!result) return true;
+          result.push([sourceWords[i]!.start, sourceWords[i + EN_FACT_WORDS - 1]!.end]);
+        }
+      }
+    }
+    return false;
+  }
+}
+
 const BLOCKED:MaskResult=Object.freeze({text:'',state:'blocked'});
 
 function computeMask(entry:DetailEntry,layer:string,protectedFacts:readonly string[],mode:GuardMode):MaskResult {
   if(isLegacyTemplate(layer)||!layer.trim())return BLOCKED;
   const compactLayer=compact(layer),compactDetail=entry.compact;
   if(compactLayer===compactDetail||(compactDetail.length>=6&&compactLayer.includes(compactDetail)))return BLOCKED;
-  const spans:[number,number][]=[],factSpans:[number,number][]=[];
-  const facts=protectedFacts.map(fact=>{const compactFact=compact(fact),mapped=mappedText(fact,{dropPunctuation:true}).text;
-    return {fact,compactFact,needles:mapped===compactFact?[mapped]:[mapped,compactFact]};})
-    .filter(item=>item.compactFact.length>=2&&item.needles[0]!.length>=2);
-  if(facts.length){
-    const loose=mappedText(layer,{dropPunctuation:true});
-    const markLoose=(from:number,to:number)=>factSpans.push([loose.start[from]!,loose.end[to-1]!]);
-    // Two needles when the two foldings differ: the fact read with the layer's own mapping (per cluster) and
-    // compact(fact) (whole-string lowercase and composition). Either form found in the layer is masked, so a fact
-    // written in one form never escapes a layer written in the other (final sigma, decomposed Hangul, half-width kana).
-    for(const {fact,needles} of facts){
-      const zhFact=scriptOf(fact)==='zh';
-      for(const needle of needles)for(let at=loose.text.indexOf(needle);at>=0;at=loose.text.indexOf(needle,at+1)){
-        // An English fact such as "No." matches whole words only, never the inside of "knows nothing".
-        if(!zhFact&&!onWordBoundaries(layer,loose.start[at]!,loose.end[at+needle.length-1]!))continue;
-        markLoose(at,at+needle.length);
-      }
-      // Exact-only mode: a run shared with a protected fact is ordinary wording, not a copy of the value.
-      if(mode==='exact')continue;
-      if(zhFact){
-        for(const needle of needles)for(const [from,to] of sharedRuns([...needle],[...loose.text],ZH_FACT_RUN,true))markLoose(from,to);
-      }else{
-        const layerWords=wordsOf(layer);
-        for(const [from,to] of sharedRuns(wordsOf(fact).map(word=>fold(word.word)),layerWords.map(word=>fold(word.word)),EN_FACT_WORDS,false))
-          factSpans.push([layerWords[from]!.start,layerWords[to-1]!.end]);
-      }
-    }
-  }
+  const spans:[number,number][]=[],factSpans=new ProtectedFactDetector(protectedFacts).spans(layer,mode);
   const tokens=[...entry.tokens,...protectedFacts.flatMap(tokensOf)];
   // Digit-bearing codes (letter-digit mixes, digit runs): every case-insensitive occurrence, even inside A4729 or
   // Rm4729. Known limit (recorded, not changed): the code must appear as written, so a reformatted code
@@ -350,13 +456,6 @@ function computeMask(entry:DetailEntry,layer:string,protectedFacts:readonly stri
   if(!clausesOf(text).some(clause=>units(clause)>=(scriptOf(clause)==='zh'?ZH_RESIDUAL_UNITS:EN_RESIDUAL_UNITS)))return BLOCKED;
   return {text,state:'masked'};
 }
-
-/** The original range neither starts nor ends inside a word. */
-function onWordBoundaries(layer:string,start:number,end:number):boolean {
-  return !WORD_END.test(layer.slice(0,start))&&!WORD_START.test(layer.slice(end));
-}
-
-function fold(value:string):string {return value.normalize('NFKC').toLowerCase();}
 
 /**
  * Ranges of `right` covered by a common run with `left` of at least `minimum` items. With `offsets` the ranges
@@ -388,13 +487,13 @@ const CLOSING=new Set(['”','’','」','』','）',')','】','》',']','}','"'
 const SENTENCE_FINAL=new Set(['。','．','.','!','！','?','？','…']);
 /** The sentence-final marks that state; the only ones restored after a drop. */
 const FULL_STOPS=new Set(['。','．','.']);
-const PAIRS=new Map([['“','”'],['‘','’'],['「','」'],['『','』'],['（','）'],['(',')'],['【','】'],['《','》'],['[',']'],['"','"'],['\'','\'']]);
+export const PAIRS=new Map([['“','”'],['‘','’'],['「','」'],['『','』'],['（','）'],['(',')'],['【','】'],['《','》'],['[',']'],['"','"'],['\'','\'']]);
 /** Bracket pairs whose removal leaves an aside, not a hole in the clause (quotes usually carry an object). */
 const ASIDES=new Set(['（','(','【','[']);
 /** A removal inside one of these clauses drops the whole clause. The enumeration comma splits clauses here too. */
 const CLAUSE_BOUNDARY=new Set([...SEPARATORS,...SENTENCE_FINAL,'\n']);
 /** For the residual an enumeration (码头旧书摊、航海日志) is one clause. */
-const RESIDUAL_BOUNDARY=/[，,;；:：。．.!！?？…\n]/u;
+export const RESIDUAL_BOUNDARY=/[，,;；:：。．.!！?？…\n]/u;
 type Piece={char:string}|{cut:true;aside?:true;fact?:true};
 
 function clausesOf(text:string):string[] {return text.split(RESIDUAL_BOUNDARY).filter(clause=>clause.trim());}

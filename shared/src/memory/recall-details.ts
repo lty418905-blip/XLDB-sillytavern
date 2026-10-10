@@ -1,5 +1,5 @@
 import type {Memory} from './access.ts';
-import {FRAGMENT_BANDS, FRAGMENT_TOTAL_RATIO, isLegacyTemplate, sharedRuns} from './retention.ts';
+import {FRAGMENT_BANDS, FRAGMENT_TOTAL_RATIO, FRAGMENT_RAW_LIMIT, ZH_FACT_RUN, EN_FACT_WORDS, PAIRS, RESIDUAL_BOUNDARY, ProtectedFactDetector, isLegacyTemplate, sharedRuns} from './retention.ts';
 import {compact, units, scriptOf, wordsOf, codeTokenRanges, numericRanges, mappedText} from './text-units.ts';
 import {foldCue} from './trace.ts';
 import {scanAmounts} from '../common/amount-expressions.ts';
@@ -12,7 +12,7 @@ export const DETAIL_CANDIDATE_LIMIT = 8;
 export const DETAIL_RESTATE_DISTANCE = 0.15;
 /** Maximum newly selected details for one record; valid window items may already exceed its current budget. */
 export const DETAIL_SHOWN_MAX = 3;
-/** Planned share. The low seed bit implements this value only. */
+/** Default probability of adding a random detail; configurable per selection. */
 export const DETAIL_RANDOM_SHARE = 0.5;
 export const DETAIL_NOVEL_MIN = 3;
 export const DETAIL_CONTENT_MIN = Object.freeze({zh: 4, en: 3});
@@ -50,13 +50,6 @@ export const DETAIL_CUE_SCAN_LIMIT = 64;
 /** Maximum raw UTF-16 units per selection cue; longer cues are skipped whole. */
 export const DETAIL_CUE_RAW_LIMIT = 1_000;
 
-// These local values must stay equal to the copy guard's private values.
-const ZH_FACT_RUN = 6;
-const EN_FACT_WORDS = 3;
-/** Maximum raw UTF-16 units per candidate, before trimming, not the whole detail. */
-const FRAGMENT_RAW_LIMIT = 1000;
-const PAIRS = new Map([['“','”'],['‘','’'],['「','」'],['『','』'],['（','）'],['(',')'],['【','】'],['《','》'],['[',']'],['"','"'],["'","'"]]);
-const RESIDUAL_BOUNDARY = /[，,;；:：。．.!！?？…\n]/u;
 const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const PERSON = new Set('我你妳您他她它咱');
 const EN_YOU = new Set(['you','your','yours','yourself']);
@@ -78,12 +71,15 @@ export interface DetailWork {
   split: number; novelty: number; pronouns: number; sharedIndex: number;
   sharedProbe: number; sharedCells: number; substring: number; candidates: number;
   validation: number; helpers: number; local: number; protection: number; encoding: number;
+  codeIndex: number; codeProbe: number;
 }
 export interface DetailPool {candidates: DetailCandidate[]; work: DetailWork}
 export interface DetailSelectionInput {
   pool: readonly DetailCandidate[];
   distances?: readonly number[] | null;
   seed: number;
+  /** Null, omission, invalid values and throwing getters use DETAIL_RANDOM_SHARE. */
+  randomShare?: number | null;
   cueRecall?: boolean | null;
   matchedCueFolds?: readonly string[] | null;
   previous?: readonly DetailPosition[] | null;
@@ -103,7 +99,7 @@ export interface DetailRevalidationInput {
   detailCompactLength: number;
 }
 
-const workOf = (): DetailWork => ({split: 0, novelty: 0, pronouns: 0, sharedIndex: 0, sharedProbe: 0, sharedCells: 0, substring: 0, candidates: 0, validation: 16, helpers: 0, local: 0, protection: 0, encoding: 0});
+const workOf = (): DetailWork => ({split: 0, novelty: 0, pronouns: 0, sharedIndex: 0, sharedProbe: 0, sharedCells: 0, substring: 0, candidates: 0, validation: 16, helpers: 0, local: 0, protection: 0, encoding: 0, codeIndex: 0, codeProbe: 0});
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object';
 const integer = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 // Even a naive substring search takes at most (a+1)(b+1) comparisons; no engine-specific guarantee is needed.
@@ -127,102 +123,53 @@ function foldedSize(text: string, limit: number, work: DetailWork): number {
 }
 const foldedWithin = (text: string, limit: number, work: DetailWork) => foldedSize(text, limit, work) >= 0;
 
-/** KMP: at most two character comparisons per haystack unit, including failed prefixes. */
-class Pattern {
-  key: string;
-  failure: Uint32Array;
+interface CodeNode {next: Map<string, number>; fail: number; hit: boolean; transitions: Uint32Array}
+/**
+ * Aho-Corasick for source digit codes: O(s + n), s combined code units, n queried mapped units.
+ * Source codes are ASCII. Each breadth-first node copies one fixed 128-entry transition row from its failure
+ * node, then overrides its own edges; no depth-dependent failure search or output-list copying is needed.
+ * Construction is O(128*s), queries O(n); hit flags propagate once.
+ */
+class DigitCodeIndex {
+  nodes: CodeNode[] = [{next: new Map(), fail: 0, hit: false, transitions: new Uint32Array(128)}];
   work: DetailWork;
-  constructor(key: string, work: DetailWork) {
-    this.key = key; this.work = work; this.failure = new Uint32Array(key.length);
-    work.substring += key.length;
-    for (let i = 1, j = 0; i < key.length; i++) {
-      while (j && key[i] !== key[j]) {work.substring++; j = this.failure[j - 1]!;}
-      work.substring++; if (key[i] === key[j]) j++;
-      this.failure[i] = j;
-    }
-  }
-  contains(text: string, boundary?: (start: number, end: number) => boolean): boolean {
-    const key = this.key;
-    for (let i = 0, j = 0; i < text.length; i++) {
-      while (j && text[i] !== key[j]) {this.work.substring++; j = this.failure[j - 1]!;}
-      this.work.substring++;
-      if (text[i] === key[j]) j++;
-      if (j === key.length) {
-        if (!boundary || boundary(i + 1 - j, i + 1)) return true;
-        j = this.failure[j - 1]!;
-      }
-    }
-    return false;
-  }
-}
-
-/** Fixed six-character / three-word windows are built once per record, never per clause. */
-class ProtectionIndex {
-  exact: {pattern: Pattern; han: boolean}[] = [];
-  hanRuns = new Set<string>();
-  enRuns = new Set<string>();
-  work: DetailWork;
-  constructor(facts: string[], work: DetailWork) {
-    this.work = work;
-    for (const fact of facts) {
-      textWork(fact, work, 5); // compact, mappedText, scriptOf, wordsOf and per-word folding.
-      const key = compact(fact), mapped = mappedText(fact, {dropPunctuation: true}).text;
-      work.protection += 1 + key.length + mapped.length;
-      if (key.length < 2 || mapped.length < 2) continue;
-      const han = scriptOf(fact) === 'zh', needles = mapped === key ? [mapped] : [mapped, key];
-      for (const needle of needles) {
-        this.exact.push({pattern: new Pattern(needle, work), han});
-        if (han) {
-          const chars = [...needle]; work.protection += needle.length;
-          for (let i = 0; i + ZH_FACT_RUN <= chars.length; i++) {
-            work.protection += 2 * ZH_FACT_RUN;
-            this.hanRuns.add(chars.slice(i, i + ZH_FACT_RUN).join(''));
-          }
+  constructor(codes: string[], work: DetailWork) {
+    this.work = work; work.codeIndex += 128;
+    for (const code of codes) {
+      let at = 0;
+      for (const char of code) {
+        work.substring++; work.codeIndex++;
+        let next = this.nodes[at]!.next.get(char);
+        if (next === undefined) {
+          next = this.nodes.length; this.nodes[at]!.next.set(char, next);
+          this.nodes.push({next: new Map(), fail: 0, hit: false, transitions: new Uint32Array(128)});
+          work.codeIndex += 128;
         }
+        at = next;
       }
-      if (!han) {
-        const words = wordsOf(fact).map(item => item.word.normalize('NFKC').toLowerCase());
-        for (let i = 0; i + EN_FACT_WORDS <= words.length; i++) {
-          const window = words.slice(i, i + EN_FACT_WORDS);
-          work.protection += 2 * (EN_FACT_WORDS + window.join('').length);
-          this.enRuns.add(JSON.stringify(window));
-        }
+      this.nodes[at]!.hit = true;
+    }
+    const root = this.nodes[0]!;
+    for (const [char, next] of root.next) {root.transitions[char.charCodeAt(0)] = next; work.codeIndex++;}
+    const queue = [...root.next.values()];
+    for (let i = 0; i < queue.length; i++) {
+      const at = queue[i]!, node = this.nodes[at]!, fallback = this.nodes[node.fail]!;
+      node.transitions.set(fallback.transitions); work.codeIndex += 128;
+      for (const [char, next] of node.next) {
+        work.substring++; work.codeIndex++;
+        const target = fallback.transitions[char.charCodeAt(0)]!;
+        this.nodes[next]!.fail = target;
+        this.nodes[next]!.hit ||= this.nodes[target]!.hit;
+        node.transitions[char.charCodeAt(0)] = next; queue.push(next);
       }
     }
   }
-  hits(text: string): boolean {
-    const work = this.work;
-    if (!this.exact.length) return false;
-    textWork(text, work, 3); // mappedText, wordsOf and per-word folding.
-    const loose = mappedText(text, {dropPunctuation: true});
-    // A Latin/number followed by marks is still a word end, just as the copy guard's regex specifies.
-    const wordEnd = new Uint8Array(text.length + 1), wordStart = new Uint8Array(text.length + 1);
-    let last = false;
-    for (let at = 0; at < text.length;) {
-      const char = String.fromCodePoint(text.codePointAt(at)!);
-      if (!/\p{M}/u.test(char)) last = /[\p{Script=Latin}\p{N}]/u.test(char);
-      wordStart[at] = /[\p{Script=Latin}\p{N}]/u.test(char) ? 1 : 0;
-      at += char.length; wordEnd[at] = last ? 1 : 0; work.protection += 4;
-    }
-    for (const {pattern, han} of this.exact) {
-      work.protection++;
-      if (pattern.contains(loose.text, han ? undefined : (from, to) => {
-        work.protection += 3;
-        return !wordEnd[loose.start[from]!] && !wordStart[loose.end[to - 1]!];
-      })) return true;
-    }
-    const chars = [...loose.text]; work.protection += loose.text.length;
-    if (this.hanRuns.size) for (let i = 0; i + ZH_FACT_RUN <= chars.length; i++) {
-      work.protection += 2 * ZH_FACT_RUN;
-      if (this.hanRuns.has(chars.slice(i, i + ZH_FACT_RUN).join(''))) return true;
-    }
-    if (this.enRuns.size) {
-      const words = wordsOf(text).map(item => item.word.normalize('NFKC').toLowerCase());
-      for (let i = 0; i + EN_FACT_WORDS <= words.length; i++) {
-        const window = words.slice(i, i + EN_FACT_WORDS);
-        work.protection += 2 * (EN_FACT_WORDS + window.join('').length);
-        if (this.enRuns.has(JSON.stringify(window))) return true;
-      }
+  contains(text: string): boolean {
+    let at = 0;
+    for (const char of text) {
+      this.work.substring++; this.work.codeProbe++;
+      at = this.nodes[at]!.transitions[char.charCodeAt(0)] ?? 0;
+      if (this.nodes[at]!.hit) return true;
     }
     return false;
   }
@@ -439,7 +386,7 @@ function clauseContent(text: string, han: boolean, user: boolean, work: DetailWo
  * Work charges every helper's cold upper bound, even on cache hits: folds use at most 54 emitted units per
  * raw unit, token sorting adds ceil(log2(1+54*n)) passes; sharedRuns includes table initialization and ranges.
  * Whole-detail and protected copies are checked directly. Rule four rejects raw code spans; dotted-I folds
- * additionally check source digit codes in lowercase mapped text, using one lazy source index and linear KMP.
+ * additionally check source digit codes in lowercase mapped text, using one lazy multi-pattern source index and a single linear scan.
  * The exported legacy-template predicate is charged for trim/hash. No guard result cache is populated.
  * scanAmounts uses 256 folded passes.
  * No source/chat-size cutoff. Selection and revalidation retain their existing independent input limits.
@@ -503,11 +450,11 @@ export function buildRecallDetailPool(input: DetailPoolInput): DetailPool {
     const layers = [gistKey, compact(feeling), compact(anchor)].filter(Boolean);
     const hanTokens = [...gistKey], knownHan = new Set(hanTokens), knownWords = new Set(gistWords);
     const hanRuns = runIndex(hanTokens, ZH_FACT_RUN, true, work), enRuns = runIndex(gistWords, EN_FACT_WORDS, false, work);
-    const verbatim = new TextIndex(work), accepted = new AcceptedIndex(work), protectedIndex = new ProtectionIndex(facts, work);
+    const verbatim = new TextIndex(work), accepted = new AcceptedIndex(work), protectedIndex = new ProtectedFactDetector(facts, work);
     work.local += 8 + 4 * (gistKey.length + gist.length);
     if (stored.some(value => typeof value === 'string' && value.length <= FRAGMENT_RAW_LIMIT)) verbatim.append(detail);
     const all: DetailCandidate[] = [];
-    let digitCodes: Pattern[] | undefined;
+    let digitCodes: DigitCodeIndex | undefined;
     const consider = (raw: unknown, origin: 'stored' | 'clause', offset?: number) => {
       work.candidates++;
       if (typeof raw !== 'string' || raw.length > FRAGMENT_RAW_LIMIT) return;
@@ -535,11 +482,11 @@ export function buildRecallDetailPool(input: DetailPoolInput): DetailPool {
               if (code.kind !== 'caps') codes.add(code.token.toLowerCase());
             }
           }
-          digitCodes = [...codes].map(code => new Pattern(code, work));
+          digitCodes = new DigitCodeIndex([...codes], work);
         }
         textWork(text, work); work.protection += text.length;
         const folded = mappedText(text, {dropPunctuation: false}).text;
-        if (digitCodes.some(code => code.contains(folded))) return;
+        if (digitCodes.contains(folded)) return;
       }
       if (protectedIndex.hits(text)) return;
       // Full-detail copies are also rejected by the later half-detail ratio; keep this direct check.
@@ -684,6 +631,21 @@ export function revalidateRecallDetails(input: DetailRevalidationInput): ShownDe
  * Reads external fields once into local copies. Only invalid distances fall back; other malformed inputs return empty.
  * Output is in source order; render non-stray items together and the marked stray separately.
  */
+/** Invalid shares fall back to the default without invalidating otherwise usable selection inputs. */
+function randomShareOf(input: DetailSelectionInput): number {
+  try {
+    const share = input.randomShare;
+    return typeof share === 'number' && Number.isFinite(share) && share >= 0 && share <= 1 ? share : DETAIL_RANDOM_SHARE;
+  } catch {return DETAIL_RANDOM_SHARE;}
+}
+
+/** An avalanche permutation decorrelates the index from the probability's rotated seed bits. */
+function randomIndexSeed(seed: number): number {
+  let value = Math.imul(seed ^ (seed >>> 16), 0x7feb352d);
+  value = Math.imul(value ^ (value >>> 15), 0x846ca68b);
+  return (value ^ (value >>> 16)) >>> 0;
+}
+
 export function selectRecallDetails(input: DetailSelectionInput): DetailSelection {
   const empty = (): DetailSelection => ({items: [], candidateCount: 0, budget: 0, mode: 'empty'});
   try {
@@ -724,9 +686,14 @@ export function selectRecallDetails(input: DetailSelectionInput): DetailSelectio
       if (!distances) add(cue ?? pool[seed % pool.length]);
       else {
         add(ranked[0]!.item);
-        const coin = (seed & 1) === 1;
+        const share = randomShareOf(input);
+        // Rotate the low bit (inverted) into the high bit: odd seeds occupy [0, .5), even seeds [.5, 1).
+        // At .5 this is exactly the old low-bit coin for every uint32 seed, including both endpoints.
+        const roll = ((seed >>> 1) + ((seed & 1) === 0 ? 0x80000000 : 0)) / 0x100000000;
+        const coin = roll < share;
+        const indexSeed = share === 0.5 ? seed >>> 1 : randomIndexSeed(seed);
         if (budget >= 2 && (!coin || budget === 3)) add(ranked[1]!.item);
-        if (budget >= 2 && coin) add(ranked[2 + ((seed >>> 1) % (n - 2))]!.item, true);
+        if (budget >= 2 && coin) add(ranked[2 + (indexSeed % (n - 2))]!.item, true);
       }
     }
     return {items: display(picked), candidateCount: n, budget, mode: distances ? 'fresh' : 'fallback'};
