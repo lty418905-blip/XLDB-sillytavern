@@ -382,19 +382,24 @@ export function createToolLoop<C>(options: ToolLoopOptions<C>): ToolLoopRun {
         const tool = typeof value.tool === 'string' ? tools.get(value.tool) : undefined;
         let issue: ToolIssue | null = !tool ? { path: 'tool', expected: 'known_tool' }
           : !isObject(value.args) ? { path: 'args', expected: 'object' } : null;
+        let args: ToolObject = {}, canonical = '';
+        if (issue === null) {
+          // Bound and snapshot model arguments before invoking the tool's check.
+          try { args = snapshotObject(value.args); }
+          catch { issue = { path: 'args', expected: 'serializable_object' }; }
+        }
         if (tool && issue === null) {
           failure = 'check_failed';
-          issue = tool.check(value.args as ToolObject);
+          issue = tool.check(args);
           if (issue !== null) {
             if (!isObject(issue) || typeof issue.path !== 'string' || typeof issue.expected !== 'string') throw invalid();
             issue = { path: issue.path, expected: issue.expected };
           }
         }
-        let args: ToolObject = {}, canonical = '';
         if (issue === null) {
-          // Bound and snapshot arguments before execution; all tree serialization is iterative.
+          // Preserve post-check validation and canonicalization when check edits its snapshot.
           try {
-            args = snapshotObject(value.args);
+            args = snapshotObject(args);
             canonical = canonicalToolArgs(args).json;
           } catch { issue = { path: 'args', expected: 'serializable_object' }; }
         }

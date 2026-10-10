@@ -235,7 +235,7 @@ function currentImpactBand(item:EmotionRankCandidate):number {
       if(!clause||/^(?:回忆|想起|记得)|(?:十年前|多年前|当年|以前|过去|曾经)/u.test(clause)&&
         !/(?:此刻|现在|如今|再次|重新|刚刚|刚|这时)/u.test(clause))continue;
       if(/(?:档案|书中|报道)/u.test(clause)&&!/(?:自己|本人|此刻|现在)/u.test(clause))continue;
-      const other=/(?:别人|另一个人|旁人|其他人|他人|隔壁有人)/u.exec(clause);
+      const other=/(?:别人|另一个人|旁人|其[他它]人|他人|隔壁有人)/u.exec(clause);
       if(other){
         const after=clause.slice(other.index+other[0].length);
         const own=[after.indexOf('自己'),after.indexOf('本人'),after.indexOf(name)]

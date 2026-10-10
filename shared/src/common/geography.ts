@@ -1,4 +1,4 @@
-import {foldForMatch} from './script-fold.ts';
+import {foldForMatch,sourceQuote} from './script-fold.ts';
 import type {DatabaseSync} from 'node:sqlite';
 import {createHash,randomUUID} from 'node:crypto';
 import {scopeKey} from '../core/types.ts';
@@ -622,8 +622,10 @@ function playerMovementOperation(operation:GeographyOperation,observation:Perspe
   if(operation.basis!=='actual_event'||operation.kind!=='place'&&operation.kind!=='position')throw new Error('invalid_geography_fact_source');
   const destination=playerDestination(observation.quote);
   if(!destination)throw new Error('invalid_geography_position_source');
-  if(operation.kind==='place'&&foldForMatch(operation.place.name)!==foldForMatch(destination)||operation.kind==='position'&&(
-    operation.actorId!=='player'||operation.position.state!=='at'&&operation.position.state!=='within'||placeName!==undefined&&foldForMatch(placeName)!==foldForMatch(destination)))
+  // Three fixed quote-search passes: O(name.length + destination.length); destination is at most 80 units.
+  const matchesDestination=(name:string)=>name.length===destination.length&&sourceQuote(destination,name)===destination;
+  if(operation.kind==='place'&&!matchesDestination(operation.place.name)||operation.kind==='position'&&(
+    operation.actorId!=='player'||operation.position.state!=='at'&&operation.position.state!=='within'||placeName!==undefined&&!matchesDestination(placeName)))
     throw new Error('invalid_geography_position_source');
   if(operation.kind==='place')operation.place.name=destination;
 }

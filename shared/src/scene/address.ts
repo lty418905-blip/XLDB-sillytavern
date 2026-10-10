@@ -17,7 +17,7 @@ export function addressConversation(messages:readonly {role:string;text:string}[
     // Match a length-preserving copy; capture indices still point into the original nickname.
     const source=message.text.trim(),text=foldForMatch(source);
     const scope:AddressPreference['scope']=/(?:只在|仅在|只限|仅限)\s*(?:私下|私聊|两个人)|私下.{0,8}(?:叫|称呼)/.test(text)?'private':
-      /(?:只在|仅在|只限|仅限)\s*(?:公开|公共|正式|有其他人)/.test(text)?'public':'all';
+      /(?:只在|仅在|只限|仅限)\s*(?:公开|公共|正式|有其[他它]人)/.test(text)?'public':'all';
     if(scope!=='all'&&scope!==visibility)continue;
     if(/^(?:请|以后|你)?(?:别|不要|不许).{0,5}(?:亲昵|昵称|小名|宝贝|叫我|称呼我)/.test(text)){
       preference={status:'accepted',scope,kind:'reject-intimate'};nicknameAsked=true;continue;
