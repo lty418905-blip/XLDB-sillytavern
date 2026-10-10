@@ -2,6 +2,8 @@ import {foldForMatch,includesForMatch,scriptQuoteSearch,sourceQuote} from '../co
 import { calculate } from '../core/arithmetic.ts';
 import type { PerspectivePlan } from './types.ts';
 import {legacyTemporalGuard} from './time-expressions.ts';
+import {hasLedgerData, prepareLedgerSources, prepareLedgerOptions, foldLedgerWorld, foldLedgerPrefix, legacyLedgerKey, markLedgerCorrections, projectLedger,
+  type LedgerFoldBridge, type LedgerLegacyHooks, type LedgerLegacyResult, type LedgerWork, type LedgerFoldOptions, type StoredLedger, type LedgerMarks, type LedgerFold, type LedgerProjection, type LedgerDetail} from './world-ledger.ts';
 
 export const WORLD_PLAYER_ID = 'player' as const;
 
@@ -119,6 +121,9 @@ export interface WorldSourceEffects {
    * validated exactly as before and never applied: the story clock owns that source's time.
    */
   storyClockOwned?: boolean;
+  ledger?: StoredLedger;
+  ledgerMarks?: LedgerMarks;
+  replyTo?: {id:string;revision:number};
 }
 
 export interface WorldEffectReceipt {
@@ -160,6 +165,7 @@ export interface WorldFoldResult {
   state: WorldState;
   receipts: WorldEffectReceipt[];
   issues: WorldIssue[];
+  ledger?: LedgerFold;
 }
 
 export interface WorldProjection {
@@ -168,9 +174,11 @@ export interface WorldProjection {
   balances: { ownerId: string; unit: string; value: string }[];
   inventory: { ownerId: string; item: string; count: number }[];
   receipts: Omit<WorldEffectReceipt, 'readerIds' | 'quote' | 'effectId'>[];
+  ledger?: LedgerProjection;
+  accounts?: {id:string;kind:'organisation'|'shared';label:string}[];
 }
 
-interface MutableBalance { ownerId: string; unit: string; cents: bigint; readerIds: Set<string> }
+interface MutableBalance { ownerId: string; unit: string; cents: bigint; readerIds: Set<string>; tracked?: boolean }
 interface MutableInventory { ownerId: string; item: string; count: number; readerIds: Set<string> }
 interface MutableState {
   timeMs: number;
@@ -210,9 +218,45 @@ const TIME_LABELS = new Map<string, readonly string[]>([
 export function foldWorldState(
   settings: WorldSettings,
   sources: readonly WorldSourceEffects[],
-  options: { nowMs?: number; monotonicFloorMs?: number } = {},
+  options: { nowMs?: number; monotonicFloorMs?: number } & LedgerFoldOptions = {},
 ): WorldFoldResult {
   const validated = validateSettings(settings);
+  if (hasLedgerData(sources, options)) {
+    options = prepareLedgerOptions(options,settings.mode==='companion');
+    const prepared = prepareLedgerSources(Array.isArray(sources) ? sources : [...sources]), ledgerIssues: WorldIssue[] = [], validSources: WorldSourceEffects[] = [];
+    for (const source of uniqueSourceRevisions(prepared, ledgerIssues)) {
+      const invalid = validateSource(source);
+      if (invalid.length) ledgerIssues.push(...invalid); else validSources.push(source);
+    }
+    const initial = cloneState(validated.initial);
+    if (settings.mode === 'companion') {
+      const bounds = [settings.startTimeMs, options.nowMs, options.monotonicFloorMs, ...validSources.map(source => source.acceptedAtMs)]
+        .filter((value): value is number => isTime(value));
+      initial.timeMs = bounds.reduce((latest, value) => Math.max(latest, value), settings.startTimeMs);
+    }
+    const result = foldLedgerWorld(settings, prepared, options, {
+      initial, validSources, issues: ledgerIssues,
+      serialize: state => serializeState(settings, state),
+      readers: (source, region) => {
+        if ('span' in region) return observedReaders(validated, source, region.span);
+        const readers = new Set<string>();
+        for (const observation of source.plan.observations) {
+          for (const id of observedReaders(validated, source, observation)) readers.add(id);
+          if (typeof observation.playerEvidence === 'string' && observation.playerEvidence) {
+            const match = scriptQuoteSearch(source.text.slice(observation.start, observation.end), observation.playerEvidence, 2).matches;
+            if (match.length === 1) for (const id of observedReaders(validated, source,
+              {start: observation.start + match[0]!.start, end: observation.start + match[0]!.end})) readers.add(id);
+          }
+        }
+        return [...readers].sort();
+      },
+      legacy: ledgerLegacy(validated),
+    });
+    if (Array.isArray(options.corrections) && options.corrections.length) {
+      return markLedgerCorrections(result, foldWorldState(settings, sources, {...options, corrections: []}));
+    }
+    return result;
+  }
   const issues: WorldIssue[] = [];
   const uniqueSources = uniqueSourceRevisions(sources, issues);
   const validSources: WorldSourceEffects[] = [];
@@ -267,8 +311,59 @@ export interface WorldRunningStep {
  * changes nothing, and an invalid source marks its own prefix and every later one. Any other input (a companion world,
  * a repeated source revision) is folded once per prefix. Throws invalid_world_settings as foldWorldState does.
  */
-export function foldWorldStateRunning(settings: WorldSettings, sources: readonly WorldSourceEffects[]): WorldRunningStep[] {
+export function foldWorldStateRunning(settings: WorldSettings, sources: readonly WorldSourceEffects[], options: LedgerFoldOptions = {}, runningWork?: LedgerWork): WorldRunningStep[] {
   const validated = validateSettings(settings);
+  if (hasLedgerData(sources, options)) {
+    options = prepareLedgerOptions(options,settings.mode==='companion');
+    const prepared = prepareLedgerSources(sources), validSources: WorldSourceEffects[] = [];
+    const fingerprints = new Map<string, string>(), rawIssues: (string | null)[] = [], validationIssues: (string | null)[] = [];
+    let conflict = false;
+    for (const source of prepared) {
+      let fingerprint: string;
+      try { fingerprint = canonical(source); } catch { rawIssues.push('invalid_world_source'); validationIssues.push(null); continue; }
+      const sourceId = isRecord(source) && typeof source.sourceId === 'string' ? source.sourceId : '';
+      const revision = isRecord(source) && Number.isSafeInteger(source.revision) ? source.revision : 0;
+      const key = pairKey(sourceId, String(revision)), prior = fingerprints.get(key);
+      if (prior !== undefined) { conflict ||= prior !== fingerprint; rawIssues.push(prior !== fingerprint ? 'duplicate_source_conflict' : null); validationIssues.push(null); continue; }
+      fingerprints.set(key, fingerprint);
+      const invalid = validateSource(source); rawIssues.push(null); validationIssues.push(invalid[0]?.code ?? null);
+      if (!invalid.length) validSources.push(source);
+    }
+    // Conflicting revisions retroactively remove the first occurrence and its
+    // dependent state. The incremental path applies to nonconflicting sequences.
+    if (conflict) return sources.map((_source, index) => {
+      const prefix = foldLedgerPrefix(settings, sources, index + 1, options, foldWorldState);
+      return prefix.ok ? {timeMs: prefix.value.state.timeMs, issue: prefix.value.issues[0]?.code ?? null} : {timeMs: settings.startTimeMs, issue: null};
+    });
+    const steps: WorldRunningStep[] = [], valid = new Set(validSources);
+    let firstRaw: string | null = null, firstValidation: string | null = null;
+    let companionTime = Math.max(settings.startTimeMs, isTime(options.nowMs) ? options.nowMs : 0, isTime(options.monotonicFloorMs) ? options.monotonicFloorMs : 0);
+    const folded = foldLedgerWorld(settings, prepared, options, {
+      initial: cloneState(validated.initial), validSources, issues: [],
+      serialize: state => serializeState(settings, state),
+      readers: (source, region) => {
+        if ('span' in region) return observedReaders(validated, source, region.span);
+        const readers = new Set<string>();
+        for (const observation of source.plan.observations) {
+          for (const id of observedReaders(validated, source, observation)) readers.add(id);
+          if (typeof observation.playerEvidence === 'string' && observation.playerEvidence) {
+            const match = scriptQuoteSearch(source.text.slice(observation.start, observation.end), observation.playerEvidence, 2).matches;
+            if (match.length === 1) for (const id of observedReaders(validated, source,
+              {start: observation.start + match[0]!.start, end: observation.start + match[0]!.end})) readers.add(id);
+          }
+        }
+        return [...readers].sort();
+      },
+      legacy: ledgerLegacy(validated),
+      step: (position, timeMs, firstIssue) => {
+        firstRaw ??= rawIssues[position] ?? null; firstValidation ??= validationIssues[position] ?? null;
+        if (settings.mode === 'companion' && valid.has(prepared[position]!)) companionTime = Math.max(companionTime, prepared[position]!.acceptedAtMs);
+        steps.push({timeMs: settings.mode === 'companion' ? companionTime : timeMs, issue: firstRaw ?? firstValidation ?? firstIssue});
+      },
+    });
+    if (runningWork && folded.ledger) Object.assign(runningWork, folded.ledger.work);
+    return steps;
+  }
   const perPrefix = (): WorldRunningStep[] => sources.map((_source, index) => {
     const folded = foldWorldState(settings, sources.slice(0, index + 1));
     return {timeMs: folded.state.timeMs, issue: folded.issues[0]?.code ?? null};
@@ -310,6 +405,7 @@ export function projectWorldState(result: WorldFoldResult, readerId: string): Wo
   const known = readerId === WORLD_PLAYER_ID
     || result.state.actorIds.includes(readerId);
   if (!known) throw new Error('invalid_world_reader');
+  const ledgerView = result?.ledger ? projectLedger(result.ledger, readerId) : null;
   return {
     mode: result.state.mode,
     ...((readerId === WORLD_PLAYER_ID || result.state.publicTime) ? { timeMs: result.state.timeMs } : {}),
@@ -319,6 +415,64 @@ export function projectWorldState(result: WorldFoldResult, readerId: string): Wo
       .map(({ ownerId, item, count }) => ({ ownerId, item, count })),
     receipts: result.receipts.filter(value => value.readerIds.includes(readerId))
       .map(({ readerIds: _readerIds, quote: _quote, effectId: _effectId, ...receipt }) => receipt),
+    ...(ledgerView ? {ledger: ledgerView.ledger, ...(ledgerView.accounts.length ? {accounts: ledgerView.accounts} : {})} : {}),
+  };
+}
+
+
+function ledgerLegacy(validated:ValidatedSettings):LedgerFoldBridge['legacy'] {
+  let ledgerPurchases = new Map<string, PurchaseIndexEntry>();
+  const evaluate = (state:MutableState, source:WorldSourceEffects, hooks:LedgerLegacyHooks, preview=false):LedgerLegacyResult => {
+        // Only this source's purchase keys can change; rollback visits <= 64 keys.
+        const trial = cloneState(state), trialPurchases = ledgerPurchases;
+        const purchaseUndo = new Map<string, PurchaseIndexEntry | undefined>();
+        const localReceipts: WorldEffectReceipt[] = [], localIssues: WorldIssue[] = [], details: LedgerDetail[] = [];
+        const candidates=uniqueCandidates(source,localIssues),allIssues=[...localIssues];
+        const corrected: {raw:unknown; correction:Parameters<typeof hooks.correct>[2]}[] = [];
+        let sideEffects = hooks.sideEffects;
+        for (const raw of candidates) {
+          const key = isRecord(raw) && typeof raw.effectId === 'string' ? legacyLedgerKey(source.sourceId, source.revision, raw.effectId) : null;
+          const correction = typeof key === 'string' ? hooks.corrections.get(key) : undefined;
+          if (correction) { details.push(hooks.correct(trial, raw, correction)); corrected.push({raw, correction}); sideEffects = true; continue; }
+          if (isRecord(raw)) {
+            const ref = raw.kind === 'purchase' && typeof raw.effectId === 'string' ? {sourceId: source.sourceId, revision: source.revision, effectId: raw.effectId} : raw.kind === 'refund' && isRecord(raw.purchase) ? raw.purchase : null;
+            if (ref && typeof ref.sourceId === 'string' && Number.isSafeInteger(ref.revision) && typeof ref.effectId === 'string') {
+              const indexKey = purchaseKey(ref.sourceId, ref.revision as number, ref.effectId);
+              if (!purchaseUndo.has(indexKey)) { const old = trialPurchases.get(indexKey); purchaseUndo.set(indexKey, old ? {...old, readers: new Set(old.readers)} : undefined); }
+              hooks.work.purchaseVisits = (hooks.work.purchaseVisits ?? 0) + 1;
+            }
+          }
+          const effect = applyCandidate(validated, trial, trialPurchases, source, raw);
+          if ('issue' in effect) {
+            allIssues.push(effect.issue);
+            if (sideEffects && effect.ledgerState === true) details.push(hooks.demote(raw, effect.issue.code));
+            else localIssues.push(effect.issue);
+          } else localReceipts.push(effect.receipt);
+        }
+        if (localIssues.length) {
+          for (const [key, old] of purchaseUndo) { if (old) trialPurchases.set(key, old); else trialPurchases.delete(key); }
+          const correctedState = cloneState(state);
+          const correctionDetails = corrected.map(({raw, correction}) => hooks.correct(correctedState, raw, correction));
+          return {state: correctedState, receipts: [], issues: allIssues, details: correctionDetails, sideEffects: hooks.sideEffects || corrected.length > 0};
+        }
+        if(preview)for(const [key,old] of purchaseUndo){if(old)trialPurchases.set(key,old);else trialPurchases.delete(key);}
+        else ledgerPurchases = trialPurchases;
+        return {state: trial, receipts: localReceipts, issues: [], details, sideEffects};
+
+  };
+  return (state,source,hooks)=>{
+    if(!hooks.corrections.size)return evaluate(state,source,hooks);
+    // Only corrected sources need a check-class preview. It skips corrected
+    // effects, uses the same trial/rollback boundary, and never applies a correction.
+    const preview=evaluate(state,source,{...hooks,work:{...hooks.work},correct:(_trial,raw)=>hooks.demote(raw,'')},true);
+    if(!preview.issues.length)return evaluate(state,source,hooks);
+    const correctedState=cloneState(state),details:LedgerDetail[]=[];
+    for(const raw of uniqueCandidates(source,[])){
+      const key=isRecord(raw)&&typeof raw.effectId==='string'?legacyLedgerKey(source.sourceId,source.revision,raw.effectId):null;
+      const correction=typeof key==='string'?hooks.corrections.get(key):undefined;
+      if(correction)details.push(hooks.correct(correctedState,raw,correction));
+    }
+    return {state:correctedState,receipts:[],issues:preview.issues,details,sideEffects:hooks.sideEffects||details.length>0};
   };
 }
 
@@ -365,7 +519,7 @@ function validateSettings(settings: WorldSettings): ValidatedSettings {
 }
 
 function applyCandidate(validated: ValidatedSettings, state: MutableState, purchases: Map<string, PurchaseIndexEntry>, source: WorldSourceEffects, raw: unknown):
-  { receipt: WorldEffectReceipt } | { issue: WorldIssue } {
+  { receipt: WorldEffectReceipt } | { issue: WorldIssue; ledgerState?: true } {
   const base = readBase(raw, source);
   if ('code' in base) return {issue:issue(source, base.effectId, base.code)};
   const { candidate, effectId, quote, classification, evidence } = base;
@@ -418,10 +572,10 @@ function applyCandidate(validated: ValidatedSettings, state: MutableState, purch
     if (classification !== 'current') return {receipt:{...receipt,ignoredReason:'non_current'}};
     const balance=findAsset(state.balances,purchase.ownerId,purchase.unit);
     const item=findAsset(state.inventory,purchase.ownerId,purchase.item);
-    if (!balance || !item) return {issue:issue(source,effectId,'unconfigured_world_asset')};
-    if (balance.cents<purchase.costCents) return {issue:issue(source,effectId,'insufficient_funds')};
-    if (!Number.isSafeInteger(item.count+purchase.quantity)) return {issue:issue(source,effectId,'inventory_overflow')};
-    balance.cents-=purchase.costCents;item.count+=purchase.quantity;
+    if (!balance || !item) return {issue:issue(source,effectId,'unconfigured_world_asset'),ledgerState:true};
+    if (balance.tracked!==false&&balance.cents<purchase.costCents) return {issue:issue(source,effectId,'insufficient_funds'),ledgerState:true};
+    if (!Number.isSafeInteger(item.count+purchase.quantity)) return {issue:issue(source,effectId,'inventory_overflow'),ledgerState:true};
+    if(balance.tracked!==false)balance.cents-=purchase.costCents;item.count+=purchase.quantity;
     restrictReaders(balance.readerIds,readers);restrictReaders(item.readerIds,readers);
     purchases.set(purchaseKey(source.sourceId,source.revision,effectId),{
       ownerId:purchase.ownerId,unit:balance.unit,item:item.item,quantity:purchase.quantity,
@@ -434,16 +588,16 @@ function applyCandidate(validated: ValidatedSettings, state: MutableState, purch
     if ('code' in refund) return {issue:issue(source,effectId,refund.code)};
     if (classification !== 'current') return {receipt:{...receipt,ignoredReason:'non_current'}};
     const original=purchases.get(purchaseKey(refund.purchase.sourceId,refund.purchase.revision,refund.purchase.effectId));
-    if (!original) return {issue:issue(source,effectId,'unknown_purchase_reference')};
+    if (!original) return {issue:issue(source,effectId,'unknown_purchase_reference'),ledgerState:true};
     if (!readers.some(reader=>original.readers.has(reader))) return {issue:issue(source,effectId,'refund_not_authorized')};
-    if (refund.quantity>original.quantity-original.refundedQuantity) return {issue:issue(source,effectId,'refund_quantity_exceeded')};
+    if (refund.quantity>original.quantity-original.refundedQuantity) return {issue:issue(source,effectId,'refund_quantity_exceeded'),ledgerState:true};
     const balance=state.balances.get(assetKey(original.ownerId,original.unit));
     const item=state.inventory.get(assetKey(original.ownerId,original.item));
-    if (!balance || !item) return {issue:issue(source,effectId,'unconfigured_world_asset')};
-    if (item.count<refund.quantity) return {issue:issue(source,effectId,'insufficient_inventory')};
+    if (!balance || !item) return {issue:issue(source,effectId,'unconfigured_world_asset'),ledgerState:true};
+    if (item.count<refund.quantity) return {issue:issue(source,effectId,'insufficient_inventory'),ledgerState:true};
     const amount=original.unitPriceCents*BigInt(refund.quantity);
-    if (!Number.isSafeInteger(item.count-refund.quantity)) return {issue:issue(source,effectId,'inventory_overflow')};
-    balance.cents+=amount;item.count-=refund.quantity;original.refundedQuantity+=refund.quantity;
+    if (!Number.isSafeInteger(item.count-refund.quantity)) return {issue:issue(source,effectId,'inventory_overflow'),ledgerState:true};
+    if(balance.tracked!==false)balance.cents+=amount;item.count-=refund.quantity;original.refundedQuantity+=refund.quantity;
     restrictReaders(balance.readerIds,readers);restrictReaders(item.readerIds,readers);
     return {receipt:{...receipt,readerIds:readers.filter(reader=>original.readers.has(reader)),applied:true,ownerId:original.ownerId,unit:original.unit,item:original.item,balanceDeltaCents:`${amount}`,inventoryDelta:-refund.quantity}};
   }
@@ -451,8 +605,8 @@ function applyCandidate(validated: ValidatedSettings, state: MutableState, purch
   if ('code' in consume) return {issue:issue(source,effectId,consume.code)};
   if (classification !== 'current') return {receipt:{...receipt,ignoredReason:'non_current'}};
   const item=findAsset(state.inventory,consume.ownerId,consume.item);
-  if (!item) return {issue:issue(source,effectId,'unconfigured_world_asset')};
-  if (item.count<consume.quantity) return {issue:issue(source,effectId,'insufficient_inventory')};
+  if (!item) return {issue:issue(source,effectId,'unconfigured_world_asset'),ledgerState:true};
+  if (item.count<consume.quantity) return {issue:issue(source,effectId,'insufficient_inventory'),ledgerState:true};
   item.count-=consume.quantity;restrictReaders(item.readerIds,readers);
   return {receipt:{...receipt,applied:true,ownerId:consume.ownerId,item:item.item,inventoryDelta:-consume.quantity}};
 }
@@ -619,7 +773,7 @@ function validateSource(source:WorldSourceEffects):WorldIssue[] {
 
 function serializeState(settings:WorldSettings,state:MutableState):WorldState {
   return {mode:settings.mode,timeMs:state.timeMs,publicTime:settings.publicTime,actorIds:Object.keys(settings.actorLabels).sort(),
-    balances:[...state.balances.values()].map(value=>({ownerId:value.ownerId,unit:value.unit,value:centsToMoney(value.cents),readerIds:[...value.readerIds].sort()})),
+    balances:[...state.balances.values()].filter(value=>value.tracked!==false).map(value=>({ownerId:value.ownerId,unit:value.unit,value:centsToMoney(value.cents),readerIds:[...value.readerIds].sort()})),
     inventory:[...state.inventory.values()].map(value=>({ownerId:value.ownerId,item:value.item,count:value.count,readerIds:[...value.readerIds].sort()}))};
 }
 

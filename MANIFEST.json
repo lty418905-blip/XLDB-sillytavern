@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "dee39622559fb53b1729aae0d002f632ebe9191589be2251e7aa020dcbc4ff6b",
+  "sourceManifestSha256": "d5108618e62369a7b3c4b7adc107e995498fdf7210edf1a75aa6341c1f693c57",
   "files": [
     {
       "file": ".gitattributes",
@@ -298,6 +298,11 @@
       "bytes": 10049
     },
     {
+      "file": "shared/src/memory/recall-details.ts",
+      "sha256": "dcf91175c77f7abcf66934d2b9d0abb3e100c48f9688f785b73195dcc8702e4a",
+      "bytes": 38361
+    },
+    {
       "file": "shared/src/memory/relevance.ts",
       "sha256": "5387f9d72ac94783742c9aae5720df495aa817b2aedc68ead96367f6f71077c0",
       "bytes": 17124
@@ -503,9 +508,14 @@
       "bytes": 45797
     },
     {
+      "file": "shared/src/scene/world-ledger.ts",
+      "sha256": "c975bede2163ec49334832b038f13e5ae75c94b7c477212b68b5352795e1a5b9",
+      "bytes": 151778
+    },
+    {
       "file": "shared/src/scene/world-state.ts",
-      "sha256": "9c9cb28e22ec66eea63cff372f96cd5b145e20d9558f054c52e82e227523f6aa",
-      "bytes": 46224
+      "sha256": "af37fa2d8113e5160b4361a1ea775ff9bc14fcc30b232e7124aafa5490f67aa0",
+      "bytes": 57537
     },
     {
       "file": "shared/third-party/agentjev/agentjev/model.py",
@@ -614,12 +624,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "bf3f16525cab33792ae33815b6378b71d8681bc99efa112a62f9ab90a86f0b61",
+      "sha256": "da6f70fa2f9f2241986c947c665454f29969cc7fa703e7c465cad06381daa74f",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "f26418edad1e0a90789c329e9d8e1fa987237411e57c1ade85e84f88f9b9fff0",
+      "sha256": "477d0b1d0baf007bff3f16e1edbd582835ac0adc9915370571942fb47a4ca576",
       "bytes": 355817
     }
   ]
