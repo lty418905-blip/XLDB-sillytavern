@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "4564431f59da3a091b0bce5ffbcf72d900493621de0f801ffd08660b9f5e3ff5",
+  "sourceManifestSha256": "bffb78b3165f1235b88d91034d8ae40ad815b5f91a5b69fbd32a412182bff8c4",
   "files": [
     {
       "file": ".gitattributes",
@@ -319,8 +319,8 @@
     },
     {
       "file": "shared/src/memory/retrieval.ts",
-      "sha256": "b76bcf35ff9dd2cb6c663dbced4defaba7d68dd42317deac5a4110e18e31a984",
-      "bytes": 59072
+      "sha256": "4fac0b30f391eb72f2bad425ad4e71ad011c96cb0807e3f97cb9c9cf5fbd1a6d",
+      "bytes": 70271
     },
     {
       "file": "shared/src/memory/text-units.ts",
@@ -369,8 +369,8 @@
     },
     {
       "file": "shared/src/scene/director.ts",
-      "sha256": "05b8d7cc5826fc9ee820ca6110f5c9a615135cd77a8ff9a58fb13ea48c1b86ff",
-      "bytes": 31795
+      "sha256": "96d971686c0f7431fb1692539754a83452c3ddc002b09dacd03c74b2120e1dae",
+      "bytes": 37192
     },
     {
       "file": "shared/src/scene/emotion-scheduler.ts",
@@ -629,12 +629,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "e1840138ce25a02a196fd59fcae9206f3c0014483bb232a23ed60f67680a2e39",
+      "sha256": "84c710d0f72c15327e852219b6df877d169627449ba0c53b75ead96d2191ed25",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "acc74ba86297811fb6ee3134d4d85f345a7333156ac104e7d062705397bae34e",
+      "sha256": "103b862b339d179f11fdc19a93c08bca3f2061e069b84724671cb16e009bf112",
       "bytes": 355817
     }
   ]

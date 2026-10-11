@@ -130,196 +130,662 @@ export class Retrieval {
     this.traceEnabled=trace.enabled;this.traceCeiling=trace.ceiling;this.traceLimit=trace.limit;
   }
 
+  /**
+   * Search only this reader's permitted memory projection. Query text is limited to 20,000 UTF-16 units;
+   * nowMs is a nonnegative integer in milliseconds. Provider failures return classified lexical fallbacks,
+   * while invalid inputs and projection failures propagate. Result hits still record fallback diagnostics.
+   */
   async search(
     snapshot: MemorySnapshot,
     query: string,
     config: RetrievalConfig,
     nowMs: number,
-    options:{currentSource?:CurrentSource}={},
+    options: {
+      currentSource?: CurrentSource;
+    } = {}
   ): Promise<RetrievalResult> {
-    if (typeof query !== 'string' || query.length > 20_000) throw new Error('invalid_query');
-    if (!Number.isSafeInteger(nowMs) || nowMs < 0) throw new Error('invalid_time');
-    const currentSource=options.currentSource;
+    if (typeof query !== 'string' || query.length > 20000)
+      throw new Error('invalid_query');
+
+    if (!Number.isSafeInteger(nowMs) || nowMs < 0)
+      throw new Error('invalid_time');
+
+    const currentSource = options.currentSource;
+
     checkCurrentSource(currentSource);
     // The index and the ranking read the stages without any cue. The cue recalls only feed the gate.
-    const raw=snapshot;
-    snapshot=retentionSnapshot(raw,nowMs);
-    const cued=retentionSnapshot(raw,nowMs,query);
 
-    const key=scopeKey(snapshot.scope);
-    return this.serialized(key,async () => {
-      const views = projectMemories(snapshot, {
-        scope: snapshot.scope,
-        asOfMs: nowMs,
-        ids: [...snapshot.memories.keys()],
-      }).memories;
-      const viewsById=new Map(views.map(view=>[view.id,view]));
-      const rows:IndexedRow[] = views.map(view => ({ id: view.id, text: allowedText(view),semantic:semanticText(view),kind:view.kind??'legacy' }))
-        .filter(row => row.text.length > 0);
-      // Equal scores fall back to one explicit salience order, never to index order or bare id.
-      const bySalience=(a:string,b:string)=>{
-        const left=viewsById.get(a),right=viewsById.get(b);
-        const x=left&&snapshot.memories.get(a),y=right&&snapshot.memories.get(b);
-        return x&&y?compareSalience({memory:x,view:left!},{memory:y,view:right!}):x?-1:y?1:0;
-      };
-      const embedding = configured(config.embedding, 'embedding');
-      const reranker = configured(config.reranker, 'reranker');
-      const mode = embedding ? 'hybrid' : 'bm25';
-      const intent=queryIntent(query);
-      const result=(resultMode:string,ids:string[],extra:Partial<RetrievalResult>={}):RetrievalResult=>({ids,mode:resultMode,tokenizer:this.tokenizer.name,intent,cacheHit:false,
-        rerankUsed:false,rerankReason:reranker?'no_candidates':'not_configured',admission:[],traceCandidates:[],
-        trace:{status:this.traceEnabled?'idle':'off',keys:0,missing:0},...extra});
-      // The one "reminded" predicate: a cue of the memory's event stands in the query. A candidate of the recall trace
-      // is not reminded: whether it is recalled is decided after the search.
-      const reminded=(id:string)=>cued.memories.get(id)?.reactivated===true;
-      const limits={floor:this.minimumRerankScore,rescue:this.cosineRescueDistance};
-      if (rows.length === 0) {
-        await this.clearProjection(key);
-        return result(mode,[]);
-      }
-      // A protected fact remains stored and searchable, not automatically injected
-      // into every unrelated query. An empty query is an explicit recent-memory view.
-      if(!query.trim())return result(mode,recentMemoryIds(views));
-      const identifiers=query.match(/\b[A-Z][A-Z0-9]*(?:[-_][A-Z0-9]+)+\b/g)??[];
-      if(identifiers.some(id=>!rows.some(row=>row.text.includes(id))))return result(mode,[]);
-      const deadline=Date.now()+this.externalTimeoutMs;
-      const run=async(activeEmbedding:Provider|undefined,activeReranker:Provider|undefined,resultMode:string,providerDegradation?:RetrievalDegradation)=>{
-        const fallbackReason=providerDegradation&&fallbackReasonOf(providerDegradation);
-        const fingerprint = digest(JSON.stringify({
-          format:5,vectorIndex:this.vectorIndex==='auto'?'ivf-pq-8bit-256rows-v1':'flat',tokenizer:this.tokenizer.fingerprint,embedding:identity(activeEmbedding),rows,
-        }));
-        const projection=await this.table(key,fingerprint,rows,activeEmbedding,deadline);
-        const table=projection.table;
-        // The salience order decides ids, so its inputs (memory-clock time, reaction keys) are part of the key.
-        const policyRows=views.map(view=>[view.id,view.access,view.anchor,view.protectedFacts,
-          snapshot.memories.get(view.id)?.retention?.kind,snapshot.memories.get(view.id)?.accessOverride,
-          snapshot.memories.get(view.id)?.source.reference,memoryClockTimeMs(snapshot.memories.get(view.id)!),view.emotionalReaction?.reactions]);
-        const cacheKey=digest(JSON.stringify([RERANK_POLICY_VERSION,query,nowMs,snapshot.version,policyRows,
-          identity(activeReranker),activeReranker?digest(activeReranker.key):'',activeEmbedding?digest(activeEmbedding.key):'',
-          this.minimumRerankScore,this.cosineRescueDistance,this.salienceMinimum,this.rerankCosineGap,fallbackReason,providerDegradation?.failure,providerDegradation?.httpStatus,
-          // The candidates depend on the answered source; a search with the trace switched off does not.
-          TRACE_POLICY_VERSION,this.traceEnabled,this.traceCeiling,this.traceLimit,...(this.traceEnabled?[currentSource?.id,currentSource?.revision]:[])]));
-        const cached=projection.results.get(cacheKey);
-        if(cached){
-          // Every degraded search is logged, including one answered from the local fallback cache.
-          if(cached.degraded)recordRetrievalFallback(cached.fallbackReason!,cached.degraded);
-          return {...detached(cached),cacheHit:true};
+    const raw = snapshot;
+
+    snapshot = retentionSnapshot(raw, nowMs);
+
+    const cued = retentionSnapshot(raw, nowMs, query);
+
+    const key = scopeKey(snapshot.scope);
+
+    return this.serialized(
+      key,
+      async () => {
+        const views = projectMemories(
+          snapshot,
+          {
+            scope: snapshot.scope,
+            asOfMs: nowMs,
+            ids: [...snapshot.memories.keys()]
+          }
+        ).memories;
+
+        const viewsById = new Map(views.map(view => [view.id, view]));
+
+        const rows: IndexedRow[] = views.map(
+          view => ({
+            id: view.id,
+            text: allowedText(view),
+            semantic: semanticText(view),
+            kind: view.kind ?? 'legacy'
+          })
+        )
+          .filter(
+            row => row.text.length > 0
+          );
+        // Equal scores fall back to one explicit salience order, never to index order or bare id.
+
+        const bySalience = (a: string, b: string) => {
+          const left = viewsById.get(a);
+
+          const right = viewsById.get(b);
+
+          const x = left && snapshot.memories.get(a);
+
+          const y = right && snapshot.memories.get(b);
+
+          return x && y
+            ? compareSalience(
+              {
+                memory: x,
+                view: left!
+              },
+              {
+                memory: y,
+                view: right!
+              }
+            )
+            : x ? -1 : y ? 1 : 0;
+        };
+
+        const embedding = configured(config.embedding, 'embedding');
+
+        const reranker = configured(config.reranker, 'reranker');
+
+        const mode = embedding ? 'hybrid' : 'bm25';
+
+        const intent = queryIntent(query);
+
+        const result = (resultMode: string, ids: string[], extra: Partial<RetrievalResult> = {}): RetrievalResult => ({
+          ids,
+          mode: resultMode,
+          tokenizer: this.tokenizer.name,
+          intent,
+          cacheHit: false,
+          rerankUsed: false,
+          rerankReason: reranker ? 'no_candidates' : 'not_configured',
+          admission: [],
+          traceCandidates: [],
+          trace: {
+            status: this.traceEnabled ? 'idle' : 'off',
+            keys: 0,
+            missing: 0
+          },
+          ...extra
+        });
+        // The one "reminded" predicate: a cue of the memory's event stands in the query.
+        // A candidate of the recall trace
+        // is not reminded: whether it is recalled is decided after the search.
+
+        const reminded = (id: string) => cued.memories.get(id)?.reactivated === true;
+
+        const limits = {
+          floor: this.minimumRerankScore,
+          rescue: this.cosineRescueDistance
+        };
+
+        if (rows.length === 0) {
+          await this.clearProjection(key);
+
+          return result(mode, []);
         }
-        const rowById=new Map(rows.map(row=>[row.id,row]));
-        const queries=queryParts(query);
-        // Batch the aspect vectors and share the same bounded external deadline.
-        if(activeEmbedding)await this.prepareQueryVectors(key,queries,activeEmbedding,deadline);
-        // Recall trace, decision: hashing, loading and distances, no provider call. A failure stays inside.
-        let trace:RetrievalResult['trace']={status:this.traceEnabled?'idle':'off',keys:0,missing:0};
-        let traceFound:TraceCandidate[]=[],tracePlan:TracePlan|undefined,traceCacheable=true;
-        if(this.traceEnabled&&activeEmbedding){
-          try{
-            tracePlan=await this.traceDecision(key,raw,cued,nowMs,currentSource,activeEmbedding,
-              ()=>this.queryVector(key,queries[0],activeEmbedding,deadline));
-            if(tracePlan){
-              traceFound=tracePlan.candidates;
-              trace={status:tracePlan.status,keys:tracePlan.needed.size,missing:0};
+        // A protected fact remains stored and searchable, not automatically injected
+        // into every unrelated query. An empty query is an explicit recent-memory view.
+
+        if (!query.trim())
+          return result(mode, recentMemoryIds(views));
+
+        const identifiers = query.match(/\b[A-Z][A-Z0-9]*(?:[-_][A-Z0-9]+)+\b/g) ?? [];
+
+        if (identifiers.some(id => !rows.some(row => row.text.includes(id))))
+          return result(mode, []);
+
+        const deadline = Date.now() + this.externalTimeoutMs;
+
+        const run = async (
+          activeEmbedding: Provider | undefined,
+          activeReranker: Provider | undefined,
+          resultMode: string,
+          providerDegradation?: RetrievalDegradation
+        ) => {
+          const fallbackReason = providerDegradation && fallbackReasonOf(providerDegradation);
+
+          const fingerprint = digest(
+            JSON.stringify(
+              {
+                format: 5,
+                vectorIndex: this.vectorIndex === 'auto' ? 'ivf-pq-8bit-256rows-v1' : 'flat',
+                tokenizer: this.tokenizer.fingerprint,
+                embedding: identity(activeEmbedding),
+                rows
+              }
+            )
+          );
+
+          const queries = queryParts(query);
+
+          let vectorDimension: number | undefined;
+          // Probe missing query vectors before rebuilding: an outage must not publish a vector table first.
+          // An existing result projection still checks its result cache before asking for query vectors.
+
+          const existingProjection = this.tables.get(key);
+
+          const hasPreviousProjection = existingProjection !== undefined
+            ||
+            fs.existsSync(path.join(this.directory, `${projectionName(key)}.projection.json`));
+
+          if (activeEmbedding && hasPreviousProjection
+            &&
+            (existingProjection?.fingerprint !== fingerprint || existingProjection?.indexFailure)) {
+            await this.prepareQueryVectors(key, queries, activeEmbedding, deadline);
+
+            vectorDimension = (await this.queryVector(key, queries[0], activeEmbedding, deadline)).length;
+          }
+
+          const projection = await this.table(key, fingerprint, rows, activeEmbedding, deadline, vectorDimension);
+
+          const table = projection.table;
+          // The salience order decides ids, so its inputs (memory-clock time, reaction keys) are part of the key.
+
+          const policyRows = views.map(
+            view => [
+              view.id,
+              view.access,
+              view.anchor,
+              view.protectedFacts,
+              snapshot.memories.get(view.id)?.retention?.kind,
+              snapshot.memories.get(view.id)?.accessOverride,
+              snapshot.memories.get(view.id)?.source.reference,
+              memoryClockTimeMs(snapshot.memories.get(view.id)!),
+              view.emotionalReaction?.reactions,
+              reminded(view.id)
+            ]
+          );
+          // Time is read only through current membership, access and cue/trace eligibility. Visit records once;
+          // hashing is O(records + projected text bytes). clearKeyText retains its per-record bound in trace.ts.
+
+          const traceRows = this.traceEnabled
+            ? [...raw.memories.keys()].flatMap(
+              id => {
+                const memory = currentMemory(raw, id, nowMs);
+
+                if (!memory)
+                  return [];
+
+                const clock = raw.memoryTimeMs ?? nowMs;
+
+                return [[
+                  id,
+                  digest(clearKeyText(memory)),
+                  digest(eventKey(memory)),
+                  traceEligible(memory, clock),
+                  retainedAccess(memory, clock).access,
+                  memory.source.messageId,
+                  memory.source.revision,
+                  cued.memories.get(id)?.reactivated === true
+                ]];
+              }
+            )
+            : [];
+
+          const cacheKey = digest(
+            JSON.stringify(
+              [
+                RERANK_POLICY_VERSION,
+                query,
+                snapshot.version,
+                policyRows,
+                traceRows,
+                identity(activeReranker),
+                activeReranker ? digest(activeReranker.key) : '',
+                activeEmbedding ? digest(activeEmbedding.key) : '',
+                this.minimumRerankScore,
+                this.cosineRescueDistance,
+                this.salienceMinimum,
+                this.rerankCosineGap,
+                fallbackReason,
+                providerDegradation?.failure,
+                providerDegradation?.httpStatus,
+                // The candidates depend on the answered source; a search with the trace switched off does not.
+                TRACE_POLICY_VERSION,
+                this.traceEnabled,
+                this.traceCeiling,
+                this.traceLimit,
+                ...(this.traceEnabled ? [currentSource?.id, currentSource?.revision] : [])
+              ]
+            )
+          );
+
+          const cached = projection.results.get(cacheKey);
+
+          if (cached) {
+            // Every degraded search is logged, including one answered from the local fallback cache.
+
+            if (cached.degraded)
+              recordRetrievalFallback(cached.fallbackReason!, cached.degraded);
+
+            return {
+              ...detached(cached),
+              cacheHit: true
+            };
+          }
+
+          const rowById = new Map(rows.map(row => [row.id, row]));
+          // Batch the aspect vectors and share the same bounded external deadline.
+
+          if (activeEmbedding)
+
+            await this.prepareQueryVectors(key, queries, activeEmbedding, deadline);
+          // Recall trace, decision: hashing, loading and distances, no provider call. A failure stays inside.
+
+          let trace: RetrievalResult['trace'] = {
+            status: this.traceEnabled ? 'idle' : 'off',
+            keys: 0,
+            missing: 0
+          };
+
+          let traceFound: TraceCandidate[] = [];
+
+          let tracePlan: TracePlan | undefined;
+
+          let traceCacheable = true;
+
+          if (this.traceEnabled && activeEmbedding) {
+            try {
+              tracePlan = await this.traceDecision(
+                key,
+                raw,
+                cued,
+                nowMs,
+                currentSource,
+                activeEmbedding,
+                () => this.queryVector(key, queries[0], activeEmbedding, deadline)
+              );
+
+              if (tracePlan) {
+                traceFound = tracePlan.candidates;
+
+                trace = {
+                  status: tracePlan.status,
+                  keys: tracePlan.needed.size,
+                  missing: 0
+                };
+              }
             }
-          }catch(error){
-            const provider=providerFailure(error);
-            const failed:TraceFailure=provider?{failure:provider.failure,attention:provider.attention}:{failure:'trace_store_failed',attention:'transient'};
-            this.traces.delete(key);
-            // A projection that could not be read is no longer trusted: without its metadata the next search rebuilds it.
-            if(!provider){try{fs.rmSync(path.join(this.directory,`${traceName(key)}.trace.json`),{force:true});}catch{/* The next persist removes it. */}}
-            recordRetrievalFallback('trace_keys_failed',{stage:'trace',...failed});
-            trace={status:'failed',keys:0,missing:0,failure:failed.failure};traceCacheable=false;
+            catch (error) {
+              const provider = providerFailure(error);
+
+              const failed: TraceFailure = provider
+                ? {
+                  failure: provider.failure,
+                  attention: provider.attention
+                }
+                : {
+                  failure: 'trace_store_failed',
+                  attention: 'transient'
+                };
+
+              this.traces.delete(key);
+              // A projection that could not be read is no longer trusted.
+              // Without its metadata the next search rebuilds it.
+
+              if (!provider) {
+                try {
+                  fs.rmSync(
+                    path.join(this.directory, `${traceName(key)}.trace.json`),
+                    {
+                      force: true
+                    }
+                  );
+                }
+                catch { /* The next persist removes it. */ }
+              }
+
+              recordRetrievalFallback(
+                'trace_keys_failed',
+                {
+                  stage: 'trace',
+                  ...failed
+                }
+              );
+
+              trace = {
+                status: 'failed',
+                keys: 0,
+                missing: 0,
+                failure: failed.failure
+              };
+
+              traceCacheable = false;
+            }
           }
-        }
-        const lists=await Promise.all(queries.map(async part=>{
-          const lexicalQuery=await this.tokenizer.query(part);
-          const [lexical,semantic]=await Promise.all([
-            lexicalQuery?table.search(lexicalQuery,'fts','lexical').select(['id','_score']).limit(SEARCH_LIMIT).toArray()
-              .then((found:unknown[])=>tieOrdered(found,'_score',bySalience)):[],
-            activeEmbedding?this.queryVector(key,part,activeEmbedding,deadline).then(async vector=>{
-              let search=table.vectorSearch(vector).column('vector').distanceType('cosine');
-              if(projection.index!=='ivf-pq')return tieOrdered(await search.select(['id','_distance']).limit(SEARCH_LIMIT).toArray(),'_distance',bySalience);
-              // IVF-PQ only proposes candidates. Threshold-bearing distances are recomputed exactly from the stored
-              // float32 vectors, so the gap, rescue and reactivation thresholds see the same scale as a flat scan.
-              search=search.nprobes(8).refineFactor(2);
-              return tieOrdered(exactDistances(await search.select(['id','vector']).limit(SEARCH_LIMIT).toArray(),vector),'_distance',bySalience);
-            }):[],
-          ]);
-          const ranked=new Map<string,number>();addRanks(ranked,lexical);addRanks(ranked,semantic);
-          const candidates=[...ranked.entries()].filter(([id])=>rowById.has(id)).map(([id,score])=>({id,score:score*(intent!=='balanced'&&rowById.get(id)!.kind===intent?1.15:1)}))
-            .sort((a,b)=>b.score-a.score||bySalience(a.id,b.id)).slice(0,CANDIDATE_LIMIT).map(item=>item.id);
-          const rerankReason=await this.rerankDecision(part,candidates,semantic,activeEmbedding,activeReranker,rowById,viewsById);
-          // The relevance gate: the cosine distance of each candidate in this part's vector list, if any. A flat scan
-          // returns LanceDB's float32 value, which can be a hair below 0 for an exact match; like the exact IVF-PQ
-          // distances (cosineDistance), it is read on the provider-independent [0, 2] scale.
-          const distances=new Map<string,number>();
-          for(const item of semantic){
-            const row=record(item);
-            if(typeof row.id==='string'&&typeof row._distance==='number'&&Number.isFinite(row._distance)&&!distances.has(row.id))
-              distances.set(row.id,Math.min(2,Math.max(0,row._distance)));
+
+          const lists = await Promise.all(
+            queries.map(
+              async (part) => {
+                const lexicalQuery = await this.tokenizer.query(part);
+
+                const [lexical, semantic] = await Promise.all(
+                  [
+                    lexicalQuery
+                      ? table.search(lexicalQuery, 'fts', 'lexical')
+                        .select(['id', '_score'])
+                        .limit(SEARCH_LIMIT)
+                        .toArray()
+                        .then(
+                          (found: unknown[]) => tieOrdered(found, '_score', bySalience)
+                        )
+                      : [],
+                    activeEmbedding
+                      ? this.queryVector(key, part, activeEmbedding, deadline).then(
+                        async (vector) => {
+                          let search = table.vectorSearch(vector).column('vector').distanceType('cosine');
+
+                          if (projection.index !== 'ivf-pq')
+                            return tieOrdered(
+                              await search.select(['id', '_distance']).limit(SEARCH_LIMIT).toArray(),
+                              '_distance',
+                              bySalience
+                            );
+                          // IVF-PQ only proposes candidates. Threshold-bearing distances are recomputed exactly
+                          // from stored float32 vectors, so gap, rescue and reactivation use the flat scan scale.
+                          search = search.nprobes(8).refineFactor(2);
+
+                          return tieOrdered(
+                            exactDistances(await search.select(['id', 'vector']).limit(SEARCH_LIMIT).toArray(), vector),
+                            '_distance',
+                            bySalience
+                          );
+                        }
+                      )
+                      : [],
+                  ]
+                );
+
+                const ranked = new Map<string, number>();
+
+                addRanks(ranked, lexical);
+
+                addRanks(ranked, semantic);
+
+                const candidates = [...ranked.entries()].filter(([id]) => rowById.has(id)).map(
+                  ([id, score]) => ({
+                    id,
+                    score: score * (intent !== 'balanced' && rowById.get(id)!.kind === intent ? 1.15 : 1)
+                  })
+                )
+                  .sort(
+                    (a, b) => b.score - a.score || bySalience(a.id, b.id)
+                  ).slice(
+                    0,
+                    CANDIDATE_LIMIT
+                  ).map(
+                    item => item.id
+                  );
+
+                const rerankReason = await this.rerankDecision(
+                  part,
+                  candidates,
+                  semantic,
+                  activeEmbedding,
+                  activeReranker,
+                  rowById,
+                  viewsById
+                );
+                // The relevance gate uses each candidate's cosine distance in this part's vector list, if any.
+                // A flat scan's float32 value can be a hair below 0 for an exact match; like the exact IVF-PQ
+                // distances (cosineDistance), it is read on the provider-independent [0, 2] scale.
+
+                const distances = new Map<string, number>();
+
+                for (const item of semantic) {
+                  const row = record(item);
+
+                  if (typeof row.id === 'string' && typeof row._distance === 'number' && Number.isFinite(row._distance)
+                    && !distances.has(row.id))
+                    distances.set(row.id, Math.min(2, Math.max(0, row._distance)));
+                }
+
+                const gated = (scores?: Map<string, number>): Admitted[] => gate(
+                  scores ? 'reranked' : activeEmbedding ? 'cosine' : 'lexical',
+                  candidates.map(
+                    id => ({
+                      id,
+                      ...(scores?.has(id) ? {
+                        score: scores.get(id)
+                      } : {}),
+                      ...(distances.has(id)
+                        ? {
+                          distance: distances.get(id)
+                        }
+                        : {}),
+                      reminded: reminded(id)
+                    }) as GateCandidate
+                  ),
+                  limits,
+                  bySalience
+                );
+
+                if (rerankReason === 'not_configured' || rerankReason === 'no_candidates'
+                  || rerankReason === 'clear_cosine_gap')
+                  return {
+                    admitted: gated(),
+                    topScore: undefined,
+                    semantic,
+                    rerankUsed: false,
+                    rerankReason
+                  };
+
+                let reranked: RerankResult[];
+
+                try {
+                  reranked = await rerank(activeReranker!, part, candidates.map(id => rowById.get(id)!.text), deadline);
+                }
+                catch (error) {
+                  const rerankFailed = providerFailure(error);
+
+                  if (rerankFailed?.stage !== 'reranker')
+                    throw error;
+
+                  return {
+                    admitted: gated(),
+                    topScore: undefined,
+                    rerankFailed,
+                    semantic,
+                    rerankUsed: true,
+                    rerankReason
+                  };
+                }
+                // A provider score is an ordering signal; the floor is a reference value for bge-reranker-v2-m3.
+                return {
+                  admitted: gated(new Map(reranked.map(item => [candidates[item.index], item.score]))),
+                  topScore: reranked[0]?.score,
+                  semantic,
+                  rerankUsed: true,
+                  rerankReason
+                };
+              }
+            )
+          );
+
+          const ids: string[] = [];
+
+          const admission: Admitted[] = [];
+
+          for (let rank = 0;rank < CANDIDATE_LIMIT && ids.length < CANDIDATE_LIMIT;rank++)
+
+            for (const list of lists) {
+              const entry = list.admitted[rank];
+
+              if (entry && !ids.includes(entry.id) && ids.length < CANDIDATE_LIMIT) {
+                ids.push(entry.id);
+
+                admission.push(
+                  {
+                    id: entry.id,
+                    by: entry.by
+                  }
+                );
+              }
+            }
+
+          const terms = await this.tokenizer.terms(query);
+
+          const contentTerms = await this.tokenizer.contentTerms(query);
+
+          const merged = new Set(ids);
+
+          const pool = rows.filter(row => !merged.has(row.id) && !snapshot.memories.get(row.id)?.source.reference)
+            .map(
+              row => ({
+                memory: snapshot.memories.get(row.id)!,
+                view: viewsById.get(row.id)!
+              })
+            );
+
+          const filled = salienceFill(
+            {
+              ids,
+              query,
+              terms,
+              contentTermCount: contentTerms.length,
+              minimum: this.salienceMinimum,
+              pool
+            }
+          );
+
+          for (const entry of filled?.added ?? []) {
+            ids.push(entry.id);
+
+            admission.push(entry);
           }
-          const gated=(scores?:Map<string,number>):Admitted[]=>gate(scores?'reranked':activeEmbedding?'cosine':'lexical',
-            candidates.map(id=>({id,...(scores?.has(id)?{score:scores.get(id)}:{}),...(distances.has(id)?{distance:distances.get(id)}:{}),reminded:reminded(id)}) as GateCandidate),
-            limits,bySalience);
-          if(rerankReason==='not_configured'||rerankReason==='no_candidates'||rerankReason==='clear_cosine_gap')
-            return {admitted:gated(),topScore:undefined,semantic,rerankUsed:false,rerankReason};
-          let reranked:RerankResult[];
-          try{reranked=await rerank(activeReranker!,part,candidates.map(id=>rowById.get(id)!.text),deadline);}
-          catch(error){
-            const rerankFailed=providerFailure(error);
-            if(rerankFailed?.stage!=='reranker')throw error;
-            return {admitted:gated(),topScore:undefined,rerankFailed,semantic,rerankUsed:true,rerankReason};
+          // With several query parts, a configuration failure outranks a transient one so it is never hidden.
+
+          const rerankFailed = lists.map(list => 'rerankFailed' in list ? list.rerankFailed : undefined)
+            .filter(
+              (item): item is RetrievalDegradation => !!item
+            ).sort(
+              (a, b) => failureRank(a) - failureRank(b)
+            )[0];
+
+          const degraded = rerankFailed ?? providerDegradation;
+
+          const rerankUsed = lists.some(list => list.rerankUsed);
+
+          const rerankReason = fallbackReason
+            ? 'provider_fallback'
+            : lists.find(list => list.rerankReason === 'relevant_anchor')?.rerankReason ??
+            lists.find(list => list.rerankReason === 'near_cosine_gap')?.rerankReason ??
+            lists.find(list => list.rerankReason === 'bm25_no_embedding')?.rerankReason
+            ?? lists[0]?.rerankReason
+            ?? 'no_candidates';
+          // Recall trace, build: after the main result is assembled, so a key call never takes the rerank call's time.
+          // A search that had a missing key decides here when its build completed the projection.
+
+          if (tracePlan && activeEmbedding) {
+            const built = await this.traceBuild(key, tracePlan, activeEmbedding, deadline);
+
+            trace = built.trace;
+
+            traceCacheable = built.cacheable;
+
+            if (built.candidates)
+              traceFound = built.candidates;
           }
-          // A provider score is an ordering signal; the floor is a reference value for bge-reranker-v2-m3 (MR7a).
-          return {admitted:gated(new Map(reranked.map(item=>[candidates[item.index],item.score]))),topScore:reranked[0]?.score,semantic,rerankUsed:true,rerankReason};
-        }));
-        const ids:string[]=[],admission:Admitted[]=[];
-        for(let rank=0;rank<CANDIDATE_LIMIT&&ids.length<CANDIDATE_LIMIT;rank++)for(const list of lists){
-          const entry=list.admitted[rank];
-          if(entry&&!ids.includes(entry.id)&&ids.length<CANDIDATE_LIMIT){ids.push(entry.id);admission.push({id:entry.id,by:entry.by});}
+
+          const output = result(
+            rerankFailed
+              ? (activeEmbedding ? 'hybrid-fallback' : 'bm25-fallback')
+              : rerankUsed ? `${resultMode}+rerank` : resultMode,
+            ids,
+            {
+              topScore: lists[0]?.topScore,
+              traceCandidates: traceFound,
+              trace,
+              vectorIndex: projection.index,
+              rerankUsed,
+              rerankReason,
+              admission,
+              ...(filled
+                ? {
+                  salience: {
+                    trigger: filled.trigger,
+                    reactions: filled.reactions
+                  }
+                }
+                : {}),
+              ...(degraded
+                ? {
+                  fallbackReason: fallbackReasonOf(degraded),
+                  degraded: {
+                    ...degraded
+                  }
+                }
+                : projection.indexFailure
+                  ? {
+                    fallbackReason: 'pq_index_build_failed' as const
+                  }
+                  : {})
+            }
+          );
+
+          if (!rerankFailed && traceCacheable)
+            cache(projection.results, cacheKey, output, 64);
+
+          if (output.degraded)
+            recordRetrievalFallback(output.fallbackReason!, output.degraded);
+          // Not a provider failure: `degraded` stays absent and the event is visible in the exported runtime log only.
+          else if (output.fallbackReason === 'pq_index_build_failed')
+            recordRetrievalFallback(
+              'pq_index_build_failed',
+              {
+                stage: 'index',
+                failure: 'index_build_failed',
+                attention: 'transient'
+              }
+            );
+
+          return detached(output);
+        };
+
+        try {
+          return await run(embedding, reranker, mode);
         }
-        // The salience path runs after the merge, on healthy and degraded results alike. Reference rows are never salient memories.
-        const terms=await this.tokenizer.terms(query),contentTerms=await this.tokenizer.contentTerms(query);
-        const merged=new Set(ids);
-        const pool=rows.filter(row=>!merged.has(row.id)&&!snapshot.memories.get(row.id)?.source.reference)
-          .map(row=>({memory:snapshot.memories.get(row.id)!,view:viewsById.get(row.id)!}));
-        const filled=salienceFill({ids,query,terms,contentTermCount:contentTerms.length,minimum:this.salienceMinimum,pool});
-        for(const entry of filled?.added??[]){ids.push(entry.id);admission.push(entry);}
-        // With several query parts, a configuration failure outranks a transient one so it is never hidden.
-        const rerankFailed=lists.map(list=>'rerankFailed' in list?list.rerankFailed:undefined)
-          .filter((item):item is RetrievalDegradation=>!!item).sort((a,b)=>failureRank(a)-failureRank(b))[0];
-        const degraded=rerankFailed??providerDegradation;
-        const rerankUsed=lists.some(list=>list.rerankUsed);
-        const rerankReason=fallbackReason?'provider_fallback':lists.find(list=>list.rerankReason==='relevant_anchor')?.rerankReason??
-          lists.find(list=>list.rerankReason==='near_cosine_gap')?.rerankReason??
-          lists.find(list=>list.rerankReason==='bm25_no_embedding')?.rerankReason??lists[0]?.rerankReason??'no_candidates';
-        // Recall trace, build: after the main result is assembled, so a key call never takes the rerank call's time.
-        // A search that had a missing key decides here when its build completed the projection.
-        if(tracePlan&&activeEmbedding){
-          const built=await this.traceBuild(key,tracePlan,activeEmbedding,deadline);
-          trace=built.trace;traceCacheable=built.cacheable;
-          if(built.candidates)traceFound=built.candidates;
+        catch (error) {
+          const failure = providerFailure(error);
+
+          if (!failure)
+            throw error;
+          // Search only text on failure, retaining exact vectors of unchanged permitted rows for recovery.
+          return run(undefined, undefined, 'bm25-fallback', failure);
         }
-        const output=result(rerankFailed?(activeEmbedding?'hybrid-fallback':'bm25-fallback'):rerankUsed?`${resultMode}+rerank`:resultMode,ids,
-          {topScore:lists[0]?.topScore,traceCandidates:traceFound,trace,vectorIndex:projection.index,rerankUsed,rerankReason,admission,
-            ...(filled?{salience:{trigger:filled.trigger,reactions:filled.reactions}}:{}),
-            ...(degraded?{fallbackReason:fallbackReasonOf(degraded),degraded:{...degraded}}:projection.indexFailure?{fallbackReason:'pq_index_build_failed' as const}:{})});
-        if(!rerankFailed&&traceCacheable)cache(projection.results,cacheKey,output,64);
-        if(output.degraded)recordRetrievalFallback(output.fallbackReason!,output.degraded);
-        // Not a provider failure: `degraded` stays absent and the event is visible in the exported runtime log only.
-        else if(output.fallbackReason==='pq_index_build_failed')
-          recordRetrievalFallback('pq_index_build_failed',{stage:'index',failure:'index_build_failed',attention:'transient'});
-        return detached(output);
-      };
-      try{return await run(embedding,reranker,mode);}
-      catch(error){
-        const failure=providerFailure(error);
-        if(!failure)throw error;
-        // Rebuild a text-only projection from this authority snapshot. Failed or
-        // partial vectors never enter the projection, and the next search retries
-        // the configured provider because its fingerprint differs from this one.
-        return run(undefined,undefined,'bm25-fallback',failure);
       }
-    });
+    );
   }
 
   close(): void {
@@ -339,83 +805,294 @@ export class Retrieval {
     key: string,
     fingerprint: string,
     rows: IndexedRow[],
-    embedding: { url: string; key: string; model: string } | undefined,
+    embedding: {
+      url: string;
+      key: string;
+      model: string;
+    } | undefined,
     deadline: number,
+    vectorDimension?: number
   ): Promise<Projection> {
-    const cached=this.tables.get(key);
-    if(cached?.fingerprint===fingerprint&&!cached.indexFailure)return cached;
-    const name=projectionName(key);
-    const metadataPath=path.join(this.directory,`${name}.projection.json`);
+    const cached = this.tables.get(key);
+
+    if (cached?.fingerprint === fingerprint && !cached.indexFailure)
+      return cached;
+
+    const name = projectionName(key);
+
+    const metadataPath = path.join(this.directory, `${name}.projection.json`);
+
     try {
-      const database=this.connection??=await connect(this.directory);
-      let metadata:{fingerprint?:string;embedding?:string;tokenizer?:string;index?:'ivf-pq'|'flat'|'none';semanticColumn?:boolean;quantizationVersion?:number;vectorEncoding?:string;indexFailure?:boolean}={};
-      try{metadata=JSON.parse(fs.readFileSync(metadataPath,'utf8'));}catch{/* Disposable cache, rebuild from authority. */}
-      let previous:Awaited<ReturnType<typeof database.openTable>>|undefined;
-      try{previous=await database.openTable(name);}catch{/* First projection. */}
-      if(previous&&metadata.fingerprint===fingerprint&&!metadata.indexFailure){
-        const indices=await previous.listIndices();
-        const actual=indices.find(item=>item.columns.includes('vector'));
-        if((metadata.index==='ivf-pq'&&actual?.indexType==='IvfPq')||
-          (metadata.index!=='ivf-pq'&&!actual)){
-          const projection={fingerprint,table:previous,index:metadata.index??'none',results:new Map<string,RetrievalResult>()};cache(this.tables,key,projection,16);return projection;
+      const database = this.connection ??= await connect(this.directory);
+
+      let metadata: {
+        fingerprint?: string;
+        embedding?: string;
+        tokenizer?: string;
+        index?: 'ivf-pq' | 'flat' | 'none';
+        semanticColumn?: boolean;
+        quantizationVersion?: number;
+        vectorEncoding?: string;
+        indexFailure?: boolean;
+      } = {};
+
+      try {
+        metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+      }
+      catch { /* Disposable cache, rebuild from authority. */ }
+
+      let previous: Awaited<ReturnType<typeof database.openTable>> | undefined;
+
+      try {
+        previous = await database.openTable(name);
+      }
+      catch { /* First projection. */ }
+
+      if (previous && metadata.fingerprint === fingerprint && !metadata.indexFailure) {
+        const indices = await previous.listIndices();
+
+        const actual = indices.find(item => item.columns.includes('vector'));
+
+        if ((metadata.index === 'ivf-pq' && actual?.indexType === 'IvfPq')
+          ||
+          (metadata.index !== 'ivf-pq' && !actual)) {
+          const projection = {
+            fingerprint,
+            table: previous,
+            index: metadata.index ?? 'none',
+            results: new Map<string, RetrievalResult>()
+          };
+
+          cache(this.tables, key, projection, 16);
+
+          return projection;
         }
       }
-      const oldRows=new Map<string,IndexedRow&{precisionBits?:number}>();
-      if(previous&&metadata.tokenizer&&(metadata.embedding===identity(embedding)||!embedding)){
+
+      const oldRows = new Map<string, IndexedRow & {
+        precisionBits?: number;
+      }>();
+
+      if (previous && metadata.tokenizer && (metadata.embedding === identity(embedding) || !embedding)) {
         // Tables from the pre-semantic projection do not have this column.
         // Their lexical text may be reused, but their old vectors must be
         // recomputed from the current permitted semantic text.
-        const columns=embedding?['id','text','lexical','vector']:['id','text','lexical'];
-        if(metadata.semanticColumn)columns.push('semantic');
+
+        const columns = metadata.embedding && metadata.embedding !== 'none'
+          ? [
+            'id',
+            'text',
+            'lexical',
+            'vector'
+          ]
+          : ['id', 'text', 'lexical'];
+
+        if (metadata.semanticColumn)
+          columns.push('semantic');
         // A retention-quantized projection (quantizationVersion 1) kept exact vectors only in its 32-bit rows.
-        if(metadata.semanticColumn&&metadata.quantizationVersion===1)columns.push('precisionBits');
-        const stored=await previous.query().select(columns).toArray();
-        for(const row of stored)oldRows.set(row.id,{...row,...(row.vector?{vector:Array.from(row.vector) as number[]}: {})});
+
+        if (metadata.semanticColumn && metadata.quantizationVersion === 1)
+          columns.push('precisionBits');
+
+        const stored = await previous.query().select(columns).toArray();
+
+        for (const row of stored)
+          oldRows.set(
+            row.id,
+            {
+              ...row,
+              ...(row.vector ? {
+                vector: Array.from(row.vector) as number[]
+              } : {})
+            }
+          );
       }
-      const indexed:IndexedRow[]=[];const missing:number[]=[];
-      for(const row of rows){
-        const old=oldRows.get(row.id);const same=old?.text===row.text;
-        const lexical=same&&metadata.tokenizer===this.tokenizer.fingerprint&&old.lexical!==undefined?old.lexical:await this.tokenizer.document(row.text);
-        const exact=metadata.vectorEncoding===EXACT_VECTORS||(metadata.quantizationVersion===1&&old?.precisionBits===32);
-        const next={...row,lexical,...(embedding&&same&&old.semantic===row.semantic&&exact&&old.vector?{vector:old.vector}: {})};
-        if(embedding&&!next.vector)missing.push(indexed.length);
+
+      const indexed: IndexedRow[] = [];
+
+      const missing: number[] = [];
+
+      for (const row of rows) {
+        const old = oldRows.get(row.id);
+
+        const same = old?.text === row.text;
+
+        const lexical = same && metadata.tokenizer === this.tokenizer.fingerprint && old.lexical !== undefined
+          ? old.lexical
+          : await this.tokenizer.document(row.text);
+
+        const exact = metadata.vectorEncoding === EXACT_VECTORS
+          || (metadata.quantizationVersion === 1 && old?.precisionBits === 32);
+
+        const dimensionMatches = !embedding || vectorDimension === undefined || old?.vector?.length === vectorDimension;
+
+        const next = {
+          ...row,
+          lexical,
+          ...(same && old.semantic === row.semantic && exact && old.vector && dimensionMatches
+            ? {
+              vector: old.vector
+            }
+            : {})
+        };
+
+        if (embedding && !next.vector)
+          missing.push(indexed.length);
+
         indexed.push(next);
       }
-      if(embedding)for(let offset=0;offset<missing.length;offset+=EMBEDDING_BATCH){
-        const batch=missing.slice(offset,offset+EMBEDDING_BATCH);
-        const vectors=await embed(embedding,batch.map(index=>indexed[index].semantic||indexed[index].text),deadline);
-        batch.forEach((index,i)=>{indexed[index].vector=vectors[i];});
-      }
+
+      if (embedding)
+
+        for (let offset = 0;offset < missing.length;offset += EMBEDDING_BATCH) {
+          const batch = missing.slice(offset, offset + EMBEDDING_BATCH);
+
+          const vectors = await embed(
+            embedding,
+            batch.map(index => indexed[index].semantic || indexed[index].text),
+            deadline
+          );
+
+          batch.forEach((index, i) => {
+            indexed[index].vector = vectors[i];
+          });
+        }
       // The index is disposable. Remove the old table before publishing a new
       // encoding so a failed rebuild cannot leave a mixed or trusted version.
-      if(previous)await database.dropTable(name);
-      fs.rmSync(metadataPath,{force:true});
-      const table=await database.createTable(name,indexed,{mode:'overwrite'});
-      await table.createIndex('lexical',{config:Index.fts({baseTokenizer:'whitespace',stem:false,removeStopWords:false,asciiFolding:false})});
-      let index:Projection['index']=embedding?'flat':'none';
-      let indexFailure=false;
-      const dimension=indexed[0].vector?.length??0;
-      if(this.vectorIndex==='auto'&&embedding&&indexed.length>=256&&dimension>=16){
-        const numSubVectors=dimension%16===0?dimension/16:dimension%8===0?dimension/8:1;
+
+      if (previous)
+
+        await database.dropTable(name);
+
+      fs.rmSync(metadataPath, {
+        force: true
+      });
+      // Nullable vectors preserve unchanged rows beside new or revised rows during a text-only fallback.
+
+      const hasVectors = indexed.some(row => row.vector !== undefined);
+
+      const table = await database.createTable(
+        name,
+        hasVectors
+          ? indexed.map(row => ({
+            ...row,
+            vector: row.vector ?? null
+          }))
+          : indexed,
+        {
+          mode: 'overwrite'
+        }
+      );
+
+      await table.createIndex(
+        'lexical',
+        {
+          config: Index.fts(
+            {
+              baseTokenizer: 'whitespace',
+              stem: false,
+              removeStopWords: false,
+              asciiFolding: false
+            }
+          )
+        }
+      );
+
+      let index: Projection['index'] = embedding ? 'flat' : 'none';
+
+      let indexFailure = false;
+
+      const dimension = indexed[0].vector?.length ?? 0;
+
+      if (this.vectorIndex === 'auto' && embedding && indexed.length >= 256 && dimension >= 16) {
+        const numSubVectors = dimension % 16 === 0 ? dimension / 16 : dimension % 8 === 0 ? dimension / 8 : 1;
+
         try {
-          await table.createIndex('vector',{config:Index.ivfPq({distanceType:'cosine',numPartitions:Math.max(1,Math.min(16,Math.floor(Math.sqrt(indexed.length)/8))),numSubVectors,numBits:8})});
-          const actual=(await table.listIndices()).find(item=>item.columns.includes('vector'));
-          if(actual?.indexType!=='IvfPq'||actual.numIndexedRows!==indexed.length)throw new Error('index_build_failed');
-          index='ivf-pq';
-        } catch {
-          const partial=(await table.listIndices()).find(item=>item.columns.includes('vector'));
-          if(partial)await table.dropIndex(partial.name);
-          index='flat';
-          indexFailure=true;
+          await table.createIndex(
+            'vector',
+            {
+              config: Index.ivfPq(
+                {
+                  distanceType: 'cosine',
+                  numPartitions: Math.max(1, Math.min(16, Math.floor(Math.sqrt(indexed.length) / 8))),
+                  numSubVectors,
+                  numBits: 8
+                }
+              )
+            }
+          );
+
+          const actual = (await table.listIndices()).find(item => item.columns.includes('vector'));
+
+          if (actual?.indexType !== 'IvfPq' || actual.numIndexedRows !== indexed.length)
+            throw new Error('index_build_failed');
+
+          index = 'ivf-pq';
+        }
+        catch {
+          const partial = (await table.listIndices()).find(item => item.columns.includes('vector'));
+
+          if (partial)
+
+            await table.dropIndex(partial.name);
+
+          index = 'flat';
+
+          indexFailure = true;
         }
       }
-      fs.mkdirSync(this.directory,{recursive:true});
-      const temporary=metadataPath+'.tmp';fs.writeFileSync(temporary,JSON.stringify({fingerprint,embedding:identity(embedding),tokenizer:this.tokenizer.fingerprint,index,semanticColumn:true,vectorEncoding:EXACT_VECTORS,indexFailure}));fs.renameSync(temporary,metadataPath);
-      const projection={fingerprint,table,index,...(indexFailure?{indexFailure:true as const}:{}),results:new Map<string,RetrievalResult>()};cache(this.tables,key,projection,16);return projection;
-    } catch (error) {
+
+      fs.mkdirSync(this.directory, {
+        recursive: true
+      });
+
+      const temporary = metadataPath + '.tmp';
+
+      fs.writeFileSync(
+        temporary,
+        JSON.stringify(
+          {
+            fingerprint,
+            embedding: embedding ? identity(embedding) : hasVectors ? metadata.embedding : identity(embedding),
+            tokenizer: this.tokenizer.fingerprint,
+            index,
+            semanticColumn: true,
+            vectorEncoding: EXACT_VECTORS,
+            indexFailure
+          }
+        )
+      );
+
+      fs.renameSync(temporary, metadataPath);
+
+      const projection = {
+        fingerprint,
+        table,
+        index,
+        ...(indexFailure ? {
+          indexFailure: true as const
+        } : {}),
+        results: new Map<string, RetrievalResult>()
+      };
+
+      cache(this.tables, key, projection, 16);
+
+      return projection;
+    }
+    catch (error) {
       this.tables.delete(key);
-      fs.rmSync(metadataPath,{force:true});
-      if (error instanceof Error && (error.message === 'invalid_embedding_response' || error.message === 'embedding_request_failed')) throw error;
+      // Provider errors happen before publication; the previous table and its metadata are still valid.
+
+      if (!providerFailure(error)
+        && !(error instanceof Error && error.message === 'invalid_embedding_response'))
+        fs.rmSync(metadataPath, {
+          force: true
+        });
+
+      if (error instanceof Error
+        && (error.message === 'invalid_embedding_response' || error.message === 'embedding_request_failed'))
+        throw error;
+
       throw new Error('index_build_failed');
     }
   }
