@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "de97ce6a54b686f146243920b0a2c290e477b2d6b8543228ea1d531cc1ef1cb3",
+  "sourceManifestSha256": "da6836b3e6188255e86e2a07f3cb77584af1e26181899e68f8d741ec6f825eb4",
   "files": [
     {
       "file": ".gitattributes",
@@ -99,8 +99,8 @@
     },
     {
       "file": "shared/src/common/amount-expressions.ts",
-      "sha256": "5b9cee583035470b26b5a29f8f42744aa906d383125409ce43d7f52036d92818",
-      "bytes": 103645
+      "sha256": "8f05e9cdc1fb88f6deb291ed4a76635793c97fa2524aa4e2c25e3258c0918773",
+      "bytes": 154577
     },
     {
       "file": "shared/src/common/geography-background.ts",
@@ -153,6 +153,11 @@
       "bytes": 36691
     },
     {
+      "file": "shared/src/core/context-budget.ts",
+      "sha256": "5ef7047e3952a09a473bb6f7786ee4d6b359ea5560b2ca16ddec2eeb1192c96f",
+      "bytes": 5129
+    },
+    {
       "file": "shared/src/core/controls.ts",
       "sha256": "89d2106f186a2ec2d2c523847437f1fe786d15569cb60aae72f80d3423f3cf56",
       "bytes": 4169
@@ -194,8 +199,8 @@
     },
     {
       "file": "shared/src/core/service.ts",
-      "sha256": "6771384a76f4e71a853f001f68ed152d528b94fd4af1d7c01bd19b614091ce4b",
-      "bytes": 31249
+      "sha256": "348e73796bb91765e849dfc942cf42aff9dbe6c62977c410f4625ff3637f5ade",
+      "bytes": 39216
     },
     {
       "file": "shared/src/core/store.ts",
@@ -204,8 +209,8 @@
     },
     {
       "file": "shared/src/core/tool-loop.ts",
-      "sha256": "4d8a26439b7ce567eed728a95cf3538edabe8dc572de29c9426c33ec4dab26d0",
-      "bytes": 25395
+      "sha256": "223f982a57fea0237497697f24d2d927840985e9b489381d21fdb769e5743d27",
+      "bytes": 50027
     },
     {
       "file": "shared/src/core/types.ts",
@@ -284,8 +289,8 @@
     },
     {
       "file": "shared/src/memory/context.ts",
-      "sha256": "bf678aaea9e39f7a7a4a9ea88f1cd2eacf5bd56de46ad48226ed24d983ae5ac1",
-      "bytes": 9054
+      "sha256": "162076eacc0bbbf0794dbec423d9d0ac01f43c1a3af39d4f4b1f412bb9998648",
+      "bytes": 10804
     },
     {
       "file": "shared/src/memory/current-record.ts",
@@ -354,8 +359,8 @@
     },
     {
       "file": "shared/src/scene/backup.ts",
-      "sha256": "264d118f66294f4b070d491d8d8d28c3f43d2bec5b34194a3a0a31086f09dcb6",
-      "bytes": 50523
+      "sha256": "c884fa1902273d3d533b52cdd49197052850b80912a1b5c2dee40e828e538a46",
+      "bytes": 50368
     },
     {
       "file": "shared/src/scene/calendar-store.ts",
@@ -449,8 +454,8 @@
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "f0987651ad7559d5d28226fcd5453d6e1cd4040fd7b362ed6a6ea878c91a84be",
-      "bytes": 115923
+      "sha256": "c7a9c1dcfe50e77056207401b684d98c82b56fdffbd1a1eccc4a7803d3deb856",
+      "bytes": 116109
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
@@ -554,8 +559,8 @@
     },
     {
       "file": "sillytavern/adapters/xldb.js",
-      "sha256": "7accf2e5b054bb07e6fefd92a031525b0fcc12922ea5fb9c864e6b073b84e9ba",
-      "bytes": 338707
+      "sha256": "1d7923957287bfec0298c8e9519313860766d2c9ef5f54a65d630858e85c9a62",
+      "bytes": 339412
     },
     {
       "file": "sillytavern/src/dashboard.ts",
@@ -629,13 +634,13 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "f977f8fd501dc59d1f66e4cab85417f0eeeb38f350275693187eb6ad12fdb249",
-      "bytes": 350715
+      "sha256": "af2cc4b7fd81def962b56a42147118a002980401f154847aa0fdbcce615733f1",
+      "bytes": 351441
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "a947513a3d7adb6630b1aa38a6eb14041652119e910378e1bb1613ca1eac536d",
-      "bytes": 355817
+      "sha256": "9c2c73afe799ed331cd4bbc68680dad2fb8911bbabc99148169ee420698f2388",
+      "bytes": 356564
     }
   ]
 }

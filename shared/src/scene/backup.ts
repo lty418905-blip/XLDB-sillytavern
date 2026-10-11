@@ -16,7 +16,6 @@ import {captureReferenceRows,restoreReferenceRows} from './transfer.ts';
 import type {PersistedReferenceRow} from './transfer.ts';
 import type {SceneScope} from './types.ts';
 import {
-  eraseWorldLedgerSource,
   interruptDeferredLedgerAnalysis,
   sweepWorldLedgerTombstones,
 } from './world-ledger-store.ts';
@@ -725,12 +724,13 @@ function removeCoreControls(db:DatabaseSync,scope:string,sourceId:string):void {
   for(const control of controls)if(isSourceControl(control,sourceId))remove.run(scope,control.id,control.revision,control.kind);
 }
 
-/** Applies tombstones within the caller's transaction; bound corrections are erased across every revision. */
+/**
+ * Applies tombstones within the caller's transaction. The caller then sweeps ledger rows once per scope,
+ * after every deletion rule has been applied, including scopes whose tombstones came from the backup.
+ */
 function applySceneDeletions(db: DatabaseSync, scope: string, deletions: SceneDeletion[]): void {
   const before = sceneRows(db, scope);
   const changes: {index: number; characters: Set<string>}[] = [];
-  const storedScope = db.prepare('SELECT scope FROM scene_worlds WHERE key=?').get(scope) as {scope: string};
-  const ledgerScope = JSON.parse(storedScope.scope) as SceneScope;
 
   for (const deletion of deletions) {
     const existing = before.find(row => row.id === deletion.id);
@@ -751,7 +751,6 @@ function applySceneDeletions(db: DatabaseSync, scope: string, deletions: SceneDe
       observed=excluded.observed,status='deleted',processing='ready',analysis=NULL`)
       .run(scope, deletion.id, revision, JSON.stringify(message), deletion.observed);
     removeScenePreferenceControls(db, scope, deletion.id);
-    eraseWorldLedgerSource(db, ledgerScope, deletion.id);
   }
 
   let changed = true;

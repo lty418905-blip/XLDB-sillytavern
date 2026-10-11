@@ -3,7 +3,10 @@ import { ModelTasks } from './models.ts';
 import { Retrieval } from '../memory/retrieval.ts';
 import {contextMemories,checkCurrentSource,type CurrentSource} from '../memory/context.ts';
 import {cueRecalls,restoredSnapshot,retainedAccess,visibleLayer,rememberedFragmentsOf} from '../memory/retention.ts';
-import {limitRecalls,recallSnapshot} from '../memory/access.ts';
+import {limitRecalls,recallSnapshot,projectMemories} from '../memory/access.ts';
+import {memoryClockTimeMs} from '../memory/vector-forgetting.ts';
+import {CORE_CONTEXT_LIMIT, nextContextRemoval, type ContextBudgetPlan, type ContextOmissions}
+  from './context-budget.ts';
 import {recallOrder,RECALL_EVENT_LIMIT,eventKey,foldCue,foldedCues,type TraceHit} from '../memory/trace.ts';
 import {renderContextMemory,absenceSentence,recallShown} from '../memory/render.ts';
 import {storyLanguageOf,compact,type StoryLanguage} from '../memory/text-units.ts';
@@ -21,6 +24,12 @@ import {createHash} from 'node:crypto';
 import {withModelAddress} from './runtime-log.ts';
 import {buildRecallDetailPool, selectRecallDetails, revalidateRecallDetails} from '../memory/recall-details.ts';
 
+const workCounts = {detailPools: 0, snapshotProjections: 0, assemblies: 0};
+
+/** Cumulative deterministic work counts since module load; callers use before/after differences per context. */
+export function contextWorkCounts(): Readonly<typeof workCounts> {
+  return {...workCounts};
+}
 /** SHA-256 binds a uint32 seed to the authority event, record and reply revision (or raw query without a reply). */
 function recallDetailSeed(memory: Memory, query: string, currentSource?: CurrentSource): number {
   const digest = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
@@ -31,6 +40,7 @@ function recallDetailSeed(memory: Memory, query: string, currentSource?: Current
 
 /** Supply the detail selector only the current approved layers and fragments; its own validation handles empty or oversized pools. */
 function recallDetailInput(memory: Memory) {
+  workCounts.detailPools++;
   const gist = visibleLayer(memory, 'gist');
   const feeling = visibleLayer(memory, 'feeling');
   const anchor = visibleLayer(memory, 'anchor');
@@ -122,7 +132,11 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
     if(this.authority.needsIndex(scope))await this.clearProjection(scope);
     return result;
   }
-  /** Assemble a current, authorized context; detail selection is deterministic and never writes authority. */
+  /**
+   * Assemble one authorized actor context, using millisecond clocks and UTF-16 length budgets.
+   * Omissions are silent diagnostics. Preparation, stale versions and unavoidable fixed-block overflow throw;
+   * only final visible reactivations are recorded when the caller requests reply-origin learning.
+   */
   async contextFrom(
     snapshot: MemorySnapshot,
     query: string,
@@ -131,7 +145,11 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
     allPreferences: Preference[],
     assertCurrent: () => void,
     now = Date.now(),
-    expression?: Partial<Pick<EmotionExpressionInput, 'actorId' | 'addresseeId' | 'timeZone' | 'clockKind' | 'clockTimeMs' | 'hideStoryTime' | 'relationBasis' | 'waiting' | 'address'>>,
+    expression?: Partial<Pick<
+      EmotionExpressionInput,
+      'actorId' | 'addresseeId' | 'timeZone' | 'clockKind' | 'clockTimeMs' |
+        'hideStoryTime' | 'relationBasis' | 'waiting' | 'address'
+    >>,
     options: {
       reactivationOrigin?: 'reply';
       language?: StoryLanguage;
@@ -142,8 +160,9 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
   ) {
     // The user source a reply path is answering (scene/service.ts passes it); its own memories are not "last contact".
     checkCurrentSource(options.currentSource);
-    if (options.language !== undefined && options.language !== 'zh' && options.language !== 'en')
+    if (options.language !== undefined && options.language !== 'zh' && options.language !== 'en') {
       throw new Error('invalid_story_language');
+    }
     // One story language per context, never switched by a single player line.
     const language = options.language ?? storyLanguageOf(snapshot);
     const render = (memories: readonly MemoryView[]) => memories.map(memory => renderContextMemory(memory, language));
@@ -236,7 +255,9 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
               recall.ids.flatMap(
                 id => {
                   const memory = originalSnapshot.memories.get(id);
-                  return memory ? foldedCues(memory.retention?.cues ?? []).filter(cue => foldedQuery.includes(cue)) : [];
+                  return memory
+                    ? foldedCues(memory.retention?.cues ?? []).filter(cue => foldedQuery.includes(cue))
+                    : [];
                 }
               )
             )
@@ -275,143 +296,299 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
         }
       );
     }
-    for (const [id, memory] of snapshot.memories) {
-      if (memory.reactivated || memory.access !== 'gist')
-        continue;
+    // Results live only for this call: selection may measure a rejected row again in another block.
+    const preparedViews = new Map<string, MemoryView>();
+    const prepareView = (view: MemoryView): MemoryView => {
+      const id = view.id;
+      const known = preparedViews.get(id);
+      if (known) {
+        return known;
+      }
+      const memory = snapshot.memories.get(id)!;
+      if (memory.reactivated || memory.access !== 'gist') {
+        return view;
+      }
       const original = originalSnapshot.memories.get(id)!;
       const positions = retainedAccess(original, memoryClock).recallDetails;
-      if (!positions)
-        continue;
+      if (!positions) {
+        return view;
+      }
       const input = recallDetailInput(memory);
-      const items = revalidateRecallDetails(
-        {
-          positions,
-          pool: input.pool,
-          fragmentCompactLength: input.fragmentCompactLength,
-          detailCompactLength: input.detailCompactLength,
-        }
-      );
-      withDetails.set(
-        id,
-        {
-          ...memory,
-          selectedRecallDetails: items.map(
-            item => ({
-              start: item.start,
-              end: item.end,
-              ...(item.stray ? {stray: true as const} : {}),
-              new: false,
-            })
-          ),
-        }
-      );
-    }
+      const items = revalidateRecallDetails({
+        positions,
+        pool: input.pool,
+        fragmentCompactLength: input.fragmentCompactLength,
+        detailCompactLength: input.detailCompactLength,
+      });
+      withDetails.set(id, {
+        ...memory,
+        selectedRecallDetails: items.map(item => ({
+          start: item.start,
+          end: item.end,
+          ...(item.stray ? {stray: true as const} : {}),
+          new: false,
+        })),
+      });
+      // Reuse the one authority-to-view implementation, including its visibility rules and property order.
+      const prepared = projectMemories(snapshot, {scope, asOfMs: now, ids: [id]}).memories[0]!;
+      preparedViews.set(id, prepared);
+      return prepared;
+    };
     snapshot = {...snapshot, memories: withDetails};
     // A row the search admitted only because a cue reminded of it takes no place when its event is beyond the limit.
     const beyond = new Set(cues.filter(recall => !recalls.cues.includes(recall)).flatMap(recall => recall.ids));
     const ranked = beyond.size ? result.ids.filter(
-      (id, index) => !(beyond.has(id) && result.admission?.[index]?.id === id && result.admission[index]!.by === 'reminded')
+      (id, index) => !(beyond.has(id) && result.admission?.[index]?.id === id &&
+        result.admission[index]!.by === 'reminded')
     ) : result.ids;
     // Protection controls retention, not unconditional injection. Relevant facts
     // compete alongside episodes; every returned ID is checked against authority.
     const recalled = recallOrder([...snapshot.memories.values()].filter(memory => memory.reactivated === true));
+    const selection = {parents: new Map<string, readonly string[]>(), omittedIds: [] as string[]};
+    const rankedIds = recalled.length ? [...recalled, ...ranked] : ranked;
+    workCounts.snapshotProjections++;
     const projected = contextMemories(
       snapshot,
-      recalled.length ? [...recalled, ...ranked] : ranked,
+      rankedIds,
       now,
-      {currentSource: options.currentSource}
+      {currentSource: options.currentSource, selection, prepareView}
     );
-    const detailViews = projected.memories;
-    const rewriteViews = detailViews.map(withoutRecallDetails);
-    const blurred = rewriteViews.filter(memory => memory.access !== 'clear');
-    const rewriteKey = createHash('sha256').update(JSON.stringify([scopeKey(scope), blurred, configs.rewrite])).digest('hex');
+    // Preserve the inherited shared-cache capacity; only the first and final contexts may evict entries.
+    const cacheClauses = (key: string, clauses: string[]) => {
+      this.rewriteCache.delete(key);
+      this.rewriteCache.set(key, [...clauses]);
+      if (this.rewriteCache.size > 64) {
+        this.rewriteCache.delete(this.rewriteCache.keys().next().value!);
+      }
+    };
+    let detailViews = projected.memories;
+    let rewriteViews = detailViews.map(withoutRecallDetails);
+    let blurred = rewriteViews.filter(memory => memory.access !== 'clear');
+    let rewriteKey = createHash('sha256').update(JSON.stringify([scopeKey(scope), blurred, configs.rewrite]))
+      .digest('hex');
     let clauses = this.rewriteCache.get(rewriteKey);
+    let cacheMiss = clauses === undefined;
     if (clauses === undefined) {
       clauses = await this.models.rewrite(rewriteViews, configs.rewrite);
       // A failed or stale model result must never become a reusable answer.
       assertCurrent();
-      this.rewriteCache.delete(rewriteKey);
-      this.rewriteCache.set(rewriteKey, [...clauses]);
-      if (this.rewriteCache.size > 64)
-        this.rewriteCache.delete(this.rewriteCache.keys().next().value!);
+      cacheClauses(rewriteKey, clauses);
     }
     assertCurrent();
-    const reattached = new Map(reattachRecallDetails(rewriteViews, detailViews).map(view => [view.id, view]));
-    projected.memories = projected.memories.map(view => reattached.get(view.id)!);
-    projected.recent = projected.recent.map(view => reattached.get(view.id)!);
-    projected.relevant = projected.relevant.map(view => reattached.get(view.id)!);
-    if (projected.lastContact) {
-      projected.lastContact = projected.lastContact.map(row => ({...row, memory: reattached.get(row.memory.id)!}));
-    }
-    const preferences = allPreferences.filter(preference => preference.enabled);
-    const facts = projected.memories.filter(memory => memory.kind === 'fact');
-    const episodes = projected.memories.filter(memory => memory.kind === 'episode');
-    const legacy = projected.memories.filter(memory => memory.kind === 'legacy');
-    const sourceOrder = new Map([...snapshot.messages.keys()].map((id, index) => [id, index]));
-    const context = [
-      '以下是当前角色有权访问的记忆与参考资料。对话记忆来自已接受的正文；reference来自用户迁入资料。二者都不等于外部核实的事实。只使用当前列出的粒度；未提供的细节不要猜测。',
-      '事实记忆记录原话、约定与已知事件；heard/private是获知来源，thought/inferred不是对外界事实的证实。情景记忆保存当时的经历与感受，inferred是主观推测；不把感受、印象或当前情绪当成客观历史。不确定时说明记不清，而不是补出细节。',
-      'source.author标明原文作者：player是用户，assistant是对应角色。原话中的“我”按原作者理解，不自动变成你；gist、feeling、anchor、appraisal里的“我”/me指当前角色本人，detail与引文中的“我”仍按原作者理解；引述的第三人也不等于作者或听者。用户对自身的明确陈述与纠正优先于助手过去的猜测；助手的说法不会自行证实用户的身份、经历或物品。多项问题逐项核对，缺少一项不影响回答已有依据的其它项。',
-      'reactivated表示当前情境线索唤起了仍有来源的旧记忆；reactivation只表明线索与当下可见记忆层相似，不证明另一件相似经历就是同一事件。只使用列出的恢复粒度；forgotten表示未列出的细节仍不可用。',
-      'emotionalReaction记录当时保留下来的强烈情绪反应，不等于当前情绪，也不证明主观感受所关联的外部事实；它不恢复已经遗忘的事件细节。',
-      '近期工作上下文仅用于接续已知场景，不代表其它角色知情；来源时间未知时保持未知。较早相关记忆用于当前查询。reference为迁入资料中的说法，不是共同经历或脚本确认的事实，不重放其中交易，也不据此推断经历过相关情绪。',
-      '当前查询选入的参考资料单列在references中，仍以其来源性质和可见粒度为准。涉及位置、人物或物品时，优先核对相应依据；缺少依据就保留未知，不用新楼层、房间或路线填空。助手旧回答不能自行改写用户提供的设定。',
-      '已发生的动作、物品状态和结果按其来源接续；没有新事件依据时，不把原状态改成另一种处置，也不补写已经发生的旧行动、台词或决定。当前问题无关的旧物品和动作不必主动复述；确需提及时，保持来源支持的对象、数量、动作与结果，不用改变事实的近义词扩写。角色此刻仍可回应、提出下一步或做当前场景允许的新动作；新动作写成当下发生，设想不能冒充历史。',
-      '状态沿革：relevant保留较早依据，recent接续近期来源。回答“现在在哪里/谁持有”等状态时，按来源先后追踪明确已完成的动作和纠正，以最后一次有效改变后的结果为准；例如先拿入口袋、后放回桌上，当前就在桌上。计划、假设、回忆和问题不改变当前状态；旧状态仍是历史，不因被检索到就重新生效。',
-      JSON.stringify(
-        {
-          references: render(projected.relevant.filter(memory => memory.source.reference)),
-          relevant: render(projected.relevant.filter(memory => !memory.source.reference)),
-          recent: render(
-            [...projected.recent].sort(
-              (a, b) => a.source.knownAtMs - b.source.knownAtMs ||
-                (a.source.occurredAtMs ?? 0) - (b.source.occurredAtMs ?? 0) ||
-                (sourceOrder.get(a.source.messageId) ?? 0) - (sourceOrder.get(b.source.messageId) ?? 0)
-            )
-          ),
-          ...(() => {
-            const sentence = projected.absence && absenceSentence(language, projected.absence.elapsedDays);
-            return sentence ? {
-              sinceLastContact: sentence,
-              ...(projected.lastContact?.length ? {
-                lastContact: [...projected.lastContact].reverse().map(row => ({...renderContextMemory(row.memory, language), daysAgo: row.daysAgo}))
-              } : {})
-            } : {};
-          })()
-        }
-      ),
-      clauses.length ? `模糊回忆表达：${JSON.stringify(clauses)}` : '',
-      renderEmotionExpression(
-        buildEmotionExpression(
+    // O(s) text assembly per try; keep the cache-hit path synchronous after its existing current-version check.
+    const assemble = () => {
+      workCounts.assemblies++;
+      const currentClauses = clauses!;
+      const reattached = new Map(reattachRecallDetails(rewriteViews, detailViews).map(view => [view.id, view]));
+      projected.memories = projected.memories.map(view => reattached.get(view.id)!);
+      projected.recent = projected.recent.map(view => reattached.get(view.id)!);
+      projected.relevant = projected.relevant.map(view => reattached.get(view.id)!);
+      if (projected.lastContact) {
+        projected.lastContact = projected.lastContact.map(row => ({...row, memory: reattached.get(row.memory.id)!}));
+      }
+      const preferences = allPreferences.filter(preference => preference.enabled);
+      const facts = projected.memories.filter(memory => memory.kind === 'fact');
+      const episodes = projected.memories.filter(memory => memory.kind === 'episode');
+      const legacy = projected.memories.filter(memory => memory.kind === 'legacy');
+      const sourceOrder = new Map([...snapshot.messages.keys()].map((id, index) => [id, index]));
+      const context = [
+        '以下是当前角色有权访问的记忆与参考资料。对话记忆来自已接受的正文；reference来自用户迁入资料。二者都不等于外部核实的事实。只使用当前列出的粒度；未提供的细节不要猜测。',
+        '事实记忆记录原话、约定与已知事件；heard/private是获知来源，thought/inferred不是对外界事实的证实。情景记忆保存当时的经历与感受，inferred是主观推测；不把感受、印象或当前情绪当成客观历史。不确定时说明记不清，而不是补出细节。',
+        'source.author标明原文作者：player是用户，assistant是对应角色。原话中的“我”按原作者理解，不自动变成你；gist、feeling、anchor、appraisal里的“我”/me指当前角色本人，detail与引文中的“我”仍按原作者理解；引述的第三人也不等于作者或听者。用户对自身的明确陈述与纠正优先于助手过去的猜测；助手的说法不会自行证实用户的身份、经历或物品。多项问题逐项核对，缺少一项不影响回答已有依据的其它项。',
+        'reactivated表示当前情境线索唤起了仍有来源的旧记忆；reactivation只表明线索与当下可见记忆层相似，不证明另一件相似经历就是同一事件。只使用列出的恢复粒度；forgotten表示未列出的细节仍不可用。',
+        'emotionalReaction记录当时保留下来的强烈情绪反应，不等于当前情绪，也不证明主观感受所关联的外部事实；它不恢复已经遗忘的事件细节。',
+        '近期工作上下文仅用于接续已知场景，不代表其它角色知情；来源时间未知时保持未知。较早相关记忆用于当前查询。reference为迁入资料中的说法，不是共同经历或脚本确认的事实，不重放其中交易，也不据此推断经历过相关情绪。',
+        '当前查询选入的参考资料单列在references中，仍以其来源性质和可见粒度为准。涉及位置、人物或物品时，优先核对相应依据；缺少依据就保留未知，不用新楼层、房间或路线填空。助手旧回答不能自行改写用户提供的设定。',
+        '已发生的动作、物品状态和结果按其来源接续；没有新事件依据时，不把原状态改成另一种处置，也不补写已经发生的旧行动、台词或决定。当前问题无关的旧物品和动作不必主动复述；确需提及时，保持来源支持的对象、数量、动作与结果，不用改变事实的近义词扩写。角色此刻仍可回应、提出下一步或做当前场景允许的新动作；新动作写成当下发生，设想不能冒充历史。',
+        '状态沿革：relevant保留较早依据，recent接续近期来源。回答“现在在哪里/谁持有”等状态时，按来源先后追踪明确已完成的动作和纠正，以最后一次有效改变后的结果为准；例如先拿入口袋、后放回桌上，当前就在桌上。计划、假设、回忆和问题不改变当前状态；旧状态仍是历史，不因被检索到就重新生效。',
+        JSON.stringify(
           {
-            scope,
-            actorId: expression?.actorId ?? scope.characterId,
-            addresseeId: expression?.addresseeId ?? 'user',
-            sourceVersion: snapshot.version,
-            nowMs: now,
-            timeZone: expression?.timeZone ?? null,
-            clockKind: expression?.clockKind,
-            clockTimeMs: expression?.clockTimeMs,
-            hideStoryTime: expression?.hideStoryTime,
-            relationBasis: expression?.relationBasis,
-            emotion,
-            memories: rewriteViews,
-            waiting: expression?.waiting,
-            address: expression?.address
+            references: render(projected.relevant.filter(memory => memory.source.reference)),
+            relevant: render(projected.relevant.filter(memory => !memory.source.reference)),
+            recent: render(
+              [...projected.recent].sort(
+                (left, right) => left.source.knownAtMs - right.source.knownAtMs ||
+                  (left.source.occurredAtMs ?? 0) - (right.source.occurredAtMs ?? 0) ||
+                  (sourceOrder.get(left.source.messageId) ?? 0) - (sourceOrder.get(right.source.messageId) ?? 0)
+              )
+            ),
+            ...(() => {
+              const sentence = projected.absence && absenceSentence(language, projected.absence.elapsedDays);
+              return sentence ? {
+                sinceLastContact: sentence,
+                ...(projected.lastContact?.length ? {
+                  lastContact: [...projected.lastContact].reverse().map(row => ({
+                    ...renderContextMemory(row.memory, language),
+                    daysAgo: row.daysAgo,
+                  }))
+                } : {})
+              } : {};
+            })()
           }
-        )
-      ),
-      '情绪数值仅指导语气、接近/回避和表达，不赋予新知识，不改变事实，不突破用户拒绝或隐私边界。',
-      preferences.length ? `用户回答要求（当前指令优先；turn仅本轮有效；旧记录legacy未判定时效，以原quote为准，一次任务要求不得推广成持续偏好）：${JSON.stringify(
-        preferences.map(
-          ({category, text, quote, duration, sourceId}) => ({category, text, quote, duration: duration ?? 'legacy', sourceId})
-        )
-      )}` : '',
-    ].filter(Boolean).join('\n');
-    if (context.length > 32000)
-      throw new Error('context_budget_exceeded');
+        ),
+        currentClauses.length ? `模糊回忆表达：${JSON.stringify(currentClauses)}` : '',
+        renderEmotionExpression(
+          buildEmotionExpression(
+            {
+              scope,
+              actorId: expression?.actorId ?? scope.characterId,
+              addresseeId: expression?.addresseeId ?? 'user',
+              sourceVersion: snapshot.version,
+              nowMs: now,
+              timeZone: expression?.timeZone ?? null,
+              clockKind: expression?.clockKind,
+              clockTimeMs: expression?.clockTimeMs,
+              hideStoryTime: expression?.hideStoryTime,
+              relationBasis: expression?.relationBasis,
+              emotion,
+              memories: rewriteViews,
+              waiting: expression?.waiting,
+              address: expression?.address
+            }
+          )
+        ),
+        '情绪数值仅指导语气、接近/回避和表达，不赋予新知识，不改变事实，不突破用户拒绝或隐私边界。',
+        preferences.length ? `用户回答要求（当前指令优先；turn仅本轮有效；旧记录legacy未判定时效，以原quote为准，一次任务要求不得推广成持续偏好）：${JSON.stringify(
+          preferences.map(
+            ({category, text, quote, duration, sourceId}) => ({
+              category,
+              text,
+              quote,
+              duration: duration ?? 'legacy',
+              sourceId,
+            })
+          )
+        )}` : '',
+      ].filter(Boolean).join('\n');
+
+      return {context, facts, episodes, legacy, preferences, rewriteKey, clauses: currentClauses, cacheMiss};
+    };
+    let assembled = assemble();
+    const contextOmissions: ContextOmissions = {
+      characterId: scope.characterId,
+      selection: {
+        reason: 'memory_selection_budget',
+        count: selection.omittedIds.length,
+        ids: selection.omittedIds,
+      },
+      trim: {
+        reason: 'core_context_budget',
+        count: 0,
+        ids: [],
+        rows: [],
+        initialCharacters: assembled.context.length,
+        finalCharacters: assembled.context.length,
+        assemblies: 1,
+      },
+    };
+    const removedIds = new Set<string>();
+    if (assembled.context.length > CORE_CONTEXT_LIMIT) {
+      const initialRelevant = [...projected.relevant];
+      const positions = new Map(initialRelevant.map((memory, index) => [memory.id, index]));
+      const ranks = new Map<string, number>();
+      rankedIds.forEach((id, index) => {
+        if (!ranks.has(id)) {
+          ranks.set(id, index);
+        }
+      });
+      const admissions = new Map<string, string>();
+      for (const admission of result.admission ?? []) {
+        if (!admissions.has(admission.id)) {
+          admissions.set(admission.id, admission.by);
+        }
+      }
+      // Scan authority records once, so a recalled fixed-block twin also protects its relevant event.
+      const events = new Map<string, string>();
+      const reactivatedEvents = new Set<string>();
+      for (const memory of snapshot.memories.values()) {
+        const event = eventKey(memory);
+        events.set(memory.id, event);
+        if (memory.reactivated === true) {
+          reactivatedEvents.add(event);
+        }
+      }
+      const strongEvents = new Set(recalls.cues.filter(recall => recall.strong).map(recall => recall.event));
+      for (const hit of recalls.hits) {
+        const event = events.get(hit.id);
+        if (hit.strong && event !== undefined) {
+          strongEvents.add(event);
+        }
+      }
+      const plan: ContextBudgetPlan = {
+        parents: selection.parents,
+        ranks,
+        admissions,
+        events,
+        reactivatedEvents,
+        strongEvents,
+      };
+      let step = 0;
+      // Termination follows strictly fewer relevant rows, even when replacement emotion causes grow the text.
+      while (assembled.context.length > CORE_CONTEXT_LIMIT) {
+        const unitIds = nextContextRemoval(projected.relevant, plan);
+        if (!unitIds.length) {
+          break;
+        }
+        step++;
+        const unit = new Set(unitIds);
+        for (const memory of projected.relevant) {
+          if (!unit.has(memory.id)) {
+            continue;
+          }
+          const rank = ranks.get(memory.id);
+          const admission = admissions.get(memory.id);
+          const record = snapshot.memories.get(memory.id)!;
+          contextOmissions.trim.rows.push({
+            id: memory.id,
+            position: positions.get(memory.id)!,
+            ...(rank !== undefined ? {rank} : {}),
+            ...(admission !== undefined ? {admission} : {}),
+            access: memory.access,
+            kind: memory.kind,
+            // One story day is 86,400,000 ms, the existing memory-clock unit; future records have age zero.
+            ageDays: Math.max(0, memoryClock - memoryClockTimeMs(record)) / 86_400_000,
+            reactivated: memory.reactivated === true,
+            reference: Boolean(memory.source.reference),
+            protectedFacts: memory.protectedFacts.length,
+            step,
+            unitIds: [...unitIds],
+          });
+          removedIds.add(memory.id);
+          contextOmissions.trim.ids.push(memory.id);
+        }
+        projected.relevant = projected.relevant.filter(memory => !unit.has(memory.id));
+        projected.memories = projected.memories.filter(memory => !unit.has(memory.id));
+        projected.grounding.selectedEvidence = projected.grounding.selectedEvidence
+          .filter(evidence => !unit.has(evidence.memoryId));
+        projected.budget.totalCharacters = projected.memories
+          .reduce((total, memory) => total + JSON.stringify(memory).length, 0);
+        detailViews = projected.memories;
+        rewriteViews = detailViews.map(withoutRecallDetails);
+        blurred = rewriteViews.filter(memory => memory.access !== 'clear');
+        rewriteKey = createHash('sha256').update(JSON.stringify([scopeKey(scope), blurred, configs.rewrite]))
+          .digest('hex');
+        clauses = this.rewriteCache.get(rewriteKey);
+        cacheMiss = clauses === undefined;
+        if (clauses === undefined) {
+          clauses = await this.models.rewrite(rewriteViews, configs.rewrite);
+          assertCurrent();
+        }
+        assertCurrent();
+        assembled = assemble();
+        contextOmissions.trim.assemblies++;
+      }
+      if (assembled.context.length <= CORE_CONTEXT_LIMIT && assembled.cacheMiss) {
+        cacheClauses(assembled.rewriteKey, assembled.clauses);
+      }
+    }
+    contextOmissions.trim.count = removedIds.size;
+    contextOmissions.trim.finalCharacters = assembled.context.length;
+    if (assembled.context.length > CORE_CONTEXT_LIMIT) {
+      throw Object.assign(new Error('context_budget_exceeded'), {contextOmissions});
+    }
+    const {context, facts, episodes, legacy, preferences} = assembled;
     // Only a reply context records what it brought back, and only once the whole context is known current. Without the
-    // option (her own proactive contact, tavern, recall) nothing is written, so her outreach never feeds its own pressure.
+    // option (her own proactive contact, tavern, recall) nothing is written; outreach never feeds its own pressure.
     if (options.reactivationOrigin === 'reply') {
       const reactivated = projected.memories.flatMap(
         memory => recallShown(memory) && (memory.access === 'clear' || memory.access === 'gist')
@@ -436,7 +613,8 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
       context,
       emotion: emotionSummary(emotion),
       preferences: preferences.map(({id, category, text}) => ({id, category, text})),
-      retrieval: result.mode
+      retrieval: result.mode,
+      contextOmissions,
     };
     const cueEvents = new Set(recalls.cues.map(recall => recall.event));
     const weakEvents = new Set(
@@ -451,6 +629,16 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
       [...snapshot.memories.values()]
         .filter(memory => memory.reactivated === true && weakEvents.has(eventKey(memory))).map(memory => memory.id)
     );
+    if (removedIds.size) {
+      const finalMemories = new Map(snapshot.memories);
+      for (const id of removedIds) {
+        weakIds.delete(id);
+        const memory = finalMemories.get(id)!;
+        const {selectedRecallDetails: _removedDetails, ...withoutDetails} = memory;
+        finalMemories.set(id, withoutDetails);
+      }
+      snapshot = {...snapshot, memories: finalMemories};
+    }
     // A non-enumerable server-only channel preserves the host packet and view JSON shapes.
     // Scene acceptance copies only the shown recalled rows into its private ticket or draft.
     return Object.defineProperty(output, 'rehearsal', {value: {snapshot, weakIds}}) as typeof output & {
@@ -460,7 +648,7 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
       };
     };
   }
-  /** Distance seam: one ordered batch; today every record synchronously receives no distances and uses seeded fallback. */
+  /** One ordered distance batch; the default returns absent distances synchronously for seeded fallback. */
   private recallDetailDistances(
     requests: readonly {
       id: string;

@@ -225,17 +225,66 @@ const CLAUSE_END_CHARACTER = /[，。！？、；：,;:!?…\p{Pf}\p{Pe}\n\r]/u;
 
 const ARABIC_NUMBER_PATTERN = /^(?:0|[1-9][0-9]*|[1-9][0-9]{0,2}(?:,[0-9]{3})+)(?:\.[0-9]{1,2})?$/;
 
+// A fullwidth comma groups whole sections exactly like its ASCII twin; one spelling never mixes the two.
+const FULL_WIDTH_GROUPED_PATTERN = /^[1-9][0-9]{0,2}(?:，[0-9]{3})+(?:\.[0-9]{1,2})?$/;
+
 const CHINESE_CENTS_TAIL_PATTERN = /^[一二三四五六七八九]十[一二三四五六七八九]?$/;
 
 const DECIMAL_RATE_PATTERN = /^[0-9]\.[0-9]$/;
 
 const TWO_DIGIT_RATE_PATTERN = /^[1-9]{2}$/;
 
+// Period words identify clock hours only in rates; blanks break their adjacency to the hour.
+const TIME_OF_DAY_WORDS = new Set([
+  '上午',
+  '下午',
+  '早上',
+  '晚上',
+  '凌晨',
+  '中午',
+  '傍晚',
+  '今晚',
+  '今早',
+  '明早',
+  '明晚',
+  '昨晚',
+  '每晚',
+  '当晚',
+  '半夜',
+  '清晨',
+  '早晨',
+  '深夜',
+  '午夜'
+]);
+
+// Day words also identify clock hours only in rates; neither list changes monetary readings.
+const DAY_WORDS = new Set([
+  '今天',
+  '明天',
+  '昨天',
+  '后天',
+  '每天',
+  '每日',
+  '当天',
+  '今日',
+  '明日',
+  '昨日'
+]);
+
 const REJECTED_LEFT_SIGNS = new Set(['+', '-', '＋', '－', '−', '负', '$', '＄']);
 
-const AMOUNT_CONNECTORS = new Set('到至-~～—、');
+// The fullwidth hyphen and the minus sign join a range exactly like the ASCII hyphen; the en dash stays out.
+const AMOUNT_CONNECTORS = new Set('到至-~～—、－−');
 
-const QUANTITY_CONNECTORS = new Set('到至-~～');
+const QUANTITY_CONNECTORS = new Set('到至-~～－−');
+
+// These five capital numerals can also end ordinary words such as 人参, 收拾, 大陆, 队伍 and 放肆;
+// an ordinary letter directly before one of them releases the numeric field in the closed
+// word-ending cases below.
+const WORD_ENDING_CAPITALS = '参拾陆伍肆';
+
+// A place value releases a following Arabic number only without its own written coefficient.
+const RELEASING_PLACE_VALUES = '百千万亿';
 
 const isInlineWhitespace = (character: string | undefined) =>
   character === ' ' || character === '\t' || character === '　';
@@ -262,6 +311,77 @@ const isNumberCharacter = (character: string | undefined) =>
   // For example, scanNumbers("半俩仨") returns the single span [0, 3).
   character !== undefined && (NUMERIC_FIELD_CHARACTERS.has(character) || '半俩仨'.includes(character));
 
+/**
+ * Returns the exclusive end of a fullwidth-comma grouped number at startPosition, or -1 when the text
+ * there does not form one. A grouped number is one to three Arabic digits that do not start with 0
+ * followed by one or more groups of a fullwidth comma and exactly three digits, read as the same
+ * digits grouped with ASCII commas. startPosition is the index of the first digit in the folded text
+ * and the result is a UTF-16 position. The character directly before the first digit, the grouping
+ * itself and the character directly after the run decide, so 1，2345, 1，23, 1，234，56 and 1，234,567
+ * are not one number. probe.work counts every probed character; one call visits the number's own
+ * characters plus a fixed lookahead, so all calls together stay linear in the text length.
+ */
+function fullWidthGroupedNumberEnd(text: string, startPosition: number, probe: { work: number }): number {
+  probe.work += 2;
+
+  const first = text[startPosition];
+  const before = text[startPosition - 1];
+
+  // A leading zero or a continuing character directly before the first digit keeps the ordinary reading.
+  if (!isArabicDigit(first) || first === '0'
+    || before !== undefined && (isArabicDigit(before) || '.,，'.includes(before))) {
+    return -1;
+  }
+
+  let position = startPosition;
+  let digits = 0;
+
+  while (digits < 3 && isArabicDigit(text[position])) {
+    digits++;
+    position++;
+    probe.work++;
+  }
+
+  // A fourth digit directly after the first run already breaks the grouping.
+  probe.work++;
+
+  if (isArabicDigit(text[position])) {
+    return -1;
+  }
+
+  let groups = 0;
+
+  while (text[position] === '，') {
+    probe.work += 4;
+
+    // Each group is exactly three digits; a missing digit or a fourth one breaks the grouping.
+    if (!isArabicDigit(text[position + 1]) || !isArabicDigit(text[position + 2])
+      || !isArabicDigit(text[position + 3]) || isArabicDigit(text[position + 4])) {
+      break;
+    }
+
+    groups++;
+    position += 4;
+  }
+
+  // Charge the comma lookahead that ends the group loop.
+  probe.work++;
+
+  if (!groups) {
+    return -1;
+  }
+
+  // A comma directly before a digit belongs to the number and invalidates the whole grouping;
+  // 1，234，56 and 1，234,567 keep their ordinary reading.
+  probe.work++;
+
+  if ((text[position] === '，' || text[position] === ',') && isArabicDigit(text[position + 1])) {
+    return -1;
+  }
+
+  return position;
+}
+
 interface NumericField {
   start: number;
   end: number;
@@ -274,8 +394,11 @@ interface ReaderContext {
   numericFieldEnds: Int32Array;
   nextNonWhitespace: Int32Array;
   previousNonWhitespaceEnd: Int32Array;
-  ordinal: Uint8Array;
   units: readonly string[];
+  unitInitials: ReadonlySet<string>;
+
+  // Continuation reads for written-unit chains, keyed by start position; see the chained-read helper.
+  chainedAmounts: Map<number, AmountCore | null>;
   work: number;
 }
 
@@ -291,7 +414,7 @@ export interface WorkResult<Result> {
 
 /**
  * Normalization preserves UTF-16 width so every cached jump remains an original-input offset.
- * O(n): folding, numeric fields, inline-whitespace jumps and clause flags each make a bounded pass.
+ * O(n): folding, numeric fields and inline-whitespace jumps each make a bounded pass.
  * The initial 4 * length work baseline is retained diagnostic accounting; its derivation is not recorded.
  */
 function createReaderContext(input: string, options?: Options): ReaderContext {
@@ -317,24 +440,12 @@ function createReaderContext(input: string, options?: Options): ReaderContext {
   const numericFieldEnds = new Int32Array(textLength + 1);
   const nextNonWhitespace = new Int32Array(textLength + 1);
   const previousNonWhitespaceEnd = new Int32Array(textLength + 1);
-  const ordinal = new Uint8Array(textLength + 1);
 
   // Existing diagnostic baseline; source not recorded for the multiplier 4.
   let work = textLength * 4;
-  let clauseOrdinal = false;
+  const groupingProbe = { work: 0 };
 
   for (let i = 0; i < textLength; i++) {
-    if (CLAUSE_END_CHARACTER.test(text[i]!) || text[i] === '.' && !isArabicDigit(text[i + 1])) {
-      clauseOrdinal = false;
-    }
-
-    // An ordinal suppresses rates throughout its clause, rather than only at the first numeric field.
-    // For example, scanRates("第2件8折，甲9折。") keeps only the 90/100 rate after the comma.
-    if (text[i] === '第' && NUMERIC_FIELD_CHARACTERS.has(text[i + 1]!)) {
-      clauseOrdinal = true;
-    }
-
-    ordinal[i] = clauseOrdinal ? 1 : 0;
     previousNonWhitespaceEnd[i + 1] = isInlineWhitespace(text[i]) ? previousNonWhitespaceEnd[i]! : i + 1;
 
     if (!isNumberCharacter(text[i])) {
@@ -344,11 +455,22 @@ function createReaderContext(input: string, options?: Options): ReaderContext {
     const start = i;
     let capital = false;
 
-    // Punctuation belongs to a numeric field only between Arabic digits; other punctuation separates fields.
+    // A complete fullwidth-comma grouped number is one field, so its probe runs before the field loop.
+    let groupedNumberEnd = fullWidthGroupedNumberEnd(text, start, groupingProbe);
+
+    // Punctuation belongs to a numeric field only between Arabic digits or inside that grouped number;
+    // other punctuation separates fields.
     while (i < textLength
       && (isNumberCharacter(text[i])
         || (text[i] === '.' || text[i] === ',') && isArabicDigit(text[i - 1])
-        && isArabicDigit(text[i + 1]))) {
+        && isArabicDigit(text[i + 1])
+        || i < groupedNumberEnd)) {
+      // A released Arabic run can begin after a Chinese numeral inside the same field.
+      // Each probe visits only its own Arabic run, so these interior starts add one bounded pass.
+      if (i > start && isArabicDigit(text[i]) && !isArabicDigit(text[i - 1])) {
+        groupedNumberEnd = Math.max(groupedNumberEnd, fullWidthGroupedNumberEnd(text, i, groupingProbe));
+      }
+
       capital ||= CAPITAL_NUMERALS.includes(text[i]!);
       work++;
       i++;
@@ -365,15 +487,17 @@ function createReaderContext(input: string, options?: Options): ReaderContext {
       work++;
     }
 
-    // The skipped positions still need whitespace and ordinal metadata.
+    // The skipped positions still need their whitespace metadata.
     for (let j = start + 1; j < i; j++) {
       previousNonWhitespaceEnd[j + 1] = j + 1;
-      ordinal[j] = clauseOrdinal ? 1 : 0;
       work++;
     }
 
     i--;
   }
+
+  // Charge every fullwidth-grouping probe once, after all field starts have been examined.
+  work += groupingProbe.work;
 
   nextNonWhitespace[textLength] = textLength;
 
@@ -416,8 +540,9 @@ function createReaderContext(input: string, options?: Options): ReaderContext {
     numericFieldEnds,
     nextNonWhitespace,
     previousNonWhitespaceEnd,
-    ordinal,
     units,
+    unitInitials: new Set(units.map(word => word[0]!)),
+    chainedAmounts: new Map(),
     work
   };
 }
@@ -538,7 +663,8 @@ interface ParsedNumber {
  * Missing zeros retain the existing omission rules.
  * The 40 UTF-16-unit syntax bound has no recorded derivation; it is preserved independently of fragment length.
  * A section coefficient must be below 10000 (four decimal places), matching the finite-number grammar boundaries.
- * Recursion has a fixed number of section levels; character work is O(spelling.length) within the syntax bound.
+ * Every recursive spelling is shorter than its parent, whose syntax bound is 40 UTF-16 units.
+ * Thus at most 40 frames can be active, independently of input length; character work within that bound is O(1).
  */
 function readChineseInteger(
   spelling: string,
@@ -711,16 +837,49 @@ function readChineseInteger(
 
 /**
  * Strict three-digit grouping and one/two fractional digits come from the frozen decimal/grouping grammar cases.
+ * A fullwidth grouping comma reads like its ASCII twin; the two separator styles are never mixed.
  * 100 hundredths per unit and padding to two digits preserve exact cents; text processing is O(spelling.length).
  */
 function readArabicCents(spelling: string): bigint | null {
-  if (!ARABIC_NUMBER_PATTERN.test(spelling)) {
+  if (!ARABIC_NUMBER_PATTERN.test(spelling) && !FULL_WIDTH_GROUPED_PATTERN.test(spelling)) {
     return null;
   }
 
-  const [whole, fraction = ''] = spelling.replaceAll(',', '').split('.');
+  const [whole, fraction = ''] = spelling.replaceAll(',', '').replaceAll('，', '').split('.');
 
   return BigInt(whole!) * 100n + BigInt(fraction.padEnd(2, '0') || '0');
+}
+
+/**
+ * Reads the fraction of a Chinese decimal standing directly before one 万/亿 and returns the whole
+ * decimal in integer hundredths, that is the decimal value times the section. fraction is the
+ * folded characters after 点, and integerYuan is the whole-yuan part before 点, below 10000.
+ * Returns null when fraction is not one or two digits from 零一二三四五六七八九 followed by exactly
+ * one 万 or 亿, so callers keep their ordinary fraction checks.
+ */
+function readSectionedDecimalFraction(fraction: string, integerYuan: bigint): bigint | null {
+  if (!/^[零一二三四五六七八九]{1,2}[万亿]$/.test(fraction)) {
+    return null;
+  }
+
+  const digits = [...fraction.slice(0, -1)]
+    .map(character => character === '零' ? '0' : String(SMALL_DIGITS.indexOf(character) + 1))
+    .join('')
+    .padEnd(2, '0');
+  const sectionCharacter = fraction[fraction.length - 1]!;
+
+  return (integerYuan * 100n + BigInt(digits)) * PLACE_VALUES[sectionCharacter]!;
+}
+
+/**
+ * True when raw is a Chinese decimal whose fraction after 点 is one or two digits from
+ * 零一二三四五六七八九 directly before exactly one 万 or 亿. raw is one folded numeric field; the
+ * check is bounded by its length, and any other spelling returns false.
+ */
+function isSectionedDecimalRaw(raw: string): boolean {
+  const point = raw.indexOf('点');
+
+  return point > 0 && /^[零一二三四五六七八九]{1,2}[万亿]$/.test(raw.slice(point + 1));
 }
 
 /**
@@ -739,11 +898,32 @@ function readExactNumber(spelling: string, isQuantity = false): {
   }
 
   if (isArabicDigit(spelling[0])) {
+    // 点 stands for the decimal dot between Arabic digits; one or two digits directly after it are
+    // the fraction. Amount callers require a following currency for this spelling, and quantities
+    // reject it, so the substituted dot never widens the closed reading by itself.
+    const decimalPoint = spelling.indexOf('点');
+
+    if (decimalPoint >= 0) {
+      let fractionDigits = 0;
+
+      while (isArabicDigit(spelling[decimalPoint + 1 + fractionDigits])) {
+        fractionDigits++;
+      }
+
+      if (isQuantity || !/^(?:0|[1-9][0-9]*)$/.test(spelling.slice(0, decimalPoint))
+        || fractionDigits < 1 || fractionDigits > 2) {
+        return null;
+      }
+
+      spelling = spelling.slice(0, decimalPoint) + '.' + spelling.slice(decimalPoint + 1);
+    }
+
     let position = 0;
 
+    // Either grouping comma is scanned so readArabicCents can validate the complete spelling.
     while (position < spelling.length
       && (isArabicDigit(spelling[position]) || spelling[position] === '.'
-        || spelling[position] === ',')) {
+        || spelling[position] === ',' || spelling[position] === '，')) {
       position++;
     }
 
@@ -806,10 +986,12 @@ function readExactNumber(spelling: string, isQuantity = false): {
       lastPlaceValue = next;
     }
 
+    // The fraction flag follows the multiplied value, so a caller can still see that the spelling
+    // carried a decimal point.
     return {
       value: total,
       capital: false,
-      decimal: false,
+      decimal,
       omitted
     };
   }
@@ -837,6 +1019,21 @@ function readExactNumber(spelling: string, isQuantity = false): {
 
     const integerPart = readChineseInteger(plain.slice(0, point));
     const fraction = plain.slice(point + 1);
+
+    // A Chinese decimal standing directly before exactly one 万/亿 multiplies by that section: the
+    // whole part stays below 10000 yuan, and the fraction is one or two digits plus the section word.
+    if (!isQuantity && integerPart && integerPart.value < 10000n) {
+      const sectionedValue = readSectionedDecimalFraction(fraction, integerPart.value);
+
+      if (sectionedValue !== null) {
+        return {
+          value: sectionedValue,
+          capital: false,
+          decimal: true,
+          omitted: integerPart.omitted
+        };
+      }
+    }
 
     if (!integerPart || fraction.length < 1 || fraction.length > 2
       || [...fraction].some(character => !SMALL_DIGITS.includes(character) && character !== '零')) {
@@ -879,6 +1076,219 @@ function readExactNumber(spelling: string, isQuantity = false): {
 }
 
 /**
+ * Reads one spelling with 亿 and/or 万 whose coefficients may use different scripts.
+ * spelling is one numeric field of folded text; the result is integer cents, or null when the
+ * spelling is not a closed sectioned form, so callers keep the ordinary grammar results.
+ * The first coefficient keeps the ordinary Arabic limits; later coefficients count 1 to 9999,
+ * and the rest stays below the place of the section word before it. O(spelling.length).
+ */
+function readSectionedNumber(spelling: string): bigint | null {
+  const yiIndex = spelling.indexOf('亿');
+  const wanIndex = spelling.indexOf('万');
+
+  if (yiIndex < 0 && wanIndex < 0) {
+    return null;
+  }
+
+  // 亿 occurs at most once, 万 occurs at most once, and 亿 stands before 万.
+  if (yiIndex >= 0 && spelling.indexOf('亿', yiIndex + 1) >= 0) {
+    return null;
+  }
+
+  if (wanIndex >= 0 && spelling.indexOf('万', wanIndex + 1) >= 0) {
+    return null;
+  }
+
+  if (yiIndex >= 0 && wanIndex >= 0 && yiIndex > wanIndex) {
+    return null;
+  }
+
+  const yiCoefficientSpelling = yiIndex >= 0 ? spelling.slice(0, yiIndex) : '';
+  const wanCoefficientSpelling = wanIndex < 0
+    ? ''
+    : spelling.slice(yiIndex >= 0 ? yiIndex + 1 : 0, wanIndex);
+  const restSpelling = spelling.slice((wanIndex >= 0 ? wanIndex : yiIndex) + 1);
+  const firstCoefficientSpelling = yiIndex >= 0 ? yiCoefficientSpelling : wanCoefficientSpelling;
+
+  // A decimal point or a grouping comma in the first coefficient keeps the ordinary Arabic result;
+  // the sectioned forms read whole coefficients only, and either comma style counts as grouping.
+  if (firstCoefficientSpelling.includes('.') || firstCoefficientSpelling.includes(',')
+    || firstCoefficientSpelling.includes('，')) {
+    return null;
+  }
+
+  let total = 0n;
+
+  if (yiIndex >= 0) {
+    const yiCoefficient = readSectionCoefficient(yiCoefficientSpelling, true, true);
+
+    if (yiCoefficient === null) {
+      return null;
+    }
+
+    total += yiCoefficient * 100000000n;
+  }
+
+  if (wanIndex >= 0) {
+    // A 万 coefficient that follows 亿 keeps the narrower acceptance of that place: an opening
+    // 十 cannot supply one there, and only a first coefficient may be an unlimited Arabic number.
+    const wanIsFirst = yiIndex < 0;
+    const wanCoefficient = readSectionCoefficient(wanCoefficientSpelling, wanIsFirst, wanIsFirst);
+
+    if (wanCoefficient === null) {
+      return null;
+    }
+
+    total += wanCoefficient * 10000n;
+  }
+
+  const restCents = readSectionRest(restSpelling, wanIndex >= 0 ? 10000n : 100000000n, wanIndex >= 0);
+
+  if (restCents === null) {
+    return null;
+  }
+
+  return total + restCents;
+}
+
+/**
+ * Reads one coefficient before 亿 or before 万 and returns it in integer cents, or null.
+ * A Chinese coefficient counts 1 to 9999 whole units; the closed shorthand is one Arabic digit
+ * from 1 to 9 directly before 千 or 百 (5千 is 5000, 5百 is 500); a plain Arabic integer counts
+ * 1 to 9999. allowArabicAny adds the unlimited first-coefficient Arabic form with its ordinary
+ * limits. allowInitialTen marks a first coefficient, where an opening 十 may supply one.
+ */
+function readSectionCoefficient(
+  spelling: string,
+  allowInitialTen: boolean,
+  allowArabicAny: boolean
+): bigint | null {
+  const chinese = readChineseInteger(spelling, true, 1n, allowInitialTen);
+
+  if (chinese && !chinese.omitted && chinese.value > 0n && chinese.value < 10000n) {
+    return chinese.value * 100n;
+  }
+
+  if (/^[1-9]千$/.test(spelling)) {
+    return BigInt(spelling[0]!) * 100000n;
+  }
+
+  if (/^[1-9]百$/.test(spelling)) {
+    return BigInt(spelling[0]!) * 10000n;
+  }
+
+  if (/^[1-9][0-9]{0,3}$/.test(spelling)) {
+    return BigInt(spelling) * 100n;
+  }
+
+  if (allowArabicAny) {
+    return readArabicCents(spelling);
+  }
+
+  return null;
+}
+
+/**
+ * Reads the part after the last 万 or 亿: empty, a Chinese rest, an Arabic rest, or one of the
+ * two literal Arabic rests that stand only directly after 万. The result is integer cents, or
+ * null when the part is not one of the closed rest forms.
+ * unitInYuan is the place of the section word before the rest (10000 or 100000000); the rest
+ * must stay below it. afterWan admits the literal three/four-digit and 零-prefixed forms.
+ */
+function readSectionRest(spelling: string, unitInYuan: bigint, afterWan: boolean): bigint | null {
+  if (!spelling) {
+    return 0n;
+  }
+
+  const chineseRest = readChineseSectionRest(spelling, unitInYuan);
+
+  if (chineseRest !== null) {
+    return chineseRest;
+  }
+
+  const arabicRest = readArabicSectionRest(spelling, unitInYuan);
+
+  if (arabicRest !== null) {
+    return arabicRest;
+  }
+
+  // Directly after 万, three or four Arabic digits stand for themselves: 1万500 is 10500.
+  if (afterWan && /^[1-9][0-9]{2,3}$/.test(spelling)) {
+    return BigInt(spelling) * 100n;
+  }
+
+  // Also directly after 万, 零 plus one to three Arabic digits stands for itself: 1万零50 is 10050.
+  if (afterWan && /^零[1-9][0-9]{0,2}$/.test(spelling)) {
+    return BigInt(spelling.slice(1)) * 100n;
+  }
+
+  return null;
+}
+
+/**
+ * Reads a Chinese rest after a section word and returns integer cents, or null.
+ * A leading 零 marks an internal gap, so the remainder cannot omit its final place; the rest
+ * must still stay below one whole section unit, as in the ordinary section grammar.
+ */
+function readChineseSectionRest(spelling: string, unitInYuan: bigint): bigint | null {
+  let rest = spelling;
+  let zero = false;
+
+  if (rest.startsWith('零')) {
+    zero = true;
+    rest = rest.slice(1);
+  }
+
+  if (!rest) {
+    return null;
+  }
+
+  const remainder = readChineseInteger(rest, true, zero ? 1n : unitInYuan, false, false);
+
+  if (!remainder || remainder.value >= unitInYuan) {
+    return null;
+  }
+
+  return remainder.value * 100n;
+}
+
+/**
+ * Reads an Arabic rest below a section place and returns integer cents, or null.
+ * Places must strictly descend; the final digit may stand without one and fills the next lower
+ * place, so a 万 rest of 5千2百 counts 5200 whole units and a bare 5 counts 5000.
+ */
+function readArabicSectionRest(spelling: string, unitInYuan: bigint): bigint | null {
+  let position = 0;
+  let lastPlaceValue = unitInYuan;
+  let total = 0n;
+
+  while (position < spelling.length) {
+    if (!isArabicDigit(spelling[position])) {
+      return null;
+    }
+
+    const digitValue = BigInt(spelling[position++]!);
+
+    if (position === spelling.length) {
+      total += digitValue * lastPlaceValue / 10n * 100n;
+
+      return total;
+    }
+
+    const next = PLACE_VALUES[spelling[position++]!];
+
+    if (!next || next >= lastPlaceValue) {
+      return null;
+    }
+
+    total += digitValue * next * 100n;
+    lastPlaceValue = next;
+  }
+
+  return total;
+}
+
+/**
  * Starts at one whole unit (100 hundredths) and advances by decimal places (factor 10).
  * This identifies the uncertainty quantum used by more/head ranges; work is O(decimal places in value).
  */
@@ -892,6 +1302,75 @@ function lowestPlaceValueCents(value: bigint): bigint {
   }
 
   return placeValue;
+}
+
+/**
+ * Reads a number, one 多/余/来 particle and exactly one 万/亿 as a single approximate number.
+ * base.end stands on the section word right after the consumed particle; spelling is base.raw, the
+ * folded number before the particle, which stays below 10000 whole units and holds neither 万 nor 亿.
+ * Values are hundredths: cents for amounts, item count times 100 for quantities; quantum is one cent
+ * or one whole item. Returns the sectioned range with the section word consumed, or null when the
+ * number spelling, its bounds or the character after the section word cannot support that reading.
+ */
+function readSectionedParticleRange(
+  readerContext: ReaderContext,
+  base: ParsedNumber,
+  modifier: string,
+  isQuantity: boolean
+): ParsedNumber | null {
+  const text = readerContext.text;
+  const spelling = base.raw;
+  const sectionWord = text[base.end];
+  const afterSection = text[base.end + 1];
+
+  if (sectionWord !== '万' && sectionWord !== '亿'
+    || spelling.includes('万') || spelling.includes('亿')
+    || afterSection !== undefined
+    && (isNumberCharacter(afterSection) || '多余来'.includes(afterSection))) {
+    return null;
+  }
+
+  readerContext.work += spelling.length;
+
+  let exactNumber = readExactNumber(spelling, false);
+
+  // The closed shorthand 百/千 stands for itself after a particle, as in the ordinary suffix path.
+  if (!exactNumber && MISSING_COEFFICIENT.has(spelling)) {
+    exactNumber = {
+      value: PLACE_VALUES[spelling]! * 100n,
+      capital: false,
+      decimal: false,
+      omitted: false
+    };
+  }
+
+  const arabic = isArabicDigit(spelling[0]);
+  const arabicPlaced = arabic && [...spelling].some(character => PLACE_VALUES[character]);
+  const quantum = isQuantity ? 100n : 1n;
+
+  if (!exactNumber || exactNumber.value <= 0n || exactNumber.value % 100n !== 0n
+    || exactNumber.capital || exactNumber.value >= 1000000n
+    || (isQuantity ? exactNumber.decimal || arabicPlaced : exactNumber.decimal && !arabicPlaced)
+    || !arabic && !readChineseInteger(spelling) && !MISSING_COEFFICIENT.has(spelling)) {
+    return null;
+  }
+
+  const lower = exactNumber.value;
+  const upper = modifier === '多' || modifier === '余'
+    ? lower + lowestPlaceValueCents(lower) - quantum
+    : lower;
+  const section = PLACE_VALUES[sectionWord]!;
+
+  return {
+    ...base,
+    end: base.end + 1,
+    range: true,
+    decimal: exactNumber.decimal,
+    minimumHundredths: lower * section,
+    maximumHundredths: modifier === '来'
+      ? lower * section
+      : (upper + quantum) * section - quantum
+  };
 }
 
 /**
@@ -1038,6 +1517,13 @@ function readNumberAt(
     base.end++;
   }
 
+  // After one 多/余/来 particle, exactly one 万/亿 makes the particle part of a single sectioned
+  // approximate number; the same particle read without its section word must never be returned.
+  if ((suffixModifier === '多' || suffixModifier === '余' || suffixModifier === '来')
+    && (text[base.end] === '万' || text[base.end] === '亿')) {
+    return variants > 1 ? null : readSectionedParticleRange(readerContext, base, suffixModifier, isQuantity);
+  }
+
   // Do not combine independent uncertainty into precise endpoints; "上千多块" has two null bounds.
   if (variants > 1) {
     base.range = true;
@@ -1052,6 +1538,11 @@ function readNumberAt(
   }
 
   if (variants === 1 && !suffixModifier) {
+    // Quantity substitutions retain the ordinary omission rules, but cannot acquire amount-only decimals.
+    if (isQuantity && (isSectionedDecimalRaw(lowerSpelling) || isSectionedDecimalRaw(upperSpelling))) {
+      return null;
+    }
+
     const lowerNumber = readExactNumber(lowerSpelling);
     const upperNumber = readExactNumber(upperSpelling);
 
@@ -1084,23 +1575,45 @@ function readNumberAt(
     };
   }
 
+  // A number with 亿 and/or 万 may carry its coefficients in different scripts; this fallback
+  // runs only where the ordinary grammars above found nothing, so their results stay primary.
+  if (!exactNumber && !isQuantity && !suffixModifier) {
+    readerContext.work += raw.length;
+    const sectionedValue = readSectionedNumber(raw);
+
+    if (sectionedValue !== null) {
+      exactNumber = {
+        value: sectionedValue,
+        capital: false,
+        decimal: false,
+        omitted: false
+      };
+    }
+  }
+
   if (!exactNumber) {
     return null;
   }
 
-  // Approximation suffixes require a positive whole, ordinary-style value.
-  // Fractions and mixed coefficients cannot widen.
+  // Approximation suffixes require a positive whole, ordinary-style value. In amounts an Arabic
+  // spelling before a place value keeps the reading of the same Chinese value; quantity reads keep
+  // rejecting those Arabic places, and a fraction without a place cannot carry the particle.
   if (suffixModifier) {
+    const arabic = isArabicDigit(raw[0]);
+    const arabicPlaced = arabic && [...raw].some(character => PLACE_VALUES[character]);
+    const unsupportedValue = isQuantity ? exactNumber.decimal || arabicPlaced
+      : exactNumber.decimal && !arabicPlaced;
+
     if (exactNumber.value <= 0n || exactNumber.value % 100n !== 0n || exactNumber.capital
-      || exactNumber.decimal
-      || isArabicDigit(raw[0]) && [...raw].some(character => PLACE_VALUES[character])
-      || !isArabicDigit(raw[0]) && !readChineseInteger(raw) && !MISSING_COEFFICIENT.has(raw)) {
+      || unsupportedValue
+      || !arabic && !readChineseInteger(raw) && !MISSING_COEFFICIENT.has(raw)) {
       return null;
     }
 
     return {
       ...base,
       range: true,
+      decimal: exactNumber.decimal,
       minimumHundredths: exactNumber.value,
       maximumHundredths: suffixModifier === '多' || suffixModifier === '余'
         ? exactNumber.value + lowestPlaceValueCents(exactNumber.value) - (isQuantity ? 100n : 1n)
@@ -1159,6 +1672,10 @@ interface AmountCore {
   checkedEnd: number;
   candidate: boolean;
   major: boolean;
+
+  // Set while a deferred read of a chain member leaves its continuation to the chain walk; every
+  // read that decides the continuation on the spot, and every complete amount, leaves it unset.
+  chainPending?: boolean;
 }
 
 /**
@@ -1210,10 +1727,27 @@ function buildNumericAmount(
 }
 
 /**
+ * Reads the closed colloquial fen tail of an amount, such as 二五 in 一块二五.
+ * body is the folded numeric field directly after a yuan word; the result is the first digit times ten
+ * plus five cents, that is d1 jiao and five fen, or null when body is not exactly two ordinary digits
+ * whose second digit is 五. 两, 零, capital digits, Arabic digits and every other second digit are not
+ * this spelling; the caller checks that the tail stands directly before a sentence end.
+ */
+function readColloquialFenTail(body: string): bigint | null {
+  if (body.length !== 2 || body[1] !== '五' || !SMALL_DIGITS.includes(body[0]!)) {
+    return null;
+  }
+
+  return readSmallDigit(body[0])! * 10n + 5n;
+}
+
+/**
  * Yuan tails have at most two currency levels; all alternatives keep their own endpoints.
  * Written currency levels resolve before implicit tails; ordinary-word endings retain competing readings.
  * The grammar fixes yuan/jiao/fen levels at 100/10/1 hundredths and half a next level at five tenths.
- * At most two subunit levels are followed; O(tail field length) work, with no extra full-text pass.
+ * Two ordinary digits ending in 五 are read as jiao and five fen only directly before a sentence end.
+ * Every recursive call lowers the level along 100 -> 10 -> 1, so at most three frames are active.
+ * O(tail field length) work, with no extra full-text pass.
  */
 function readCurrencyTail(
   readerContext: ReaderContext,
@@ -1364,6 +1898,12 @@ function readCurrencyTail(
   let candidate = false;
   const factor = level === 100n ? 10n : 1n;
 
+  // The two-digit colloquial fen tail is complete only directly before a sentence end; after an ordinary
+  // word the older implicit-tail readings stay in force. parseAmount("一块二五本") keeps 120 cents.
+  const colloquialFenTail = level === 100n && endCategory === 'end'
+    ? readColloquialFenTail(body)
+    : null;
+
   // An ordinary word leaves both the main amount and one implicit subunit possible;
   // parseAmount("三元五本") retains 300 cents at end 2 and 350 cents at end 3.
   if (body.length === 1 && (digitValue !== null || body === '半')) {
@@ -1411,6 +1951,15 @@ function readCurrencyTail(
       main,
       withTail
     ];
+  } else if (colloquialFenTail !== null) {
+    // Two ordinary digits after a yuan word, the second one being 五, directly before a sentence end
+    // spell a complete colloquial amount: the first digit counts jiao and the second a written five fen.
+    // parseAmount("一块二五") is 125 cents at end 4; "五块三五" is 535 cents although 三五 is an adjacent pair.
+    list = [{
+      cents: value + colloquialFenTail,
+      end: numericEnd
+    }];
+    candidate = true;
   } else if (body.length > 1) {
     // A longer field may begin with a monetary tail and continue with a separate count; only that prefix is consumed.
     let consumed = 0;
@@ -1486,14 +2035,15 @@ function readCurrencyTail(
 }
 
 /**
- * O(field length) prefix validity avoids reparsing growing invalid prefixes for numeric unit words.
+ * Lazily yields valid split positions without reading or allocating the unconsumed suffix of a numeric unit chain.
+ * Each consumed prefix character is classified once, in O(consumed prefix length) work and O(1) extra space.
  * Grouping uses three integer digits per comma group and at most two fraction digits (decimal grammar).
  */
-function classifyArabicPrefixes(readerContext: ReaderContext, startPosition: number, end: number): {
-  valid: Uint8Array;
-  numericEnd: number;
-} {
-  const valid = new Uint8Array(end - startPosition + 1);
+function* classifyArabicPrefixes(
+  readerContext: ReaderContext,
+  startPosition: number,
+  end: number
+): Generator<number> {
   const text = readerContext.text;
   let group = 0;
   let hasComma = false;
@@ -1541,16 +2091,193 @@ function classifyArabicPrefixes(readerContext: ReaderContext, startPosition: num
       break;
     }
 
-    valid[position + 1 - startPosition] = !invalid
-      && (decimal ? fraction >= 1 && fraction <= 2 : group > 0 && (!hasComma || group === 3))
-      ? 1
-      : 0;
+    if (!invalid && (decimal ? fraction >= 1 && fraction <= 2 : group > 0 && (!hasComma || group === 3))) {
+      yield position + 1;
+    }
   }
 
-  return {
-    valid,
-    numericEnd: position
-  };
+  // The retained split grammar probes at most ten positions beyond the Arabic run.
+  // Yielding lazily stops both classification and allocation when the earliest unit split succeeds.
+  for (let split = position + 1; split <= Math.min(end, position + 10); split++) {
+    yield split;
+  }
+}
+
+/**
+ * Returns the exclusive end of a closed half-yuan spelling at startPosition, or 0 when the text there
+ * is not one. startPosition is the index of 半 in the folded text; the spellings are the three
+ * characters 块钱 and the two characters 半元. The result is a position in the
+ * folded text, which is also an original UTF-16 offset.
+ * 元 is rejected before 旦, 宵 and 音, and either unit
+ * spelling is rejected when a numeral character follows it directly, because a further digit would be
+ * part of the same number rather than of a half yuan.
+ */
+function readHalfYuanEnd(readerContext: ReaderContext, startPosition: number): number {
+  const text = readerContext.text;
+
+  if (text[startPosition] !== '半') {
+    return 0;
+  }
+
+  // 块钱 writes the yuan and its 钱 tail, so nothing else is needed after it; the two unit spellings
+  // below leave the number open, which the numeral check at the end closes.
+  if (matchesWordAt(readerContext, startPosition + 1, '块钱')) {
+    return startPosition + 3;
+  }
+
+  if (text[startPosition + 1] !== '元') {
+    return 0;
+  }
+
+  // Holiday words and the phonetic term 元音 cannot identify money.
+  if ('旦宵音'.includes(text[startPosition + 2] ?? '\0')) {
+    return 0;
+  }
+
+  if (isNumberCharacter(text[startPosition + 2])) {
+    return 0;
+  }
+
+  return startPosition + 2;
+}
+
+/**
+ * Returns the registered unit word carried by an amount expression, or null when the expression has
+ * a yuan unit or no written unit at all.
+ * expression is one completed reading; the result is the caller-provided folded word, never a
+ * converted value. Both readings and range forms answer through their unit field, so a range over one
+ * named unit reports that word and a bare candidate reports null.
+ */
+function namedUnitWord(expression: AmountExpression): string | null {
+  return expression.unit?.kind === 'named' ? expression.unit.word : null;
+}
+
+// One provisional member and the dependency flag that the reverse pass resolves against its cached successor.
+interface ChainMember {
+  startPosition: number;
+  amount: AmountCore | null;
+  pending: boolean;
+}
+
+/**
+ * Reads one provisional member of a written-unit chain at startPosition without deciding whether the
+ * member's own continuation keeps it readable. startPosition is a folded-text position; the result is
+ * the amount read with standalone fragment semantics, retaining connectors and modifiers while
+ * ignoring the preceding member's unit, or null when the text there is
+ * no readable amount. A non-null result carries chainPending true while its continuation is still
+ * open; the chain walk below resolves that flag.
+ */
+function readProvisionalChainAmount(readerContext: ReaderContext, startPosition: number): AmountCore | null {
+  // Ignore only the preceding member's unit. Standalone semantics still read connectors and modifiers;
+  // using a range endpoint read here would discard both parts of those ordinary fragment semantics.
+  return readAmountAt(readerContext, startPosition, false, false, true, true);
+}
+
+/**
+ * Reads the amount standing directly after a named unit as the next member of a written-unit chain.
+ * startPosition is the first folded-text position of that amount; the result is the amount read with
+ * the ordinary fragment semantics, or, when the preceding unit blocks that read, with the standalone
+ * joining semantics used for a range's right side, or null when no readable chain stands there.
+ * The chain is followed with a loop over its members and then decided with a second loop. All member
+ * reads and their single connector endpoints set deferChain. A reverse pass resolves each member
+ * against its already cached continuation, including the failure semantics of a range endpoint.
+ * Cached reads return before entering the walker, so the call stack stays bounded independently of chain length.
+ * Each position has at most one provisional read and one resolved read, so k members cost O(k) reads instead
+ * of re-reading its whole suffix once per member; the map probes and reads are charged to work.
+ */
+function readChainedAmountCore(readerContext: ReaderContext, startPosition: number): AmountCore | null {
+  const cached = readerContext.chainedAmounts.get(startPosition);
+
+  if (cached !== undefined) {
+    readerContext.work++;
+
+    return cached;
+  }
+
+  readerContext.work++;
+
+  const members: ChainMember[] = [];
+  let position = startPosition;
+
+  // Follow the chain forward with a loop: a member whose continuation is still open leads to the
+  // amount directly after its own unit, which is its next member.
+  for (;;) {
+    readerContext.work++;
+
+    const known = readerContext.chainedAmounts.get(position);
+
+    // A cached position is already decided, so it ends the walk; its word still joins the decision.
+    if (known !== undefined) {
+      members.push({
+        startPosition: position,
+        amount: known,
+        pending: false
+      });
+
+      break;
+    }
+
+    const amount = readProvisionalChainAmount(readerContext, position);
+    const pending = amount !== null && amount.chainPending === true;
+
+    members.push({
+      startPosition: position,
+      amount,
+      pending
+    });
+
+    // A member standing alone ends the chain; only an open continuation leads to a next member.
+    if (!pending) {
+      break;
+    }
+
+    position = (amount!).expression.end;
+  }
+
+  // Resolve dependencies from the end. Ordinary reads now consult only cached continuations,
+  // preserving an unreadable right endpoint's fallback to its written left amount without recursion.
+  for (let index = members.length - 1; index >= 0; index--) {
+    const member = members[index]!;
+    const resolved = member.pending
+      ? readAmountAt(readerContext, member.startPosition, false, false, false, true)
+      : member.amount;
+
+    readerContext.chainedAmounts.set(member.startPosition, resolved);
+  }
+
+  return readerContext.chainedAmounts.get(startPosition) ?? null;
+}
+
+/**
+ * True when the text directly after a named unit reads as a further amount with a different
+ * registered unit, so one written unit directly follows another.
+ * unitEnd is the folded-text position directly after the amount's own unit and unit is that unit;
+ * the answer is a boolean. A follower without a named unit (bare or yuan), one carrying the same
+ * word, and unreadable text all answer false and leave the existing rejection in force.
+ */
+function continuesWithChainedUnit(readerContext: ReaderContext, unitEnd: number, unit: AmountUnit): boolean {
+  if (unit === null || unit.kind !== 'named') {
+    return false;
+  }
+
+  const continuation = readChainedAmountCore(readerContext, unitEnd);
+  const continuedWord = continuation ? namedUnitWord(continuation.expression) : null;
+
+  return continuedWord !== null && continuedWord !== unit.word;
+}
+
+/**
+ * True when a numeric field directly after a named unit closes with a written sub-unit from 钱厘毫文
+ * that does not begin a registered unit, so the named amount ends at its own unit.
+ * unitEnd is the position directly after the amount's own unit and numericEnd is the end of the
+ * numeric run that reaches unitEnd; the answer is a boolean. A missing numeric character at unitEnd,
+ * any other following character, and a position where a registered unit begins all answer false, so
+ * those spellings keep the existing rejection of the whole amount.
+ */
+function closesWithUnregisteredSubunit(readerContext: ReaderContext, unitEnd: number, numericEnd: number): boolean {
+  return isNumberCharacter(readerContext.text[unitEnd])
+    && '钱厘毫文'.includes(readerContext.text[numericEnd] ?? '\0')
+    && readNamedUnitAt(readerContext, numericEnd) === null;
 }
 
 /**
@@ -1558,35 +2285,26 @@ function classifyArabicPrefixes(readerContext: ReaderContext, startPosition: num
  * The extra 10 positions after an Arabic prefix and 40-position other split limit have no recorded derivation.
  * 50 hundredths for half yuan, and 100/10/1 currency levels, are fixed by the half/subunit grammar cases.
  * Character work is O(field length) for a fixed unit list; candidate tail order and counted probes stay intact.
+ * deferChain marks a provisional chain member whose continuation the chain walk decides after every
+ * member has been read; every read outside that walk decides the continuation on the spot.
  */
-function readAmountCore(readerContext: ReaderContext, start: number): AmountCore | null {
+function readAmountCore(readerContext: ReaderContext, start: number, deferChain = false): AmountCore | null {
   const text = readerContext.text;
   const symbol = text[start] === '¥' || text[start] === '￥';
   const startPosition = start + (symbol ? 1 : 0);
-  let parsedNumber = readNumberAt(readerContext, startPosition);
+  let parsedNumber: ParsedNumber | null = null;
   let unit: AmountUnit = null;
   let unitEnd = 0;
   const fieldEnd = readerContext.numericFieldEnds[startPosition]!;
 
   // Numeric named-unit words can begin inside the field; classify prefixes once to avoid reparsing every bad split.
-  const prefixes = readerContext.units.length && isArabicDigit(text[startPosition])
+  const splitPositions = !readerContext.units.length ? [] : isArabicDigit(text[startPosition])
     ? classifyArabicPrefixes(readerContext, startPosition, fieldEnd)
-    : null;
-
-  // Keep both existing trial bounds (10 extra positions or 40 from the start); source not recorded.
-  const splitEnd = prefixes ? Math.min(fieldEnd, prefixes.numericEnd + 10) : Math.min(fieldEnd, startPosition + 40);
+    : Array.from({length: Math.min(fieldEnd - startPosition, 40)}, (_, index) => startPosition + index + 1);
 
   // Configured units can start inside a numeric field; Chinese syntax keeps these split trials bounded.
-  for (let position = startPosition + 1; position <= splitEnd; position++) {
-    if (!readerContext.units.length) {
-      break;
-    }
-
+  for (const position of splitPositions) {
     readerContext.work++;
-
-    if (prefixes && position <= prefixes.numericEnd && !prefixes.valid[position - startPosition]) {
-      continue;
-    }
 
     const unitPosition = readerContext.nextNonWhitespace[position]!;
     const direct = readNamedUnitAt(readerContext, unitPosition);
@@ -1617,9 +2335,15 @@ function readAmountCore(readerContext: ReaderContext, start: number): AmountCore
     }
   }
 
-  // The closed half-yuan spelling is resolved before ordinary numeric failure; "半块钱" reads 50 cents.
-  if (!parsedNumber && text[startPosition] === '半'
-    && matchesWordAt(readerContext, startPosition + 1, '块钱')) {
+  // Numeric unit words can keep an entire chain inside one lexical field. Read only the chosen
+  // member's prefix before trying the full field, so successive members never reparse growing suffixes.
+  parsedNumber ??= readNumberAt(readerContext, startPosition);
+
+  // The closed half-yuan spellings are resolved before ordinary numeric failure; 半块钱 and 半元
+  // read 50 cents, while 半块 without 钱 and the shape 半圆 stay unreadable.
+  const halfYuanEnd = parsedNumber ? 0 : readHalfYuanEnd(readerContext, startPosition);
+
+  if (halfYuanEnd > 0) {
     parsedNumber = {
       end: startPosition + 1,
       raw: '半',
@@ -1638,10 +2362,10 @@ function readAmountCore(readerContext: ReaderContext, start: number): AmountCore
         kind: 'yuan'
       }, [{
         cents: 50n,
-        end: startPosition + 3
+        end: halfYuanEnd
       }]),
       number: parsedNumber,
-      checkedEnd: startPosition + 3,
+      checkedEnd: halfYuanEnd,
       candidate: false,
       major: true
     };
@@ -1673,13 +2397,23 @@ function readAmountCore(readerContext: ReaderContext, start: number): AmountCore
 
   if (unit !== null) {
     const numericEnd = readerContext.numericFieldEnds[unitEnd]!;
+    let chainPending = false;
 
-    // 钱/厘/毫/文 forbid a numeric monetary tail after a named unit, even when classified as an ordinary word.
-    // parseAmount("十二金币五文", {units: ["金币"]}) is null; the 五 is not another named-currency subunit.
+    // A numeric field directly after a named unit keeps the named amount readable only when a closed
+    // continuation stands there: a second amount carrying a different registered unit (3金币5银币),
+    // or a following 钱/厘/毫/文 that does not begin a registered unit (十二两五钱). A sentence end,
+    // a bare number, a yuan word and the same unit twice still reject the whole named amount.
     if (numericEnd > unitEnd
       && (classifyNumberEnd(readerContext, numericEnd) !== 'word'
         || '钱厘毫文'.includes(text[numericEnd] ?? '\0'))) {
-      return null;
+      if (deferChain) {
+        // A provisional member only records that its continuation is still open; a written sub-unit
+        // already closes the amount here, and the chain walk decides the rest.
+        chainPending = !closesWithUnregisteredSubunit(readerContext, unitEnd, numericEnd);
+      } else if (!continuesWithChainedUnit(readerContext, unitEnd, unit)
+        && !closesWithUnregisteredSubunit(readerContext, unitEnd, numericEnd)) {
+        return null;
+      }
     }
 
     return {
@@ -1687,7 +2421,8 @@ function readAmountCore(readerContext: ReaderContext, start: number): AmountCore
       number: parsedNumber,
       checkedEnd: unitEnd,
       candidate: false,
-      major: true
+      major: true,
+      chainPending
     };
   }
 
@@ -1791,7 +2526,13 @@ function readAmountCore(readerContext: ReaderContext, start: number): AmountCore
   }
 
   // A Chinese decimal needs a monetary unit; failed currency spellings cannot fall back to a bare amount.
-  if (parsedNumber.decimal && !isArabicDigit(parsedNumber.raw[0])
+  // A sectioned 万/亿 decimal reads bare by its own rule, and so does an Arabic decimal whose point is
+  // the dot; an Arabic 点 spelling keeps the unit requirement.
+  const bareDecimal = parsedNumber.decimal
+    && (isSectionedDecimalRaw(parsedNumber.raw)
+      || isArabicDigit(parsedNumber.raw[0]) && !parsedNumber.raw.includes('点'));
+
+  if (parsedNumber.decimal && !bareDecimal
     || isCurrencyAt(readerContext, unitPosition)) {
     return null;
   }
@@ -1806,28 +2547,185 @@ function readAmountCore(readerContext: ReaderContext, start: number): AmountCore
 }
 
 /**
- * Neighbor checks precede parsing; the isolated zero exception uses the cached inline-whitespace jump.
+ * Tests whether the single UTF-16 position directly before position holds an ordinary letter.
+ * position is a folded-text position; the answer is a boolean and one character is visited.
+ * A blank, a punctuation character, a numeral character, a missing position and the text start
+ * answer false; the word-ending checks use this direct neighbor only, never a whitespace jump.
  */
-function allowsAmountLeftNeighbor(readerContext: ReaderContext, start: number): boolean {
+function isOrdinaryLetterBefore(readerContext: ReaderContext, position: number): boolean {
+  const character = readerContext.text[position - 1];
+  readerContext.work++;
+
+  return character !== undefined && !isNumberCharacter(character) && LETTER_CHARACTER.test(character);
+}
+
+/**
+ * Decides whether a Chinese digit or a coefficient-less place value directly left of an Arabic
+ * number is an ordinary letter, so that number is read on its own from its first Arabic digit.
+ * start is the position of that first Arabic digit in the folded text; the answer is a boolean.
+ * Inline blanks are crossed through cached jumps. After 十 the following Arabic spelling is visited
+ * a fixed number of times, including punctuation and uncertainty particles, in O(spelling length) work.
+ * 一..九 always release; 十 releases only without a following place value. 百/千/万/亿 release when their left neighbor across
+ * blanks is absent or is not a numeral character; every other character answers false.
+ */
+function releasesArabicAfterChineseDigit(readerContext: ReaderContext, start: number): boolean {
+  const text = readerContext.text;
+  const boundary = readerContext.previousNonWhitespaceEnd[start]!;
+  const previousCharacter = text[boundary - 1];
+  readerContext.work += 2;
+
+  if (previousCharacter === undefined) {
+    return false;
+  }
+
+  if (previousCharacter === '十') {
+    let end = start;
+
+    while (isArabicDigit(text[end])
+      || text[end] !== undefined && '.,，点多余来'.includes(text[end]!)) {
+      end++;
+      readerContext.work++;
+    }
+
+    // A following written place belongs to the mixed spelling, rather than to a released bare digit.
+    return !'百千万亿佰仟'.includes(text[end] ?? '\0');
+  }
+
+  if (SMALL_DIGITS.includes(previousCharacter)) {
+    return true;
+  }
+
+  if (!RELEASING_PLACE_VALUES.includes(previousCharacter)) {
+    return false;
+  }
+
+  const coefficient = text[readerContext.previousNonWhitespaceEnd[boundary - 1]! - 1];
+
+  return coefficient === undefined || !isNumberCharacter(coefficient);
+}
+
+/**
+ * Applies the word-ending release to a numeric field starting with one of the five word-ending
+ * capitals directly after an ordinary letter.
+ * fieldStart is the first folded-text position of that field; the answer is a boolean.
+ * The field is examined once, position by position, and every visited position is counted.
+ * Registered unit words do not supply the further ordinary numeral, but their capital numerals still
+ * protect the entire field. A field holding another capital numeral,
+ * or only 零/万/亿 outside those words after its first character, answers
+ * false and keeps the numeral reading; otherwise true releases the field's second character.
+ */
+function startsReleasedCapitalField(readerContext: ReaderContext, fieldStart: number): boolean {
+  const text = readerContext.text;
+
+  if (!WORD_ENDING_CAPITALS.includes(text[fieldStart]!)
+    || !isOrdinaryLetterBefore(readerContext, fieldStart)) {
+    return false;
+  }
+
+  const fieldEnd = readerContext.numericFieldEnds[fieldStart]!;
+  let hasOtherCharacter = false;
+  let unitEnd = fieldStart + 1;
+
+  for (let position = fieldStart + 1; position < fieldEnd; position++) {
+    readerContext.work++;
+    const character = text[position]!;
+
+    // Capital numerals protect the field even inside a registered unit; only the ordinary-digit test skips words.
+    if (CAPITAL_NUMERALS.includes(character)) {
+      return false;
+    }
+
+    if (position >= unitEnd && readerContext.unitInitials.has(character)) {
+      const unitWord = readNamedUnitAt(readerContext, position);
+
+      if (unitWord !== null) {
+        unitEnd = position + unitWord.length;
+      }
+    }
+
+    if (position < unitEnd) {
+      continue;
+    }
+
+    if (!'零万亿'.includes(character)) {
+      hasOtherCharacter = true;
+    }
+  }
+
+  return hasOtherCharacter;
+}
+
+/**
+ * Finds the first Arabic run inside one numeric field whose left side is a released Chinese digit
+ * or coefficient-less place value, so that run is read on its own from its first digit.
+ * fieldStart and fieldEnd bound the field in the folded text; the answer is that UTF-16 position,
+ * or -1 when no released run exists. The field is examined once and each position is counted.
+ */
+function releasedArabicStartInField(readerContext: ReaderContext, fieldStart: number, fieldEnd: number): number {
+  const text = readerContext.text;
+
+  for (let position = fieldStart + 1; position < fieldEnd; position++) {
+    readerContext.work++;
+
+    if (isArabicDigit(text[position]) && !isArabicDigit(text[position - 1])
+      && releasesArabicAfterChineseDigit(readerContext, position)) {
+      return position;
+    }
+  }
+
+  return -1;
+}
+
+/**
+ * A capital numeral released by a preceding ordinary letter never becomes the left side of a range
+ * connection while it stands alone and bare.
+ * core is one successful amount read; the answer is a boolean and at most one character is visited.
+ * True only for a bare single-character spelling from the five word-ending capitals directly after
+ * a letter; every other left side keeps its connection.
+ */
+function blocksReleasedCapitalConnection(readerContext: ReaderContext, core: AmountCore): boolean {
+  return core.expression.bare
+    && core.number.raw.length === 1
+    && WORD_ENDING_CAPITALS.includes(core.number.raw)
+    && isOrdinaryLetterBefore(readerContext, core.expression.start);
+}
+
+/**
+ * Neighbor checks precede parsing; the isolated zero exception uses the cached inline-whitespace jump.
+ * releasedStart marks a start whose left numeral character was already released as an ordinary letter;
+ * the numeral check below is skipped there, while the sign and currency-chain checks still apply.
+ */
+function allowsAmountLeftNeighbor(readerContext: ReaderContext, start: number, releasedStart = false): boolean {
   const text = readerContext.text;
   const position = readerContext.previousNonWhitespaceEnd[start]!;
   const previousCharacter = text[position - 1];
   const immediate = text[start - 1];
 
+  // A released Arabic number is read on its own even though a Chinese digit or a coefficient-less
+  // place value stands left of it; every other numeral keeps blocking its right side.
+  const released = releasedStart
+    || isArabicDigit(text[start]) && releasesArabicAfterChineseDigit(readerContext, start);
+
   // The isolated 零 exception admits change after inline whitespace, while rejecting a zero inside another number.
   // scanAmounts("找零 五块") returns one 500-cent reading at [3, 5).
-  if (previousCharacter === '第'
-    || previousCharacter !== undefined && NUMERIC_FIELD_CHARACTERS.has(previousCharacter)) {
+  if (!released && (previousCharacter === '第'
+    || previousCharacter !== undefined && NUMERIC_FIELD_CHARACTERS.has(previousCharacter))) {
     if (!(previousCharacter === '零' && !isNumberCharacter(text[position - 2])
       && !isCurrencyAt(readerContext, position - 2))) {
       return false;
     }
   }
 
-  // Adjacent identifiers and rejected signs suppress a numeric suffix; scanning must not turn it into a new amount.
-  if (immediate
-    && (LATIN_CHARACTER.test(immediate) || immediate === '_' || immediate === '#'
-      || REJECTED_LEFT_SIGNS.has(immediate))) {
+  // Underscores, hashes and the blocking signs suppress a numeric suffix; scanning must not turn it
+  // into a new amount. A plus sign never blocks, and a minus sign blocks only directly after another
+  // numeral, where it is a hyphen between two numbers. A Latin letter is judged after parsing, where
+  // a written currency or configured unit can still allow the amount.
+  if (immediate && (immediate === '_' || immediate === '#' || immediate === '负'
+    || immediate === '$' || immediate === '＄')) {
+    return false;
+  }
+
+  if (immediate && '－-−'.includes(immediate) && isNumberCharacter(text[start - 2])) {
     return false;
   }
 
@@ -1837,7 +2735,8 @@ function allowsAmountLeftNeighbor(readerContext: ReaderContext, start: number): 
     return false;
   }
 
-  if (isArabicDigit(text[start]) && (immediate === '.' || immediate === '．')) {
+  if (isArabicDigit(text[start]) && (immediate === '.'
+    || immediate === '．' && fullWidthGroupedNumberEnd(text, start, readerContext) < 0)) {
     return false;
   }
 
@@ -1875,6 +2774,37 @@ function blocksBareAmountRightNeighbor(readerContext: ReaderContext, startPositi
     || TIME_CLASSIFIERS.has(readerContext.text[startPosition]!)
     || QUANTITY_CLASSIFIER_WORDS.some(word => matchesWordAt(readerContext, startPosition, word))
     || TIME_CLASSIFIER_WORDS.some(word => matchesWordAt(readerContext, startPosition, word));
+}
+
+/**
+ * True when text[position - 1] is a colon and text[position - 2] an Arabic digit, the digit-colon of
+ * a clock time, so the number at position is a minute rather than a standalone amount.
+ * position is a folded-text index; at most two characters are visited and charged to work.
+ * A missing position, a colon after anything else and every other character answer false.
+ */
+function followsDigitColon(readerContext: ReaderContext, position: number): boolean {
+  readerContext.work += 2;
+
+  return readerContext.text[position - 1] === ':'
+    && isArabicDigit(readerContext.text[position - 2]);
+}
+
+/**
+ * True when the number spanning start to end touches a slash that separates two Arabic digits: a
+ * slash directly after the number followed by a digit, or a slash directly before it preceded by a
+ * digit. That context marks a date or a ratio. start and end are half-open UTF-16 positions in the
+ * folded text; at most four characters are visited and charged to work, and every other slash
+ * context answers false, so 50元/个 and "3/ 5" keep their ordinary reading.
+ */
+function touchesNumericSlash(readerContext: ReaderContext, start: number, end: number): boolean {
+  const text = readerContext.text;
+  readerContext.work += 4;
+
+  const before = text[start - 1];
+  const after = text[end];
+
+  return ((before === '/' || before === '／') && isArabicDigit(text[start - 2]))
+    || ((after === '/' || after === '／') && isArabicDigit(text[end + 1]));
 }
 
 /**
@@ -1928,6 +2858,17 @@ function allowsBareAmount(
   // Dots, commas and colons before another number prevent a date/time or malformed decimal suffix becoming money.
   // For example, parseAmount("12:30") is null.
   if ('.．,，:：'.includes(text[position] ?? '\0') && isNumberCharacter(text[position + 1])) {
+    return false;
+  }
+
+  // A bare Arabic number directly after a digit-colon or next to a numeric slash is a clock minute,
+  // a date or a ratio, not an amount. A written currency keeps those numbers: "3:30元" still lists
+  // 30元, while "2024/3/5 收到100元" lists only the later 100元.
+  readerContext.work += parsedNumber.raw.length;
+
+  if (/^[0-9.,，]+$/.test(parsedNumber.raw)
+    && (followsDigitColon(readerContext, expression.start)
+      || touchesNumericSlash(readerContext, expression.start, expression.end))) {
     return false;
   }
 
@@ -2088,6 +3029,7 @@ function connectNumberRange(
 /**
  * Point estimates preserve an intrinsic more/head range before conflict handling; incompatible modifiers erase bounds.
  * 100 hundredths per unit and a 1-cent or 100-hundredth item quantum preserve the closed range endpoints.
+ * The only recursive branch clears first, so recursion has at most two frames regardless of input length.
  */
 function applyAmountModifiers(
   expression: AmountExpression,
@@ -2160,30 +3102,107 @@ function applyAmountModifiers(
 }
 
 /**
+ * Tests whether a Latin-adjacent numeric field could carry a written unit before parsing it.
+ * start is a folded UTF-16 offset. A unit initial inside the field or at its ordinary unit positions,
+ * or a yuan/subunit word there, returns true; false proves the candidate would remain bare and be rejected.
+ * This conservative scan costs O(field length), independent of the configured unit lengths and count.
+ */
+function mayCarryWrittenUnit(readerContext: ReaderContext, start: number): boolean {
+  const text = readerContext.text;
+
+  if (text[start] === '¥' || text[start] === '￥') {
+    return true;
+  }
+
+  let end = readerContext.numericFieldEnds[start]!;
+
+  if (text[end] === '点' && readerContext.numericFieldEnds[end + 1]! > end + 1) {
+    end = readerContext.numericFieldEnds[end + 1]!;
+  }
+
+  // Sectioned particle ranges carry their unit after the following 万/亿 field, not after the initial coefficient.
+  if ('多余来'.includes(text[end] ?? '\0') && '万亿'.includes(text[end + 1] ?? '\0')) {
+    end = readerContext.numericFieldEnds[end + 1]!;
+  }
+
+  for (let position = start + 1; position < end; position++) {
+    readerContext.work++;
+
+    if (readerContext.unitInitials.has(text[position]!)) {
+      return true;
+    }
+  }
+
+  // A suffix particle can stand between the number and its unit, and a classifier can precede a named unit.
+  for (const boundary of [end, end + 1]) {
+    const position = readerContext.nextNonWhitespace[boundary];
+    readerContext.work += 2;
+
+    if (position !== undefined && ('元圆块角毛分'.includes(text[position] ?? '\0')
+      || readerContext.unitInitials.has(text[position]!)
+      || '个枚块颗两'.includes(text[position] ?? '\0')
+      && readerContext.unitInitials.has(text[position + 1]!))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * A joined right side skips left-neighbor checks and modifier application; outer modifiers apply to the combined range.
  * An unreadable right side rejects a bare left side but keeps a written-unit left side and its modifiers.
+ * releasedCapitalStart marks the shifted start of a word-released capital field, where the left-neighbor
+ * numeral check must be skipped; a bare spelling directly after a Latin letter is rejected after parsing.
+ * deferChain leaves a chain member's continuation to the chain walk, exactly as readAmountCore explains.
+ * standalone ignores only left context for a chain member. joining reads at most one right endpoint;
+ * that endpoint retains deferChain, so the chain walk cannot re-enter itself through a connector.
  */
-function readAmountAt(readerContext: ReaderContext, start: number, joining = false): AmountCore | null {
-  if (!joining && !allowsAmountLeftNeighbor(readerContext, start)) {
+function readAmountAt(
+  readerContext: ReaderContext,
+  start: number,
+  joining = false,
+  releasedCapitalStart = false,
+  deferChain = false,
+  standalone = false
+): AmountCore | null {
+  if (!joining && !standalone && LATIN_CHARACTER.test(readerContext.text[start - 1] ?? '')
+    && !mayCarryWrittenUnit(readerContext, start)) {
     return null;
   }
 
-  const core = readAmountCore(readerContext, start);
+  if (!joining && !standalone && !allowsAmountLeftNeighbor(readerContext, start, releasedCapitalStart)) {
+    return null;
+  }
+
+  const core = readAmountCore(readerContext, start, deferChain);
 
   if (!core) {
+    return null;
+  }
+
+  // A Latin letter directly before a spelling without a written unit keeps the digits out of a scan;
+  // a yuan word or a configured unit still identifies the amount. parseAmount("A12") is null.
+  if (!joining && !standalone && core.expression.unit === null
+    && LATIN_CHARACTER.test(readerContext.text[start - 1] ?? '')) {
     return null;
   }
 
   let expression = core.expression;
   let after = expression.end;
   let connected = false;
+  let endpointPending = false;
 
-  // 、 joins only a bare left spelling: "三、四十五块" is a range, but parseAmount("三元、四元") is null.
-  // A written left unit keeps those comma-separated amounts separate.
+  // 、 joins only a bare left spelling whose sides both start with Chinese numerals: "三、四十五块"
+  // is a range, but parseAmount("三元、四元") is null. An Arabic digit directly on either side of
+  // 、 marks a numbered list such as "1、200元押金", where each side is read on its own.
   if (!joining && AMOUNT_CONNECTORS.has(readerContext.text[after]!)
-    && (readerContext.text[after] !== '、' || expression.bare)
+    && !blocksReleasedCapitalConnection(readerContext, core)
+    && (readerContext.text[after] !== '、' || expression.bare
+      && !isArabicDigit(core.number.raw[0])
+      && !isArabicDigit(readerContext.text[after + 1]))
     && NUMERIC_FIELD_CHARACTERS.has(readerContext.text[after + 1]!)) {
-    const secondNumber = readAmountAt(readerContext, after + 1, true);
+    const secondNumber = readAmountAt(readerContext, after + 1, true, false, deferChain);
 
     // A failed right side invalidates a bare left side, but a written unit still identifies its independent amount.
     // scanAmounts("大概十块到三个") keeps the 1000..1000-cent left estimate.
@@ -2192,6 +3211,7 @@ function readAmountAt(readerContext: ReaderContext, start: number, joining = fal
     }
 
     if (secondNumber) {
+      endpointPending = secondNumber.chainPending === true;
       const firstValue = expression.kind === 'readings' && expression.readings.length === 1
         ? expression.readings[0]!.cents
         : null;
@@ -2259,7 +3279,8 @@ function readAmountAt(readerContext: ReaderContext, start: number, joining = fal
   return {
     ...core,
     expression,
-    checkedEnd: after
+    checkedEnd: after,
+    chainPending: core.chainPending === true || endpointPending
   };
 }
 
@@ -2352,11 +3373,33 @@ function parseAmountWithWork(input: string, options?: Options): WorkResult<Amoun
     startPosition++;
   }
 
+  // A word-ending capital directly after an ordinary letter loses the numeral reading; the field is
+  // read from its second character instead. parseAmount("人参50元") returns 5000 cents at [2, 5).
+  const releasedCapitalStart = startsReleasedCapitalField(readerContext, first.start);
+
+  if (releasedCapitalStart) {
+    startPosition = first.start + 1;
+
+    if (readerContext.text[startPosition] === '零' && first.end > startPosition + 1) {
+      startPosition++;
+    }
+  }
+
   if (readerContext.text[startPosition - 1] === '¥' || readerContext.text[startPosition - 1] === '￥') {
     startPosition--;
   }
 
-  const found = readAmountAt(readerContext, startPosition);
+  let found = readAmountAt(readerContext, startPosition, false, releasedCapitalStart);
+
+  // A failed first read retries once, from the field's first released Arabic digit.
+  // parseAmount("初十200元") returns 20000 cents at [2, 6).
+  if (!found) {
+    const releasedPosition = releasedArabicStartInField(readerContext, first.start, first.end);
+
+    if (releasedPosition >= 0) {
+      found = readAmountAt(readerContext, releasedPosition);
+    }
+  }
 
   if (!found) {
     return {
@@ -2422,12 +3465,24 @@ function scanAmountsWithWork(input: string, options?: Options): WorkResult<Amoun
 
     let startPosition = numericField.start;
 
+    // A word-ending capital directly after an ordinary letter loses the numeral reading; the field
+    // is read from its second character instead. scanAmounts("收拾五块") starts the 500-cent reading at 2.
+    const releasedCapitalStart = startsReleasedCapitalField(readerContext, numericField.start);
+
+    if (releasedCapitalStart) {
+      startPosition = numericField.start + 1;
+
+      if (readerContext.text[startPosition] === '零' && numericField.end > startPosition + 1) {
+        startPosition++;
+      }
+    }
+
     if (readerContext.text[startPosition - 1] === '¥'
       || readerContext.text[startPosition - 1] === '￥') {
       startPosition--;
     }
 
-    let found = readAmountAt(readerContext, startPosition);
+    let found = readAmountAt(readerContext, startPosition, false, releasedCapitalStart);
 
     // Only 零/俩/仨/半 allow one retry inside a failed field;
     // scanAmounts("半十二块") starts the 1200-cent amount at 1.
@@ -2436,10 +3491,47 @@ function scanAmountsWithWork(input: string, options?: Options): WorkResult<Amoun
       found = readAmountAt(readerContext, numericField.start + 1);
     }
 
+    // A still-failed field retries once, from its first released Arabic digit.
+    // scanAmounts("三十四50元") starts the 5000-cent reading at 3.
+    if (!found) {
+      const releasedPosition = releasedArabicStartInField(readerContext, numericField.start, numericField.end);
+
+      if (releasedPosition >= 0) {
+        found = readAmountAt(readerContext, releasedPosition);
+      }
+    }
+
     // Capital numerals need a written unit for amounts; accepting a candidate also advances the nonoverlap cursor.
-    if (found && !(numericField.capital && found.expression.bare)) {
+    if (found && !(!releasedCapitalStart && numericField.capital && found.expression.bare)) {
       result.push(found.expression);
       cursor = found.expression.end;
+
+      // A named readings amount directly followed by a numeric field continues as a chain of further
+      // amounts, each carrying a different registered unit; see the chained-read helper for the rule.
+      let chainEnd = found.expression.end;
+      let chainWord = namedUnitWord(found.expression);
+
+      // A word-ending capital released by a preceding letter is not a chain member; the field loop
+      // above reads such a field from its second character instead.
+      while (chainWord !== null && isNumberCharacter(readerContext.text[chainEnd])
+        && !startsReleasedCapitalField(readerContext, chainEnd)) {
+        const continuation = readChainedAmountCore(readerContext, chainEnd);
+
+        if (!continuation) {
+          break;
+        }
+
+        const continuedWord = namedUnitWord(continuation.expression);
+
+        if (continuedWord === null || continuedWord === chainWord) {
+          break;
+        }
+
+        result.push(continuation.expression);
+        chainEnd = continuation.expression.end;
+        chainWord = continuedWord;
+        cursor = continuation.expression.end;
+      }
     }
   }
 
@@ -2888,7 +3980,123 @@ export function scanQuantities(text: string): QuantityExpression[] {
 }
 
 /**
- * Ordinals govern a clause, not only the nearby number; the existing field pointer advances monotonically.
+ * True when character is one Chinese digit of a rate body, namely 零 or a digit from 一 to 九.
+ * character is one character of the folded text; the answer is a boolean and no character is visited.
+ * 两, 十, the place values and the capital numerals answer false, so they never join a 点 rate body.
+ */
+function isChineseRateDigit(character: string | undefined): boolean {
+  return character !== undefined && (character === '零' || SMALL_DIGITS.includes(character));
+}
+
+/**
+ * Reads one digit of a rate body and returns its value from 0 to 9, or null when the character is not
+ * a digit of either rate script. character is one character of the folded text; 零 and 0 count zero,
+ * and 一 to 九 and 1 to 9 count one to nine. Every other character gives null, so 两, 十 and the
+ * capital numerals never supply a 点 rate digit.
+ */
+function readRateDigit(character: string | undefined): bigint | null {
+  if (character === '零' || character === '0') {
+    return 0n;
+  }
+
+  return readSmallDigit(character);
+}
+
+/**
+ * True when two rate digits are written in the same script: both Arabic, or both Chinese from 零 to 九.
+ * first and second are two characters of the folded text; the answer is a boolean and no character is
+ * visited. A mixed spelling such as 九点5折 answers false.
+ */
+function sameRateScript(first: string | undefined, second: string | undefined): boolean {
+  return isArabicDigit(first) && isArabicDigit(second)
+    || isChineseRateDigit(first) && isChineseRateDigit(second);
+}
+
+/**
+ * True when a closed period word, or an allowed day word, stands directly before position with nothing in
+ * between, not even an inline blank. position is a UTF-16 index into the folded text; the answer is a
+ * boolean and at most two characters are visited and charged to work. includeDayWords is true only for rates.
+ * A word held away by a blank and
+ * every other text before position answer false, so 下午 三点五折 is no clock time.
+ */
+function followsTimeOfDayWord(readerContext: ReaderContext, position: number, includeDayWords = false): boolean {
+  readerContext.work += 2;
+
+  if (position < 2) {
+    return false;
+  }
+
+  const word = readerContext.text.slice(position - 2, position);
+
+  return TIME_OF_DAY_WORDS.has(word) || includeDayWords && DAY_WORDS.has(word);
+}
+
+// The closed range spelling distinguishes two adjacent clock hours from an ordinary decimal rate.
+const CLOCK_RANGE_CONNECTORS = new Set(['到', '至', '-', '－', '−', '~', '～', '—']);
+
+/**
+ * Reads the two digits of a rate body joined by 点, such as the 九点五 of 九点五折, and returns the
+ * start of the body and its numerator in percentage points, or null when the text at 折 is not that
+ * shape. foldPosition is the position of 折 in the folded text and fieldIndex is the index in
+ * readerContext.fields of the field ending there; the shape needs that field to be exactly one digit
+ * directly before 折, a 点 directly before it, and a field of exactly one digit directly before the
+ * 点, both digits in the same script. The digit before 点 counts tens of percentage points, so
+ * 九点五折 is 95/100. A time-of-day word directly before the first digit makes 点 a clock hour, where
+ * only the digit after 点 is the rate, so the answer is null there. The same holds when the first digit
+ * is exactly one in either script, preserving that colloquial reading. A preceding hour followed by 点
+ * and a range connector also makes the first digit a clock hour. Three cached fields and their adjacent
+ * characters are inspected in O(1) work; the returned start is a folded UTF-16 position.
+ */
+function readPointRate(readerContext: ReaderContext, fieldIndex: number, foldPosition: number): {
+  start: number;
+  numerator: bigint;
+} | null {
+  const text = readerContext.text;
+  const secondField = readerContext.fields[fieldIndex];
+  readerContext.work += 8;
+
+  // The body field is exactly the one digit directly before 折, with 点 directly before that digit.
+  if (!secondField || secondField.end !== foldPosition || secondField.start !== foldPosition - 1
+    || text[foldPosition - 2] !== '点') {
+    return null;
+  }
+
+  const firstField = readerContext.fields[fieldIndex - 1];
+
+  // The field directly before 点 is exactly one digit; 十二点五折 and 一百点五折 answer null here.
+  if (!firstField || firstField.end !== foldPosition - 2 || firstField.end - firstField.start !== 1) {
+    return null;
+  }
+
+  // Both digits must be digits of one script; 九点5折 and 9点五折 keep the ordinary body reading,
+  // which is the value of the digit after 点 alone. The check also guarantees both values below.
+  if (!sameRateScript(text[firstField.start], text[secondField.start])) {
+    return null;
+  }
+
+  const firstDigit = readRateDigit(text[firstField.start])!;
+  const secondDigit = readRateDigit(text[secondField.start])!;
+  const precedingHour = readerContext.fields[fieldIndex - 2];
+  const followsHourRange = precedingHour !== undefined
+    && precedingHour.end === firstField.start - 2
+    && text[precedingHour.end] === '点'
+    && CLOCK_RANGE_CONNECTORS.has(text[firstField.start - 1]!);
+
+  // A written hour range needs no time word; 三点到五点五折 keeps only the trailing 五折.
+  if (firstDigit === 1n || followsTimeOfDayWord(readerContext, firstField.start, true) || followsHourRange) {
+    return null;
+  }
+
+  // The numerator is in percentage points, so the digit before 点 counts tens and the digit after it units.
+  return {
+    start: firstField.start,
+    numerator: firstDigit * 10n + secondDigit
+  };
+}
+
+/**
+ * A rate body is the numeric field touching 折, or two single digits joined by 点; the field pointer
+ * advances monotonically.
  * One digit denotes tenths, two digits percentage points, and half price is 50/100 (frozen rate cases).
  * O(input length) character work: each numeric field and the output span are consumed in source order.
  */
@@ -2939,7 +4147,13 @@ function scanRatesWithWork(input: string): WorkResult<RateExpression[]> {
       const body = text.slice(start, i);
       readerContext.work += body.length;
 
-      if (body.length === 1 && readSmallDigit(body) !== null) {
+      // A body joined by 点 carries both of its digits: 九点五折 is 95/100, read from the field before 点.
+      const pointRate = readPointRate(readerContext, field, i);
+
+      if (pointRate) {
+        start = pointRate.start;
+        numerator = pointRate.numerator;
+      } else if (body.length === 1 && readSmallDigit(body) !== null) {
         numerator = readSmallDigit(body)! * 10n;
       } else if (DECIMAL_RATE_PATTERN.test(body)) {
         numerator = BigInt(body[0]!) * 10n + BigInt(body[2]!);
@@ -2963,8 +4177,9 @@ function scanRatesWithWork(input: string): WorkResult<RateExpression[]> {
       continue;
     }
 
-    // Use the clause flag computed before scanning, so ordinal text cannot turn a later number into a discount.
-    if (readerContext.ordinal[start]) {
+    // A 第 directly before the body makes the body the ordinal number itself, so 第八折, 第三四折 and
+    // 第二八折 stay unreadable. An ordinal earlier in the clause does not hide a rate: 第二件八折 lists 八折.
+    if (text[start - 1] === '第' && text[start] !== '半' && isNumberCharacter(text[start])) {
       continue;
     }
 
@@ -3015,7 +4230,7 @@ function scanRatesWithWork(input: string): WorkResult<RateExpression[]> {
 }
 
 /**
- * Lists whole discount bodies; an ordinal suppresses rates only in its punctuation-delimited clause.
+ * Lists whole discount bodies; only a 第 directly before a body hides it, as that body is the ordinal number.
  * No input length cap; half-open spans use original UTF-16 offsets and values are percentage points over 100.
  * Invalid input or no readable bodies returns []. Character/probe work is O(n).
  */
@@ -3103,13 +4318,16 @@ function scanNumbersWithWork(input: string): WorkResult<{
     }
 
     const start = i;
+    const groupedNumberEnd = fullWidthGroupedNumberEnd(text, i, readerContext);
 
-    // Punctuation connects only adjacent Arabic digits; this is a lexical span, not numeric validation.
+    // Punctuation connects only adjacent Arabic digits, and a complete fullwidth-comma grouped number
+    // stays in one span; this is a lexical span, not numeric validation.
     // scanNumbers("12.3,4") returns [0, 6) even though that spelling is not an exact number.
     while (i < text.length
       && (PLAIN_NUMBER_CHARACTERS.has(text[i]!)
         || (text[i] === '.' || text[i] === ',') && isArabicDigit(text[i - 1])
-        && isArabicDigit(text[i + 1]))) {
+        && isArabicDigit(text[i + 1])
+        || i < groupedNumberEnd)) {
       i++;
       readerContext.work++;
     }

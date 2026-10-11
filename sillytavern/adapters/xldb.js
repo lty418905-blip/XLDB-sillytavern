@@ -366,11 +366,32 @@
     if(state.panel?.dashboardArea&&state.dashboard.tab==='overview')renderDashboard();
   }
 
+  // Exact error envelopes preserve all other messages. Matching scans O(n) UTF-16 code units at most.
   function friendlyError(message) {
-    const explanations={model_catalog_invalid_input:'请检查 API 地址与密钥格式，再重新获取模型列表。',model_catalog_unauthorized:'上游认证失败，请检查 API 密钥后重新获取。',model_catalog_unavailable:'暂时无法读取上游模型列表，请检查地址和网络后重试。',model_catalog_unsupported:'此上游未提供兼容的模型列表接口，请核对 API 基础地址。已有模型配置仍保留。',model_catalog_invalid_response:'上游未返回可识别的模型列表，请核对 API 基础地址。',model_catalog_empty:'上游返回的模型列表为空，请检查账号可用模型。',model_connection_failed:'后台模型连接失败或等待超时。请检查 API 地址、密钥和网络连接，然后重试刚才的操作。',invalid_api_url:'API 地址格式不正确。请填写以 http:// 或 https:// 开头的服务商基础地址，不包含账号、查询参数或片段，再保存。',invalid_scene_character:'请先选择要查看的角色，再查询该角色知道的资料。',unauthorized:'连接认证已失效。请重新运行启动器，并重新加载酒馆中的 XLDB 脚本。',context_changed_retry:'当前聊天已经变化。请刷新状态，核对当前聊天后重试。',config_revision_conflict:'另一页面更新了模型配置。你的草稿仍在，请核对后再保存。',invalid_scene_processing:'本轮资料尚未处理完成。请在高级设置中查看处理进度并重试失败项。'};
-    const code=message.match(/^XLDB：([a-z_0-9]+)$/)?.[1];
-    const localized=code&&RETRIEVAL_TEXT[playerLanguage()].codes[code];
-    return localized||(code&&explanations[code]?explanations[code]:message);
+    const explanations = {
+      model_catalog_invalid_input:'请检查 API 地址与密钥格式，再重新获取模型列表。',
+      model_catalog_unauthorized:'上游认证失败，请检查 API 密钥后重新获取。',
+      model_catalog_unavailable:'暂时无法读取上游模型列表，请检查地址和网络后重试。',
+      model_catalog_unsupported:'此上游未提供兼容的模型列表接口，请核对 API 基础地址。已有模型配置仍保留。',
+      model_catalog_invalid_response:'上游未返回可识别的模型列表，请核对 API 基础地址。',
+      model_catalog_empty:'上游返回的模型列表为空，请检查账号可用模型。',
+      model_connection_failed:'后台模型连接失败或等待超时。请检查 API 地址、密钥和网络连接，然后重试刚才的操作。',
+      invalid_api_url:'API 地址格式不正确。请填写以 http:// 或 https:// 开头的服务商基础地址，不包含账号、查询参数或片段，再保存。',
+      invalid_scene_character:'请先选择要查看的角色，再查询该角色知道的资料。',
+      unauthorized:'连接认证已失效。请重新运行启动器，并重新加载酒馆中的 XLDB 脚本。',
+      context_changed_retry:'当前聊天已经变化。请刷新状态，核对当前聊天后重试。',
+      config_revision_conflict:'另一页面更新了模型配置。你的草稿仍在，请核对后再保存。',
+      invalid_scene_processing:'本轮资料尚未处理完成。请在高级设置中查看处理进度并重试失败项。',
+      context_budget_exceeded: '这个角色每一轮都要带上的资料（偏好、人物关系、情绪和最近的记忆）加起来太长，其余记忆全部让出后仍然放不下。请在工作台缩短或停用较长的偏好，或减少 NPC 名单里的人物，然后重试。',
+    };
+    const nativePrefix = '已停止本轮生成：';
+    if (message === nativePrefix + 'XLDB：context_budget_exceeded') {
+      return nativePrefix + explanations.context_budget_exceeded;
+    }
+
+    const code = message.match(/^XLDB：([a-z_0-9]+)$/)?.[1];
+    const localized = code && RETRIEVAL_TEXT[playerLanguage()].codes[code];
+    return localized || (code && explanations[code] ? explanations[code] : message);
   }
 
   // Player-language retrieval sentences (DESIGN §13); machine fields stay in the diagnostic detail, never a key.

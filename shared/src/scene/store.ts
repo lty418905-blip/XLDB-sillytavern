@@ -1285,19 +1285,26 @@ export class SceneAuthority {
   worldLedgerRows(scope:SceneScope) {return readWorldLedgerRows(this.db,scope);}
 
   /** One panel decision: one transaction, checkpoint and version bump; source processing and parked stages stay intact. */
-  writeWorldLedger(scope:SceneScope,expectedVersion:number,items:readonly WorldLedgerWrite[]) {
-    return this.transaction(()=>{
-      const state=this.state(scope);
-      if(state.version!==expectedVersion)throw new Error('context_changed_retry');
-      const writes=prepareWorldLedgerWrites(items);
-      guardWorldLedgerBindings(state,writes,captureWorldLedgerRows(this.db,scope));
-      this.lifecycle.checkpoint(scope,writes.some(write=>write.table==='accounts')?'账户变更':'交易校正',{automatic:true});
+  writeWorldLedger(scope: SceneScope, expectedVersion: number, items: readonly WorldLedgerWrite[]) {
+    return this.transaction(() => {
+      const state = this.state(scope);
+      if (state.version !== expectedVersion) throw new Error('context_changed_retry');
+
+      const writes = prepareWorldLedgerWrites(items);
+      guardWorldLedgerBindings(state, writes, captureWorldLedgerRows(this.db, scope));
+      // Sweep inside this transaction so its checkpoint cannot retain tombstone-bound correction bytes.
+      sweepWorldLedgerTombstones(this.db, scope);
+      this.lifecycle.checkpoint(
+        scope,
+        writes.some(write => write.table === 'accounts') ? '账户变更' : '交易校正',
+        {automatic: true},
+      );
       ensureWorldLedgerTables(this.db);
-      sweepWorldLedgerTombstones(this.db,scope);
-      const rows=appendWorldLedgerRows(this.db,scope,state,writes);
+
+      const rows = appendWorldLedgerRows(this.db, scope, state, writes);
       this.bump(scope);
       this.rebuildDerived(scope);
-      return {version:state.version+1,rows};
+      return {version: state.version + 1, rows};
     });
   }
 
