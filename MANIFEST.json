@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "3a232cc1acc9edb5fd2394687933522131c95030836710a52ae7f32d741d6518",
+  "sourceManifestSha256": "4564431f59da3a091b0bce5ffbcf72d900493621de0f801ffd08660b9f5e3ff5",
   "files": [
     {
       "file": ".gitattributes",
@@ -99,8 +99,8 @@
     },
     {
       "file": "shared/src/common/amount-expressions.ts",
-      "sha256": "5d75dfe443686047ff2e86c5d593d7a1c8fd9b546229013c5849e89d7dbdb703",
-      "bytes": 49691
+      "sha256": "5b9cee583035470b26b5a29f8f42744aa906d383125409ce43d7f52036d92818",
+      "bytes": 103645
     },
     {
       "file": "shared/src/common/geography-background.ts",
@@ -349,8 +349,8 @@
     },
     {
       "file": "shared/src/scene/address.ts",
-      "sha256": "4aae39c73a4d6d4b457ae9eed36648be3bff0a25583c9fa9d690b19d1b462853",
-      "bytes": 5035
+      "sha256": "d679955e07a30b15bd1efd27e97f3ffb4bc22921d6048a034a8840f1a4124609",
+      "bytes": 5239
     },
     {
       "file": "shared/src/scene/backup.ts",
@@ -379,8 +379,8 @@
     },
     {
       "file": "shared/src/scene/extension.ts",
-      "sha256": "306f162e941e4b4dd776ecb4315322d2c7a3359de2637ea24d8669face5d4d67",
-      "bytes": 8540
+      "sha256": "d6fc9785c7234c9d9899a46ee385a1c382bba93df1b00bdf22c9f369f47c9006",
+      "bytes": 8590
     },
     {
       "file": "shared/src/scene/extraction.ts",
@@ -389,8 +389,8 @@
     },
     {
       "file": "shared/src/scene/generation-view.ts",
-      "sha256": "c4e7a538b406d30c7068a3cc43452eb431fc4d7d72b3021a5d77fb8b0b0ea6c7",
-      "bytes": 850
+      "sha256": "b92690fd77f3091f67775447ce8f01b942c8ed44a49fc899ea638036cb26d7ad",
+      "bytes": 931
     },
     {
       "file": "shared/src/scene/identities.ts",
@@ -409,8 +409,8 @@
     },
     {
       "file": "shared/src/scene/lifecycle.ts",
-      "sha256": "6a368a0ee0b7e64dd2919e49df5edd3a93bbdfd3fb3a448adcab0eb7ff04454a",
-      "bytes": 28609
+      "sha256": "47139f2bf6be85c301fcd6a4f33befcec26438ff3c91a9a4913f2c83f9e274d2",
+      "bytes": 29952
     },
     {
       "file": "shared/src/scene/outward.ts",
@@ -444,23 +444,23 @@
     },
     {
       "file": "shared/src/scene/service.ts",
-      "sha256": "51614753f85b6a9f397264509b75aa054a04b78a2d473d2cadc8422a68ce5efa",
-      "bytes": 124207
+      "sha256": "c075d853230ca288ff0bc16ebf4cf2f47217b375e461330170986ec0f0c0bbe3",
+      "bytes": 124430
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "05feadd8eaeb2b028b827d682c6fd0a89ae4df63ca804cad2962eee3492262b1",
-      "bytes": 84349
+      "sha256": "1641e981de87771db3bfa5ec69d03e4e380cb52b704a01db021ac25b734d40ca",
+      "bytes": 101751
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
-      "sha256": "5a8caca168acc3d8b46ef272d772f2a2e68b10c78441f1bfe7177cfcf94e5ab5",
-      "bytes": 5800
+      "sha256": "920f7ceaa33ac37d9c5b33d839d3ebaa02d7cd005b31ee6254f8be835ce616a8",
+      "bytes": 6215
     },
     {
       "file": "shared/src/scene/story-clock-store.ts",
-      "sha256": "dd45bfdbfe20d372a24bee68e1f27311692cec4fd2d230ffa6e7a6284e870d3b",
-      "bytes": 30486
+      "sha256": "d82e829ce1a9f6cf1093ff0d138556b0a996cbb5731e29a7d1be4332db56e824",
+      "bytes": 33474
     },
     {
       "file": "shared/src/scene/story-clock-types.ts",
@@ -489,8 +489,8 @@
     },
     {
       "file": "shared/src/scene/types.ts",
-      "sha256": "c3b948045cd135008cf611bc78b8d8064851cfa93816b8a5c5cc107579647768",
-      "bytes": 7032
+      "sha256": "af3744b2dbe527537c3dd9325c560f338d35618db91a150a82b5a52eb215d4f5",
+      "bytes": 7208
     },
     {
       "file": "shared/src/scene/views.ts",
@@ -506,6 +506,11 @@
       "file": "shared/src/scene/world-extraction.ts",
       "sha256": "325d9dd2fbb95f58612b97fb3590ed9572c1ccccb5b34264d03c22973fd4a963",
       "bytes": 45797
+    },
+    {
+      "file": "shared/src/scene/world-ledger-store.ts",
+      "sha256": "930e2e777fd3930f467cb7f7d1d84cb74f37bb7deee687cb4cfaa3f455985d11",
+      "bytes": 17581
     },
     {
       "file": "shared/src/scene/world-ledger.ts",
@@ -624,12 +629,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "de1a4b6b3c2a1325ab92d39c9bd46e296abc94ae64c40f84ca9fb5a0948674ff",
+      "sha256": "e1840138ce25a02a196fd59fcae9206f3c0014483bb232a23ed60f67680a2e39",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "00cead0254d19d78ec200d526abd9fc903ec5fa4911109658dcdd4f4061b18b0",
+      "sha256": "acc74ba86297811fb6ee3134d4d85f345a7333156ac104e7d062705397bae34e",
       "bytes": 355817
     }
   ]

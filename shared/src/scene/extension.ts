@@ -91,7 +91,7 @@ export interface SceneCompanionPort {
   systemContext(scope:SceneScope,characterId:string,legalContext:string,configs:Configurations,assertCurrent:()=>void,
     currentUserSourceId?:string,nowMs?:number,diagnostics?:ReplyDiagnostic[]):Promise<string>;
   contactEmotion(scope:SceneScope,characterId:string,nowMs:number,state?:SceneState,
-    currentReply?:{sourceId:string;revision:number}|null):ContactEmotionProjection;
+    currentReply?:{sourceId:string;revision:number}|null,timeline?:SceneState['sources']):ContactEmotionProjection;
   extract(scope:SceneScope,source:SceneMessage,configs:Configurations,assertCurrent:()=>void,run?:ModelRunner):Promise<SceneProfileCandidate[]>;
   /** The profile controls that key the profile stage fingerprint, or null without a bound subject. */
   profileControls(scope:SceneScope):unknown;
@@ -120,8 +120,8 @@ export function defaultCompanionPort(scene:SceneAuthority):SceneCompanionPort {
   return {
     responseExpectationExtractor:null,absenceExplanationExtractor:null,
     systemContext:async()=>'',
-    contactEmotion:(scope,characterId,nowMs,state=scene.state(scope),currentReply=null)=>
-      scene.contactEmotionProjection(scope,characterId,nowMs,state,currentReply),
+    contactEmotion:(scope,characterId,nowMs,state=scene.state(scope),currentReply=null,timeline)=>
+      scene.contactEmotionProjection(scope,characterId,nowMs,state,currentReply,timeline),
     extract:async()=>[],
     profileControls:()=>null,
     feedbackDelivery:()=>({delivery:null,bindings:[]}),

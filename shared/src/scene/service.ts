@@ -208,6 +208,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       }
       this.backgroundEmotionErrors.delete(key);
     }catch(error){
+      if(error instanceof TypeError&&error.message==='story_clock_prefix_mismatch')throw error;
       if(this.authority.isOpen())this.backgroundEmotionErrors.set(key,error instanceof Error?error.message:'operation_failed');
     }
   }
@@ -527,7 +528,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     const assertCurrent=()=>this.assertVersion(scope,state.version);
     const decisionNowMs=Date.now();
     const affect=this.companion.contactEmotion(scope,character.id,decisionNowMs,state,{sourceId:source.id,revision:source.revision});
-    const expression=sceneExpressionOptions(this.authority,scope,character.id,envelope,state,affect.emotion,decisionNowMs,affect.affect);
+    const expression=sceneExpressionOptions(this.authority,scope,character.id,envelope,state,affect.emotion,decisionNowMs,affect.affect,true);
     const snapshot=this.authority.snapshot(scope,character.id,state);
     const language=story?contextLanguage(snapshot,state):undefined;
     const context=await this.core.contextFrom(snapshot,current,configs,
@@ -597,11 +598,11 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       const prepared=await this.authority.npcResources.runActivationBatches(scope,{
         rosterIds:state.roster.characters.map(item=>item.id),npcIds:[actor.id],interactionIds:[actor.id],presentIds:source.envelope.presentIds,
       },{
-        materialize:actorId=>this.authority.responseEmotion(scope,actorId,decisionNowMs,state),
+        materialize:actorId=>this.authority.responseEmotion(scope,actorId,decisionNowMs,state,'player'),
         onInvalidated:()=>this.invalidateModelConfiguration(),
         runBatch:async batch=>{
       const current=actorInput(actor.id);
-      const expression=sceneExpressionOptions(this.authority,scope,actor.id,source.envelope,state,batch[0]!.group,decisionNowMs);
+      const expression=sceneExpressionOptions(this.authority,scope,actor.id,source.envelope,state,batch[0]!.group,decisionNowMs,undefined,true);
       const snapshot=this.authority.snapshot(scope,actor.id,state);
       const language=story?contextLanguage(snapshot,state):undefined;
       const context=await this.core.contextFrom(snapshot,current,configs,
@@ -1305,6 +1306,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         }
         return {status:'ready',version:this.authority.commit(scope,state.version,[...backfilled.values(),...results])};
       } catch(error) {
+        if(error instanceof TypeError&&error.message==='story_clock_prefix_mismatch')throw error;
         const message=error instanceof Error?error.message:'';
         if(activeSource&&message.startsWith('invalid_world_')){
           const source=accepted.find(item=>item.id===activeSource);

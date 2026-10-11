@@ -26,6 +26,11 @@ import {PhysiologyStore} from '../common/physiology.ts';
 import {GeographyStore} from '../common/geography.ts';
 import {SceneCalendarStore} from './calendar-store.ts';
 import {initialStorySettings} from './story-initial-clock.ts';
+import {readWorldLedgerRows,worldLedgerOptions,storedLedgerFields,ledgerOnlySettings,captureWorldLedgerRows,
+  ensureWorldLedgerTables,prepareWorldLedgerWrites,guardWorldLedgerBindings,appendWorldLedgerRows,
+  eraseWorldLedgerSource,sweepWorldLedgerTombstones} from './world-ledger-store.ts';
+import type {WorldLedgerWrite,WorldLedgerRows} from './world-ledger-store.ts';
+import type {LedgerAfter,LedgerFoldOptions} from './world-ledger.ts';
 import {StoryClockStore,storyClockLine} from './story-clock-store.ts';
 import type {StoryClockLegacySettings,StoryClockSummary} from './story-clock-store.ts';
 import {STORY_CLOCK_DEGRADE_REASONS} from './story-clock-types.ts';
@@ -43,6 +48,21 @@ export class SceneAuthority {
   private db: DatabaseSync;
   private emotionReplayCache=new Map<string,EmotionState>();
   private savepointSequence=0;
+  declare private ledgerReadFrame?: {
+    key: string;
+    rows?: WorldLedgerRows;
+    stamp?: string;
+    databaseStamp?: string;
+    liveSources?: SceneSource[];
+    views?: Map<SceneSource[], {
+      timeline: SceneSource[] | undefined;
+      sources: WorldSourceEffects[];
+      options: LedgerFoldOptions;
+      stamp?: string;
+    }>;
+  };
+  readonly #ledgerTimelineIdentities = new WeakMap<SceneSource[], number>();
+  #nextLedgerTimelineIdentity = 0;
   readonly lifecycle:SceneLifecycle;
   readonly processing:Processing;
   readonly transfer:SceneTransfer;
@@ -82,24 +102,48 @@ export class SceneAuthority {
       PRIMARY KEY(scope,id));
       CREATE TABLE IF NOT EXISTS scene_index_cleanup (
       scope TEXT NOT NULL, character TEXT NOT NULL, version INTEGER NOT NULL, PRIMARY KEY(scope,character));`);
+    this.initializeLedgerSourceRevision();
     this.processing=new Processing(db);
     this.transfer=new SceneTransfer(db,this);
     this.storyClock=new StoryClockStore(db,{
       state:scope=>this.state(scope),
       isStoryScope:scope=>this.isStoryScope(scope),
       tavernRoleplay:scope=>this.interactions.isTavernRoleplay(scope),
-      worldFold:(_scope,sources,settings)=>foldWorldState(settings,this.worldSources(sources)),
-      // One running fold over the sources the world fold reads (the condition of worldSources); a source it does not
-      // read repeats the entry before it, and before the first one stands the fold of no source.
-      worldRunning:(_scope,sources,settings)=>{
-        const steps=foldWorldStateRunning(settings,this.worldSources(sources));
+      worldFold:(scope,sources,settings,timeline)=>{
+        const input=this.ledgerViewInput(scope,sources,settings,timeline);
+        return Object.keys(input.options).length?foldWorldState(settings,input.sources,input.options):foldWorldState(settings,input.sources);
+      },
+      // One running fold of this view's sources and selected rows, aligned to the original source array.
+      worldRunning:(scope,sources,settings,timeline)=>{
+        const input=this.ledgerViewInput(scope,sources,settings,timeline);
+        const steps=foldWorldStateRunning(settings,input.sources,input.options);
         let position=-1,last:WorldRunningStep={timeMs:settings.startTimeMs,issue:null};
         return sources.map(source=>{
           if(source.status==='accepted'&&source.processing==='ready'&&source.analysis?.plan)last=steps[++position]!;
           return last;
         });
       },
-      legacySettings:scope=>this.legacyWorldSettings(scope),
+      withLedgerRows:(scope,action)=>this.withLedgerRows(scope,action),
+      ledgerReader:scope=>this.ledgerReader(scope),
+      ledgerTimeline:(scope,sources,timeline)=>this.ledgerTimelineForCall(scope,sources,timeline),
+      ledgerData: (scope, sources = this.state(scope).sources, timeline) => {
+        const rows = this.ledgerRowsForCall(scope);
+        if (!this.usableLedgerRows(rows)) return null;
+        if (timeline !== undefined) this.checkLedgerPrefix(sources, timeline);
+
+        // Row bytes and connection metadata validate a memo without decoding the source table.
+        const frame = this.ledgerReadFrame;
+        const digest = () => createHash('sha256').update(JSON.stringify(rows)).digest('hex');
+        const raw = frame?.key === scopeKey(scope) ? frame.stamp ??= digest() : digest();
+        let timelineIdentity = 0;
+        if (timeline !== undefined) {
+          timelineIdentity = this.#ledgerTimelineIdentities.get(timeline) ?? ++this.#nextLedgerTimelineIdentity;
+          this.#ledgerTimelineIdentities.set(timeline, timelineIdentity);
+        }
+        return JSON.stringify([raw, timelineIdentity]);
+      },
+      ledgerVersion: () => this.ledgerDatabaseStamp(),
+      legacySettings:(scope,sources)=>this.legacyWorldSettings(scope,sources),
       frozenRoleplayTime:scope=>this.interactions.frozenRoleplayTime(scope),
       afterCorrection:scope=>{this.rebuildEmotionStates(scope);this.bump(scope);this.rebuildDerived(scope);},
     });
@@ -278,6 +322,7 @@ export class SceneAuthority {
         this.hooks.onSourceErased(scope,source);
         const preferences=this.db.prepare('SELECT character,id FROM scene_preference_controls WHERE scope=?').all(scopeKey(scope)) as {character:string;id:string}[];
         for(const preference of preferences)if(preferenceSourceId(preference.id)===source.id)this.db.prepare('DELETE FROM scene_preference_controls WHERE scope=? AND character=? AND id=?').run(scopeKey(scope),preference.character,preference.id);
+        eraseWorldLedgerSource(this.db,scope,source.id);
         deletedSourceIds.add(source.id);
         changed = true; removed++;
       }
@@ -455,8 +500,9 @@ export class SceneAuthority {
         windowSelections.set(schedule.windowId,selected);
       }
       const acceptedResults=prepared;
-      if(settings){
-        const folded=foldWorldState(settings,this.worldSources(effective));
+      const foldInput=this.worldLedgerInput(scope,effective,settings);
+      if(foldInput.settings){
+        const folded=foldWorldState(foldInput.settings,foldInput.sources,foldInput.options);
         if(folded.issues.length) throw new Error('invalid_world_'+folded.issues[0]!.code.replace(/^invalid_world_/,''));
       }
       for (const result of acceptedResults) {
@@ -581,18 +627,21 @@ export class SceneAuthority {
       ...(reading?{memoryTimeMs:reading.result.state.atMs}:{})};
   }
 
-  emotion(scope: SceneScope, characterId: string, now = Date.now(), state = this.state(scope)) {
-    const {emotion,settings}=this.emotionBase(scope,characterId,state);
-    const clock=this.interactions.modeOf(scope)?this.interactions.clock(scope,now):null;
-    return emotionAt(emotion,this.legacyEmotionTime(scope,state.sources,now),settings,
-      clock===null?this.worldSettings(scope)?.mode==='story'?'UTC':null:clock.known?clock.timeZone:null);
+  emotion(scope: SceneScope, characterId: string, now = Date.now(), state = this.state(scope), timeline?:SceneSource[]) {
+    return this.withLedgerRows(scope,()=>{
+      const {emotion,settings}=this.emotionBase(scope,characterId,state,timeline);
+      const clock=this.interactions.modeOf(scope)?this.interactions.clock(scope,now):null;
+      return emotionAt(emotion,this.legacyEmotionTime(scope,state.sources,now,state.sources,timeline),settings,
+        clock===null?this.worldSettings(scope)?.mode==='story'?'UTC':null:clock.known?clock.timeZone:null);
+    });
   }
 
   /**
    * E0: the latest persisted (replayed) OpenHer state before any read-time projection, with the character's emotion
    * settings. Cached by the same replay key as `emotion`; the caller must not mutate it.
    */
-  emotionBase(scope: SceneScope, characterId: string, state = this.state(scope)): {emotion:EmotionState;settings:unknown} {
+  emotionBase(scope: SceneScope, characterId: string, state = this.state(scope), timeline?:SceneSource[]): {emotion:EmotionState;settings:unknown} {
+    return this.withLedgerRows(scope,()=>{
     const character = state.roster.characters.find(character=>character.id===characterId);
     if (!character) throw new Error('invalid_scene_character');
     // The ordinary state read omits neural snapshots. Read them once and fingerprint
@@ -601,7 +650,7 @@ export class SceneAuthority {
       .all(scopeKey(scope),characterId) as {id:string;revision:number;body:string}[];
     const storedBySource=new Map(rows.map(row=>[JSON.stringify([row.id,row.revision]),row.body]));
     // One object for this call: at most one settings derivation, one legacy world fold and one clock reading.
-    const replayTimes=this.storyClock.legacyTimeline(scope,state.sources);
+    const replayTimes=this.storyClock.legacyTimeline(scope,state.sources,timeline);
     const initialTime=replayTimes.initial(state.createdAtMs);
     const events: {stored:EmotionState|undefined;body:string|undefined;delta:import('../emotion/openher.ts').EmotionDelta;at:number|undefined}[]=[];
     for(const [index,source] of state.sources.entries()){
@@ -626,11 +675,12 @@ export class SceneAuthority {
       if(this.emotionReplayCache.size>64)this.emotionReplayCache.delete(this.emotionReplayCache.keys().next().value!);
     }
     return {emotion,settings:character.emotion};
+    });
   }
 
   /** Expression uses one explicit addressee, never the legacy global relation. */
-  responseEmotion(scope:SceneScope,characterId:string,now=Date.now(),state=this.state(scope),targetId:string|null='player') {
-    const emotion=this.emotion(scope,characterId,now,state);
+  responseEmotion(scope:SceneScope,characterId:string,now=Date.now(),state=this.state(scope),targetId:string|null='player',timeline?:SceneSource[]) {
+    const emotion=this.emotion(scope,characterId,now,state,timeline);
     const relation=targetId===null?undefined:this.relationshipAnchor(scope,characterId,targetId,state);
     return {...emotion,stableRelations:relation?.relations??{depth:0,trust:0,valence:0}};
   }
@@ -640,8 +690,8 @@ export class SceneAuthority {
    * extension (or outside an Agent companion scope) it is the response emotion without a contact affect.
    */
   contactEmotionProjection(scope:SceneScope,characterId:string,nowMs:number,state=this.state(scope),
-    currentReply:{sourceId:string;revision:number}|null=null):ContactEmotionProjection{
-    const base=this.responseEmotion(scope,characterId,nowMs,state);
+    currentReply:{sourceId:string;revision:number}|null=null,timeline?:SceneSource[]):ContactEmotionProjection{
+    const base=this.responseEmotion(scope,characterId,nowMs,state,'player',timeline);
     return this.hooks.contactEmotion(scope,characterId,nowMs,state,currentReply,base)??{emotion:base,affect:null};
   }
 
@@ -668,8 +718,8 @@ export class SceneAuthority {
    * explicit cue movement of their post-SC analyses, read from the one fold of `timeline` (the whole list the caller
    * works on; `sources` is a prefix of it). Never wall-clock waiting.
    */
-  legacyEmotionTime(scope:SceneScope,sources:SceneSource[],fallbackMs:number,timeline:SceneSource[]=sources):number {
-    return this.storyClock.legacyTimeMs(scope,sources,fallbackMs,timeline);
+  legacyEmotionTime(scope:SceneScope,sources:SceneSource[],fallbackMs:number,timeline:SceneSource[]=sources,rowTimeline?:SceneSource[]):number {
+    return this.storyClock.legacyTimeMs(scope,sources,fallbackMs,timeline,rowTimeline);
   }
 
   preferences(scope: SceneScope, characterId: string, state = this.state(scope), currentReplySourceId?:string): Preference[] {
@@ -719,12 +769,13 @@ export class SceneAuthority {
   }
 
   /** worldSettings(scope), with the inputs the story clock needs to rebuild a derived start in the opening's own zone. */
-  private legacyWorldSettings(scope:SceneScope):StoryClockLegacySettings {
+  private legacyWorldSettings(scope:SceneScope,sources?:SceneSource[]):StoryClockLegacySettings {
     let settings=this.rawWorldSettings(scope);
     const stored=settings!==null;
     let references:StoryClockLegacySettings['references']=[],liveZone:string|null=null;
     if(!settings&&this.interactions.isTavernRoleplay(scope)){
-      const state=this.settingsHead(scope);
+      const head=this.settingsHead(scope);
+      const state=sources!==undefined&&this.usableLedgerRows(this.ledgerRowsForCall(scope))?{...head,sources}:head;
       if(state.version){
         const candidates=this.transfer.acceptedReferences(scope),zone=this.interactions.get(scope,'sillytavern').timeZone;
         settings=initialStorySettings(state,candidates,zone);
@@ -791,12 +842,21 @@ export class SceneAuthority {
     });
   }
 
-  world(scope:SceneScope,readerId?:string,now=Date.now(),state=this.state(scope)):
+  world(scope:SceneScope,readerId?:string,now=Date.now(),state=this.state(scope),timeline?:SceneSource[]):
     (WorldFoldResult&{storyClock?:StoryClockSummary})|(WorldProjection&{storyClock?:StoryClockView|null})|null {
-    const settings=this.worldSettings(scope);
-    if(!settings)return null;
+    const originalSettings=this.worldSettings(scope);
+    return this.withLedgerRows(scope,()=>{
+    const rows=this.ledgerRowsForCall(scope);
+    let settings=originalSettings;
+    if(this.usableLedgerRows(rows)){
+      const derived=this.legacyWorldSettings(scope,state.sources);
+      if(!derived.stored)settings=derived.settings;
+    }
+    if(!settings){if(this.usableLedgerRows(rows)&&timeline!==undefined)this.checkLedgerPrefix(state.sources,timeline);return null;}
+    const input=this.ledgerViewInput(scope,state.sources,settings,timeline);
     const row=this.db.prepare('SELECT clock_floor FROM scene_world_settings WHERE scope=?').get(scopeKey(scope)) as {clock_floor:number}|undefined;
-    const folded=foldWorldState(settings,this.worldSources(state.sources),{nowMs:now,monotonicFloorMs:row?.clock_floor??settings.startTimeMs});
+    const options={nowMs:now,monotonicFloorMs:row?.clock_floor??settings.startTimeMs,...input.options};
+    const folded=foldWorldState(settings,input.sources,options);
     if(settings.mode==='companion'&&row&&folded.state.timeMs>row.clock_floor)this.db.prepare('UPDATE scene_world_settings SET clock_floor=? WHERE scope=?').run(folded.state.timeMs,scopeKey(scope));
     if(settings.mode!=='story')return readerId===undefined?folded:projectWorldState(folded,readerId);
     // A story world carries the unified clock beside the legacy one.
@@ -807,6 +867,7 @@ export class SceneAuthority {
     const projection=projectWorldState(folded,readerId);
     // The same visibility rule as timeMs: the player, or everyone when the time is public.
     return readerId==='player'||folded.state.publicTime?{...projection,storyClock:summary?.view??null}:projection;
+    });
   }
 
   /**
@@ -814,9 +875,9 @@ export class SceneAuthority {
    * legacy timeMs nor the structured clock: the line is the only time a character reads. `language` is the story
    * language the caller renders memories in; without it the reader's own memories decide, as contextFrom does.
    */
-  worldContext(scope:SceneScope,readerId:string,state=this.state(scope),language?:StoryLanguage) {
+  worldContext(scope:SceneScope,readerId:string,state=this.state(scope),language?:StoryLanguage,timeline?:SceneSource[]) {
     if(language!==undefined&&language!=='zh'&&language!=='en')throw new Error('invalid_story_language');
-    const world=this.world(scope,readerId,Date.now(),state) as (WorldProjection&{storyClock?:StoryClockView|null})|null;
+    const world=this.world(scope,readerId,Date.now(),state,timeline) as (WorldProjection&{storyClock?:StoryClockView|null})|null;
     const header='\n脚本确认的当前世界状态（仅此角色可见；不得自行改算或补全未知余额）：';
     if(world&&world.mode!=='story')return header+JSON.stringify(world);
     let worldPart='',view:StoryClockView|null;
@@ -832,12 +893,290 @@ export class SceneAuthority {
     return worldPart+storyClockLine(view,resolved);
   }
 
+  /** Administrative rows, including original body strings for fingerprints and rejected rows for the panel. */
+  worldLedgerRows(scope:SceneScope) {return readWorldLedgerRows(this.db,scope);}
+
+  /** One panel decision: one transaction, checkpoint and version bump; source processing and parked stages stay intact. */
+  writeWorldLedger(scope:SceneScope,expectedVersion:number,items:readonly WorldLedgerWrite[]) {
+    return this.transaction(()=>{
+      const state=this.state(scope);
+      if(state.version!==expectedVersion)throw new Error('context_changed_retry');
+      const writes=prepareWorldLedgerWrites(items);
+      guardWorldLedgerBindings(state,writes,captureWorldLedgerRows(this.db,scope));
+      this.lifecycle.checkpoint(scope,writes.some(write=>write.table==='accounts')?'账户变更':'交易校正',{automatic:true});
+      ensureWorldLedgerTables(this.db);
+      sweepWorldLedgerTombstones(this.db,scope);
+      const rows=appendWorldLedgerRows(this.db,scope,state,writes);
+      this.bump(scope);
+      this.rebuildDerived(scope);
+      return {version:state.version+1,rows};
+    });
+  }
+
+  /** One input for full folds and prefix queries. The caller owns the complete source timeline; only rows are read here. */
+  worldLedgerInput(scope:SceneScope,sources:SceneSource[],settings:WorldSettings|null=this.worldSettings(scope),purpose:'ledger'|'clock'='ledger',rows=this.ledgerRowsForCall(scope)) {
+    const options=worldLedgerOptions(rows),baseline=settings===null;
+    if(settings===null&&purpose==='ledger'&&this.interactions.isTavernRoleplay(scope)&&
+      (this.usableLedgerRows(rows)||sources.some(source=>source.analysis!=null&&Object.hasOwn(source.analysis,'ledger')&&source.analysis.ledger!=null)))
+      settings=ledgerOnlySettings(this.settingsHead(scope));
+    const input=this.worldSources(sources);
+    if(baseline&&settings)for(const source of input){source.candidates=[];delete source.storyClockOwned;}
+    return {settings,sources:input,options};
+  }
+
+  /** A synchronous call owns its row snapshot; nested folds share it and the frame is discarded even on failure. */
+  private withLedgerRows<T>(scope:SceneScope,action:()=>T):T {
+    const key=scopeKey(scope),previous=this.ledgerReadFrame;
+    if(previous?.key===key)return action();
+    this.ledgerReadFrame={key};
+    try{return action();}finally{if(previous)this.ledgerReadFrame=previous;else delete this.ledgerReadFrame;}
+  }
+
+  /** Related lazy readings keep a single snapshot for one immutable synchronous consumer. */
+  private ledgerReader(scope:SceneScope):<T>(action:()=>T)=>T {
+    const key=scopeKey(scope);let captured:NonNullable<SceneAuthority['ledgerReadFrame']>|undefined;
+    return action=>{
+      const previous=this.ledgerReadFrame;captured??={key};this.ledgerReadFrame=captured;
+      try{return action();}finally{if(previous)this.ledgerReadFrame=previous;else delete this.ledgerReadFrame;}
+    };
+  }
+
+  /** Only successfully decoded rows select the ledger-aware behaviour; rejected rows remain administrative data. */
+  private usableLedgerRows(rows:WorldLedgerRows):boolean {return rows.accounts.length+rows.corrections.length>0;}
+
+  /** Explicit timelines must be the very same positional prefix objects; O(n) time, O(1) extra space. */
+  private checkLedgerPrefix(sources:SceneSource[],timeline:SceneSource[]):void {
+    if(sources.length>timeline.length||sources.some((source,index)=>source!==timeline[index]))
+      throw new TypeError('story_clock_prefix_mismatch');
+  }
+
+  /** O(sources log sources + row bytes): keep raw row pairs until the final world fold. */
+  private ledgerViewInput(
+    scope: SceneScope,
+    sources: SceneSource[],
+    settings: WorldSettings | null,
+    timeline?: SceneSource[],
+  ) {
+    const rows = this.ledgerRowsForCall(scope);
+    const input = this.worldLedgerInput(scope, sources, settings, 'clock', rows);
+    if (!this.usableLedgerRows(rows)) {
+      return {...input, timeline, stamp: undefined as string | undefined};
+    }
+
+    const frame = this.ledgerReadFrame;
+    const cached = frame?.key === scopeKey(scope) ? frame.views?.get(sources) : undefined;
+    if (cached && cached.timeline === timeline) return cached;
+
+    const complete = this.ledgerTimelineForCall(scope, sources, timeline, rows)!;
+    // Full or standalone inputs keep every raw row, even a clear with no surviving target.
+    if (complete.length === sources.length) {
+      const view = {...input, timeline, stamp: undefined as string | undefined};
+      if (frame?.key === scopeKey(scope)) (frame.views ??= new Map()).set(sources, view);
+      return view;
+    }
+    const completeSources = this.worldLedgerInput(scope, complete, settings, 'clock', rows).sources;
+    const count = input.sources.length;
+    const positions = new Map<string, number>();
+    const identity = (source: {sourceId?: string; revision?: number}) =>
+      JSON.stringify([source.sourceId, source.revision]);
+    for (let index = 0; index < completeSources.length; index++) {
+      const key = identity(completeSources[index]!);
+      if (!positions.has(key)) positions.set(key, index + 1);
+    }
+
+    // The model locates unknown anchors by accepted time, retaining the greatest preceding position.
+    let times: {time: number; position: number}[] | undefined;
+    const positionAfter = (after: LedgerAfter): number => {
+      if (after === null) return 0;
+      const exact = positions.get(identity(after));
+      if (exact !== undefined) return exact;
+      if (times === undefined) {
+        times = completeSources.flatMap((source, index) =>
+          Number.isSafeInteger(source.acceptedAtMs) && source.acceptedAtMs >= 0
+            ? [{time: source.acceptedAtMs, position: index + 1}]
+            : []);
+        times.sort((left, right) => left.time - right.time);
+        let maximum = 0;
+        for (const entry of times) {
+          maximum = Math.max(maximum, entry.position);
+          entry.position = maximum;
+        }
+      }
+      let lower = 0;
+      let upper = times.length;
+      while (lower < upper) {
+        const middle = (lower + upper) >>> 1;
+        if (times[middle]!.time <= after.acceptedAtMs) lower = middle + 1;
+        else upper = middle;
+      }
+      return lower ? times[lower - 1]!.position : 0;
+    };
+    const adjustments = new Map(rows.corrections
+      .filter(row => row.value.action === 'adjustment')
+      .map(row => ['user:' + row.value.id, row.value]));
+    const accountEvents = rows.accounts
+      .filter(row => row.value.kind === 'create' || positionAfter(row.value.after) <= count)
+      .map(row => row.value);
+    const corrections = rows.corrections.filter(row => {
+      const correction = row.value;
+      const adjusted = typeof correction.anchor === 'string' ? adjustments.get(correction.anchor) : undefined;
+      // A source-less withdrawal travels with its adjustment, including when neither remains active.
+      if (correction.action === 'adjustment' || correction.action === 'clear' && adjusted) {
+        return positionAfter((adjusted ?? correction).after ?? null) <= count;
+      }
+      const position = positions.get(identity(correction)) ?? 0;
+      return position > 0 && position <= count;
+    }).map(row => row.value);
+    const selected: LedgerFoldOptions = {
+      ...(accountEvents.length ? {accountEvents} : {}),
+      ...(corrections.length ? {corrections} : {}),
+    };
+    const view = {timeline, sources: input.sources, options: selected, stamp: undefined as string | undefined};
+    if (frame?.key === scopeKey(scope)) (frame.views ??= new Map()).set(sources, view);
+    return view;
+  }
+
+  /** O(source bytes) per frame; unknown, unordered or incomplete identities keep the standalone input semantics. */
+  private ledgerTimelineForCall(
+    scope: SceneScope,
+    sources: SceneSource[],
+    timeline?: SceneSource[],
+    rows = this.ledgerRowsForCall(scope),
+  ): SceneSource[] | undefined {
+    if (!this.usableLedgerRows(rows)) return undefined;
+    if (timeline !== undefined) {
+      this.checkLedgerPrefix(sources, timeline);
+      return timeline;
+    }
+
+    const frame = this.ledgerReadFrame;
+    let live = frame?.key === scopeKey(scope) ? frame.liveSources : undefined;
+    if (live === undefined) {
+      const liveRows = this.db.prepare(
+        "SELECT message,revision,observed,status,processing,json_remove(analysis,'$.emotionStates') AS analysis " +
+        'FROM scene_sources WHERE scope=? ORDER BY rowid',
+      ).all(scopeKey(scope)) as {
+        message: string;
+        revision: number;
+        observed: number;
+        status: SceneSource['status'];
+        processing: SceneSource['processing'];
+        analysis: string | null;
+      }[];
+      live = liveRows.map(source => ({
+        ...JSON.parse(source.message),
+        revision: source.revision,
+        observedAtMs: source.observed,
+        status: source.status,
+        processing: source.processing,
+        analysis: source.analysis ? JSON.parse(source.analysis) : null,
+      }));
+      if (frame?.key === scopeKey(scope)) frame.liveSources = live;
+    }
+
+    const identity = (source: SceneSource) => JSON.stringify([source.id, source.revision]);
+    const positions = new Map(live.map((source, index) => [identity(source), index]));
+    const included = new Set<string>();
+    let boundary = -1;
+    for (const source of sources) {
+      const key = identity(source);
+      const position = positions.get(key);
+      if (position === undefined || position <= boundary) return sources;
+      boundary = position;
+      included.add(key);
+    }
+    if (live.slice(0, boundary + 1).some(source => source.status === 'accepted' && !included.has(identity(source)))) {
+      return sources;
+    }
+    if (boundary === live.length - 1) return sources;
+
+    // Processing can hold a newer analysis at an accepted position; it remains the view's own fold input.
+    return [...sources, ...live.slice(boundary + 1)];
+  }
+
+  /** A connection-local revision rolls back with tracked writes without changing persisted schema or rows. */
+  private initializeLedgerSourceRevision(): void {
+    this.db.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS scene_source_revision (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1), revision INTEGER NOT NULL
+      );
+      INSERT OR IGNORE INTO scene_source_revision VALUES(1, 0);
+      CREATE TEMP TRIGGER IF NOT EXISTS scene_source_revision_insert AFTER INSERT ON main.scene_sources
+      BEGIN
+        UPDATE scene_source_revision SET revision = revision + 1 WHERE singleton = 1;
+      END;
+      CREATE TEMP TRIGGER IF NOT EXISTS scene_source_revision_update AFTER UPDATE ON main.scene_sources
+      BEGIN
+        UPDATE scene_source_revision SET revision = revision + 1 WHERE singleton = 1;
+      END;
+      CREATE TEMP TRIGGER IF NOT EXISTS scene_source_revision_delete AFTER DELETE ON main.scene_sources
+      BEGIN
+        UPDATE scene_source_revision SET revision = revision + 1 WHERE singleton = 1;
+      END;
+    `);
+  }
+
+  /** Attach connection-local triggers only after the lazy ledger tables exist, including after DDL rollback. */
+  private trackLedgerRowRevisions(): void {
+    const untracked = this.db.prepare(
+      "SELECT name FROM main.sqlite_schema WHERE type='table' " +
+      "AND name IN ('scene_world_ledger_accounts','scene_world_ledger_corrections') " +
+      "AND NOT EXISTS (SELECT 1 FROM temp.sqlite_schema WHERE type='trigger' " +
+      "AND name = main.sqlite_schema.name || '_read_revision_insert')",
+    ).all() as {name: string}[];
+
+    // The schema query restricts these identifiers to two fixed table names; no caller text reaches the SQL.
+    for (const table of untracked) {
+      for (const operation of ['INSERT', 'UPDATE', 'DELETE']) {
+        this.db.exec(`
+          CREATE TEMP TRIGGER IF NOT EXISTS ${table.name}_read_revision_${operation.toLowerCase()}
+          AFTER ${operation} ON main.${table.name}
+          BEGIN
+            UPDATE scene_source_revision SET revision = revision + 1 WHERE singleton = 1;
+          END;
+        `);
+      }
+    }
+  }
+
+  /** O(1) metadata: local writes, rollback-sensitive source/ledger revision, and external commits. */
+  private ledgerDatabaseStamp(): string {
+    this.trackLedgerRowRevisions();
+    const local = this.db.prepare(
+      'SELECT revision, total_changes() AS changes FROM temp.scene_source_revision WHERE singleton = 1',
+    ).get() as {revision: number; changes: number};
+    const external = this.db.prepare('PRAGMA data_version').get() as {data_version: number};
+
+    // total_changes distinguishes revision reuse after rollback; data_version changes only for external commits.
+    return JSON.stringify([local.changes, local.revision, external.data_version]);
+  }
+
+  /** A write or rollback invalidates all derived frame data before another snapshot can be used. */
+  private ledgerRowsForCall(scope: SceneScope): WorldLedgerRows {
+    const frame = this.ledgerReadFrame;
+    if (frame?.key !== scopeKey(scope)) return this.worldLedgerRows(scope);
+
+    const databaseStamp = this.ledgerDatabaseStamp();
+    if (frame.databaseStamp !== databaseStamp) {
+      delete frame.rows;
+      delete frame.stamp;
+      delete frame.liveSources;
+      delete frame.views;
+      frame.databaseStamp = databaseStamp;
+    }
+
+    return frame.rows ??= this.worldLedgerRows(scope);
+  }
+
   private worldSources(sources:SceneSource[]):WorldSourceEffects[] {
     return sources.filter(source=>source.status==='accepted'&&source.processing==='ready'&&source.analysis?.plan).map(source=>({
       sourceId:source.id,revision:source.revision,role:source.role,text:source.text,acceptedAtMs:source.acceptedAtMs,
       plan:source.analysis!.plan!,candidates:source.analysis!.worldEffects??[],
       // A post-SC source: its clock candidates are still checked, never applied (the story clock owns its time).
       ...(Object.hasOwn(source.analysis!,'storyClock')?{storyClockOwned:true}:{}),
+      ...(source.analysis!.ledger==null?{}:{ledger:source.analysis!.ledger}),
+      ...(source.analysis!.ledgerMarks==null?{}:{ledgerMarks:source.analysis!.ledgerMarks}),
+      ...(source.replyTo==null?{}:{replyTo:source.replyTo}),
     }));
   }
 
@@ -1140,6 +1479,7 @@ function localAnalysis(value:SceneAnalysis,source:SceneSource,
     ...(input.commitmentOperations===undefined?{}:{commitmentOperations:input.commitmentOperations}),
     ...(input.physiologyOperations===undefined?{}:{physiologyOperations:input.physiologyOperations}),
     ...(input.geographyOperations===undefined?{}:{geographyOperations:input.geographyOperations}),
+    ...storedLedgerFields(input),
     ...userModelCandidatesOf(input.userModelCandidates,source.text,decodeUserModelCandidates),
     ...(clockAbsent?{}:{storyClock:JSON.parse(clockText) as unknown})};
 }

@@ -35,7 +35,9 @@ export function storyTimelineOf(processed:readonly SceneSource[],accepted:readon
  * world is a story world is read once, here. The object belongs to the synchronous call that builds it: it keeps what
  * it has read, so it is never stored and never used after an await or after a write to the scene.
  */
-export function commitmentStoryClock(authority:SceneAuthority,scope:SceneScope,timeline:SceneSource[]):CommitmentStoryClock|undefined {
+export function commitmentStoryClock(authority:SceneAuthority,scope:SceneScope,timeline:SceneSource[],completeTimeline?:SceneSource[]):CommitmentStoryClock|undefined {
+  const withRows=authority.storyClock.ledgerReader?.(scope)??(<T>(action:()=>T)=>action());
+  if(completeTimeline!==undefined)withRows(()=>authority.storyClock.checkTimeline?.(scope,timeline,completeTimeline));
   const story=authority.worldSettings(scope)?.mode==='story';
   // The story-scope test, with the mode already in hand.
   if(!story&&authority.interactions.frozenRoleplayTime(scope)===undefined)return undefined;
@@ -44,10 +46,11 @@ export function commitmentStoryClock(authority:SceneAuthority,scope:SceneScope,t
   const states=new Map<string,StoryDeadlineClock>();
   const key=(id:string,revision:number)=>JSON.stringify([id,revision]);
   const indices=new Map(timeline.map((source,index)=>[key(source.id,source.revision),index]));
+  const rowArguments:[]|[SceneSource[]]=completeTimeline===undefined?[]:[completeTimeline];
   return {
-    at(source){
+    at(source){return withRows(()=>{
       if(reading===undefined){
-        reading=authority.storyClock.readTimeline(scope,timeline);
+        reading=authority.storyClock.readTimeline(scope,timeline,...rowArguments);
         if(reading!==null)for(const entry of reading.result.sources){
           const {atMs,dateKnown,yearKnown,timeOfDayKnown}=entry.state;
           states.set(key(entry.sourceId,entry.revision),{atMs,dateKnown,yearKnown,timeOfDayKnown});
@@ -55,17 +58,17 @@ export function commitmentStoryClock(authority:SceneAuthority,scope:SceneScope,t
       }
       if(reading===null)return null;
       return states.get(key(source.id,source.revision))??null;
-    },
-    legacyAt(source){
+    });},
+    legacyAt(source){return withRows(()=>{
       if(!story)return null;
       const i=indices.get(key(source.id,source.revision))??-1;
       if(i<0)return null;
-      try{return (legacyTimes??=authority.storyClock.legacyTimeline(scope,timeline)).at(i,source.acceptedAtMs);}
+      try{return (legacyTimes??=authority.storyClock.legacyTimeline(scope,timeline,...rowArguments)).at(i,source.acceptedAtMs);}
       catch(error){
         if(error instanceof Error&&error.message.startsWith('invalid_world_'))return null;
         throw error;
       }
-    },
+    });},
   };
 }
 

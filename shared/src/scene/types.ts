@@ -5,6 +5,7 @@ import type { ValidatedCommitmentOperation } from '../commitments/types.ts';
 import type { AbsenceExplanationOperation } from '../emotion/absence-explanation.ts';
 import type { PhysiologyOperation } from '../common/physiology.ts';
 import type { GeographyOperation } from '../common/geography.ts';
+import type { StoredLedger, LedgerMarks } from './world-ledger.ts';
 
 /** A user-model candidate is opaque to the shared core; the companion extension decodes and narrows it. */
 export type SceneProfileCandidate=unknown;
@@ -107,6 +108,8 @@ export interface SceneAnalysis {
   physiologyOperations?: PhysiologyOperation[];
   /** Source-grounded geography operations, replayed from accepted prose. */
   geographyOperations?: GeographyOperation[];
+  ledger?: StoredLedger;
+  ledgerMarks?: LedgerMarks;
 }
 /** Pending causal/config retries may retain candidates while forcing a new plan. */
 export interface StoredSceneAnalysis {
@@ -124,6 +127,8 @@ export interface StoredSceneAnalysis {
   userModelCandidates?: SceneProfileCandidate[];
   physiologyOperations?: PhysiologyOperation[];
   geographyOperations?: GeographyOperation[];
+  ledger?: StoredLedger;
+  ledgerMarks?: LedgerMarks;
   /** Local deterministic projection after this accepted source; model output is never trusted here. */
   emotionStates?: Record<string, EmotionState>;
 }

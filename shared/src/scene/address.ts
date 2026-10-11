@@ -49,16 +49,17 @@ export function sceneAddressGuidance(authority:SceneAuthority,scope:SceneScope,s
 
 /** Collects scene-local expression inputs without reading or rendering memories. */
 export function sceneExpressionOptions(authority:SceneAuthority,scope:SceneScope,speakerId:string,envelope:SceneEnvelope,
-  state:SceneState,emotion:EmotionState,nowMs:number,waiting?:ContactAffect|null,directional=true){
+  state:SceneState,emotion:EmotionState,nowMs:number,waiting?:ContactAffect|null,directional=true,timeline?:SceneState['sources']){
   const mode=authority.interactions.modeOf(scope);
   const clock=mode?authority.interactions.clock(scope,nowMs):null;
   const story=clock?.kind==='story'||!clock&&authority.worldSettings(scope)?.mode==='story';
+  if(!story&&timeline!==undefined)authority.storyClock.withLedgerRows(scope,()=>authority.storyClock.checkTimeline?.(scope,state.sources,timeline));
   const zone=clock?.timeZone??(story?'UTC':null);
   const hideStoryTime=Boolean(story&&(authority.worldSettings(scope)===null||
     authority.worldSettings(scope)!.publicTime===false));
   let clockTimeMs:number|null=nowMs;
   if(story){
-    try{clockTimeMs=authority.legacyEmotionTime(scope,state.sources,nowMs);}
+    try{clockTimeMs=authority.legacyEmotionTime(scope,state.sources,nowMs,state.sources,timeline);}
     catch(error){
       if(error instanceof Error&&error.message.startsWith('invalid_world_'))clockTimeMs=null;
       else throw error;

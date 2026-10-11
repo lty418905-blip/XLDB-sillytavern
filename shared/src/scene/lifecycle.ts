@@ -9,6 +9,8 @@ import {captureCalendarTodoRows,captureCalendarAckRows,restoreCalendarRows} from
 import type {PersistedCalendarTodoRow,PersistedCalendarAckRow} from './calendar-store.ts';
 import {captureStoryClockCorrectionRows,restoreStoryClockCorrectionRows} from './story-clock-store.ts';
 import type {PersistedStoryClockCorrectionRow} from './story-clock-store.ts';
+import {captureWorldLedgerRows,restoreWorldLedgerRows,interruptDeferredLedgerAnalysis} from './world-ledger-store.ts';
+import type {WorldLedgerAccountRow,WorldLedgerCorrectionRow} from './world-ledger-store.ts';
 
 export const AUTOMATIC_CHECKPOINT_RETENTION = 10;
 export const AUTOMATIC_CHECKPOINT_PRUNE_LIMIT = 4;
@@ -69,6 +71,8 @@ interface SceneCheckpointSnapshot {
   calendarReminderAcks?:PersistedCalendarAckRow[];
   /** Branch state bound to source ids and revisions: a snapshot without the field restores to no rows. */
   storyClockCorrections?:PersistedStoryClockCorrectionRow[];
+  worldLedgerAccounts?:WorldLedgerAccountRow[];
+  worldLedgerCorrections?:WorldLedgerCorrectionRow[];
   /** Owned by an extension (SceneCheckpointHooks); absent from snapshots it does not own. */
   companionPreset?:unknown;
 }
@@ -273,6 +277,7 @@ export class SceneLifecycle {
       references:captureReferenceRows(this.db,scope),calendarTodos:captureCalendarTodoRows(this.db,scope),
       calendarReminderAcks:captureCalendarAckRows(this.db,scope),
       storyClockCorrections:captureStoryClockCorrectionRows(this.db,scope),
+      ...captureWorldLedgerRows(this.db,scope),
       worldSettings: settings ?? null,...(companionPreset===undefined?{}:{companionPreset}) };
   }
 
@@ -290,12 +295,19 @@ export class SceneLifecycle {
     return checkpoint;
   }
 
-  private restoreSnapshot(scope: SceneScope, snapshot: SceneCheckpointSnapshot): void {
+  private restoreSnapshot(scope: SceneScope, snapshot: SceneCheckpointSnapshot, hasParked?: (sourceId:string,revision:number)=>boolean): void {
     const key = scopeKey(scope);
     const live = this.db.prepare('SELECT version,roster FROM scene_worlds WHERE key=?').get(key) as { version: number; roster: string } | undefined;
     if (!live) throw new Error('invalid_scene_not_configured');
     if (snapshot.schema !== 1) throw new Error('invalid_scene_checkpoint');
     snapshot = this.withCurrentTombstones(scope, snapshot);
+    snapshot.sources=snapshot.sources.map(row=>{
+      const analysis=interruptDeferredLedgerAnalysis(row.analysis);
+      if(analysis===row.analysis)return row;
+      // A failed parked-result lookup is an interruption, never permission to restart inference.
+      try{if(hasParked?.(row.id,row.revision)===true)return row;}catch{ /* No usable parked result. */ }
+      return {...row,analysis};
+    });
     this.db.prepare('DELETE FROM scene_processing_stages WHERE scope=?').run(key);
     if(snapshot.references!==undefined)restoreReferenceRows(this.db,scope,snapshot.references,{replaceAccepted:true});
     const cleanupCharacters = new Set([...rosterCharacterIds(live.roster), ...rosterCharacterIds(snapshot.world.roster)]);
@@ -324,6 +336,7 @@ export class SceneLifecycle {
 
   private insertFork(scope: SceneScope, snapshot: SceneCheckpointSnapshot): void {
     if (snapshot.schema !== 1) throw new Error('invalid_scene_checkpoint');
+    snapshot={...snapshot,sources:snapshot.sources.map(row=>({...row,analysis:interruptDeferredLedgerAnalysis(row.analysis)}))};
     const key = scopeKey(scope);
     this.db.prepare('INSERT INTO scene_worlds(key,scope,roster,version,created) VALUES(?,?,?,?,?)')
       .run(key, JSON.stringify(scope), snapshot.world.roster, 1, snapshot.world.created);
@@ -332,6 +345,8 @@ export class SceneLifecycle {
 
   private insertChildren(key: string, snapshot: SceneCheckpointSnapshot, replace = false): void {
     const [worldId,sessionId,branchId,characterId]=JSON.parse(key) as string[];
+    restoreWorldLedgerRows(this.db,{worldId:worldId!,sessionId:sessionId!,branchId:branchId!,characterId:characterId!},
+      snapshot.worldLedgerAccounts??[],snapshot.worldLedgerCorrections??[]);
     restoreReferenceRows(this.db,{worldId:worldId!,sessionId:sessionId!,branchId:branchId!,characterId:characterId!},snapshot.references??[]);
     if(snapshot.calendarTodos!==undefined||snapshot.calendarReminderAcks!==undefined)
       restoreCalendarRows(this.db,{worldId:worldId!,sessionId:sessionId!,branchId:branchId!,characterId:characterId!},
@@ -388,6 +403,8 @@ export class SceneLifecycle {
     const changes: { index: number; characters: Set<string> }[] = [];
     for (const tombstone of tombstones) {
       snapshot.preferenceControls=snapshot.preferenceControls?.filter(control=>control.id.slice(0,control.id.lastIndexOf(':pref:@'))!==tombstone.id);
+      if(snapshot.worldLedgerCorrections!==undefined)snapshot.worldLedgerCorrections=snapshot.worldLedgerCorrections
+        .filter(row=>row.kind==='adjustment'||row.source_id!==tombstone.id);
       const index = snapshot.sources.findIndex(source => source.id === tombstone.id);
       const prior = index < 0 ? undefined : snapshot.sources[index];
       if (index >= 0 && prior?.status === 'accepted') {

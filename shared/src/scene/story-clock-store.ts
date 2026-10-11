@@ -55,14 +55,20 @@ export interface StoryClockDependencies {
   state: (scope: SceneScope) => SceneState;
   isStoryScope: (scope: SceneScope) => boolean;
   tavernRoleplay: (scope: SceneScope) => boolean;
-  /** The world fold over `sources` with exactly the given (merged, live-zone) settings. */
-  worldFold: (scope: SceneScope, sources: SceneSource[], settings: WorldSettings) => WorldFoldResult;
+  /** The world fold over `sources`, a positional prefix of `timeline`, with exactly the given (merged, live-zone) settings. */
+  worldFold: (scope: SceneScope, sources: SceneSource[], settings: WorldSettings, timeline?: SceneSource[]) => WorldFoldResult;
   /**
    * Aligned with `sources`: entry i is the legacy world time and the first issue code (null without one) of
    * worldFold(scope, sources.slice(0, i + 1), settings), from one pass. Throws what worldFold throws for the settings.
    */
-  worldRunning: (scope: SceneScope, sources: SceneSource[], settings: WorldSettings) => readonly WorldRunningStep[];
-  legacySettings: (scope: SceneScope) => StoryClockLegacySettings;
+  worldRunning: (scope: SceneScope, sources: SceneSource[], settings: WorldSettings, timeline?:SceneSource[]) => readonly WorldRunningStep[];
+  ledgerData?: (scope: SceneScope, sources:SceneSource[], timeline?:SceneSource[]) => string | null;
+  /** Connection metadata for source/ledger writes, rollbacks and external commits; database failures propagate. */
+  ledgerVersion?: (scope: SceneScope) => string;
+  withLedgerRows?: <T>(scope:SceneScope, action:()=>T)=>T;
+  ledgerReader?: (scope:SceneScope)=><T>(action:()=>T)=>T;
+  ledgerTimeline?: (scope:SceneScope,sources:SceneSource[],timeline?:SceneSource[])=>SceneSource[]|undefined;
+  legacySettings: (scope: SceneScope,sources?:SceneSource[]) => StoryClockLegacySettings;
   /** Creation time of a roleplay scope without world settings (today's frozen time), else undefined. */
   frozenRoleplayTime: (scope: SceneScope) => number | undefined;
   /** Runs after every correction write, delete or restore: OpenHer snapshots, version, derived projections. */
@@ -298,12 +304,20 @@ export class StoryClockStore {
     db.exec(TABLE);
   }
 
+  /** Shares a synchronous ledger frame, refreshed after database changes; returns or throws the callback's result. */
+  withLedgerRows<T>(scope: SceneScope, action: () => T): T {
+    return this.deps.withLedgerRows ? this.deps.withLedgerRows(scope, action) : action();
+  }
+
+  /** One consumer's related lazy reads share rows without eagerly evaluating future prefixes. */
+  ledgerReader(scope:SceneScope):<T>(action:()=>T)=>T {return this.deps.ledgerReader?this.deps.ledgerReader(scope):action=>action();}
+
   /** Calls of foldStoryClock so far; read by the cost test only. */
   get foldCount(): number { return this.folds; }
 
   /** Null iff the scope is not a story scope. */
   read(scope: SceneScope, state: SceneState = this.deps.state(scope)): StoryClockReading | null {
-    return this.fold(scope, state.sources, this.deps.legacySettings(scope), state);
+    return this.withLedgerRows(scope,()=>this.fold(scope, state.sources, this.deps.legacySettings(scope,state.sources), state));
   }
 
   summary(scope: SceneScope, state?: SceneState): StoryClockSummary | null {
@@ -318,9 +332,17 @@ export class StoryClockStore {
     return this.indexOf(reading).at.get(refKey(ref.sourceId, ref.revision)) ?? null;
   }
 
+  /** Validate an explicit row-selection timeline through the authority's shared positional check. */
+  checkTimeline(scope:SceneScope,sources:SceneSource[],timeline:SceneSource[]):void {
+    this.deps.ledgerTimeline?.(scope,sources,timeline);
+  }
+
   /** The fold of a given source list with the stored corrections; memoised by array identity, then by input hash. */
-  readTimeline(scope: SceneScope, timeline: SceneSource[]): StoryClockReading | null {
-    return this.fold(scope, timeline, this.deps.legacySettings(scope));
+  readTimeline(scope: SceneScope, timeline: SceneSource[], rowTimeline?:SceneSource[]): StoryClockReading | null {
+    return this.withLedgerRows(scope,()=>{
+      if(rowTimeline!==undefined)this.deps.ledgerTimeline?.(scope,timeline,rowTimeline);
+      return this.fold(scope,timeline,this.deps.legacySettings(scope,timeline),undefined,rowTimeline);
+    });
   }
 
   /**
@@ -328,9 +350,12 @@ export class StoryClockStore {
    * throws invalid_world_<code> on a world issue. X is the explicit cue movement of the 'analysis' sources in
    * `sources`, read from the one fold of the whole `timeline`.
    */
-  legacyTimeMs(scope: SceneScope, sources: SceneSource[], fallbackMs: number, timeline: SceneSource[] = sources): number {
-    const legacy = this.deps.legacySettings(scope);
-    return this.legacyBaseMs(scope, sources, fallbackMs, legacy.settings) + this.explicitMs(scope, sources, timeline, legacy);
+  legacyTimeMs(scope: SceneScope, sources: SceneSource[], fallbackMs: number, timeline: SceneSource[] = sources,rowTimeline?:SceneSource[]): number {
+    return this.withLedgerRows(scope,()=>{
+      if(rowTimeline!==undefined||timeline!==sources)this.deps.ledgerTimeline?.(scope,sources,rowTimeline??timeline);
+      const legacy=this.deps.legacySettings(scope,timeline===sources?sources:undefined);
+      return this.legacyBaseMs(scope,sources,fallbackMs,legacy.settings,rowTimeline??(timeline===sources?undefined:timeline)) + this.explicitMs(scope,sources,timeline,legacy,rowTimeline);
+    });
   }
 
   /**
@@ -344,13 +369,15 @@ export class StoryClockStore {
    * Nothing is kept on this store. The returned object
    * keeps what it has read, so its caller uses it inside one synchronous call, with `timeline` unchanged, and drops it.
    */
-  legacyTimeline(scope: SceneScope, timeline: SceneSource[]): StoryClockLegacyTimeline {
+  legacyTimeline(scope: SceneScope, timeline: SceneSource[], rowTimeline?:SceneSource[]): StoryClockLegacyTimeline {
     const length = timeline.length;
+    let selection:SceneSource[]|undefined,selected=false;
+    const rowSources=()=>{if(!selected){selection=this.deps.ledgerTimeline?.(scope,timeline,rowTimeline)??rowTimeline??timeline;selected=true;}return selection;};
     let legacy: StoryClockLegacySettings | undefined;
     let running: readonly WorldRunningStep[] | undefined;
     let firstAnalysis: number | undefined;
     let explicit: number[] | null | undefined;
-    const settings = (): StoryClockLegacySettings => legacy ??= this.deps.legacySettings(scope);
+    const settings = (): StoryClockLegacySettings => legacy ??= this.deps.legacySettings(scope,timeline);
     const analysed = (source: SceneSource): boolean => source.status === 'accepted' && storyClockSourceKind(source) === 'analysis';
     // E0 of the prefix that ends at `index`: legacyBaseMs, with the running fold in place of one fold per prefix.
     const base = (index: number, fallbackMs: number): number => {
@@ -360,7 +387,7 @@ export class StoryClockStore {
         if (frozen !== undefined) return frozen;
       }
       if (world?.mode !== 'story') return fallbackMs;
-      running ??= this.deps.worldRunning(scope, timeline, world);
+      running ??= this.deps.worldRunning(scope, timeline, world,rowSources());
       const step = running[index]!;
       if (step.issue !== null) throw new Error('invalid_world_' + step.issue.replace(/^invalid_world_/, ''));
       return step.timeMs;
@@ -370,7 +397,7 @@ export class StoryClockStore {
       firstAnalysis ??= timeline.findIndex(analysed);
       if (firstAnalysis < 0 || index < firstAnalysis) return 0;
       if (explicit === undefined) {
-        const reading = this.fold(scope, timeline, settings());
+        const reading = this.fold(scope, timeline, settings(),undefined,rowTimeline);
         if (!reading) explicit = null;
         else {
           const cues = this.indexOf(reading).explicit;
@@ -381,11 +408,12 @@ export class StoryClockStore {
       return explicit === null ? 0 : explicit[index]!;
     };
     return {
-      initial: fallbackMs => this.legacyBaseMs(scope, [], fallbackMs, settings().settings),
-      at: (index, fallbackMs) => {
+      initial: fallbackMs => this.withLedgerRows(scope,()=>this.legacyBaseMs(scope, [], fallbackMs, settings().settings, rowSources())),
+      at: (index, fallbackMs) => this.withLedgerRows(scope,()=>{
+        if(rowTimeline!==undefined)rowSources();
         if (!Number.isInteger(index) || index < 0 || index >= length) throw new RangeError('invalid_story_clock_index');
         return base(index, fallbackMs) + moved(index);
-      },
+      }),
     };
   }
 
@@ -459,40 +487,68 @@ export class StoryClockStore {
       .all(scopeKey(scope)) as unknown as PersistedStoryClockCorrectionRow[];
   }
 
-  private fold(scope: SceneScope, timeline: readonly SceneSource[], legacy: StoryClockLegacySettings,
-    state?: SceneState): StoryClockReading | null {
+  private fold(
+    scope: SceneScope,
+    timeline: readonly SceneSource[],
+    legacy: StoryClockLegacySettings,
+    state?: SceneState,
+    rowTimeline?: SceneSource[],
+  ): StoryClockReading | null {
     const settings = legacy.settings;
     // The story-scope test with the settings already in hand: no second worldSettings derivation.
     if (settings?.mode !== 'story' && this.deps.frozenRoleplayTime(scope) === undefined) return null;
-    const rows = this.rows(scope), tavernRoleplay = this.deps.tavernRoleplay(scope);
+    const rows = this.rows(scope);
+    const tavernRoleplay = this.deps.tavernRoleplay(scope);
     // A change of corrections, binding, world settings, or (derived settings) live zone or references never reuses a reading.
-    const stamp = JSON.stringify([rows, tavernRoleplay, legacy.stored, settings]);
+    const ledgerData = this.deps.ledgerData?.(scope, timeline as SceneSource[], rowTimeline);
+    const ledgerVersion = ledgerData == null ? null : this.deps.ledgerVersion?.(scope);
+    const stamp = JSON.stringify(ledgerData == null
+      ? [rows, tavernRoleplay, legacy.stored, settings]
+      : [rows, tavernRoleplay, legacy.stored, settings, ledgerData, ledgerVersion]);
     const held = this.byTimeline.get(timeline);
     if (held?.stamp === stamp) return held.reading;
 
     const story = settings?.mode === 'story' ? settings : null;
-    const legacySources = timeline.some(source => source.status === 'accepted' && storyClockSourceKind(source) === 'legacy');
+    const legacySources = timeline.some(source =>
+      source.status === 'accepted' && storyClockSourceKind(source) === 'legacy');
     let origin: StoryClockLegacyOrigin | null = null;
     // Only a legacy opening reads the anchor, so a chat without legacy sources needs neither the state nor the world fold.
     if (story && legacySources) {
-      const live = state ?? this.deps.state(scope);
-      origin = {stored: legacy.stored, startTimeMs: story.startTimeMs, createdAtMs: live.createdAtMs, liveZone: legacy.liveZone,
+      const stored = state ?? this.deps.state(scope);
+      const live = ledgerData == null ? stored : {...stored, sources: timeline as SceneSource[]};
+      origin = {
+        stored: legacy.stored,
+        startTimeMs: story.startTimeMs,
+        createdAtMs: live.createdAtMs,
+        liveZone: legacy.liveZone,
         derive: timeZone => {
           const anchor = initialStoryAnchor(live, legacy.references, timeZone);
           return anchor && {startTimeMs: anchor.settings.startTimeMs, dated: anchor.dated, timeKnown: anchor.timeKnown};
-        }};
+        },
+      };
     }
-    const input = buildStoryClockFoldInput({timeline, tavernRoleplay,
+
+    const input = buildStoryClockFoldInput({
+      timeline,
+      tavernRoleplay,
       // The same call and the same settings the legacy world time uses, so receipts and skipped sources are HEAD's.
-      receipts: story && legacySources ? this.deps.worldFold(scope, timeline as SceneSource[], story).receipts : [],
-      legacy: origin, corrections: rows.map(decodeCorrection)});
+      receipts: story && legacySources
+        ? this.deps.worldFold(scope, timeline as SceneSource[], story, rowTimeline).receipts
+        : [],
+      legacy: origin,
+      corrections: rows.map(decodeCorrection),
+    });
     const key = createHash('sha256').update(JSON.stringify([STORY_CLOCK_RULE_VERSION, input])).digest('hex');
     let reading = this.byInput.get(key);
     if (!reading) {
       this.folds++;
       const result = foldStoryClock(input);
-      reading = {status: result.pending ? 'waiting' : result.issues.length ? 'settled_with_issues' : 'settled',
-        input, result, view: storyClockView(result.state, result.dayOneStartMs)};
+      reading = {
+        status: result.pending ? 'waiting' : result.issues.length ? 'settled_with_issues' : 'settled',
+        input,
+        result,
+        view: storyClockView(result.state, result.dayOneStartMs),
+      };
       this.byInput.set(key, reading);
       if (this.byInput.size > MEMO_LIMIT) this.byInput.delete(this.byInput.keys().next().value!);
     }
@@ -518,22 +574,22 @@ export class StoryClockStore {
   }
 
   /** E0: today's legacy world time, unchanged. */
-  private legacyBaseMs(scope: SceneScope, sources: SceneSource[], fallbackMs: number, settings: WorldSettings | null): number {
+  private legacyBaseMs(scope: SceneScope, sources: SceneSource[], fallbackMs: number, settings: WorldSettings | null, timeline?:SceneSource[]): number {
     if (!settings) {
       const frozen = this.deps.frozenRoleplayTime(scope);
       if (frozen !== undefined) return frozen;
     }
     if (settings?.mode !== 'story') return fallbackMs;
-    const folded = this.deps.worldFold(scope, sources, settings);
+    const folded = this.deps.worldFold(scope, sources, settings, timeline);
     if (folded.issues.length) throw new Error('invalid_world_' + folded.issues[0]!.code.replace(/^invalid_world_/, ''));
     return folded.state.timeMs;
   }
 
   /** X: explicit cue movement only; no implicit estimate, fallback, legacy +30 step or correction movement. */
-  private explicitMs(scope: SceneScope, sources: SceneSource[], timeline: SceneSource[], legacy: StoryClockLegacySettings): number {
+  private explicitMs(scope: SceneScope, sources: SceneSource[], timeline: SceneSource[], legacy: StoryClockLegacySettings,rowTimeline?:SceneSource[]): number {
     const analysed = sources.filter(source => source.status === 'accepted' && storyClockSourceKind(source) === 'analysis');
     if (!analysed.length) return 0;
-    const reading = this.fold(scope, timeline, legacy);
+    const reading = this.fold(scope, timeline, legacy,undefined,rowTimeline);
     if (!reading) return 0;
     const explicit = this.indexOf(reading).explicit;
     let total = 0;
