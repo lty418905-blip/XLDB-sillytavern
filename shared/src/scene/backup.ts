@@ -15,6 +15,11 @@ import {SceneInteractions} from './interaction.ts';
 import {captureReferenceRows,restoreReferenceRows} from './transfer.ts';
 import type {PersistedReferenceRow} from './transfer.ts';
 import type {SceneScope} from './types.ts';
+import {
+  eraseWorldLedgerSource,
+  interruptDeferredLedgerAnalysis,
+  sweepWorldLedgerTombstones,
+} from './world-ledger-store.ts';
 
 export interface BackupManifest {
   schemaVersion: number;
@@ -385,6 +390,7 @@ function readRestoreRules(filename: string, extension?: BackupExtension): Restor
   } finally { db.close(); }
 }
 
+/** Restores one staged database transactionally; returns source/reference deletion count or throws and rolls back. */
 function applyRestoreRules(filename: string, rules?: RestoreRules, extension?: BackupExtension): number {
   const db = new DatabaseSync(filename);
   let transaction = false;
@@ -394,43 +400,61 @@ function applyRestoreRules(filename: string, rules?: RestoreRules, extension?: B
     transaction = true;
     clearProcessingCandidates(db);
     clearDirectorCache(db);
-    ensureExtendedRestoreSchema(db,extension,rules?.targetControls.extensionSchema??[]);
-    if(rules)restoreTargetControls(db,rules.targetControls);
-    for(const deletion of rules?.referenceDeletions??[]) {
-      restoreReferenceRows(db,deletion.scope,deletion.rows);
-      appliedDeletionCount+=deletion.rows.length;
+    ensureExtendedRestoreSchema(db, extension, rules?.targetControls.extensionSchema ?? []);
+    if (rules) restoreTargetControls(db, rules.targetControls);
+    for (const deletion of rules?.referenceDeletions ?? []) {
+      restoreReferenceRows(db, deletion.scope, deletion.rows);
+      appliedDeletionCount += deletion.rows.length;
     }
     const rebuiltCoreScopes = new Set<string>();
-    for (const deletion of rules?.coreDeletions??[]) {
+    for (const deletion of rules?.coreDeletions ?? []) {
       if (!db.prepare('SELECT 1 FROM scopes WHERE key=?').get(deletion.scope)) continue;
       const existing = db.prepare('SELECT revision,status FROM sources WHERE scope=? AND id=?')
-        .get(deletion.scope,deletion.id) as {revision:number;status:string}|undefined;
-      const revision = Math.max(deletion.revision, existing && existing.status !== 'deleted' ? existing.revision + 1 : existing?.revision ?? 0);
+        .get(deletion.scope, deletion.id) as {revision: number; status: string} | undefined;
+      const revision = Math.max(
+        deletion.revision,
+        existing && existing.status !== 'deleted' ? existing.revision + 1 : existing?.revision ?? 0,
+      );
       db.prepare(`INSERT INTO sources(scope,id,revision,role,text,hash,accepted,observed,status,payload)
         VALUES(?,?,?,?,?,?,?,?, 'deleted',NULL)
         ON CONFLICT(scope,id) DO UPDATE SET revision=excluded.revision,role=excluded.role,text='',hash='',
         accepted=excluded.accepted,observed=excluded.observed,status='deleted',payload=NULL`)
-        .run(deletion.scope,deletion.id,revision,deletion.role,'','',deletion.accepted,deletion.observed);
-      removeCoreControls(db,deletion.scope,deletion.id);
+        .run(deletion.scope, deletion.id, revision, deletion.role, '', '', deletion.accepted, deletion.observed);
+      removeCoreControls(db, deletion.scope, deletion.id);
       rebuiltCoreScopes.add(deletion.scope);
       appliedDeletionCount++;
     }
-    for (const scope of rebuiltCoreScopes) rebuildCoreScope(db,scope);
+    for (const scope of rebuiltCoreScopes) rebuildCoreScope(db, scope);
 
     const sceneScopes = new Map<string, SceneDeletion[]>();
-    for (const deletion of rules?.sceneDeletions??[]) {
+    for (const deletion of rules?.sceneDeletions ?? []) {
       if (!db.prepare('SELECT 1 FROM scene_worlds WHERE key=?').get(deletion.scope)) continue;
       const group = sceneScopes.get(deletion.scope) ?? [];
       group.push(deletion);
-      sceneScopes.set(deletion.scope,group);
+      sceneScopes.set(deletion.scope, group);
       appliedDeletionCount++;
     }
-    for (const [scope,deletions] of sceneScopes) applySceneDeletions(db,scope,deletions);
+    for (const [scope, deletions] of sceneScopes) applySceneDeletions(db, scope, deletions);
+
+    // A legacy backup can already contain tombstones; cleanup must also run without target deletion rules.
+    for (const row of db.prepare('SELECT scope FROM scene_worlds').iterate()) {
+      sweepWorldLedgerTombstones(db, JSON.parse(row.scope as string) as SceneScope);
+    }
+
+    // Backups carry no parked results. Scan every processing state after deletions can requeue the suffix.
+    // O(source rows) visits, one row held at a time; the shared converter owns JSON/ledger normalization work.
+    const updateAnalysis = db.prepare('UPDATE scene_sources SET analysis=? WHERE rowid=?');
+    for (const row of db.prepare('SELECT rowid,analysis FROM scene_sources WHERE analysis IS NOT NULL').iterate()) {
+      const original = row.analysis as string;
+      const interrupted = interruptDeferredLedgerAnalysis(original);
+      if (interrupted !== original) updateAnalysis.run(interrupted, row.rowid);
+    }
+
     rebuildCommitmentProjections(db);
     clearProfileProjections(db);
     clearRelationshipModels(db);
-    if(rules)bumpRestoredVersions(db,rules);
-    scheduleRestoredSceneIndexCleanup(db,rules);
+    if (rules) bumpRestoredVersions(db, rules);
+    scheduleRestoredSceneIndexCleanup(db, rules);
     db.exec('COMMIT');
     transaction = false;
     db.exec('PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE');
@@ -438,7 +462,9 @@ function applyRestoreRules(filename: string, rules?: RestoreRules, extension?: B
   } catch (error) {
     if (transaction) db.exec('ROLLBACK');
     throw error;
-  } finally { db.close(); }
+  } finally {
+    db.close();
+  }
 }
 
 function clearProcessingCandidates(db:DatabaseSync):void {
@@ -699,53 +725,65 @@ function removeCoreControls(db:DatabaseSync,scope:string,sourceId:string):void {
   for(const control of controls)if(isSourceControl(control,sourceId))remove.run(scope,control.id,control.revision,control.kind);
 }
 
+/** Applies tombstones within the caller's transaction; bound corrections are erased across every revision. */
 function applySceneDeletions(db: DatabaseSync, scope: string, deletions: SceneDeletion[]): void {
-  const before = sceneRows(db,scope);
-  const changes:{index:number;characters:Set<string>}[]=[];
+  const before = sceneRows(db, scope);
+  const changes: {index: number; characters: Set<string>}[] = [];
+  const storedScope = db.prepare('SELECT scope FROM scene_worlds WHERE key=?').get(scope) as {scope: string};
+  const ledgerScope = JSON.parse(storedScope.scope) as SceneScope;
+
   for (const deletion of deletions) {
-    const existing = before.find(row=>row.id===deletion.id);
+    const existing = before.find(row => row.id === deletion.id);
     if (existing?.status === 'accepted') {
-      changes.push({index:before.indexOf(existing),characters:analysisCharacters(existing.analysis)});
+      changes.push({index: before.indexOf(existing), characters: analysisCharacters(existing.analysis)});
     }
-    const revision = Math.max(deletion.revision, existing && existing.status !== 'deleted' ? existing.revision + 1 : existing?.revision ?? 0);
-    const message = JSON.parse(deletion.message) as Record<string,unknown>;
-    message.revision=revision;message.text='';message.dependencies=[];
+    const revision = Math.max(
+      deletion.revision,
+      existing && existing.status !== 'deleted' ? existing.revision + 1 : existing?.revision ?? 0,
+    );
+    const message = JSON.parse(deletion.message) as Record<string, unknown>;
+    message.revision = revision;
+    message.text = '';
+    message.dependencies = [];
     db.prepare(`INSERT INTO scene_sources(scope,id,revision,message,observed,status,processing,analysis)
       VALUES(?,?,?,?,?,'deleted','ready',NULL)
       ON CONFLICT(scope,id) DO UPDATE SET revision=excluded.revision,message=excluded.message,
       observed=excluded.observed,status='deleted',processing='ready',analysis=NULL`)
-      .run(scope,deletion.id,revision,JSON.stringify(message),deletion.observed);
-    removeScenePreferenceControls(db,scope,deletion.id);
+      .run(scope, deletion.id, revision, JSON.stringify(message), deletion.observed);
+    removeScenePreferenceControls(db, scope, deletion.id);
+    eraseWorldLedgerSource(db, ledgerScope, deletion.id);
   }
 
   let changed = true;
   while (changed) {
     changed = false;
-    const rows = sceneRows(db,scope);
+    const rows = sceneRows(db, scope);
     for (const row of rows) {
       if (row.status !== 'accepted') continue;
-      const message = JSON.parse(row.message) as {dependencies?:{id:string;revision:number}[]};
-      const valid = (message.dependencies??[]).every(dependency=>rows.some(origin=>
-        origin.id===dependency.id&&origin.revision===dependency.revision&&origin.status==='accepted'));
+      const message = JSON.parse(row.message) as {dependencies?: {id: string; revision: number}[]};
+      const valid = (message.dependencies ?? []).every(dependency => rows.some(origin =>
+        origin.id === dependency.id && origin.revision === dependency.revision && origin.status === 'accepted'));
       if (valid) continue;
-      changes.push({index:rows.indexOf(row),characters:analysisCharacters(row.analysis)});
+      changes.push({index: rows.indexOf(row), characters: analysisCharacters(row.analysis)});
       db.prepare("UPDATE scene_sources SET status='needs_review',processing='failed',analysis=NULL WHERE scope=? AND id=?")
-        .run(scope,row.id);
+        .run(scope, row.id);
       changed = true;
     }
   }
 
   const hasWorld = Boolean(db.prepare('SELECT 1 FROM scene_world_settings WHERE scope=?').get(scope));
-  const rows = sceneRows(db,scope);
-  for (const [index,row] of rows.entries()) {
+  const rows = sceneRows(db, scope);
+  for (const [index, row] of rows.entries()) {
     if (row.status !== 'accepted' || !row.analysis) continue;
     const characters = analysisCharacters(row.analysis);
-    if (!changes.some(change=>change.index<index&&(hasWorld||[...characters].some(id=>change.characters.has(id))))) continue;
+    const affected = changes.some(change => change.index < index &&
+      (hasWorld || [...characters].some(id => change.characters.has(id))));
+    if (!affected) continue;
     db.prepare("UPDATE scene_sources SET processing='pending',analysis=? WHERE scope=? AND id=?")
-      .run(withoutStoredEmotionStates(row.analysis),scope,row.id);
-    changes.push({index,characters});
+      .run(withoutStoredEmotionStates(row.analysis), scope, row.id);
+    changes.push({index, characters});
   }
-  removeUnsafeCheckpoints(db,scope,new Set(deletions.map(row=>row.id)));
+  removeUnsafeCheckpoints(db, scope, new Set(deletions.map(row => row.id)));
 }
 
 function removeScenePreferenceControls(db:DatabaseSync,scope:string,sourceId:string):void {

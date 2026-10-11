@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "bffb78b3165f1235b88d91034d8ae40ad815b5f91a5b69fbd32a412182bff8c4",
+  "sourceManifestSha256": "5f2cdff734d90e309dabbf978f9f779a450b005f7bf921fd0961b5516a524e74",
   "files": [
     {
       "file": ".gitattributes",
@@ -354,8 +354,8 @@
     },
     {
       "file": "shared/src/scene/backup.ts",
-      "sha256": "f50bc71569a8ce6d5b7a4dbeda702ac12d9d960bc284072e1994e42f3e8338bd",
-      "bytes": 48801
+      "sha256": "264d118f66294f4b070d491d8d8d28c3f43d2bec5b34194a3a0a31086f09dcb6",
+      "bytes": 50523
     },
     {
       "file": "shared/src/scene/calendar-store.ts",
@@ -629,12 +629,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "84c710d0f72c15327e852219b6df877d169627449ba0c53b75ead96d2191ed25",
+      "sha256": "e96a4ee4f60eeed572a0faf5b22deac9fc3f3a735b573090aac6625d7e7eed09",
       "bytes": 350715
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "103b862b339d179f11fdc19a93c08bca3f2061e069b84724671cb16e009bf112",
+      "sha256": "3398f3b6882520f4f24aa90515708783934a6c6223e95e9bbd3af1db4afd36aa",
       "bytes": 355817
     }
   ]
