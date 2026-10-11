@@ -113,7 +113,20 @@ export const recalledMark:Readonly<Record<StoryLanguage,string>>={
   zh:'被刚才的事勾起来了。',
   en:'Something just now brought it back.',
 };
-export type RenderedMemory=Omit<MemoryView,'forgottenMarker'|'emotionalReaction'|'reactivation'>&{forgotten?:string}&Partial<Record<typeof RECALLED_KEY,string>>;
+/** Localized context copy; internal recall metadata is omitted. */
+export type RenderedMemory=Omit<MemoryView,'forgottenMarker'|'emotionalReaction'|'reactivation'|'recallSameTier'>&{forgotten?:string}&Partial<Record<typeof RECALLED_KEY,string>>;
+
+/** FINAL wording for a gist with a few recalled details, in the story language. */
+export const recalledDetailSentence: Readonly<Record<StoryLanguage, string>> = {
+  zh: '大概就是这样，别的都模糊了，只有这几处还清楚。',
+  en: "That's roughly it; the rest has blurred, only these bits stayed.",
+};
+
+/** FINAL prefix for the random detail; the English trailing U+0020 is significant. */
+export const strayDetailPrefix: Readonly<Record<StoryLanguage, string>> = {
+  zh: '不知怎么还记得：',
+  en: 'Oddly, I also remember: ',
+};
 
 const blank=(value:unknown):boolean=>typeof value!=='string'||!value.trim();
 
@@ -123,11 +136,17 @@ const blank=(value:unknown):boolean=>typeof value!=='string'||!value.trim();
  * the row shows what it showed before: it carries no mark and leaves no recall seed. The remembered reaction comes
  * back with the feeling stage, so a row restored to feeling with a reaction shows something new.
  */
-export function recallShown(view:MemoryView):boolean {
-  if(view.reactivated!==true)return false;
-  if(view.access==='clear')return true;
-  if(view.access==='hidden')return false;
-  return !blank(view[view.access])||(view.access==='feeling'&&view.emotionalReaction!==undefined);
+export function recallShown(view: MemoryView): boolean {
+  if (view.reactivated !== true)
+    return false;
+  if (view.recallSameTier) {
+    return view.recallSameTier.newDetails && view.access === 'gist' && !!view.recalledDetails?.length;
+  }
+  if (view.access === 'clear')
+    return true;
+  if (view.access === 'hidden')
+    return false;
+  return !blank(view[view.access]) || (view.access === 'feeling' && view.emotionalReaction !== undefined);
 }
 
 /**
@@ -135,18 +154,27 @@ export function recallShown(view:MemoryView):boolean {
  * structured reaction is left out, and a protected reaction without feeling text gains the phrase of its first
  * reaction. The API views keep their codes and their reaction.
  */
-export function renderContextMemory(view:MemoryView,language:StoryLanguage):RenderedMemory {
-  const {forgottenMarker,emotionalReaction,reactivation:_reactivation,...rest}=view;
-  const rendered:RenderedMemory={...rest};
-  if(emotionalReaction&&blank(rendered.feeling)){
-    const phrase=reactionPhrase(language,emotionalReaction.reactions);
-    if(phrase!==undefined)rendered.feeling=phrase;
+export function renderContextMemory(view: MemoryView, language: StoryLanguage): RenderedMemory {
+  const {forgottenMarker, emotionalReaction, reactivation: _reactivation, recallSameTier: _sameTier, recalledDetails, strayDetail, ...rest} = view;
+  const rendered: RenderedMemory = {...rest};
+  if (emotionalReaction && blank(rendered.feeling)) {
+    const phrase = reactionPhrase(language, emotionalReaction.reactions);
+    if (phrase !== undefined)
+      rendered.feeling = phrase;
   }
-  if(forgottenMarker!==undefined)rendered.forgotten=forgottenMarker!=='gist_faded'?markerSentences[language][forgottenMarker]:
-    blank(rendered.feeling)?gistFadedWithoutFeeling[language]:
-    Array.isArray(view.rememberedFragments)&&view.rememberedFragments.length>0?gistFadedWithFragments[language]:
-    markerSentences[language].gist_faded;
+  if (forgottenMarker !== undefined)
+    rendered.forgotten = forgottenMarker !== 'gist_faded' ? markerSentences[language][forgottenMarker] :
+      blank(rendered.feeling) ? gistFadedWithoutFeeling[language] :
+        Array.isArray(view.rememberedFragments) && view.rememberedFragments.length > 0 ? gistFadedWithFragments[language] :
+          markerSentences[language].gist_faded;
+  if (view.access === 'gist' && recalledDetails?.length) {
+    rendered.forgotten = recalledDetailSentence[language];
+    rendered.recalledDetails = recalledDetails;
+    if (strayDetail)
+      rendered.strayDetail = strayDetailPrefix[language] + strayDetail;
+  }
   // The "just remembered" mark: in the context copy only, as its last key, and only when the recall shows something new.
-  if(recallShown(view))rendered[RECALLED_KEY]=recalledMark[language];
+  if (recallShown(view))
+    rendered[RECALLED_KEY] = recalledMark[language];
   return rendered;
 }

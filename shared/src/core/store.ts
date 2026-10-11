@@ -6,6 +6,7 @@ import { createEmotion, advanceEmotion, emotionAt, validateEmotionState } from '
 import type { EmotionState } from '../emotion/openher.ts';
 import { projectMemories } from '../memory/access.ts';
 import {retentionSnapshot} from '../memory/retention.ts';
+import {foldCue, foldedCues, TRACE_STRONG_CUES} from '../memory/trace.ts';
 import type { Scope, Access, Memory, MemorySnapshot } from '../memory/access.ts';
 import { scopeKey,text } from './types.ts';
 import type { AcceptedMessage, Analysis } from './types.ts';
@@ -264,35 +265,95 @@ export class Authority<M extends object = {}> {
   }
   private rebuild(scope: Scope) {
     const key = scopeKey(scope);
-    const row = this.db.prepare('SELECT created FROM scopes WHERE key=?').get(key) as {created:number};
-    let emotion = createEmotion(row.created,undefined,emotionIdentitySeed(scope));
+    const row = this.db.prepare('SELECT created FROM scopes WHERE key=?').get(key) as {
+      created: number;
+    };
+    let emotion = createEmotion(row.created, undefined, emotionIdentitySeed(scope));
     this.migrateControls(scope);
     this.db.prepare('DELETE FROM memories WHERE scope=?').run(key);
     this.db.prepare('DELETE FROM preferences WHERE scope=?').run(key);
     const controls = this.db.prepare('SELECT id,revision,kind,body FROM controls WHERE scope=?').all(key) as unknown as StoredControl[];
     const preferences = new Map<string, Preference>();
-    const sources=this.sources(scope),currentUserId=sources.filter(source=>source.status==='committed'&&source.role==='user').at(-1)?.id;
+    const sources = this.sources(scope), currentUserId = sources.filter(source => source.status === 'committed' && source.role === 'user').at(-1)?.id;
+    // Fold each committed source once. Assistant replies share the preceding committed user's turn.
+    const committed = sources.filter(source => source.status === 'committed');
+    const foldedSources = new Map(committed.map(source => [source.id, foldCue(source.text)]));
+    const turnKeys = new Map<string, string>();
+    let precedingUser: string | undefined;
+    for (const source of committed) {
+      if (source.role === 'user')
+        precedingUser = source.id;
+      turnKeys.set(source.id, source.role === 'assistant' ? precedingUser ?? source.id : source.id);
+    }
     for (const source of sources) {
-      if (source.status !== 'committed' || !source.payload) continue;
+      if (source.status !== 'committed' || !source.payload)
+        continue;
       const payload = JSON.parse(source.payload) as Analysis;
-      const accesses=memoryAccesses(source.id,source.revision,payload.memories,controls);
+      const accesses = memoryAccesses(source.id, source.revision, payload.memories, controls);
       for (const [i, candidate] of payload.memories.entries()) {
         const id = `${source.id}#${i}`;
-        const accessOverride=controls.some(control=>control.kind==='access'&&
-          ((control.id===memoryControlId(source.id,candidate)&&control.revision===0)||(control.id===id&&control.revision===source.revision)));
-        const rehearsed=candidate.retention?.cues.length?this.sources(scope).filter(later=>later.status==='committed'&&later.acceptedAtMs>source.acceptedAtMs&&
-          candidate.retention!.cues.some(cue=>later.text.includes(cue))).at(-1):undefined;
-        const memory: Memory = { ...candidate, id, scope, status: 'accepted', access: accesses[i],accessOverride,retentionAtMs:rehearsed?.acceptedAtMs??source.acceptedAtMs,
-          source: { messageId: source.id, revision: source.revision, occurredAtMs: source.acceptedAtMs, knownAtMs: Math.max(source.acceptedAtMs, source.observedAtMs) } };
+        const accessOverride = controls.some(
+          control => control.kind === 'access' &&
+            ((control.id === memoryControlId(source.id, candidate) && control.revision === 0) || (control.id === id && control.revision === source.revision))
+        );
+        const cues = foldedCues(candidate.retention?.cues ?? []);
+        let retentionAtMs = source.acceptedAtMs;
+        let gistAtMs: number | undefined;
+        const turns = new Set<string>();
+        // For fixed candidate cues the scan is linear in committed text size; cue folding is outside this scan.
+        if (cues.length)
+          for (const later of committed) {
+            if (later.acceptedAtMs <= source.acceptedAtMs)
+              continue;
+            const found = cues.filter(cue => foldedSources.get(later.id)!.includes(cue));
+            const count = found.filter(cue => !found.some(other => other !== cue && other.includes(cue))).length;
+            if (!count)
+              continue;
+            if (count >= TRACE_STRONG_CUES)
+              retentionAtMs = later.acceptedAtMs;
+            else
+              gistAtMs = later.acceptedAtMs;
+            const turn = turnKeys.get(later.id)!;
+            if (turn !== turnKeys.get(source.id))
+              turns.add(turn);
+          }
+        const memory: Memory = {
+          ...candidate,
+          id,
+          scope,
+          status: 'accepted',
+          access: accesses[i],
+          accessOverride,
+          retentionAtMs,
+          ...(gistAtMs !== undefined && gistAtMs > retentionAtMs ? {gistRetentionAtMs: gistAtMs} : {}),
+          ...(turns.size ? {rehearsalSources: turns.size} : {}),
+          source: {
+            messageId: source.id,
+            revision: source.revision,
+            occurredAtMs: source.acceptedAtMs,
+            knownAtMs: Math.max(source.acceptedAtMs, source.observedAtMs)
+          }
+        };
         this.db.prepare('INSERT INTO memories VALUES(?,?,?,?,?)').run(key, id, source.id, source.revision, JSON.stringify(memory));
       }
-      const overrides=preferenceOverrides(source.id,source.revision,payload.preferences,controls);
+      const overrides = preferenceOverrides(source.id, source.revision, payload.preferences, controls);
       for (const [i, candidate] of payload.preferences.entries()) {
-        if(candidate.duration==='turn'&&source.id!==currentUserId)continue;
+        if (candidate.duration === 'turn' && source.id !== currentUserId)
+          continue;
         const id = `${source.id}:preference:${i}`;
-        const override=overrides[i]??{};
-        preferences.set(candidate.category, { ...candidate, id, sourceId: source.id, revision: source.revision,
-          enabled: override.enabled ?? true, text: override.text ?? candidate.text, corrected: typeof override.text === 'string' });
+        const override = overrides[i] ?? {};
+        preferences.set(
+          candidate.category,
+          {
+            ...candidate,
+            id,
+            sourceId: source.id,
+            revision: source.revision,
+            enabled: override.enabled ?? true,
+            text: override.text ?? candidate.text,
+            corrected: typeof override.text === 'string'
+          }
+        );
       }
       // Only recorded accepted deltas are replayed; reads and model upgrades do not reinterpret history.
       emotion = advanceEmotion(emotion, payload.emotion, source.acceptedAtMs);

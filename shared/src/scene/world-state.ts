@@ -2,8 +2,29 @@ import {foldForMatch,includesForMatch,scriptQuoteSearch,sourceQuote} from '../co
 import { calculate } from '../core/arithmetic.ts';
 import type { PerspectivePlan } from './types.ts';
 import {legacyTemporalGuard} from './time-expressions.ts';
-import {hasLedgerData, prepareLedgerSources, prepareLedgerOptions, foldLedgerWorld, foldLedgerPrefix, legacyLedgerKey, markLedgerCorrections, projectLedger,
-  type LedgerFoldBridge, type LedgerLegacyHooks, type LedgerLegacyResult, type LedgerWork, type LedgerFoldOptions, type StoredLedger, type LedgerMarks, type LedgerFold, type LedgerProjection, type LedgerDetail} from './world-ledger.ts';
+import {
+  createSourceHoleLedger,
+  isSourceHoleLedger,
+  hasLedgerData,
+  ledgerSourceLayout,
+  prepareLedgerSources,
+  prepareLedgerOptions,
+  foldLedgerWorld,
+  foldLedgerPrefix,
+  legacyLedgerKey,
+  markLedgerCorrections,
+  projectLedger,
+  type LedgerFoldBridge,
+  type LedgerLegacyHooks,
+  type LedgerLegacyResult,
+  type LedgerWork,
+  type LedgerFoldOptions,
+  type StoredLedger,
+  type LedgerMarks,
+  type LedgerFold,
+  type LedgerProjection,
+  type LedgerDetail,
+} from './world-ledger.ts';
 
 export const WORLD_PLAYER_ID = 'player' as const;
 
@@ -257,6 +278,22 @@ export function foldWorldState(
     }
     return result;
   }
+  const layout = Array.isArray(sources) ? ledgerSourceLayout(sources) : null;
+  const holes = layout ? layout.length - layout.positions.length : 0;
+  if (layout && holes > 0) {
+    // Fold only present sources in their original order, without preparing or merging legacy data.
+    // Enumerating positions costs O(own properties + P log P), independent of missing positions.
+    // Prepared prefixes already contain dense records; their layout still holds original positions.
+    const presentSources = layout.positions.length === sources.length
+      ? [...sources]
+      : layout.positions.map(position => sources[position]!);
+    const result = foldWorldState(settings, presentSources, options);
+    return {
+      ...result,
+      ledger: createSourceHoleLedger(holes),
+    };
+  }
+
   const issues: WorldIssue[] = [];
   const uniqueSources = uniqueSourceRevisions(sources, issues);
   const validSources: WorldSourceEffects[] = [];
@@ -302,6 +339,53 @@ export interface WorldRunningStep {
   issue: string | null;
 }
 
+/** Canonical non-negative array index text; matching costs O(property length). */
+const RUNNING_INDEX_PATTERN = /^(0|[1-9][0-9]*)$/;
+
+/** Preserve original running positions without allocating one result per missing source.
+ * Construction is O(P); an indexed read resolves its preceding checkpoint in O(log P).
+ * Holes carry the invalid-source issue and inherit the preceding time, but generate no work. */
+function sparseRunningSteps(
+  steps: readonly WorldRunningStep[],
+  positions: readonly number[],
+  length: number,
+  initialTimeMs: number,
+): WorldRunningStep[] {
+  const output: WorldRunningStep[] = [];
+  output.length = length;
+  const firstMissing = positions.findIndex((position, index) => position !== index);
+  const firstHole = firstMissing >= 0 ? firstMissing : positions.length;
+  const firstConflict = steps.findIndex(step => step.issue === 'duplicate_source_conflict');
+  const conflictBeforeHoles = firstConflict >= 0 && positions[firstConflict]! < firstHole;
+  return new Proxy(output, {
+    has(target, property) {
+      if (typeof property === 'string' && RUNNING_INDEX_PATTERN.test(property) && Number(property) < length)
+        return true;
+      return Reflect.has(target, property);
+    },
+    get(target, property, receiver) {
+      if (typeof property !== 'string' || !RUNNING_INDEX_PATTERN.test(property) || Number(property) >= length)
+        return Reflect.get(target, property, receiver);
+      const position = Number(property);
+      let lower = 0;
+      let upper = positions.length;
+      while (lower < upper) {
+        const middle = Math.floor((lower + upper) / 2);
+        if (positions[middle]! <= position)
+          lower = middle + 1;
+        else
+          upper = middle;
+      }
+      const checkpoint = lower > 0 ? steps[lower - 1] : undefined;
+      const holesBefore = position + 1 > lower;
+      return {
+        timeMs: checkpoint?.timeMs ?? initialTimeMs,
+        issue: holesBefore && !conflictBeforeHoles ? 'invalid_world_source' : checkpoint?.issue ?? null,
+      };
+    },
+  });
+}
+
 /**
  * The legacy time and the first issue code of foldWorldState(settings, sources.slice(0, i + 1)) for every i, as one
  * array aligned with `sources`. A story world whose list repeats no source revision is folded in one pass, at the
@@ -313,7 +397,8 @@ export interface WorldRunningStep {
  */
 export function foldWorldStateRunning(settings: WorldSettings, sources: readonly WorldSourceEffects[], options: LedgerFoldOptions = {}, runningWork?: LedgerWork): WorldRunningStep[] {
   const validated = validateSettings(settings);
-  if (hasLedgerData(sources, options)) {
+  // Non-array inputs retain the legacy iterable handling and its exact exceptions.
+  if (Array.isArray(sources) && hasLedgerData(sources, options)) {
     options = prepareLedgerOptions(options,settings.mode==='companion');
     const prepared = prepareLedgerSources(sources), validSources: WorldSourceEffects[] = [];
     const fingerprints = new Map<string, string>(), rawIssues: (string | null)[] = [], validationIssues: (string | null)[] = [];
@@ -331,13 +416,29 @@ export function foldWorldStateRunning(settings: WorldSettings, sources: readonly
     }
     // Conflicting revisions retroactively remove the first occurrence and its
     // dependent state. The incremental path applies to nonconflicting sequences.
-    if (conflict) return sources.map((_source, index) => {
-      const prefix = foldLedgerPrefix(settings, sources, index + 1, options, foldWorldState);
-      return prefix.ok ? {timeMs: prefix.value.state.timeMs, issue: prefix.value.issues[0]?.code ?? null} : {timeMs: settings.startTimeMs, issue: null};
-    });
+    if (conflict) {
+      const layout = ledgerSourceLayout(prepared);
+      const checkpoints = prepared.map((_source, index) => {
+        const prefix = foldLedgerPrefix(
+          settings,
+          prepared,
+          layout.positions[index]! + 1,
+          options,
+          foldWorldState,
+        );
+        return prefix.ok
+          ? {timeMs: prefix.value.state.timeMs, issue: prefix.value.issues[0]?.code ?? null}
+          : {timeMs: settings.startTimeMs, issue: null};
+      });
+      return layout.length === prepared.length
+        ? checkpoints
+        : sparseRunningSteps(checkpoints, layout.positions, layout.length, settings.startTimeMs);
+    }
     const steps: WorldRunningStep[] = [], valid = new Set(validSources);
+    const layout = ledgerSourceLayout(prepared);
     let firstRaw: string | null = null, firstValidation: string | null = null;
     let companionTime = Math.max(settings.startTimeMs, isTime(options.nowMs) ? options.nowMs : 0, isTime(options.monotonicFloorMs) ? options.monotonicFloorMs : 0);
+    const initialRunningTimeMs = settings.mode === 'companion' ? companionTime : settings.startTimeMs;
     const folded = foldLedgerWorld(settings, prepared, options, {
       initial: cloneState(validated.initial), validSources, issues: [],
       serialize: state => serializeState(settings, state),
@@ -362,10 +463,13 @@ export function foldWorldStateRunning(settings: WorldSettings, sources: readonly
       },
     });
     if (runningWork && folded.ledger) Object.assign(runningWork, folded.ledger.work);
-    return steps;
+    return layout.length === prepared.length
+      ? steps
+      : sparseRunningSteps(steps, layout.positions, layout.length, initialRunningTimeMs);
   }
   const perPrefix = (): WorldRunningStep[] => sources.map((_source, index) => {
-    const folded = foldWorldState(settings, sources.slice(0, index + 1));
+    // Running views retain legacy invalid-source issue precedence, including missing source positions.
+    const folded = foldWorldState(settings, Array.from(sources.slice(0, index + 1)));
     return {timeMs: folded.state.timeMs, issue: folded.issues[0]?.code ?? null};
   });
   if (settings.mode !== 'story') return perPrefix();
@@ -405,7 +509,9 @@ export function projectWorldState(result: WorldFoldResult, readerId: string): Wo
   const known = readerId === WORLD_PLAYER_ID
     || result.state.actorIds.includes(readerId);
   if (!known) throw new Error('invalid_world_reader');
-  const ledgerView = result?.ledger ? projectLedger(result.ledger, readerId) : null;
+  // A diagnostic about missing sources does not create a reader's ledger or account view.
+  const diagnosticOnly = isSourceHoleLedger(result?.ledger);
+  const ledgerView = result?.ledger && !diagnosticOnly ? projectLedger(result.ledger, readerId) : null;
   return {
     mode: result.state.mode,
     ...((readerId === WORLD_PLAYER_ID || result.state.publicTime) ? { timeMs: result.state.timeMs } : {}),

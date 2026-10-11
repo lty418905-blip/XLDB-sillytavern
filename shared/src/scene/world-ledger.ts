@@ -7,7 +7,9 @@ import type {WorldSettings, WorldSourceEffects, WorldFoldResult, WorldIssue, Wor
 
 /** Bounds for persisted records and pairwise work; source prose has no length limit. */
 export const LEDGER_LIMITS = Object.freeze({entries:64, unbooked:64, accounts:256, rows:256, aliases:8,
-  labelCodePoints:40, history:4096, events:16384, jsonNodes:262144, jsonDepth:80, refLength:256, moneyDigits:18});
+  labelCodePoints:40, history:4096, events:16384, jsonNodes:262144, jsonDepth:80, refLength:256, moneyDigits:18,
+  // Provisional per-result diagnostic budget; the final slot counts omitted rows.
+  diagnostics:1024});
 export type LedgerSpan = {start:number; end:number};
 export type LedgerRegion = {span:LedgerSpan} | {whole:true};
 export type LedgerMark = LedgerRegion & {id:string; kind:'money'|'use'};
@@ -109,7 +111,14 @@ export interface LedgerCorrection {
 }
 export interface LedgerFoldOptions {accountEvents?:readonly LedgerAccountEvent[]; corrections?:readonly LedgerCorrection[]; nowMs?:number; monotonicFloorMs?:number}
 export interface LedgerWork {jsonNodes:number; text:number; scans:number; entries:number; pairs:number; events:number; sourceVisits:number; rowCopies:number; purchaseVisits?:number; correctionVisits?:number; positionVisits?:number}
-export interface LedgerDiagnostic {code:string; id:string|null; index?:number; reason?:string}
+/** A diagnostic identifies a rejected row; a truncation summary also counts omitted diagnostics. */
+export interface LedgerDiagnostic {
+  code:string;
+  id:string|null;
+  index?:number;
+  reason?:string;
+  omitted?:number;
+}
 export interface LedgerAccount extends Omit<LedgerAccountDefinition,'rows'|'items'> {
   rows:{unit:string;value:string;tracked:boolean;readerIds:string[]}[];
   items:{item:string;count:number;readerIds:string[]}[];
@@ -119,6 +128,8 @@ export interface LedgerDetail extends StoredLedgerEntry {
   codes:string[]; readerIds:string[]; due:string|null; unitPrice:string|null;
   unaffordable:{variant:'self'|'account'|'other'|'user';shortfallCents:string|null;shortfallQuantity:number|null}|null;
   candidates:string[]; causedByCorrection:boolean;
+  /** Derived observation permissions for each raw quote; absent metadata discloses no raw quote to characters. */
+  quoteReaderIds?:{payer:string[];payee:string[];receiver:string[];item:string[]};
 }
 export type LedgerUnbookedDetail = LedgerUnbooked & {readerIds:string[];laterSources:number;dismissed:boolean;layer:'outer'|'inner'};
 export interface LedgerFold {
@@ -273,10 +284,18 @@ function partyOK(v:unknown):v is LedgerParty {
   if('external'in v)return quoteOK(v.external);
   return record(v.unconfigured)&&['private','organisation','shared'].includes(v.unconfigured.kind as string)&&quoteOK(v.unconfigured.label);
 }
-function keyOK(v:unknown):v is LedgerKey {
-  if(typeof v==='string')return v.length>5&&(v.startsWith('user:')||v.startsWith('legacy:'));
-  return Array.isArray(v)&&v.length===ARRAY_KEY_LENGTH&&textId(v[0])&&safeInt(v[1],1)&&KINDS.includes(v[2])
-    &&[3,4,5,7].every(i=>typeof v[i]==='string')&&(v[6]===null||Array.isArray(v[6])&&v[6].length===2&&spanOK({start:v[6][0],end:v[6][1]}))&&safeInt(v[8],1);
+
+function keyOK(decodedObject: unknown): decodedObject is LedgerKey {
+    if (typeof decodedObject === 'string')
+        return decodedObject.length > 5 && decodedObject.length <= LEDGER_LIMITS.refLength &&
+            (decodedObject.startsWith('user:') || decodedObject.startsWith('legacy:'));
+    return Array.isArray(decodedObject) && decodedObject.length === ARRAY_KEY_LENGTH &&
+        textId(decodedObject[0]) && safeInt(decodedObject[1], 1) && KINDS.includes(decodedObject[2])
+        && [3, 4, 5, 7].every(i => typeof decodedObject[i] === 'string' &&
+            decodedObject[i].length <= LEDGER_LIMITS.refLength) && (decodedObject[6] === null ||
+        Array.isArray(decodedObject[6]) && decodedObject[6].length === 2 && spanOK({
+            start: decodedObject[6][0], end: decodedObject[6][1]
+        })) && safeInt(decodedObject[8], 1);
 }
 function proofOK(v:unknown):boolean {
   return v===null||record(v)&&record(v.tree)&&Array.isArray(v.leaves)&&v.leaves.length<=1023&&typeof v.value==='string'
@@ -290,28 +309,82 @@ function moneyOK(v:unknown):v is LedgerMoney {
   return v===null||record(v)&&centsOK(v.cents)&&unitOK(v.unit)&&typeof v.approx==='boolean'&&typeof v.exact==='boolean'&&proofOK(v.proof)
     &&(v.range===null||record(v.range)&&(v.range.min===null||centsOK(v.range.min))&&(v.range.max===null||centsOK(v.range.max)));
 }
-function storedEntryOK(v:unknown):v is StoredLedgerEntry {
-  if(record(v)){omitNull(v,['externalQuotes']);if(record(v.checks)){omitNull(v.checks,['unanswered']);if(record(v.checks.history))omitNull(v.checks.history,['accountQuestioned']);}}
-  if(!sourceOK(v)||!record(v)||!keyOK(v.key)||!record(v.mark)||typeof v.mark.id!=='string'||!['money','use'].includes(v.mark.kind as string)||!regionOK(v.mark)
-    ||!(KINDS.includes(v.kind as string)||v.kind==='adjustment'&&v.origin==='user')||!STATUSES.includes(v.status as string)||!TIMES.includes(v.time as string)
-    ||!record(v.actor)||!(v.actor.id===null||typeof v.actor.id==='string')||!['name','self','speaker','addressee'].includes(v.actor.basis as string)
-    ||!(v.actor.span===null||spanOK(v.actor.span))||!(v.act===null||spanOK(v.act))
-    ||![v.payer,v.payee,v.receiver].every(p=>p===null||partyOK(p))||!['model','user'].includes(v.origin as string))return false;
-  if(v.behalf!==null&&(!record(v.behalf)||!partyOK(v.behalf.party)||!(v.behalf.span===null||spanOK(v.behalf.span))||typeof v.behalf.located!=='boolean'))return false;
-  if(v.item!==null&&(!sourceOK(v.item)||!quoteOK(v.item)))return false;
-  if(v.quantity!==null&&(!record(v.quantity)||!safeInt(v.quantity.count,1)||typeof v.quantity.approx!=='boolean'||!proofOK(v.quantity.proof)
-    ||!(v.quantity.ref===null||typeof v.quantity.ref==='string')))return false;
-  if(![v.amount,v.stated,v.tendered].every(moneyOK)||!(v.row===null||textId(v.row))||!(v.unitPrice===null||centsOK(v.unitPrice)))return false;
-  if(v.relation!==null&&(!record(v.relation)||!RELATIONS.includes(v.relation.kind as string)||!(v.relation.target===null||keyOK(v.relation.target))||!(v.relation.span===null||spanOK(v.relation.span))))return false;
-  if(v.externalQuotes!==undefined&&(!record(v.externalQuotes)||!Object.entries(v.externalQuotes).every(([key,quote])=>['payer','payee','receiver'].includes(key)&&quote!==null&&quoteOK(quote))))return false;
-  const c=v.checks;
-  return Array.isArray(v.doubts)&&v.doubts.length<=DOUBTS.length&&v.doubts.every(d=>DOUBTS.includes(d))
-    &&record(c)&&stringList(c.codes,128)&&Array.isArray(c.pending)&&c.pending.every(p=>CATEGORIES.includes(p))&&stringList(c.returned,128)
-    &&(c.unanswered===undefined||stringList(c.unanswered,6)&&c.unanswered.every(code=>SEMANTIC_QUESTIONS.includes(code)))
-    &&typeof c.actorGrounded==='boolean'&&typeof c.explicitParty==='boolean'&&record(c.first)
-    &&(c.first.amount===null||centsOK(c.first.amount))&&(c.first.quantity===null||safeInt(c.first.quantity,1))&&typeof c.first.payer==='string'&&STATUSES.includes(c.first.status as string)
-    &&record(c.history)&&Array.isArray(c.history.behalf)&&c.history.behalf.length<=64&&c.history.behalf.every(partyOK)
-    &&typeof c.history.accountDoubts==='boolean'&&(c.history.accountQuestioned===undefined||typeof c.history.accountQuestioned==='boolean')&&Array.isArray(c.history.accountConfirm)&&c.history.accountConfirm.every(x=>['a','b','c'].includes(x));
+
+function storedEntryOK(decodedObject: unknown): decodedObject is StoredLedgerEntry {
+    if (record(decodedObject)) {
+        omitNull(decodedObject, ['externalQuotes']);
+        if (record(decodedObject.externalQuotes))
+            omitNull(decodedObject.externalQuotes, ['payer', 'payee', 'receiver']);
+        if (record(decodedObject.checks)) {
+            omitNull(decodedObject.checks, ['unanswered']);
+            if (record(decodedObject.checks.history))
+                omitNull(decodedObject.checks.history, ['accountQuestioned']);
+        }
+    }
+    if (!sourceOK(decodedObject) || !record(decodedObject) || !keyOK(decodedObject.key) ||
+        !record(decodedObject.mark) || typeof decodedObject.mark.id !== 'string' ||
+        decodedObject.mark.id.length > LEDGER_LIMITS.refLength || !['money',
+        'use'].includes(decodedObject.mark.kind as string) || !regionOK(decodedObject.mark)
+        || !(KINDS.includes(decodedObject.kind as string) || decodedObject.kind === 'adjustment' &&
+            decodedObject.origin === 'user') || !STATUSES.includes(decodedObject.status as string) ||
+        !TIMES.includes(decodedObject.time as string)
+        || !record(decodedObject.actor) || !(decodedObject.actor.id === null ||
+        typeof decodedObject.actor.id === 'string' &&
+            decodedObject.actor.id.length <= LEDGER_LIMITS.refLength) || !['name', 'self', 'speaker',
+        'addressee'].includes(decodedObject.actor.basis as string)
+        || !(decodedObject.actor.span === null || spanOK(decodedObject.actor.span)) ||
+        !(decodedObject.act === null || spanOK(decodedObject.act))
+        || ![decodedObject.payer, decodedObject.payee,
+            decodedObject.receiver].every(proposedEntry => proposedEntry === null ||
+            partyOK(proposedEntry)) || !['model', 'user'].includes(decodedObject.origin as string))
+        return false;
+    if (decodedObject.behalf !== null && (!record(decodedObject.behalf) ||
+        !partyOK(decodedObject.behalf.party) || !(decodedObject.behalf.span === null ||
+        spanOK(decodedObject.behalf.span)) || typeof decodedObject.behalf.located !== 'boolean'))
+        return false;
+    if (decodedObject.item !== null && (!sourceOK(decodedObject.item) || !quoteOK(decodedObject.item)))
+        return false;
+    if (decodedObject.quantity !== null && (!record(decodedObject.quantity) ||
+        !safeInt(decodedObject.quantity.count, 1) || typeof decodedObject.quantity.approx !== 'boolean' ||
+        !proofOK(decodedObject.quantity.proof)
+        || !(decodedObject.quantity.ref === null || typeof decodedObject.quantity.ref === 'string')))
+        return false;
+    if (![decodedObject.amount, decodedObject.stated, decodedObject.tendered].every(moneyOK) ||
+        !(decodedObject.row === null || textId(decodedObject.row)) || !(decodedObject.unitPrice === null ||
+        centsOK(decodedObject.unitPrice)))
+        return false;
+    if (decodedObject.relation !== null && (!record(decodedObject.relation) ||
+        !RELATIONS.includes(decodedObject.relation.kind as string) ||
+        !(decodedObject.relation.target === null || keyOK(decodedObject.relation.target)) ||
+        !(decodedObject.relation.span === null || spanOK(decodedObject.relation.span))))
+        return false;
+    if (decodedObject.externalQuotes !== undefined && (!record(decodedObject.externalQuotes) ||
+        !Object.entries(decodedObject.externalQuotes).every(([key, quote]) => ['payer', 'payee',
+            'receiver'].includes(key) && quote !== null && quoteOK(quote))))
+        return false;
+    const storedChecks = decodedObject.checks;
+    return Array.isArray(decodedObject.doubts) && decodedObject.doubts.length <= DOUBTS.length &&
+        decodedObject.doubts.every(decodedValue => DOUBTS.includes(decodedValue))
+        && record(storedChecks) && stringList(storedChecks.codes, 128) &&
+        Array.isArray(storedChecks.pending) &&
+        storedChecks.pending.every(category => CATEGORIES.includes(category)) &&
+        stringList(storedChecks.returned, 128)
+        && (storedChecks.unanswered === undefined || stringList(storedChecks.unanswered, 6) &&
+            storedChecks.unanswered.every(code => SEMANTIC_QUESTIONS.includes(code)))
+        && typeof storedChecks.actorGrounded === 'boolean' &&
+        typeof storedChecks.explicitParty === 'boolean' && record(storedChecks.first)
+        && (storedChecks.first.amount === null || centsOK(storedChecks.first.amount)) &&
+        (storedChecks.first.quantity === null || safeInt(storedChecks.first.quantity, 1)) &&
+        typeof storedChecks.first.payer === 'string' &&
+        storedChecks.first.payer.length <= LEDGER_LIMITS.refLength &&
+        STATUSES.includes(storedChecks.first.status as string)
+        && record(storedChecks.history) && Array.isArray(storedChecks.history.behalf) &&
+        storedChecks.history.behalf.length <= 64 && storedChecks.history.behalf.every(partyOK)
+        && typeof storedChecks.history.accountDoubts === 'boolean' &&
+        (storedChecks.history.accountQuestioned === undefined ||
+            typeof storedChecks.history.accountQuestioned === 'boolean') &&
+        Array.isArray(storedChecks.history.accountConfirm) &&
+        storedChecks.history.accountConfirm.every(candidate => ['a', 'b', 'c'].includes(candidate));
 }
 function unbookedOK(v:unknown):v is LedgerUnbooked {
   if(record(v))omitNull(v,['mark']);
@@ -393,9 +466,14 @@ export function decodeLedgerCorrection(raw:unknown):LedgerDecoded<LedgerCorrecti
     &&(v.action==='adjustment'?v.values!==undefined&&(v.values as LedgerUserValues).kind==='adjustment'&&v.after!==undefined:true);
   },'ledger_correction_invalid');
 }
+
 /** Stable JSON for storage; failed validation is an explicit value, never a thrown exception. */
-export function serializeLedger(raw:unknown):LedgerDecoded<string> {
-  const decoded=decodeLedger(raw);return decoded.ok?{ok:true,value:JSON.stringify(decoded.value)}:decoded;
+export function serializeLedger(raw: unknown): LedgerDecoded<string> {
+    const decoded = decodeLedger(raw);
+    // Decode inserts missing nullable fields, so key sorting must happen afterward.
+    return decoded.ok ? {
+        ok: true, value: JSON.stringify(asJSON(decoded.value))
+    } : decoded;
 }
 
 function locate(text:string,quote:string|null,w:LedgerWork,region?:LedgerRegion,used:readonly LedgerSpan[]=[]):LedgerQuote|null {
@@ -556,7 +634,15 @@ export interface LedgerProposalContext {
   source:LedgerText; previous:LedgerText[]; marks:LedgerMark[]; readings:LedgerReadings; calculations:CalculationExecution;
   settings:WorldSettings; accounts:LedgerAccount[]; before:LedgerFold|null; state?:LedgerProposalState; entryRefs?:Record<string,LedgerKey>;keptEntries?:StoredLedgerEntry[];
 }
-export interface LedgerCheckedEntry {id:string;verdict:'returned'|'settled'|'flagged'|'accepted';codes:string[];read:Record<string,JsonValue>;entry:StoredLedgerEntry}
+/** One checked entry; returnedCodes contains only questions newly returned by this call, in order. */
+export interface LedgerCheckedEntry {
+  id:string;
+  verdict:'returned'|'settled'|'flagged'|'accepted';
+  codes:string[];
+  returnedCodes:string[];
+  read:Record<string,JsonValue>;
+  entry:StoredLedgerEntry;
+}
 export interface LedgerProposalState {
   history:{id:string;mark:string;act:LedgerSpan|null;checks:LedgerChecks}[];
   returned:Record<string,string[]>; previous:{id:string;verdict:LedgerCheckedEntry['verdict'];entry:StoredLedgerEntry}[];
@@ -663,70 +749,249 @@ function availableCandidates(e:StoredLedgerEntry,accounts:readonly LedgerAccount
   for(const p of e.checks.history.behalf){const id=partyAccount(p);if(id&&accounts.some(a=>a.id===id))ids.add(id);}
   if(other)ids.add('other');return [...ids];
 }
-function staticEntry(p:NormalizedLedgerProposedEntry,c:LedgerProposalContext,used:Map<string,LedgerSpan[]>,texts:Map<string,LedgerText>,values:ReferenceValues,
-  scans:Map<string,{quantities:QuantityExpression[];numbers:LedgerSpan[]}>,outside:string,w:LedgerWork):{entry:StoredLedgerEntry;returns:string[]} {
-  const mark=c.marks.find(m=>m.id===p.mark)??{id:'k0',kind:'money' as const,whole:true as const};
-  const e=fallbackEntry(c.source,mark),s=e.checks,returns:string[]=[];
-  const flag=(code:string)=>addCode(s.codes,code),ret=(code:string,category?:LedgerCategory)=>{flag(code);addCode(returns,code);if(category)pending(s,category);};
-  e.kind=p.kind;e.status=p.status;e.time=p.time;e.doubts=[...new Set(p.doubts)];for(const d of e.doubts)flag(d);
-  if(mark.id==='k0')ret('unknown_mark');
-  const occupied=used.get(p.mark)??[],markedAct=locate(c.source.text,p.act?.quote??null,w,mark,occupied),presentMarkedAct=markedAct??locate(c.source.text,p.act?.quote??null,w,mark),act=presentMarkedAct??locate(c.source.text,p.act?.quote??null,w);
-  if(act){e.act=act.span;occupied.push(act.span);used.set(p.mark,occupied);}
-  if(p.status==='settled'&&!presentMarkedAct){ret('act_quote_not_found','not_transacted');if(!act)flag('no_transaction_act');}
-  const actorQuote=locate(c.source.text,p.actor.quote,w);e.actor={id:p.actor.id,basis:p.actor.basis,span:actorQuote?.span??null};
-  const labels=knownActorLabels(c.settings,p.actor.id);
-  if(!labels.length)e.actor.id=null;
-  s.actorGrounded=labels.length>0&&(p.actor.basis==='name'?!!actorQuote&&labels.some(n=>foldForMatch(n)===foldForMatch(actorQuote.quote)):
-    p.actor.id==='player'&&(p.actor.basis==='self'?c.source.role==='user'&&!!actorQuote&&actorQuote.quote.includes('我'):
-      p.actor.basis==='speaker'?c.source.role==='user'&&p.actor.quote===null:c.source.role==='assistant'&&!!actorQuote&&['你','妳','您'].includes(actorQuote.quote)));
-  e.payer=resolveParty(p.payer,c.source.text,w);e.payee=resolveParty(p.payee,c.source.text,w);e.receiver=p.receiver==null?e.payer:resolveParty(p.receiver,c.source.text,w);
-  if(p.behalf){const q=locate(c.source.text,p.behalf.quote,w);e.behalf={party:resolveParty(p.behalf.party,c.source.text,w)!,span:q?.span??null,located:q!==null};
-    if(!q){ret('behalf_quote_not_found');flag('agency_unverified');}}
-  s.explicitParty=[e.payer,e.payee,e.receiver].some(x=>partyExplicit(x,e,c,w));
-  if(!s.actorGrounded){ret('actor_not_grounded');if(act&&s.explicitParty)flag('owner_weak');else{pending(s,'not_transacted');flag('owner_not_grounded');}}
-  if(act&&questionAct(c.source.text,act.span,w)){flag('act_in_question');if(c.source.role==='assistant'){ret('act_in_question','not_transacted');flag('question_sentence');}}
-  if(actorQuote&&!locate(outside,p.actor.quote,w))flag('actor_in_quote');
-  if(p.item){const body=[c.source,...c.previous].find(x=>x.sourceId===p.item!.in);const q=body?locate(body.text,p.item.quote,w):null;
-    if(body&&q)e.item={sourceId:body.sourceId,revision:body.revision,...q};else{ret('item_quote_not_found');flag('item_unverified');}}
-  const qtyResult=p.quantity&&p.quantity!=='one'?resolveNumber(p.quantity,c.readings,values,c.calculations,texts,'quantity',w):null;
-  const qty=p.quantity==='one'?{count:1,approx:false,proof:null,ref:'one'}:qtyResult?.quantity??null;
-  if(p.quantity!==null){e.quantity=qty??{count:1,approx:false,proof:null,ref:p.quantity};if(!qty){ret(qtyResult?.code??'quantity_unreadable');flag('quantity_assumed_one');}}
-  if(e.quantity?.approx)flag('quantity_approximate');
-  const resolved:ResolvedNumber[]=[];
-  for(const field of ['amount','stated','tendered'] as const)if(p[field]!==null){const n=resolveNumber(p[field]!,c.readings,values,c.calculations,texts,'money',w);resolved.push(n);e[field]=n.money;
-    if(n.code){ret(n.code,'general');flag('amount_unreadable');}}
-  for(const r of resolved)for(const leaf of r.leaves) {
-    if(leaf.reading!==null&&leaf.reading!==1)flag('reading_ambiguous');
-    if(leaf.kind!=='amount'||!leaf.source||!leaf.span)continue;
-    const body=texts.get(identity(leaf.source))!;
-    if(e.item&&identity(e.item)===identity(leaf.source)&&leaf.span.end<=e.item.span.start&&foldForMatch(body.text.slice(leaf.span.start,leaf.span.end)).endsWith('块')
-      &&[...body.text.slice(leaf.span.end,e.item.span.start)].every(ch=>WS.test(ch)))flag('kuai_before_item');
-  }
-  const amount=moneyOf(e);
-  if(amount?.approx)flag('amount_approximate');if([e.amount,e.stated,e.tendered].some(a=>a&&!a.exact))flag('rounded');
-  if(e.amount&&e.stated&&e.amount.cents!==e.stated.cents)flag('stated_differs');
-  if(amount&&amount.proof?.leaves.filter(l=>['amount','entry_amount','balance'].includes(l.kind)).every(l=>l.kind==='amount'&&record(l.value)&&l.value.unit===null))flag('no_unit_word');
-  if(p.status!=='settled'){flag('not_settled');pending(s,'not_transacted');}if(p.time!=='current'){flag('non_current');pending(s,'not_transacted');}
-  if(!shapeParties(e))ret('party_shape','general');
-  e.row=p.row;
-  if(p.relation)e.relation={kind:p.relation.kind,target:null,span:locate(c.source.text,p.relation.quote??null,w)?.span??null};
-  const matching=c.state?.history.filter(h=>h.id===p.id||h.mark===p.mark&&h.act!==null&&e.act!==null&&overlaps(h.act,e.act))??[];
-  for(const h of matching){for(const b of h.checks.history.behalf)if(!s.history.behalf.some(x=>partyKey(x)===partyKey(b)))s.history.behalf.push(b);
-    s.history.accountDoubts ||= h.checks.history.accountDoubts;
-    if(h.checks.history.accountQuestioned||h.checks.returned.some(code=>code==='actor_not_authorised'||code==='payer_account_confirm'))s.history.accountQuestioned=true;
-    for(const x of h.checks.history.accountConfirm)if(!s.history.accountConfirm.includes(x))s.history.accountConfirm.push(x);}
-  if(e.behalf&&!s.history.behalf.some(x=>partyKey(x)===partyKey(e.behalf!.party)))s.history.behalf.push(e.behalf.party);
-  s.history.accountDoubts ||= e.doubts.some(d=>['payer_unsure','account_unsure','agency_unsure'].includes(d));
-  const ownPayer=c.accounts.find(a=>a.id===partyAccount(e.payer)&&a.kind==='private'&&a.id===e.actor.id);
-  if(ownPayer){
-    if(s.history.behalf.some(b=>partyKey(b)!==partyKey(e.payer))&&!s.history.accountConfirm.includes('a'))s.history.accountConfirm.push('a');
-    if(s.history.accountDoubts&&!s.history.accountConfirm.includes('b'))s.history.accountConfirm.push('b');
-    if(e.actor.id!==null&&c.accounts.some(a=>a.status==='active'&&a.kind!=='private'&&a.actors.includes(e.actor.id!))&&!s.history.accountConfirm.includes('c'))s.history.accountConfirm.push('c');
-    if(s.history.accountConfirm.length){ret('payer_account_confirm');if(s.history.accountConfirm.some(x=>x==='a'||x==='b'))flag('private_payer_kept');}
-  }
-  s.first=matching.find(h=>h.id===p.id)?.checks.first??{amount:amount?.cents??null,quantity:e.quantity?.count??null,payer:partyKey(e.payer),status:e.status};
-  if(s.first.amount!==(amount?.cents??null)||s.first.quantity!==(e.quantity?.count??null)||s.first.payer!==partyKey(e.payer))flag('changed_after_return');
-  return {entry:e,returns};
+
+function staticEntry(proposedEntry: NormalizedLedgerProposedEntry, proposalContext: LedgerProposalContext, used:
+    Map<string, LedgerSpan[]>, texts: Map<string, LedgerText>, values: ReferenceValues, scans: Map<string, {
+    quantities: QuantityExpression[];
+    numbers: LedgerSpan[];
+}>, outside: string, ledgerWork: LedgerWork): {
+    entry: StoredLedgerEntry;
+    returns: string[];
+    sourceActExhausted: boolean;
+} {
+    const mark = proposalContext.marks.find(candidateMark => candidateMark.id === proposedEntry.mark) ?? {
+        id: 'k0', kind: 'money' as const, whole: true as const
+    };
+    const storedEntry = fallbackEntry(proposalContext.source, mark);
+    const checks = storedEntry.checks;
+    const returns: string[] = [];
+    const flag = (code: string) => addCode(checks.codes, code);
+    const ret = (code: string, category?:
+        LedgerCategory) => {
+        flag(code);
+        addCode(returns, code);
+        if (category)
+            pending(checks, category);
+    };
+    storedEntry.kind = proposedEntry.kind;
+    storedEntry.status = proposedEntry.status;
+    storedEntry.time = proposedEntry.time;
+    storedEntry.doubts = [...new Set(proposedEntry.doubts)];
+    for (const decodedValue of storedEntry.doubts)
+        flag(decodedValue);
+    if (mark.id === 'k0')
+        ret('unknown_mark');
+    const occupied = used.get(proposedEntry.mark) ?? [];
+    const markedAct = locate(proposalContext.source.text, proposedEntry.act?.quote ?? null, ledgerWork, mark, occupied);
+    const presentMarkedAct = markedAct
+        ?? locate(proposalContext.source.text, proposedEntry.act?.quote ?? null, ledgerWork, mark);
+    const act = presentMarkedAct ?? locate(proposalContext.source.text, proposedEntry.act?.quote ?? null, ledgerWork);
+    // The locator permits one unique quote to be reused; that still exhausts its occurrence here.
+    const sourceActExhausted = proposedEntry.status === 'settled' && Boolean(presentMarkedAct)
+        && (!markedAct || occupied.some(span =>
+            span.start === markedAct.span.start && span.end === markedAct.span.end));
+
+    if (act) {
+        storedEntry.act = act.span;
+        occupied.push(act.span);
+        used.set(proposedEntry.mark, occupied);
+    }
+    if (sourceActExhausted) {
+        ret('identical_entries', 'restated');
+        flag('identical_in_source');
+    }
+    if (proposedEntry.status === 'settled' && !presentMarkedAct) {
+        ret('act_quote_not_found', 'not_transacted');
+        if (!act)
+            flag('no_transaction_act');
+    }
+    const actorQuote = locate(proposalContext.source.text, proposedEntry.actor.quote, ledgerWork);
+    storedEntry.actor = {
+        id: proposedEntry.actor.id, basis: proposedEntry.actor.basis, span: actorQuote?.span ?? null
+    };
+    const labels = knownActorLabels(proposalContext.settings, proposedEntry.actor.id);
+    if (!labels.length)
+        storedEntry.actor.id = null;
+    checks.actorGrounded = labels.length > 0 && (proposedEntry.actor.basis === 'name' ? !!actorQuote &&
+        labels.some(label => foldForMatch(label) === foldForMatch(actorQuote.quote)) :
+        proposedEntry.actor.id === 'player' &&
+            (proposedEntry.actor.basis === 'self' ? proposalContext.source.role === 'user' && !!actorQuote &&
+                actorQuote.quote.includes('我') :
+                proposedEntry.actor.basis === 'speaker' ? proposalContext.source.role === 'user' &&
+                    proposedEntry.actor.quote === null : proposalContext.source.role === 'assistant' &&
+                    !!actorQuote && ['你', '妳', '您'].includes(actorQuote.quote)));
+    storedEntry.payer = resolveParty(proposedEntry.payer, proposalContext.source.text, ledgerWork);
+    storedEntry.payee = resolveParty(proposedEntry.payee, proposalContext.source.text, ledgerWork);
+    storedEntry.receiver = proposedEntry.receiver == null ? storedEntry.payer : resolveParty(proposedEntry.receiver,
+        proposalContext.source.text, ledgerWork);
+    if (proposedEntry.behalf) {
+        const locatedQuote = locate(proposalContext.source.text, proposedEntry.behalf.quote, ledgerWork);
+        storedEntry.behalf = {
+            party: resolveParty(proposedEntry.behalf.party, proposalContext.source.text, ledgerWork)!,
+            span: locatedQuote?.span ?? null, located: locatedQuote !== null
+        };
+        if (!locatedQuote) {
+            ret('behalf_quote_not_found');
+            flag('agency_unverified');
+        }
+    }
+    // Storage normalization must not turn the acting account into an explicit other party.
+    checks.explicitParty = [storedEntry.payer, storedEntry.payee,
+        storedEntry.receiver].some(candidate => partyExplicit(candidate, {
+        ...storedEntry, actor: {
+            ...storedEntry.actor, id: proposedEntry.actor.id
+        }
+    }, proposalContext, ledgerWork));
+    if (!checks.actorGrounded) {
+        ret('actor_not_grounded');
+        if (act && checks.explicitParty)
+            flag('owner_weak');
+        else {
+            pending(checks, 'not_transacted');
+            flag('owner_not_grounded');
+        }
+    }
+    if (act && questionAct(proposalContext.source.text, act.span, ledgerWork)) {
+        flag('act_in_question');
+        if (proposalContext.source.role === 'assistant') {
+            ret('act_in_question', 'not_transacted');
+            flag('question_sentence');
+        }
+    }
+    if (actorQuote && !locate(outside, proposedEntry.actor.quote, ledgerWork))
+        flag('actor_in_quote');
+    if (proposedEntry.item) {
+        const body = [proposalContext.source,
+            ...proposalContext.previous].find(candidate => candidate.sourceId === proposedEntry.item!.in);
+        const locatedQuote = body ? locate(body.text, proposedEntry.item.quote, ledgerWork) : null;
+        if (body && locatedQuote)
+            storedEntry.item = {
+                sourceId: body.sourceId, revision: body.revision, ...locatedQuote
+            };
+        else {
+            ret('item_quote_not_found');
+            flag('item_unverified');
+        }
+    }
+    const qtyResult = proposedEntry.quantity &&
+        proposedEntry.quantity !== 'one' ? resolveNumber(proposedEntry.quantity, proposalContext.readings, values,
+            proposalContext.calculations, texts, 'quantity', ledgerWork) : null;
+    const qty = proposedEntry.quantity === 'one' ? {
+        count: 1, approx: false, proof: null, ref: 'one'
+    } : qtyResult?.quantity ?? null;
+    if (proposedEntry.quantity !== null) {
+        storedEntry.quantity = qty ?? {
+            count: 1, approx: false, proof: null, ref: proposedEntry.quantity
+        };
+        if (!qty) {
+            ret(qtyResult?.code ?? 'quantity_unreadable');
+            flag('quantity_assumed_one');
+        }
+    }
+    if (storedEntry.quantity?.approx)
+        flag('quantity_approximate');
+    const resolved: ResolvedNumber[] = [];
+    for (const field of ['amount', 'stated', 'tendered'] as const)
+        if (proposedEntry[field] !== null) {
+            const resolvedNumber = resolveNumber(proposedEntry[field]!, proposalContext.readings, values, proposalContext
+                .calculations, texts, 'money', ledgerWork);
+            resolved.push(resolvedNumber);
+            storedEntry[field] = resolvedNumber.money;
+            if (resolvedNumber.code) {
+                ret(resolvedNumber.code, 'general');
+                flag('amount_unreadable');
+            }
+        }
+    for (const ledgerRow of resolved)
+        for (const leaf of ledgerRow.leaves) {
+            if (leaf.reading !== null && leaf.reading !== 1)
+                flag('reading_ambiguous');
+            if (leaf.kind !== 'amount' || !leaf.source || !leaf.span)
+                continue;
+            const body = texts.get(identity(leaf.source))!;
+            if (storedEntry.item && identity(storedEntry.item) === identity(leaf.source) &&
+                leaf.span.end <= storedEntry.item.span.start && foldForMatch(body.text.slice(leaf.span.start, leaf
+                    .span.end)).endsWith('块')
+                && [...body.text.slice(leaf.span.end, storedEntry.item.span.start)].every(ch => WS.test(ch)))
+                flag('kuai_before_item');
+        }
+    const amount = moneyOf(storedEntry);
+    if (amount?.approx)
+        flag('amount_approximate');
+    if ([storedEntry.amount, storedEntry.stated, storedEntry.tendered].some(ledgerAccount => ledgerAccount &&
+        !ledgerAccount.exact))
+        flag('rounded');
+    if (storedEntry.amount && storedEntry.stated && storedEntry.amount.cents !== storedEntry.stated.cents)
+        flag('stated_differs');
+    if (amount && amount.proof?.leaves.filter(l => ['amount', 'entry_amount',
+        'balance'].includes(l.kind)).every(l => l.kind === 'amount' && record(l.value) && l.value.unit === null))
+        flag('no_unit_word');
+    if (proposedEntry.status !== 'settled') {
+        flag('not_settled');
+        pending(checks, 'not_transacted');
+    }
+    if (proposedEntry.time !== 'current') {
+        flag('non_current');
+        pending(checks, 'not_transacted');
+    }
+    if (!shapeParties(storedEntry))
+        ret('party_shape', 'general');
+    storedEntry.row = proposedEntry.row;
+    if (proposedEntry.relation)
+        storedEntry.relation = {
+            kind: proposedEntry.relation.kind, target: null, span: locate(proposalContext.source.text, proposedEntry
+                .relation.quote ?? null, ledgerWork)?.span ?? null
+        };
+    const matching = proposalContext.state?.history.filter(h => h.id === proposedEntry.id ||
+        h.mark === proposedEntry.mark && h.act !== null && storedEntry.act !== null && overlaps(h.act, storedEntry
+            .act)) ?? [];
+    for (const h of matching) {
+        for (const historicalParty of h.checks.history.behalf)
+            if (!checks.history.behalf.some(candidate => partyKey(candidate) === partyKey(historicalParty)))
+                checks.history.behalf.push(historicalParty);
+        checks.history.accountDoubts ||= h.checks.history.accountDoubts;
+        if (h.checks.history.accountQuestioned ||
+            h.checks.returned.some(code => code === 'actor_not_authorised' || code === 'payer_account_confirm'))
+            checks.history.accountQuestioned = true;
+        for (const candidate of h.checks.history.accountConfirm)
+            if (!checks.history.accountConfirm.includes(candidate))
+                checks.history.accountConfirm.push(candidate);
+    }
+    if (storedEntry.behalf &&
+        !checks.history.behalf.some(candidate => partyKey(candidate) === partyKey(storedEntry.behalf!.party)))
+        checks.history.behalf.push(storedEntry.behalf.party);
+    checks.history.accountDoubts ||= storedEntry.doubts.some(decodedValue => ['payer_unsure',
+        'account_unsure', 'agency_unsure'].includes(decodedValue));
+    const ownPayer = proposalContext.accounts.find(ledgerAccount => ledgerAccount.id === partyAccount(storedEntry
+        .payer) && ledgerAccount.kind === 'private' && ledgerAccount.id === storedEntry.actor.id);
+    if (ownPayer) {
+        if (checks.history.behalf.some(historicalParty => partyKey(historicalParty) !== partyKey(storedEntry.payer))
+            && !checks.history.accountConfirm.includes('a'))
+            checks.history.accountConfirm.push('a');
+        if (checks.history.accountDoubts && !checks.history.accountConfirm.includes('b'))
+            checks.history.accountConfirm.push('b');
+        if (storedEntry.actor.id !== null &&
+            proposalContext.accounts.some(ledgerAccount => ledgerAccount.status === 'active' &&
+                ledgerAccount.kind !== 'private' && ledgerAccount.actors.includes(storedEntry.actor.id!)) &&
+            !checks.history.accountConfirm.includes('c'))
+            checks.history.accountConfirm.push('c');
+        if (checks.history.accountConfirm.length) {
+            ret('payer_account_confirm');
+            if (checks.history.accountConfirm.some(candidate => candidate === 'a' || candidate === 'b'))
+                flag('private_payer_kept');
+        }
+    }
+    checks.first = matching.find(h => h.id === proposedEntry.id)?.checks.first ?? {
+        amount: amount?.cents ?? null, quantity: storedEntry.quantity?.count ?? null,
+        payer: partyKey(storedEntry.payer), status: storedEntry.status
+    };
+    if (checks.first.amount !== (amount?.cents ?? null) ||
+        checks.first.quantity !== (storedEntry.quantity?.count ?? null) ||
+        checks.first.payer !== partyKey(storedEntry.payer))
+        flag('changed_after_return');
+    return {
+        entry: storedEntry, returns, sourceActExhausted
+    };
 }
 /** O(source quantity candidates * bounded proposal proof leaves). A candidate is
  * a quantity only when a proposal row actually references it as one. */
@@ -776,6 +1041,7 @@ interface BookIndex {
 interface VerifyContext {
   accounts:LedgerAccount[];source:LedgerText;previous:LedgerText[];counterpart:string|null;index:BookIndex;
   state:LedgerMutableState;work:LedgerWork;forced:boolean;mode:'proposal'|'fold';readers:string[];
+  quoteReaderIds?:LedgerDetail['quoteReaderIds'];
 }
 interface Evaluated {detail:LedgerDetail;legs:LedgerLegs;returns:string[]}
 function emptyIndex():BookIndex {return {keys:new Map(),sources:new Map(),refunds:new Map()};}
@@ -843,110 +1109,300 @@ function selectCurrency(e:StoredLedgerEntry,account:LedgerAccount|undefined):{ro
   return {row:account.rows[0]!.unit,codes};
 }
 function behalfMatches(p:LedgerParty,a:LedgerAccount):boolean {const id=partyAccount(p);return id===a.id||id!==null&&a.actors.includes(id);}
-function affordability(e:StoredLedgerEntry,a:LedgerAccount|undefined,c:VerifyContext):'self'|'account'|'other'|null {
-  if(e.actor.id===null||!a||a.status!=='active'||e.checks.history.accountDoubts||e.checks.history.accountQuestioned||e.checks.codes.includes('actor_not_authorised')||e.checks.codes.includes('owner_weak')||e.checks.returned.some(code=>code==='actor_not_authorised'||code==='payer_account_confirm')||e.checks.history.behalf.some(p=>!behalfMatches(p,a)))return null;
-  if(a.kind==='private'&&a.id===e.actor.id&&!c.accounts.some(x=>x.kind!=='private'&&x.status==='active'&&x.actors.includes(e.actor.id!)))return 'self';
-  if(a.kind!=='private'&&a.actors.includes(e.actor.id))return 'account';
-  if(a.id===e.actor.id||a.actors.includes(e.actor.id))return null;
-  if(accountLabelsPresent(a,c.source.text,c.work))return 'other';
-  if(a.kind!=='private'&&a.actors.some(id=>id!==e.actor.id&&c.accounts.some(x=>x.id===id&&accountLabelsPresent(x,c.source.text,c.work))))return 'other';
-  return null;
+
+function affordability(storedEntry: StoredLedgerEntry, ledgerAccount: LedgerAccount | undefined, proposalContext:
+    VerifyContext): 'self' | 'account' | 'other' | null {
+    if (storedEntry.actor.id === null || !ledgerAccount || ledgerAccount.status !== 'active' ||
+        storedEntry.checks.history.accountDoubts || storedEntry.checks.history.accountQuestioned ||
+        storedEntry.checks.codes.includes('actor_not_authorised') ||
+        storedEntry.checks.codes.includes('owner_weak') ||
+        storedEntry.checks.codes.includes('account_basis_weak') ||
+        storedEntry.checks.returned.some(code => code === 'actor_not_authorised' ||
+            code === 'payer_account_confirm') ||
+        storedEntry.checks.history.behalf.some(proposedEntry => !behalfMatches(proposedEntry, ledgerAccount)))
+        return null;
+    if (ledgerAccount.kind === 'private' && ledgerAccount.id === storedEntry.actor.id &&
+        !proposalContext.accounts.some(candidate => candidate.kind !== 'private' &&
+            candidate.status === 'active' && candidate.actors.includes(storedEntry.actor.id!)))
+        return 'self';
+    if (ledgerAccount.kind !== 'private' && ledgerAccount.actors.includes(storedEntry.actor.id))
+        return 'account';
+    if (ledgerAccount.id === storedEntry.actor.id || ledgerAccount.actors.includes(storedEntry.actor.id))
+        return null;
+    if (accountLabelsPresent(ledgerAccount, proposalContext.source.text, proposalContext.work))
+        return 'other';
+    if (ledgerAccount.kind !== 'private' && ledgerAccount.actors.some(id => id !== storedEntry.actor.id &&
+        proposalContext.accounts.some(candidate => candidate.id === id && accountLabelsPresent(candidate,
+            proposalContext.source.text, proposalContext.work))))
+        return 'other';
+    return null;
 }
-function verifyEntry(e0:StoredLedgerEntry,c:VerifyContext):Evaluated {
-  const e:StoredLedgerEntry={...e0,payer:resolveConfigured(e0.payer,c.accounts),payee:resolveConfigured(e0.payee,c.accounts),receiver:resolveConfigured(e0.receiver,c.accounts)};
-  const codes=c.forced?[]:[...e.checks.codes],categories=c.forced?[]:[...e.checks.pending],returns:string[]=[];
-  const d:LedgerDetail={...e,role:c.source.role,laterSources:0,disposition:'posted',category:null,layer:'inner',codes,readerIds:[...c.readers],due:null,unitPrice:e.unitPrice,
-    unaffordable:null,candidates:[],causedByCorrection:false};
-  const legs:LedgerLegs={money:[],goods:[]};
-  const flag=(code:string)=>addCode(codes,code),pend=(code:string,category:LedgerCategory='general',returned=true)=>{flag(code);if(!categories.includes(category))categories.push(category);if(returned)addCode(returns,code);};
-  const account=(p:LedgerParty|null)=>c.accounts.find(a=>a.id===partyAccount(p));
-  const payer=account(e.payer),payee=account(e.payee),receiver=account(e.receiver);
-  const target=e.relation?.target?c.index.keys.get(keyText(e.relation.target)):undefined;
-  if(!c.forced) {
-    for(const code of e.checks.unanswered??[])pend(code,code==='possible_duplicate'||code==='identical_entries'?'restated':code==='actor_not_authorised'?'general':'not_transacted',false);
-    for(const party of [e.payer,e.payee,e.receiver,e.behalf?.party??null]) {
-      const id=partyAccount(party);if(id!==null){const a=c.accounts.find(a=>a.id===id);if(!a||a.status==='closed')pend('unknown_account');}
+
+function verifyEntry(originalStoredEntry: StoredLedgerEntry, proposalContext: VerifyContext): Evaluated {
+    const storedEntry: StoredLedgerEntry = {
+        ...originalStoredEntry, payer: resolveConfigured(originalStoredEntry.payer, proposalContext.accounts),
+        payee: resolveConfigured(originalStoredEntry.payee, proposalContext.accounts),
+        receiver: resolveConfigured(originalStoredEntry.receiver, proposalContext.accounts)
+    };
+    const codes = proposalContext.forced ? [] : [...storedEntry.checks.codes];
+    const categories = proposalContext.forced ? [] : [...storedEntry.checks.pending];
+    const returns: string[] = [];
+    const decodedValue: LedgerDetail = {
+        ...storedEntry, role: proposalContext.source.role, laterSources: 0, disposition: 'posted',
+        category: null, layer: 'inner', codes, readerIds: [...proposalContext.readers], due: null,
+        unitPrice: storedEntry.unitPrice,
+        unaffordable: null, candidates: [], causedByCorrection: false,
+        ...(proposalContext.quoteReaderIds ? { quoteReaderIds: proposalContext.quoteReaderIds } : {})
+    };
+    const legs: LedgerLegs = {
+        money: [], goods: []
+    };
+    const flag = (code: string) => addCode(codes, code);
+    const pend = (code: string, category: LedgerCategory = 'general',
+        returned = true) => {
+        flag(code);
+        if (!categories.includes(category))
+            categories.push(category);
+        if (returned)
+            addCode(returns, code);
+    };
+    const account = (proposedEntry: LedgerParty | null) => proposalContext.accounts.find(ledgerAccount =>
+        ledgerAccount.id === partyAccount(proposedEntry));
+    const payer = account(storedEntry.payer);
+    const payee = account(storedEntry.payee);
+    const receiver = account(storedEntry.receiver);
+    const target = storedEntry.relation?.target ? proposalContext.index.keys.get(keyText(storedEntry.relation
+        .target)) : undefined;
+    if (!proposalContext.forced) {
+        for (const code of storedEntry.checks.unanswered ?? [])
+            pend(code, code === 'possible_duplicate' ||
+                code === 'identical_entries' ? 'restated' : code === 'actor_not_authorised' ? 'general' :
+                    'not_transacted', false);
+        for (const party of [storedEntry.payer, storedEntry.payee, storedEntry.receiver,
+            storedEntry.behalf?.party ?? null]) {
+            const id = partyAccount(party);
+            if (id !== null) {
+                const ledgerAccount = proposalContext.accounts.find(ledgerAccount => ledgerAccount.id === id);
+                if (!ledgerAccount || ledgerAccount.status === 'closed')
+                    pend('unknown_account');
+            }
+        }
+        if ([storedEntry.payer, storedEntry.payee,
+            storedEntry.receiver].some(proposedEntry => proposedEntry && 'unconfigured' in proposedEntry))
+            pend('unconfigured_account', 'unconfigured', false);
+        const currency = selectCurrency(storedEntry, storedEntry.kind === 'income' ? payee : payer ?? payee);
+        decodedValue.row = currency.row;
+        for (const code of currency.codes)
+            if (code === 'currency_assumed')
+                flag(code);
+            else
+                pend(code);
+        if (['purchase', 'payment', 'transfer'].includes(storedEntry.kind) && payer &&
+            (storedEntry.actor.id === null || !payer.actors.includes(storedEntry.actor.id))
+            && !(storedEntry.behalf?.located && behalfMatches(storedEntry.behalf.party, payer))) {
+            if (payer.kind === 'private' && proposalContext.mode === 'proposal' &&
+                !storedEntry.checks.returned.includes('actor_not_authorised'))
+                pend('actor_not_authorised');
+            else
+                flag('actor_not_authorised');
+            storedEntry.checks.history.accountQuestioned = true;
+        }
+        if (payer && payer.kind !== 'private' && !storedEntry.behalf?.located && ![proposalContext.source,
+            ...proposalContext.previous].some(currentSource => accountLabelsPresent(payer, currentSource.text,
+                proposalContext.work)))
+            flag('account_basis_weak');
+        if (storedEntry.relation?.kind !== 'in_addition_to' && storedEntry.status === 'settled' &&
+            proposalContext.counterpart) {
+            const other = (proposalContext.index.sources.get(proposalContext.counterpart) ?? []).find(targetEntry => {
+                proposalContext.work.pairs++;
+
+                return posted(targetEntry) && matchingTransaction(storedEntry, targetEntry);
+            });
+            if (other) {
+                if (proposalContext.mode === 'proposal' && !storedEntry.checks.returned.includes('possible_duplicate'))
+                    pend('possible_duplicate', 'restated');
+                else
+                    flag('possible_duplicate');
+            }
+        }
+        if (storedEntry.relation) {
+            const k = storedEntry.relation.kind;
+            if (!target || target.disposition === 'void') {
+                if (proposalContext.mode === 'fold' && storedEntry.relation.target !== null) {
+                    if (k === 'refund_of' || k === 'balance_of')
+                        pend('relation_target_changed');
+                    else if (k === 'paired_with')
+                        pend('relation_invalid');
+                    else if (k === 'settles' || k === 'in_addition_to')
+                        flag('relation_target_changed');
+                }
+                else
+                    pend('relation_invalid');
+            }
+            else if (k === 'restates')
+                pend('restates', 'restated', false);
+            else if (k === 'refund_of') {
+                if (!['purchase', 'payment'].includes(target.kind) || !posted(target) ||
+                    typeof target.key === 'string' && target.key.startsWith('legacy:'))
+                    pend('relation_invalid');
+                const direction = (refundParty: LedgerParty | null, originalParty: LedgerParty | null) =>
+                    refundParty !== null && originalParty !== null &&
+                    ('account' in originalParty ? 'account' in refundParty &&
+                        refundParty.account === originalParty.account : 'external' in originalParty
+                            ? 'external' in refundParty : 'unconfigured' in refundParty);
+                if (!direction(storedEntry.payer, target.payee) || !direction(storedEntry.payee, target.payer))
+                    pend('refund_direction');
+                const used = proposalContext.index.refunds.get(keyText(target.key)) ?? {
+                    cents: 0n, quantity: 0
+                };
+                if (BigInt(moneyOf(storedEntry)?.cents ?? '0') > BigInt(moneyOf(target)?.cents ?? '0') - used.cents
+                    || (storedEntry.quantity?.count ?? 0) > (target.quantity?.count ?? 0) - used.quantity)
+                    pend('refund_exceeds');
+            }
+            else if (k === 'balance_of' && target.kind !== 'payment' || k === 'settles' &&
+                target.status !== 'committed' && target.disposition !== 'pending'
+                || k === 'in_addition_to' && storedEntry.relation.span === null || k === 'paired_with' &&
+                moneyOf(storedEntry) === null && !posted(target))
+                pend('relation_invalid');
+        }
     }
-    if([e.payer,e.payee,e.receiver].some(p=>p&&'unconfigured'in p))pend('unconfigured_account','unconfigured',false);
-    const currency=selectCurrency(e,e.kind==='income'?payee:payer??payee);d.row=currency.row;
-    for(const code of currency.codes)if(code==='currency_assumed')flag(code);else pend(code);
-    if(['purchase','payment','transfer'].includes(e.kind)&&payer&&(e.actor.id===null||!payer.actors.includes(e.actor.id))
-      &&!(e.behalf?.located&&behalfMatches(e.behalf.party,payer))) {
-      if(payer.kind==='private'&&c.mode==='proposal'&&!e.checks.returned.includes('actor_not_authorised'))pend('actor_not_authorised');else flag('actor_not_authorised');
-      e.checks.history.accountQuestioned=true;
+    const moneyValue = moneyOf(storedEntry);
+    const amount = moneyValue ? BigInt(moneyValue.cents) : null;
+    if (amount !== null)
+        for (const [ledgerAccount, sign] of [[payer, -1n], [payee, 1n]] as const) {
+            const ledgerRow = accountRow(ledgerAccount, decodedValue.row), row = ledgerRow ? proposalContext.state
+                .balances.get(assetIdentity(ledgerAccount!.id, ledgerRow.unit)) : undefined;
+            if (row && row.tracked !== false && ledgerAccount?.status === 'active')
+                legs.money.push({
+                    row, delta: amount * sign
+                });
+        }
+    let giver: LedgerAccount | undefined;
+    let recipient: LedgerAccount | undefined;
+    let item = storedEntry.item?.quote ?? null;
+    const quantity = storedEntry.quantity?.count ?? 0;
+    if (storedEntry.kind === 'consume')
+        giver = payer;
+    else if (storedEntry.kind === 'refund' && target) {
+        giver = proposalContext.accounts.find(ledgerAccount => ledgerAccount.id === partyAccount(target.receiver));
+        recipient = proposalContext.accounts.find(ledgerAccount => ledgerAccount.id === partyAccount(target.payee));
+        item = target.item?.quote ?? item;
     }
-    if(payer&&payer.kind!=='private'&&!e.behalf?.located&&![c.source,...c.previous].some(s=>accountLabelsPresent(payer,s.text,c.work)))flag('account_basis_weak');
-    if(e.relation?.kind!=='in_addition_to'&&e.status==='settled'&&c.counterpart) {
-      const other=(c.index.sources.get(c.counterpart)??[]).find(t=>{c.work.pairs++;return posted(t)&&matchingTransaction(e,t);});
-      if(other){if(c.mode==='proposal'&&!e.checks.returned.includes('possible_duplicate'))pend('possible_duplicate','restated');else flag('possible_duplicate');}
+    else if (storedEntry.kind === 'purchase' || storedEntry.kind === 'income') {
+        giver = payee;
+        recipient = receiver;
     }
-    if(e.relation) {
-      const k=e.relation.kind;
-      if(!target||target.disposition==='void') {
-        if(c.mode==='fold'&&e.relation.target!==null) {
-          if(k==='refund_of'||k==='balance_of')pend('relation_target_changed');
-          else if(k==='paired_with')pend('relation_invalid');
-          else if(k==='settles'||k==='in_addition_to')flag('relation_target_changed');
-        } else pend('relation_invalid');
-      } else if(k==='restates')pend('restates','restated',false);
-      else if(k==='refund_of') {
-        if(!['purchase','payment'].includes(target.kind)||!posted(target)||typeof target.key==='string'&&target.key.startsWith('legacy:'))pend('relation_invalid');
-        const direction=(a:LedgerParty|null,b:LedgerParty|null)=>a!==null&&b!==null&&('account'in b?'account'in a&&a.account===b.account:'external'in b?'external'in a:'unconfigured'in a);
-        if(!direction(e.payer,target.payee)||!direction(e.payee,target.payer))pend('refund_direction');
-        const used=c.index.refunds.get(keyText(target.key))??{cents:0n,quantity:0};
-        if(BigInt(moneyOf(e)?.cents??'0')>BigInt(moneyOf(target)?.cents??'0')-used.cents||(e.quantity?.count??0)>(target.quantity?.count??0)-used.quantity)pend('refund_exceeds');
-      } else if(k==='balance_of'&&target.kind!=='payment'||k==='settles'&&target.status!=='committed'&&target.disposition!=='pending'
-        ||k==='in_addition_to'&&e.relation.span===null||k==='paired_with'&&moneyOf(e)===null&&!posted(target))pend('relation_invalid');
+    else if (storedEntry.kind === 'transfer' || storedEntry.kind === 'refund') {
+        giver = payer;
+        recipient = receiver;
     }
-  }
-  const m=moneyOf(e),amount=m?BigInt(m.cents):null;
-  if(amount!==null)for(const [a,sign] of [[payer,-1n],[payee,1n]] as const) {
-    const r=accountRow(a,d.row),row=r?c.state.balances.get(assetIdentity(a!.id,r.unit)):undefined;
-    if(row&&row.tracked!==false&&a?.status==='active')legs.money.push({row,delta:amount*sign});
-  }
-  let giver:LedgerAccount|undefined,recipient:LedgerAccount|undefined,item=e.item?.quote??null;
-  const quantity=e.quantity?.count??0;
-  if(e.kind==='consume')giver=payer;
-  else if(e.kind==='refund'&&target) {giver=c.accounts.find(a=>a.id===partyAccount(target.receiver));recipient=c.accounts.find(a=>a.id===partyAccount(target.payee));item=target.item?.quote??item;}
-  else if(e.kind==='purchase'||e.kind==='income'){giver=payee;recipient=receiver;}
-  else if(e.kind==='transfer'||e.kind==='refund'){giver=payer;recipient=receiver;}
-  const out=inventoryRow(c.state,giver?.id??null,item),incoming=inventoryRow(c.state,recipient?.id??null,item);
-  if(item&&quantity>0) {
-    if(out&&giver?.status==='active')legs.goods.push({owner:giver.id,item:out.item,delta:-quantity,row:out});
-    if(recipient?.status==='active'&&(incoming||recipient.rows.length+recipient.items.length>0))legs.goods.push({owner:recipient.id,item:incoming?.item??item,delta:quantity,row:incoming});
-  }
-  if(!c.forced) {
-    if(e.kind==='consume'&&!out)pend('unregistered_item','untracked',false);
-    else if(!legs.money.length&&!legs.goods.length)pend('untracked','untracked',false);
-    else if(!legs.money.length&&legs.goods.length&&amount!==null)flag('payer_untracked');
-  }
-  d.category=categoryOf(categories);
-  if(d.category)d.disposition='pending';
-  if(c.mode==='fold') {
-    if(!d.readerIds.length) {if(!c.forced)flag('no_observer');d.readerIds=[...new Set([e.actor.id,...(partyAccount(e.payer)==='player'?['player']:[])])].filter((id):id is string=>id!==null&&c.accounts.some(a=>a.kind==='private'&&a.id===id)).sort();}
-    if(!d.category) {
-      const fail=(a:LedgerAccount|undefined,cents:bigint|null,count:number|null):void=>{
-        if(c.forced){d.causedByCorrection=true;flag('caused_by_correction');d.disposition='unaffordable';d.unaffordable={variant:'user',shortfallCents:cents?.toString()??null,shortfallQuantity:count};flag(cents!==null?'insufficient_funds':'insufficient_inventory');return;}
-        const variant=affordability(e,a,c);
-        if(variant){d.disposition='unaffordable';d.unaffordable={variant,shortfallCents:cents?.toString()??null,shortfallQuantity:count};flag(cents!==null?'insufficient_funds':'insufficient_inventory');}
-        else{d.disposition='pending';d.category='account_uncertain';flag('account_uncertain');d.candidates=availableCandidates(e,c.accounts,true);}
-      };
-      const shortage=legs.money.find(l=>l.delta<0n&&l.row.cents < -l.delta);
-      if(shortage) {
-        if(!c.forced&&m!.approx&&m!.range&&(m!.range.min===null||BigInt(m!.range.min)<=shortage.row.cents)) {d.disposition='pending';d.category='general';flag('approximate_affordability');}
-        else fail(payer,-shortage.delta-shortage.row.cents,null);
-      }
-      if(e.kind==='consume'&&!out){d.disposition='pending';d.category='untracked';flag('unregistered_item');}
-      else if(e.kind==='income'&&item&&quantity>0&&(!out||out.count<quantity)) {flag('item_unverified_sale');legs.goods=[];}
-      else if(e.kind==='purchase'&&out&&out.count<quantity) {flag('seller_stock_short');legs.goods=legs.goods.filter(l=>l.delta>0);}
-      else if(d.disposition==='posted'&&out&&out.count<quantity)fail(giver,null,quantity-out.count);
-      if(d.disposition==='posted'&&legs.goods.some(l=>l.delta>0&&!Number.isSafeInteger((l.row?.count??0)+l.delta))) {d.disposition='pending';d.category='general';flag('inventory_overflow');}
-      if(d.disposition==='posted'&&!legs.money.length&&!legs.goods.length){d.disposition='pending';d.category='untracked';flag('untracked');}
+    const out = inventoryRow(proposalContext.state, giver?.id ?? null, item);
+    const incoming = inventoryRow(proposalContext.state, recipient?.id ?? null, item);
+    if (item && quantity > 0) {
+        if (out && giver?.status === 'active')
+            legs.goods.push({
+                owner: giver.id, item: out.item, delta: -quantity, row: out
+            });
+        if (recipient?.status === 'active' && (incoming || recipient.rows.length + recipient.items.length > 0))
+            legs.goods.push({
+                owner: recipient.id, item: incoming?.item ?? item, delta: quantity, row: incoming
+            });
     }
-  }
-  if(d.disposition==='posted'&&codes.some(code=>code!=='payer_account_confirm'))d.disposition='flagged';
-  d.layer=outerDetail(d)?'outer':'inner';
-  return {detail:d,legs,returns};
+    if (!proposalContext.forced) {
+        if (storedEntry.kind === 'consume' && !out)
+            pend('unregistered_item', 'untracked', false);
+        else if (!legs.money.length && !legs.goods.length)
+            pend('untracked', 'untracked', false);
+        else if (!legs.money.length && legs.goods.length && amount !== null)
+            flag('payer_untracked');
+    }
+    decodedValue.category = categoryOf(categories);
+    if (decodedValue.category)
+        decodedValue.disposition = 'pending';
+    if (proposalContext.mode === 'fold') {
+        if (!decodedValue.readerIds.length) {
+            if (!proposalContext.forced)
+                flag('no_observer');
+            decodedValue.readerIds = [...new Set([storedEntry.actor.id,
+                    ...(partyAccount(storedEntry.payer) === 'player' ? ['player'] : [])])].filter((id):
+                        id is string => id !== null && proposalContext.accounts.some(ledgerAccount => ledgerAccount
+                        .kind === 'private' && ledgerAccount.id === id)).sort();
+        }
+        if (!decodedValue.category) {
+            const fail = (ledgerAccount: LedgerAccount | undefined, cents: bigint | null, count: number | null):
+                void => {
+                if (proposalContext.forced) {
+                    decodedValue.causedByCorrection = true;
+                    flag('caused_by_correction');
+                    decodedValue.disposition = 'unaffordable';
+                    decodedValue.unaffordable = {
+                        variant: 'user', shortfallCents: cents?.toString() ?? null, shortfallQuantity: count
+                    };
+                    flag(cents !== null ? 'insufficient_funds' : 'insufficient_inventory');
+                    return;
+                }
+                // Grounding flags found during this fold also participate in account uncertainty.
+                const variant = codes.includes('account_basis_weak') ? null : affordability(storedEntry,
+                    ledgerAccount, proposalContext);
+                if (variant) {
+                    decodedValue.disposition = 'unaffordable';
+                    decodedValue.unaffordable = {
+                        variant, shortfallCents: cents?.toString() ?? null, shortfallQuantity: count
+                    };
+                    flag(cents !== null ? 'insufficient_funds' : 'insufficient_inventory');
+                }
+                else {
+                    decodedValue.disposition = 'pending';
+                    decodedValue.category = 'account_uncertain';
+                    flag('account_uncertain');
+                    decodedValue.candidates = availableCandidates(storedEntry, proposalContext.accounts, true);
+                }
+            };
+            const shortage = legs.money.find(l => l.delta < 0n && l.row.cents < -l.delta);
+            if (shortage) {
+                if (!proposalContext.forced && moneyValue!.approx && moneyValue!.range &&
+                    (moneyValue!.range.min === null || BigInt(moneyValue!.range.min) <= shortage.row.cents)) {
+                    decodedValue.disposition = 'pending';
+                    decodedValue.category = 'general';
+                    flag('approximate_affordability');
+                }
+                else
+                    fail(payer, -shortage.delta - shortage.row.cents, null);
+            }
+            if (storedEntry.kind === 'consume' && !out) {
+                decodedValue.disposition = 'pending';
+                decodedValue.category = 'untracked';
+                flag('unregistered_item');
+            }
+            else if (storedEntry.kind === 'income' && item && quantity > 0 && (!out || out.count < quantity)) {
+                flag('item_unverified_sale');
+                legs.goods = [];
+            }
+            else if (storedEntry.kind === 'purchase' && out && out.count < quantity) {
+                flag('seller_stock_short');
+                legs.goods = legs.goods.filter(l => l.delta > 0);
+            }
+            else if (decodedValue.disposition === 'posted' && out && out.count < quantity)
+                fail(giver, null, quantity - out.count);
+            if (decodedValue.disposition === 'posted' && legs.goods.some(l => l.delta > 0 &&
+                !Number.isSafeInteger((l.row?.count ?? 0) + l.delta))) {
+                decodedValue.disposition = 'pending';
+                decodedValue.category = 'general';
+                flag('inventory_overflow');
+            }
+            if (decodedValue.disposition === 'posted' && !legs.money.length && !legs.goods.length) {
+                decodedValue.disposition = 'pending';
+                decodedValue.category = 'untracked';
+                flag('untracked');
+            }
+        }
+    }
+    if (decodedValue.disposition === 'posted' && codes.some(code => code !== 'payer_account_confirm'))
+        decodedValue.disposition = 'flagged';
+    decodedValue.layer = outerDetail(decodedValue) ? 'outer' : 'inner';
+    return {
+        detail: decodedValue, legs, returns
+    };
 }
 
 function stateFromAccounts(accounts:LedgerAccount[]):LedgerMutableState {
@@ -1005,96 +1461,312 @@ function acceptSemanticDecision(e:StoredLedgerEntry,prior:readonly string[]):voi
   checks.returned=[...prior];
   if(prior.some(code=>code==='actor_not_authorised'||code==='payer_account_confirm'))checks.history.accountQuestioned=true;
 }
+
 /** Validate a complete proposal without consulting balances or stock quantities.
  * O(J + 64*L + 64^2 + H*64); H <= 4096, at most seven source texts, no I/O. */
-export function checkLedgerProposal(raw:unknown,rawContext:unknown):LedgerProposalResult {
-  const w=work(),empty=():LedgerProposalResult=>({entries:[],unbooked:[],uncovered:[],settled:false,withdrawn:[],withdrawalReturned:false,state:emptyProposalState(),work:w});
-  try {
-    const c=snapshotContext(rawContext,w) as LedgerProposalContext;
-    if(!sourceOK(c.source)||typeof c.source.text!=='string'||!['user','assistant'].includes(c.source.role)||!Array.isArray(c.previous)
-      ||!Array.isArray(c.marks)||c.marks.length>64||!c.marks.every(m=>regionOK(m)&&MARK.test(m.id)&&m.kind===(m.id[0]==='k'?'money':'use'))
-      ||!Array.isArray(c.accounts)||c.accounts.length>256||!record(c.settings)||!record(c.settings.actorLabels)||!record(c.readings)||Object.keys(c.readings).length>4096) return {...empty(),error:'context_invalid'};
-    const old=c.state??emptyProposalState();
-    if(!Array.isArray(old.history)||old.history.length>4096||!Array.isArray(old.previous)||!Array.isArray(old.everAccepted))return {...empty(),error:'history_invalid'};
-    const state=snapshot(old) as LedgerProposalState;c.state=state;c.previous=c.previous.slice(-6);
-    const initial=empty();initial.state=state;initial.uncovered=c.marks.map(m=>m.id);
-    if(!record(raw))return {...initial,error:'call_malformed'};
-    const descriptor=Object.getOwnPropertyDescriptor(raw,'entries'),ud=Object.getOwnPropertyDescriptor(raw,'unbooked');
-    if(!descriptor||!('value'in descriptor)||!Array.isArray(descriptor.value)||descriptor.value.length>64
-      ||!ud||!('value'in ud)||!Array.isArray(ud.value)||ud.value.length>64)return {...initial,error:'call_malformed'};
-    const texts=new Map([c.source,...c.previous].map(s=>[identity(s),s])),values=referenceValues(c.readings);
-    const scans=new Map<string,{quantities:QuantityExpression[];numbers:LedgerSpan[]}>();
-    for(const [id,s] of texts){const q=amountExpressionWork.scanQuantities(s.text),n=amountExpressionWork.scanNumbers(s.text);w.text+=q.work+n.work;w.scans+=2;scans.set(id,{quantities:q.result,numbers:n.result});}
-    const outside=outsideQuotes(c.source.text,w),used=new Map<string,LedgerSpan[]>(),ids=new Set<string>();
-    const rows:{id:string;entry:StoredLedgerEntry;returns:string[];proposal:NormalizedLedgerProposedEntry|null;read:Record<string,JsonValue>}[]=[];
-    for(let i=0;i<descriptor.value.length;i++) {
-      let p:unknown;try{p=snapshot(descriptor.value[i]);if(record(p)){if(!Object.hasOwn(p,'act'))p.act=null;for(const key of ['behalf','item','quantity','amount','stated','tendered','row','relation'])if(!Object.hasOwn(p,key))p[key]=null;}} catch{p=null;}
-      const id=record(p)&&textId(p.id)?p.id:`invalid:${i+1}`;
-      if(!proposedEntryOK(p)||ids.has(id)) {
-        const mark=record(p)&&typeof p.mark==='string'?c.marks.find(m=>m.id===p.mark):undefined;
-        const e=fallbackEntry(c.source,mark??{id:'k0',kind:'money',whole:true});e.checks.codes=['entry_malformed'];e.checks.pending=['general'];
-        rows.push({id,entry:e,returns:['entry_malformed'],proposal:null,read:{}});
-      } else {const checked=staticEntry(p,c,used,texts,values,scans,outside,w);checked.entry.unitPrice=proofUnitPrice(checked.entry,values);rows.push({id,...checked,proposal:p,read:{}});}
-      ids.add(id);w.entries++;
+export function checkLedgerProposal(raw: unknown, rawContext: unknown): LedgerProposalResult {
+    const ledgerWork = work();
+    const empty = (): LedgerProposalResult => ({
+        entries: [], unbooked: [], uncovered: [], settled: false, withdrawn: [], withdrawalReturned: false,
+        state: emptyProposalState(), work: ledgerWork
+    });
+    try {
+        const proposalContext = snapshotContext(rawContext, ledgerWork) as LedgerProposalContext;
+        if (!sourceOK(proposalContext.source) || typeof proposalContext.source.text !== 'string' || !['user',
+            'assistant'].includes(proposalContext.source.role) || !Array.isArray(proposalContext.previous)
+            || !Array.isArray(proposalContext.marks) || proposalContext.marks.length > 64 ||
+            !proposalContext.marks.every(candidateMark => regionOK(candidateMark) && MARK.test(candidateMark.id) &&
+                candidateMark.kind === (candidateMark.id[0] === 'k' ? 'money' : 'use'))
+            || !Array.isArray(proposalContext.accounts) || proposalContext.accounts.length > 256 ||
+            !record(proposalContext.settings) || !record(proposalContext.settings.actorLabels) ||
+            !record(proposalContext.readings) || Object.keys(proposalContext.readings).length > 4096)
+            return {
+                ...empty(), error: 'context_invalid'
+            };
+        const old = proposalContext.state ?? emptyProposalState();
+        if (!Array.isArray(old.history) || old.history.length > 4096 || !Array.isArray(old.previous) ||
+            !Array.isArray(old.everAccepted))
+            return {
+                ...empty(), error: 'history_invalid'
+            };
+        const state = snapshot(old) as LedgerProposalState;
+        proposalContext.state = state;
+        proposalContext.previous = proposalContext.previous.slice(-6);
+        const initial = empty();
+        initial.state = state;
+        initial.uncovered = proposalContext.marks.map(candidateMark => candidateMark.id);
+        if (!record(raw))
+            return {
+                ...initial, error: 'call_malformed'
+            };
+        const descriptor = Object.getOwnPropertyDescriptor(raw, 'entries');
+        const unbookedDescriptor = Object.getOwnPropertyDescriptor(raw, 'unbooked');
+        if (!descriptor || !('value' in descriptor) || !Array.isArray(descriptor.value) || descriptor.value.length > 64
+            || !unbookedDescriptor || !('value' in unbookedDescriptor) || !Array.isArray(unbookedDescriptor.value) || unbookedDescriptor.value.length > 64)
+            return {
+                ...initial, error: 'call_malformed'
+            };
+        const texts = new Map([proposalContext.source,
+            ...proposalContext.previous].map(source => [identity(source), source]));
+        const values = referenceValues(proposalContext.readings);
+        const scans = new Map<string, {
+            quantities: QuantityExpression[];
+            numbers: LedgerSpan[];
+        }>();
+        for (const [id, currentSource] of texts) {
+            const quantityScan = amountExpressionWork.scanQuantities(currentSource.text);
+            const numberScan = amountExpressionWork.scanNumbers(currentSource.text);
+            ledgerWork.text += quantityScan.work + numberScan.work;
+            ledgerWork.scans += 2;
+            scans.set(id, {
+                quantities: quantityScan.result, numbers: numberScan.result
+            });
+        }
+        const outside = outsideQuotes(proposalContext.source.text, ledgerWork);
+        const used = new Map<string, LedgerSpan[]>();
+        const ids = new Set<string>();
+        const rows: {
+            id: string;
+            entry: StoredLedgerEntry;
+            returns: string[];
+            sourceActExhausted?: boolean;
+            proposal: NormalizedLedgerProposedEntry | null;
+            read: Record<string, JsonValue>;
+        }[] = [];
+        for (let i = 0; i < descriptor.value.length; i++) {
+            let proposedEntry: unknown;
+            try {
+                proposedEntry = snapshot(descriptor.value[i]);
+                if (record(proposedEntry)) {
+                    if (!Object.hasOwn(proposedEntry, 'act'))
+                        proposedEntry.act = null;
+                    for (const key of ['behalf', 'item', 'quantity', 'amount', 'stated', 'tendered', 'row', 'relation'])
+                        if (!Object.hasOwn(proposedEntry, key))
+                            proposedEntry[key] = null;
+                }
+            }
+            catch {
+                proposedEntry = null;
+            }
+            const id = record(proposedEntry) && textId(proposedEntry.id) ? proposedEntry.id : `invalid:${i + 1}`;
+            if (!proposedEntryOK(proposedEntry) || ids.has(id)) {
+                const mark = record(proposedEntry) &&
+                    typeof proposedEntry.mark === 'string' ? proposalContext.marks.find(candidateMark => candidateMark.id
+                        === proposedEntry.mark) : undefined;
+                const storedEntry = fallbackEntry(proposalContext.source, mark ?? {
+                    id: 'k0', kind: 'money', whole: true
+                });
+                storedEntry.checks.codes = ['entry_malformed'];
+                storedEntry.checks.pending = ['general'];
+                rows.push({
+                    id, entry: storedEntry, returns: ['entry_malformed'], proposal: null, read: {}
+                });
+            }
+            else {
+                const checked = staticEntry(proposedEntry, proposalContext, used, texts, values, scans, outside,
+                    ledgerWork);
+                checked.entry.unitPrice = proofUnitPrice(checked.entry, values);
+                rows.push({
+                    id, ...checked, proposal: proposedEntry, read: {}
+                });
+            }
+            ids.add(id);
+            ledgerWork.entries++;
+        }
+        checkAmountOverlaps(rows, proposalContext.readings, scans, ledgerWork);
+        checkQuantityWindows(rows.map(ledgerRow => ledgerRow.entry), texts, scans, ledgerWork);
+        if (proposalContext.keptEntries && !entriesOK(proposalContext.keptEntries))
+            return {
+                ...initial, error: 'context_invalid'
+            };
+        assignKeys(rows.map(ledgerRow => ledgerRow.entry), proposalContext.keptEntries);
+        const link = () => {
+            for (const row of rows)
+                if (row.proposal?.relation && row.entry.relation) {
+                    const ref = row.proposal.relation.entry;
+                    row.entry.relation.target = rows.find(ledgerRow => ledgerRow.id === ref)?.entry.key ?? (
+                        proposalContext.entryRefs && Object.hasOwn(proposalContext.entryRefs, ref) ? proposalContext
+                        .entryRefs[ref] : null) ?? (Object.hasOwn(proposalContext.readings, ref)
+                        && 'entry' in proposalContext.readings[ref] ? proposalContext.readings[ref].entry ?? null :
+                        null);
+                }
+        };
+        link();
+        assignKeys(rows.map(ledgerRow => ledgerRow.entry), proposalContext.keptEntries);
+        link();
+        for (let i = 0; i < rows.length; i++)
+            for (let j = 0; j < i; j++) {
+                ledgerWork.pairs++;
+                const currentRow = rows[i]!;
+                const previousRow = rows[j]!;
+                if (JSON.stringify(leadingKey(currentRow.entry)) === JSON.stringify(leadingKey(previousRow
+                    .entry)) && entryCompare(currentRow.entry, previousRow.entry) === 0) {
+                    addCode(currentRow.entry.checks.codes, 'identical_entries');
+                    addCode(currentRow.entry.checks.codes, 'identical_in_source');
+                    pending(currentRow.entry.checks, 'restated');
+                    addCode(currentRow.returns, 'identical_entries');
+                    currentRow.read.same_as = previousRow.id;
+                    break;
+                }
+            }
+        const index = emptyIndex();
+        for (const decodedValue of proposalContext.before?.entries ?? [])
+            indexDetail(index, decodedValue);
+        const mutable = stateFromAccounts(proposalContext.accounts);
+        const order = dependencyOrder(rows.map(ledgerRow => ledgerRow.entry));
+        const checks = new Map<StoredLedgerEntry, LedgerCheckedEntry>();
+        const reply = proposalContext.source.role === 'assistant' &&
+            proposalContext.source.replyTo ? JSON.stringify([proposalContext.source.replyTo.id,
+            proposalContext.source.replyTo.revision]) : null;
+        const counterpart = reply &&
+            index.sources.get(reply)?.some(storedEntry => storedEntry.role === 'user') ? reply : counterpartId(
+                proposalContext.source, proposalContext.previous);
+        for (const storedEntry of order.ordered) {
+            const row = rows.find(ledgerRow => ledgerRow.entry === storedEntry)!;
+            const primary = proposalContext.accounts.find(ledgerAccount => ledgerAccount.id === partyAccount(
+                storedEntry.kind === 'income' ? storedEntry.payee : storedEntry.payer ?? storedEntry.payee));
+            const comparison = {
+                ...storedEntry, row: selectCurrency(storedEntry, primary).row ?? storedEntry.row
+            };
+            const prior = [...new Set([...(Object.hasOwn(state.returned, row.id) ? state.returned[row.id]! : []),
+                    ...state.previous.filter(proposedEntry => JSON.stringify(leadingKey(proposedEntry.entry))
+                        === JSON.stringify(leadingKey(storedEntry)) && entryCompare(proposedEntry.entry,
+                        comparison) === 0).flatMap(proposedEntry => proposedEntry.entry.checks.returned)])];
+            acceptSemanticDecision(storedEntry, prior);
+            if (order.cycles.has(keyText(storedEntry.key))) {
+                addCode(storedEntry.checks.codes, 'relation_invalid');
+                pending(storedEntry.checks, 'general');
+                addCode(row.returns, 'relation_invalid');
+            }
+            const verified = verifyEntry(storedEntry, {
+                source: proposalContext.source, previous: proposalContext.previous,
+                accounts: proposalContext.accounts, index, state: mutable, counterpart, work: ledgerWork,
+                forced: false, mode: 'proposal', readers: []
+            });
+            if (verified.detail.row !== null)
+                storedEntry.row = verified.detail.row;
+            const allReturns = [...new Set([...row.returns, ...verified.returns])];
+            const fresh = allReturns.filter(code => !prior.includes(code));
+            Object.defineProperty(state.returned, row.id, {
+                value: [...new Set([...prior, ...allReturns])], enumerable: true, writable: true, configurable: true
+            });
+            storedEntry.checks.returned = [...state.returned[row.id]!];
+            if (storedEntry.checks.returned.some(code => code === 'actor_not_authorised' ||
+                code === 'payer_account_confirm'))
+                storedEntry.checks.history.accountQuestioned = true;
+            if (verified.detail.codes.includes('payer_account_confirm')) {
+                row.read.payer = partyAccount(storedEntry.payer);
+                row.read.behalf = storedEntry.behalf?.span ? proposalContext.source.text.slice(storedEntry.behalf
+                    .span.start, storedEntry.behalf.span.end) : null;
+                row.read.candidates = availableCandidates(storedEntry, proposalContext.accounts).filter(id => id
+                    !== partyAccount(storedEntry.payer));
+            }
+            if (verified.detail.codes.includes('possible_duplicate') && counterpart) {
+                const other = index.sources.get(counterpart)?.find(decodedValue => posted(decodedValue) &&
+                    matchingTransaction(storedEntry, decodedValue));
+                if (other)
+                    row.read.same_as = asJSON(other.key);
+            }
+            const unanswered = fresh.filter(code => SEMANTIC_QUESTIONS.includes(code));
+            if (unanswered.length) {
+                storedEntry.checks.unanswered = unanswered;
+                for (const code of unanswered) {
+                    addCode(storedEntry.checks.codes, code);
+                    pending(storedEntry.checks, code === 'possible_duplicate' ||
+                        code === 'identical_entries' ? 'restated' : code === 'actor_not_authorised' ? 'general' :
+                            'not_transacted');
+                }
+            }
+            const verdict: LedgerCheckedEntry['verdict'] = fresh.length ? 'returned' : verified.detail.disposition
+                === 'pending' ? 'settled' : verified.detail.disposition === 'flagged' ? 'flagged' : 'accepted';
+            const checked = {
+                id: row.id,
+                verdict,
+                codes: verified.detail.codes,
+                // Storage retains the six-question duplicate group; feedback names this occurrence failure precisely.
+                returnedCodes: fresh.map(code => row.sourceActExhausted && code === 'identical_entries'
+                    ? 'identical_in_source' : code),
+                read: row.read,
+                entry: storedEntry
+            };
+            checks.set(storedEntry, checked);
+            indexDetail(index, verified.detail);
+        }
+        const entries = rows.map(ledgerRow => checks.get(ledgerRow.entry)!);
+        const unbooked: LedgerUnbooked[] = [];
+        for (const rawU of unbookedDescriptor.value) {
+            let u: unknown;
+            try {
+                u = snapshot(rawU);
+            }
+            catch {
+                continue;
+            }
+            if (!record(u) || !MODEL_UNBOOKED.includes(u.reason as string))
+                continue;
+            const mark = proposalContext.marks.find(candidateMark => candidateMark.id === u.mark);
+            if (mark)
+                unbooked.push({
+                    sourceId: proposalContext.source.sourceId, revision: proposalContext.source.revision,
+                    ...('whole' in mark ? { whole: true as const } : { span: mark.span }), mark: mark.id,
+                    reason: u.reason as LedgerUnbookedReason, by: 'model'
+                });
+        }
+        const covered = new Set([...entries.map(storedEntry => storedEntry.entry.mark.id),
+            ...unbooked.map(u => u.mark!)]);
+        const uncovered = proposalContext.marks.filter(candidateMark => !covered.has(
+                candidateMark.id)).map(candidateMark => candidateMark.id);
+        const withdrawn = state.previous.filter(storedEntry => !ids.has(storedEntry.id)).map(storedEntry =>
+            storedEntry.id);
+        let settled = !entries.some(storedEntry => storedEntry.verdict === 'returned') && !uncovered.length;
+        let withdrawalReturned = false;
+        if (state.awaitingWithdrawal.length) {
+            for (const id of state.awaitingWithdrawal)
+                if (!ids.has(id) && !state.confirmedWithdrawn.includes(id))
+                    state.confirmedWithdrawn.push(id);
+            state.awaitingWithdrawal = [];
+        }
+        if (settled && !state.withdrawalAsked &&
+            state.previous.some(storedEntry => withdrawn.includes(storedEntry.id) && ['accepted',
+                'flagged'].includes(storedEntry.verdict))) {
+            settled = false;
+            withdrawalReturned = true;
+            state.withdrawalAsked = true;
+            state.awaitingWithdrawal = withdrawn;
+        }
+        // A failed call must preserve every part of the previous usable state.
+        if (state.history.length + entries.length > LEDGER_LIMITS.history) {
+            return {
+                ...initial, state: snapshot(old) as LedgerProposalState, error: 'history_limit'
+            };
+        }
+        for (const checked of entries) {
+            state.history.push({
+                id: checked.id, mark: checked.entry.mark.id, act: checked.entry.act, checks: checked.entry.checks
+            });
+            if (checked.verdict === 'accepted' || checked.verdict === 'flagged') {
+                const oldIndex = state.everAccepted.findIndex(candidate => candidate.id === checked.id);
+                const row = {
+                    id: checked.id, entry: checked.entry
+                };
+                if (oldIndex >= 0)
+                    state.everAccepted[oldIndex] = row;
+                else
+                    state.everAccepted.push(row);
+            }
+        }
+        state.previous = entries.map(({ id, verdict, entry }) => ({
+            id, verdict, entry
+        }));
+        return {
+            entries, unbooked, uncovered, settled, withdrawn, withdrawalReturned, state, work: ledgerWork
+        };
     }
-    checkAmountOverlaps(rows,c.readings,scans,w);
-    checkQuantityWindows(rows.map(r=>r.entry),texts,scans,w);
-    if(c.keptEntries&&!entriesOK(c.keptEntries))return {...initial,error:'context_invalid'};
-    assignKeys(rows.map(r=>r.entry),c.keptEntries);
-    const link=()=>{for(const row of rows)if(row.proposal?.relation&&row.entry.relation){const ref=row.proposal.relation.entry;
-      row.entry.relation.target=rows.find(r=>r.id===ref)?.entry.key??(c.entryRefs&&Object.hasOwn(c.entryRefs,ref)?c.entryRefs[ref]:null)??(Object.hasOwn(c.readings,ref)&&'entry'in c.readings[ref]?c.readings[ref].entry??null:null);}};
-    link();assignKeys(rows.map(r=>r.entry),c.keptEntries);link();
-    for(let i=0;i<rows.length;i++)for(let j=0;j<i;j++){w.pairs++;const a=rows[i]!,b=rows[j]!;
-      if(JSON.stringify(leadingKey(a.entry))===JSON.stringify(leadingKey(b.entry))&&entryCompare(a.entry,b.entry)===0){
-        addCode(a.entry.checks.codes,'identical_entries');addCode(a.entry.checks.codes,'identical_in_source');pending(a.entry.checks,'restated');addCode(a.returns,'identical_entries');a.read.same_as=b.id;break;}}
-    const index=emptyIndex();for(const d of c.before?.entries??[])indexDetail(index,d);
-    const mutable=stateFromAccounts(c.accounts),order=dependencyOrder(rows.map(r=>r.entry)),checks=new Map<StoredLedgerEntry,LedgerCheckedEntry>();
-    const reply=c.source.role==='assistant'&&c.source.replyTo?JSON.stringify([c.source.replyTo.id,c.source.replyTo.revision]):null;
-    const counterpart=reply&&index.sources.get(reply)?.some(e=>e.role==='user')?reply:counterpartId(c.source,c.previous);
-    for(const e of order.ordered) {
-      const row=rows.find(r=>r.entry===e)!;
-      const primary=c.accounts.find(a=>a.id===partyAccount(e.kind==='income'?e.payee:e.payer??e.payee));
-      const comparison={...e,row:selectCurrency(e,primary).row??e.row};
-      const prior=[...new Set([...(Object.hasOwn(state.returned,row.id)?state.returned[row.id]!:[]),...state.previous.filter(p=>JSON.stringify(leadingKey(p.entry))===JSON.stringify(leadingKey(e))&&entryCompare(p.entry,comparison)===0).flatMap(p=>p.entry.checks.returned)])];
-      acceptSemanticDecision(e,prior);
-      if(order.cycles.has(keyText(e.key))){addCode(e.checks.codes,'relation_invalid');pending(e.checks,'general');addCode(row.returns,'relation_invalid');}
-      const verified=verifyEntry(e,{source:c.source,previous:c.previous,accounts:c.accounts,index,state:mutable,counterpart,work:w,forced:false,mode:'proposal',readers:[]});
-      if(verified.detail.row!==null)e.row=verified.detail.row;
-      const allReturns=[...new Set([...row.returns,...verified.returns])];
-      const fresh=allReturns.filter(code=>!prior.includes(code));
-      Object.defineProperty(state.returned,row.id,{value:[...new Set([...prior,...allReturns])],enumerable:true,writable:true,configurable:true});
-      e.checks.returned=[...state.returned[row.id]!];
-      if(e.checks.returned.some(code=>code==='actor_not_authorised'||code==='payer_account_confirm'))e.checks.history.accountQuestioned=true;
-      if(verified.detail.codes.includes('payer_account_confirm')) {
-        row.read.payer=partyAccount(e.payer);row.read.behalf=e.behalf?.span?c.source.text.slice(e.behalf.span.start,e.behalf.span.end):null;
-        row.read.candidates=availableCandidates(e,c.accounts).filter(id=>id!==partyAccount(e.payer));
-      }
-      if(verified.detail.codes.includes('possible_duplicate')&&counterpart){const other=index.sources.get(counterpart)?.find(d=>posted(d)&&matchingTransaction(e,d));if(other)row.read.same_as=asJSON(other.key);}
-      const unanswered=fresh.filter(code=>SEMANTIC_QUESTIONS.includes(code));
-      if(unanswered.length){e.checks.unanswered=unanswered;for(const code of unanswered){addCode(e.checks.codes,code);pending(e.checks,code==='possible_duplicate'||code==='identical_entries'?'restated':code==='actor_not_authorised'?'general':'not_transacted');}}
-      const verdict:LedgerCheckedEntry['verdict']=fresh.length?'returned':verified.detail.disposition==='pending'?'settled':verified.detail.disposition==='flagged'?'flagged':'accepted';
-      const checked={id:row.id,verdict,codes:verified.detail.codes,read:row.read,entry:e};checks.set(e,checked);indexDetail(index,verified.detail);
+    catch {
+        return {
+            ...empty(), error: 'context_invalid'
+        };
     }
-    const entries=rows.map(r=>checks.get(r.entry)!);
-    const unbooked:LedgerUnbooked[]=[];
-    for(const rawU of ud.value){let u:unknown;try{u=snapshot(rawU);}catch{continue;}if(!record(u)||!MODEL_UNBOOKED.includes(u.reason as string))continue;
-      const mark=c.marks.find(m=>m.id===u.mark);if(mark)unbooked.push({sourceId:c.source.sourceId,revision:c.source.revision,...('whole'in mark?{whole:true as const}:{span:mark.span}),mark:mark.id,reason:u.reason as LedgerUnbookedReason,by:'model'});}
-    const covered=new Set([...entries.map(e=>e.entry.mark.id),...unbooked.map(u=>u.mark!)]),uncovered=c.marks.filter(m=>!covered.has(m.id)).map(m=>m.id);
-    const withdrawn=state.previous.filter(e=>!ids.has(e.id)).map(e=>e.id);
-    let settled=!entries.some(e=>e.verdict==='returned')&&!uncovered.length,withdrawalReturned=false;
-    if(state.awaitingWithdrawal.length){for(const id of state.awaitingWithdrawal)if(!ids.has(id)&&!state.confirmedWithdrawn.includes(id))state.confirmedWithdrawn.push(id);state.awaitingWithdrawal=[];}
-    if(settled&&!state.withdrawalAsked&&state.previous.some(e=>withdrawn.includes(e.id)&&['accepted','flagged'].includes(e.verdict))) {
-      settled=false;withdrawalReturned=true;state.withdrawalAsked=true;state.awaitingWithdrawal=withdrawn;
-    }
-    for(const checked of entries) {
-      state.history.push({id:checked.id,mark:checked.entry.mark.id,act:checked.entry.act,checks:checked.entry.checks});
-      if(checked.verdict==='accepted'||checked.verdict==='flagged') {const oldIndex=state.everAccepted.findIndex(x=>x.id===checked.id);const row={id:checked.id,entry:checked.entry};
-        if(oldIndex>=0)state.everAccepted[oldIndex]=row;else state.everAccepted.push(row);}
-    }
-    state.previous=entries.map(({id,verdict,entry})=>({id,verdict,entry}));
-    if(state.history.length>4096)return {...initial,error:'history_limit'};
-    return {entries,unbooked,uncovered,settled,withdrawn,withdrawalReturned,state,work:w};
-  }catch{return {...empty(),error:'context_invalid'};}
 }
 
 /** Canonical anchor for an existing legacy effect. O(identifier bytes). */
@@ -1119,14 +1791,126 @@ function positionIndex(sources:readonly WorldSourceEffects[],w:LedgerWork=work()
     return lo?times[lo-1]!.position:0;
   }};
 }
-function decodeEvents(raw:unknown,diagnostics:LedgerDiagnostic[]):LedgerAccountEvent[] {
-  if(raw==null)return [];if(!Array.isArray(raw)){diagnostics.push({code:'account_events_invalid',id:null});return [];}
-  const truncated=raw.length>LEDGER_LIMITS.events;if(truncated)diagnostics.push({code:'account_events_truncated',id:null});
-  const out:LedgerAccountEvent[]=[],ids=new Map<string,string>(),conflicts=new Set<string>();
-  for(let i=0;i<raw.length;i++){const field=Object.getOwnPropertyDescriptor(raw,String(i)),d=field&&'value'in field?decodeLedgerAccountEvent(field.value):{ok:false as const,code:'account_event_invalid'};if(!d.ok){diagnostics.push({code:d.code,id:null,index:i,reason:field&&'value'in field?rowFailure(field.value):'json_accessor'});continue;}const key=JSON.stringify(d.value),old=ids.get(d.value.id);
-    if(old!==undefined){if(old!==key){conflicts.add(d.value.id);diagnostics.push({code:'account_event_id_conflict',id:d.value.id});}continue;}ids.set(d.value.id,key);out.push(d.value);}
-  const ordered=out.filter(e=>!conflicts.has(e.id)).sort((a,b)=>a.seq-b.seq);
-  return truncated?[...ordered.filter(e=>e.kind==='create'),...ordered.filter(e=>e.kind!=='create').slice(0,LEDGER_LIMITS.events)]:ordered;
+
+/** O(own keys); holes are rejected without walking the array's declared length. */
+function denseArray(raw: unknown): raw is unknown[] {
+    if (!Array.isArray(raw))
+        return false;
+    const indices = Object.keys(raw).filter(key => INTEGER.test(key) && Number(key) < raw.length);
+    return indices.length === raw.length;
+}
+
+/** Append in O(rows), retaining at most the per-result diagnostic budget.
+ * The final summary counts the displaced visible row as well as later omissions. */
+function appendDiagnostics(diagnostics: LedgerDiagnostic[], ...rows: LedgerDiagnostic[]): void {
+    for (const row of rows) {
+        const weight = row.code === 'diagnostics_truncated' ? row.omitted ?? 1 : 1;
+        const summary = diagnostics.at(-1);
+        if (summary?.code === 'diagnostics_truncated') {
+            summary.omitted = (summary.omitted ?? 1) + weight;
+        }
+        else if (diagnostics.length < LEDGER_LIMITS.diagnostics) {
+            diagnostics.push(row);
+        }
+        else {
+            diagnostics[diagnostics.length - 1] = {
+                code: 'diagnostics_truncated', id: null, omitted: 1 + weight
+            };
+        }
+    }
+}
+
+/** Positions are source counts: zero is before the first source, N is after source N. */
+export interface LedgerEventPositions {
+  accountEvents:{event:LedgerAccountEvent;position:number}[];
+  adjustments:{correction:LedgerCorrection;position:number}[];
+}
+
+/** Resolve decoded event/adjustment positions against the complete sequence, O(S log S + E log S).
+ * Exact source/revision wins; a missing anchor uses the maximum position accepted by its timestamp.
+ * Invalid or unreadable inputs return ledger_positions_invalid; no caller objects are modified. */
+export function ledgerEventPositions(sources: readonly WorldSourceEffects[], accountEvents:
+    readonly LedgerAccountEvent[], corrections: readonly LedgerCorrection[], ledgerWork: LedgerWork = work()):
+    LedgerDecoded<LedgerEventPositions> {
+    try {
+        if (!denseArray(sources) || !denseArray(accountEvents) || !denseArray(corrections)) {
+            return {
+                ok: false, code: 'ledger_positions_invalid'
+            };
+        }
+        const adjustments = corrections.filter(correction => correction.action === 'adjustment');
+        const needsIndex = accountEvents.some(event => event.kind !== 'create') || adjustments.length > 0;
+        const positions = needsIndex ? positionIndex(sources, ledgerWork) : { at: () => 0 };
+        return {
+            ok: true,
+            value: {
+                accountEvents: accountEvents.map(event => ({
+                    event, position: event.kind === 'create' ? 0 : positions.at(event.after)
+                })),
+                adjustments: adjustments.map(correction => ({
+                    correction, position: positions.at(correction.after ?? null)
+                })),
+            },
+        };
+    }
+    catch {
+        return {
+            ok: false, code: 'ledger_positions_invalid'
+        };
+    }
+}
+
+function decodeEvents(raw: unknown, diagnostics: LedgerDiagnostic[]): LedgerAccountEvent[] {
+    if (raw == null)
+        return [];
+    if (!denseArray(raw)) {
+        appendDiagnostics(diagnostics, {
+            code: 'account_events_invalid', id: null
+        });
+        return [];
+    }
+    const truncated = raw.length > LEDGER_LIMITS.events;
+    if (truncated)
+        appendDiagnostics(diagnostics, {
+            code: 'account_events_truncated', id: null
+        });
+    const events: LedgerAccountEvent[] = [];
+    const identities = new Map<string, string>();
+    for (let index = 0; index < raw.length; index++) {
+        const field = Object.getOwnPropertyDescriptor(raw, String(index));
+        const decoded = field && 'value' in field
+            ? decodeLedgerAccountEvent(field.value)
+            : {
+                ok: false as const, code: 'account_event_invalid'
+            };
+        if (!decoded.ok) {
+            appendDiagnostics(diagnostics, {
+                code: decoded.code,
+                id: null,
+                index,
+                reason: field && 'value' in field ? rowFailure(field.value) : 'json_accessor',
+            });
+            continue;
+        }
+        const fingerprint = JSON.stringify(decoded.value);
+        const previous = identities.get(decoded.value.id);
+        if (previous !== undefined) {
+            if (previous !== fingerprint)
+                appendDiagnostics(diagnostics, {
+                    code: 'account_event_id_conflict', id: decoded.value.id
+                });
+            continue;
+        }
+        identities.set(decoded.value.id, fingerprint);
+        events.push(decoded.value);
+    }
+    const ordered = events.sort((left, right) => left.seq - right.seq);
+    return truncated
+        ? [
+            ...ordered.filter(event => event.kind === 'create'),
+            ...ordered.filter(event => event.kind !== 'create').slice(0, LEDGER_LIMITS.events),
+        ]
+        : ordered;
 }
 /** Stable radix ordering of nonnegative safe-integer sequence numbers: O(7*C). */
 function correctionOrder<T extends {seq:number}>(rows:T[],w:LedgerWork,descending=false):T[] {
@@ -1144,28 +1928,162 @@ function correctionOrder<T extends {seq:number}>(rows:T[],w:LedgerWork,descendin
 function rowFailure(raw:unknown):string {
   try{snapshot(raw);return 'shape_invalid';}catch(error){return error instanceof Error?error.message:'non_json_value';}
 }
-function decodeCorrections(raw:unknown,diagnostics:LedgerDiagnostic[],w:LedgerWork=work()):LedgerCorrection[] {
-  if(raw==null)return [];if(!Array.isArray(raw)){diagnostics.push({code:'ledger_corrections_invalid',id:null});return [];}
-  const out:LedgerCorrection[]=[],ids=new Map<string,string>(),conflicts=new Set<string>();
-  for(let i=0;i<raw.length;i++){w.correctionVisits=(w.correctionVisits??0)+1;const field=Object.getOwnPropertyDescriptor(raw,String(i)),d=field&&'value'in field?decodeLedgerCorrection(field.value):{ok:false as const,code:'ledger_correction_invalid'};if(!d.ok){diagnostics.push({code:d.code,id:null,index:i,reason:field&&'value'in field?rowFailure(field.value):'json_accessor'});continue;}const key=JSON.stringify(d.value),old=ids.get(d.value.id);
-    if(old!==undefined){if(old!==key){conflicts.add(d.value.id);diagnostics.push({code:'correction_id_conflict',id:d.value.id});}continue;}ids.set(d.value.id,key);out.push(d.value);}
-  const adjustmentIds=new Set(out.filter(c=>c.action==='adjustment'&&!conflicts.has(c.id)).map(c=>`user:${c.id}`)),active=new Map<string,LedgerCorrection>();
-  for(const c of correctionOrder(out.filter(e=>!conflicts.has(e.id)),w)) {
-    w.correctionVisits=(w.correctionVisits??0)+1;
-    const adjustmentTarget=typeof c.anchor==='string'&&adjustmentIds.has(c.anchor);
-    if(adjustmentTarget&&c.action==='void'){diagnostics.push({code:'adjustment_void_invalid',id:c.id});continue;}
-    if(adjustmentTarget&&(c.action==='amend'||c.action==='confirm')){diagnostics.push({code:'adjustment_edit_invalid',id:c.id});continue;}
-    const key=(c.action==='adjustment'||adjustmentTarget?'adjustment':identity(c as LedgerSourceRef))+'/'+(c.anchor?keyText(c.anchor):`user:${c.id}`);
-    if(c.action==='clear')active.delete(key);else active.set(key,c);
-  }
-  return correctionOrder([...active.values()],w);
+
+function decodeCorrections(raw: unknown, diagnostics: LedgerDiagnostic[], ledgerWork: LedgerWork = work(), history:
+    LedgerCorrection[] = []): LedgerCorrection[] {
+    if (raw == null)
+        return [];
+    if (!denseArray(raw)) {
+        appendDiagnostics(diagnostics, {
+            code: 'ledger_corrections_invalid', id: null
+        });
+        return [];
+    }
+    const candidates: unknown[] = [];
+    try {
+        // Read the entire boundary before adopting any row; proxy failures reject the whole input.
+        for (let index = 0; index < raw.length; index++)
+            candidates.push(raw[index]);
+    }
+    catch {
+        appendDiagnostics(diagnostics, {
+            code: 'ledger_corrections_invalid', id: null
+        });
+        return [];
+    }
+    const corrections: LedgerCorrection[] = [];
+    const identities = new Map<string, string>();
+    for (let index = 0; index < raw.length; index++) {
+        ledgerWork.correctionVisits = (ledgerWork.correctionVisits ?? 0) + 1;
+        const field = Object.getOwnPropertyDescriptor(raw, String(index));
+        const decoded = field && 'value' in field
+            ? decodeLedgerCorrection(candidates[index])
+            : {
+                ok: false as const, code: 'ledger_correction_invalid'
+            };
+        if (!decoded.ok) {
+            appendDiagnostics(diagnostics, {
+                code: decoded.code,
+                id: null,
+                index,
+                reason: field && 'value' in field ? rowFailure(field.value) : 'json_accessor',
+            });
+            continue;
+        }
+        const fingerprint = JSON.stringify(decoded.value);
+        const previous = identities.get(decoded.value.id);
+        if (previous !== undefined) {
+            if (previous !== fingerprint)
+                appendDiagnostics(diagnostics, {
+                    code: 'correction_id_conflict', id: decoded.value.id
+                });
+            continue;
+        }
+        identities.set(decoded.value.id, fingerprint);
+        corrections.push(decoded.value);
+    }
+    const adjustmentIds = new Set(corrections.filter(correction => correction.action === 'adjustment')
+        .map(correction => `user:${correction.id}`));
+    const active = new Map<string, LedgerCorrection>();
+    for (const correction of correctionOrder(corrections, ledgerWork)) {
+        ledgerWork.correctionVisits = (ledgerWork.correctionVisits ?? 0) + 1;
+        const adjustmentTarget = typeof correction.anchor === 'string' && adjustmentIds.has(correction.anchor);
+        if (adjustmentTarget && correction.action === 'void') {
+            appendDiagnostics(diagnostics, {
+                code: 'adjustment_void_invalid', id: correction.id
+            });
+            continue;
+        }
+        if (adjustmentTarget && correction.action !== 'clear') {
+            appendDiagnostics(diagnostics, {
+                code: 'adjustment_edit_invalid', id: correction.id
+            });
+            continue;
+        }
+        history.push(correction);
+        const group = correction.action === 'adjustment' ||
+            adjustmentTarget ? 'adjustment' : identity(correction as LedgerSourceRef);
+        const key = group + '/' + (correction.anchor ? keyText(correction.anchor) : `user:${correction.id}`);
+        if (correction.action === 'clear') {
+            if (!active.delete(key))
+                appendDiagnostics(diagnostics, {
+                    code: 'clear_unmatched', id: correction.id
+                });
+        }
+        else {
+            active.set(key, correction);
+        }
+    }
+    return correctionOrder([...active.values()], ledgerWork);
 }
-function implicitAccounts(settings:WorldSettings,state:LedgerMutableState):LedgerAccount[] {
-  return [['player',[settings.playerName]],...Object.entries(settings.actorLabels)].map(([id,names])=>{
-    const owner=id as string,labels=names as readonly string[],rows=[...state.balances.values()].filter(r=>r.ownerId===owner).map(r=>({unit:r.unit,value:moneyText(r.cents),tracked:true,readerIds:[...r.readerIds].sort()}));
-    const items=[...state.inventory.values()].filter(r=>r.ownerId===owner).map(r=>({item:r.item,count:r.count,readerIds:[...r.readerIds].sort()}));
-    return {id:owner,kind:'private' as const,label:labels[0]!,aliases:labels.slice(1) as string[],actors:[owner],readers:[...new Set(rows.flatMap(r=>r.readerIds).concat(items.flatMap(i=>i.readerIds)))].sort(),rows,items,status:'active' as const};
-  });
+
+/** O(balance rows + inventory rows); only equal script-folded labels share a row.
+ * Totals retain the first spelling and the intersection of readers who know every component. */
+function mergeFoldedRows(state: LedgerMutableState, diagnostics: LedgerDiagnostic[]): void {
+    const balances = new Map<string, LedgerMutableBalance>();
+    for (const [key, row] of state.balances) {
+        const folded = assetIdentity(row.ownerId, foldForMatch(row.unit));
+        const first = balances.get(folded);
+        if (!first) {
+            balances.set(folded, row);
+            continue;
+        }
+        first.cents += row.cents;
+        first.readerIds = new Set([...first.readerIds].filter(reader => row.readerIds.has(reader)));
+        state.balances.delete(key);
+        appendDiagnostics(diagnostics, {
+            code: 'folded_currency_duplicate', id: row.ownerId
+        });
+    }
+    const inventory = new Map<string, LedgerMutableInventory>();
+    let inventoryIndex = -1;
+    for (const [key, row] of state.inventory) {
+        inventoryIndex++;
+        const folded = assetIdentity(row.ownerId, foldForMatch(row.item));
+        const first = inventory.get(folded);
+        if (!first) {
+            inventory.set(folded, row);
+            continue;
+        }
+        const count = first.count + row.count;
+        if (!Number.isSafeInteger(count)) {
+            // An invalid later row must not erase earlier rows or unrelated transactions.
+            state.inventory.delete(key);
+            appendDiagnostics(diagnostics, {
+                code: 'folded_inventory_overflow', id: row.ownerId, index: inventoryIndex, reason: row.item
+            });
+            continue;
+        }
+        first.count = count;
+        first.readerIds = new Set([...first.readerIds].filter(reader => row.readerIds.has(reader)));
+        state.inventory.delete(key);
+        appendDiagnostics(diagnostics, {
+            code: 'folded_item_duplicate', id: row.ownerId
+        });
+    }
+}
+
+function implicitAccounts(settings: WorldSettings, state: LedgerMutableState, diagnostics: LedgerDiagnostic[] =
+    []): LedgerAccount[] {
+    mergeFoldedRows(state, diagnostics);
+    return [['player', [settings.playerName]], ...Object.entries(settings.actorLabels)].map(([id, names]) => {
+        const owner = id as string;
+        const labels = names as readonly string[];
+        const rows = [...state.balances.values()].filter(
+            ledgerRow => ledgerRow.ownerId === owner).map(ledgerRow => ({
+            unit: ledgerRow.unit, value: moneyText(ledgerRow.cents), tracked: true,
+            readerIds: [...ledgerRow.readerIds].sort()
+        }));
+        const items = [...state.inventory.values()].filter(ledgerRow => ledgerRow.ownerId === owner).map(ledgerRow => ({
+            item: ledgerRow.item, count: ledgerRow.count, readerIds: [...ledgerRow.readerIds].sort()
+        }));
+        return {
+            id: owner, kind: 'private' as const, label: labels[0]!, aliases: labels.slice(1) as string[],
+            actors: [owner],
+            readers: [...new Set(rows.flatMap(ledgerRow => ledgerRow.readerIds).concat(items.flatMap(i => i
+                .readerIds)))].sort(), rows, items, status: 'active' as const
+        };
+    });
 }
 function syncAccounts(accounts:LedgerAccount[],state:LedgerMutableState,w:LedgerWork):void {
   for(const a of accounts)if(a.status==='active'){
@@ -1173,65 +2091,204 @@ function syncAccounts(accounts:LedgerAccount[],state:LedgerMutableState,w:Ledger
     for(const i of a.items){w.rowCopies++;const row=state.inventory.get(assetIdentity(a.id,i.item));if(row){i.count=row.count;i.readerIds=[...row.readerIds].sort();}}
   }
 }
-function applyAccountEvent(event:LedgerAccountEvent,accounts:LedgerAccount[],state:LedgerMutableState,diagnostics:LedgerDiagnostic[],w:LedgerWork):boolean {
-  w.events++;
-  const invalid=(code:string)=>{diagnostics.push({code,id:event.id});return false;};
-  const known=new Set(accounts.filter(a=>a.kind==='private').map(a=>a.id));
-  const readersOK=(ids:readonly string[])=>ids.every(id=>known.has(id));
-  if(event.kind==='create') {
-    const v=event.account;
-    if(v.kind==='private'||!v.id.startsWith('acct:')||known.has(v.id)||accounts.some(a=>a.id===v.id))return invalid('account_id_conflict');
-    if(accounts.length>=256)return invalid('account_limit');
-    if(!readersOK(v.actors)||!readersOK(v.readers)||v.rows.some(r=>!readersOK(r.readerIds??v.readers))||v.items.some(i=>!readersOK(i.readerIds??v.readers)))return invalid('account_reader_invalid');
-    if(new Set(v.rows.map(r=>r.unit)).size!==v.rows.length||new Set(v.items.map(i=>i.item)).size!==v.items.length)return invalid('account_row_conflict');
-    const a:LedgerAccount={...v,rows:v.rows.map(r=>({unit:r.unit,value:r.opening,tracked:r.tracked,readerIds:[...(r.readerIds??v.readers)].sort()})),items:v.items.map(i=>({...i,readerIds:[...(i.readerIds??v.readers)].sort()}))};
-    accounts.push(a);
-    if(a.status==='active'){for(const r of a.rows)state.balances.set(assetIdentity(a.id,r.unit),{ownerId:a.id,unit:r.unit,cents:decimalCents(r.value),tracked:r.tracked,readerIds:new Set(r.readerIds)});
-      for(const i of a.items)state.inventory.set(assetIdentity(a.id,i.item),{ownerId:a.id,item:i.item,count:i.count,readerIds:new Set(i.readerIds)});}
+
+function applyAccountEvent(event: LedgerAccountEvent, accounts: LedgerAccount[], state: LedgerMutableState,
+    diagnostics: LedgerDiagnostic[], ledgerWork: LedgerWork): boolean {
+    ledgerWork.events++;
+    const invalid = (code: string) => {
+        appendDiagnostics(diagnostics, {
+            code, id: event.id
+        });
+        return false;
+    };
+    const known = new Set(accounts.filter(ledgerAccount => ledgerAccount.kind === 'private').map(ledgerAccount =>
+        ledgerAccount.id));
+    const readersOK = (ids: readonly string[]) => ids.every(id => known.has(id));
+    if (event.kind === 'create') {
+        const decodedObject = event.account;
+        if (decodedObject.kind === 'private' || !decodedObject.id.startsWith('acct:') ||
+            known.has(decodedObject.id) || accounts.some(ledgerAccount => ledgerAccount.id === decodedObject.id))
+            return invalid('account_id_conflict');
+        if (accounts.length >= 256)
+            return invalid('account_limit');
+        if (!readersOK(decodedObject.actors) || !readersOK(decodedObject.readers) ||
+            decodedObject.rows.some(ledgerRow => !readersOK(ledgerRow.readerIds ?? decodedObject.readers)) ||
+            decodedObject.items.some(i => !readersOK(i.readerIds ?? decodedObject.readers)))
+            return invalid('account_reader_invalid');
+        const ledgerAccount: LedgerAccount = {
+            ...decodedObject, rows: decodedObject.rows.map(ledgerRow => ({
+                unit: ledgerRow.unit, value: ledgerRow.opening, tracked: ledgerRow.tracked,
+                readerIds: [...(ledgerRow.readerIds ?? decodedObject.readers)].sort()
+            })), items: decodedObject.items.map(i => ({
+                ...i, readerIds: [...(i.readerIds ?? decodedObject.readers)].sort()
+            }))
+        };
+        // Preserve the first occurrence even when the two incoming spellings are literally identical.
+        const openings: LedgerMutableState = {
+            timeMs: 0, balances: new Map(), inventory: new Map()
+        };
+        for (let index = 0; index < ledgerAccount.rows.length; index++) {
+            const row = ledgerAccount.rows[index]!;
+            openings.balances.set(String(index), {
+                ownerId: ledgerAccount.id, unit: row.unit, cents: decimalCents(row.value),
+                tracked: row.tracked, readerIds: new Set(row.readerIds),
+            });
+        }
+        for (let index = 0; index < ledgerAccount.items.length; index++) {
+            const row = ledgerAccount.items[index]!;
+            openings.inventory.set(String(index), {
+                ownerId: ledgerAccount.id, item: row.item, count: row.count, readerIds: new Set(row.readerIds)
+            });
+        }
+        try {
+            mergeFoldedRows(openings, diagnostics);
+        }
+        catch {
+            return invalid('folded_inventory_overflow');
+        }
+        ledgerAccount.rows = [...openings.balances.values()].map(row => ({
+            unit: row.unit, value: moneyText(row.cents), tracked: row.tracked !== false,
+            readerIds: [...row.readerIds].sort(),
+        }));
+        ledgerAccount.items = [...openings.inventory.values()].map(row => ({
+            item: row.item, count: row.count, readerIds: [...row.readerIds].sort(),
+        }));
+        accounts.push(ledgerAccount);
+        if (ledgerAccount.status === 'active') {
+            for (const ledgerRow of ledgerAccount.rows)
+                state.balances.set(assetIdentity(ledgerAccount.id, ledgerRow.unit), {
+                    ownerId: ledgerAccount.id, unit: ledgerRow.unit, cents: decimalCents(ledgerRow.value),
+                    tracked: ledgerRow.tracked, readerIds: new Set(ledgerRow.readerIds)
+                });
+            for (const i of ledgerAccount.items)
+                state.inventory.set(assetIdentity(ledgerAccount.id, i.item), {
+                    ownerId: ledgerAccount.id, item: i.item, count: i.count, readerIds: new Set(i.readerIds)
+                });
+        }
+        return true;
+    }
+    const ledgerAccount = accounts.find(ledgerAccount => ledgerAccount.id === event.accountId);
+    if (!ledgerAccount || ledgerAccount.status === 'closed')
+        return invalid('account_event_target_invalid');
+    if (event.kind === 'close') {
+        if (ledgerAccount.kind === 'private')
+            return invalid('private_account_cannot_close');
+        syncAccounts([ledgerAccount], state, ledgerWork);
+        ledgerAccount.status = 'closed';
+        for (const ledgerRow of ledgerAccount.rows)
+            state.balances.delete(assetIdentity(ledgerAccount.id, ledgerRow.unit));
+        for (const i of ledgerAccount.items)
+            state.inventory.delete(assetIdentity(ledgerAccount.id, i.item));
+        return true;
+    }
+    const changes = event.changes;
+    if (changes.actors && !readersOK(changes.actors) || changes.readers &&
+        !readersOK(changes.readers) || changes.rows?.some(ledgerRow => ledgerRow.readerIds &&
+        !readersOK(ledgerRow.readerIds)))
+        return invalid('account_reader_invalid');
+    if (ledgerAccount.kind === 'private' && (changes.label !== undefined ||
+        changes.aliases !== undefined || changes.actors !== undefined))
+        return invalid('private_account_identity_immutable');
+    if (changes.rows) {
+        if (new Set(changes.rows.map(ledgerRow => ledgerRow.unit)).size !== changes.rows.length)
+            return invalid('account_row_conflict');
+        let rowCount = ledgerAccount.rows.length;
+        for (const change of changes.rows) {
+            const old = ledgerAccount.rows.find(ledgerRow => ledgerRow.unit === change.unit);
+            if (old && change.opening !== undefined)
+                return invalid('account_opening_immutable');
+            if (!old && !change.remove && change.opening === undefined)
+                return invalid('account_opening_required');
+            rowCount += change.remove ? (old ? -1 : 0) : old ? 0 : 1;
+        }
+        if (rowCount > 256)
+            return invalid('account_row_limit');
+    }
+    if (changes.label !== undefined)
+        ledgerAccount.label = changes.label;
+    if (changes.aliases)
+        ledgerAccount.aliases = [...changes.aliases];
+    if (changes.actors)
+        ledgerAccount.actors = [...changes.actors];
+    if (changes.readers) {
+        ledgerAccount.readers = [...changes.readers];
+        for (const ledgerRow of ledgerAccount.rows) {
+            ledgerRow.readerIds = [...changes.readers];
+            const row = state.balances.get(assetIdentity(ledgerAccount.id, ledgerRow.unit));
+            if (row)
+                row.readerIds = new Set(changes.readers);
+        }
+        if (ledgerAccount.kind !== 'private')
+            for (const i of ledgerAccount.items) {
+                i.readerIds = [...changes.readers];
+                const row = state.inventory.get(assetIdentity(ledgerAccount.id, i.item));
+                if (row)
+                    row.readerIds = new Set(changes.readers);
+            }
+    }
+    for (const change of changes.rows ?? []) {
+        const at = ledgerAccount.rows.findIndex(ledgerRow => ledgerRow.unit === change.unit);
+        const old = at >= 0 ? ledgerAccount.rows[at] : undefined;
+        const key = assetIdentity(ledgerAccount.id, change.unit);
+        if (change.remove) {
+            if (at >= 0)
+                ledgerAccount.rows.splice(at, 1);
+            state.balances.delete(key);
+            continue;
+        }
+        if (old) {
+            if (change.tracked !== undefined) {
+                old.tracked = change.tracked;
+                state.balances.get(key)!.tracked = change.tracked;
+            }
+            if (change.readerIds) {
+                old.readerIds = [...change.readerIds];
+                state.balances.get(key)!.readerIds = new Set(change.readerIds);
+            }
+        }
+        else {
+            const row = {
+                unit: change.unit, value: change.opening!, tracked: change.tracked ?? true,
+                readerIds: [...(change.readerIds ?? ledgerAccount.readers)]
+            };
+            ledgerAccount.rows.push(row);
+            state.balances.set(key, {
+                ownerId: ledgerAccount.id, unit: row.unit, cents: decimalCents(row.value),
+                tracked: row.tracked, readerIds: new Set(row.readerIds)
+            });
+        }
+    }
     return true;
-  }
-  const a=accounts.find(a=>a.id===event.accountId);if(!a||a.status==='closed')return invalid('account_event_target_invalid');
-  if(event.kind==='close') {
-    if(a.kind==='private')return invalid('private_account_cannot_close');
-    syncAccounts([a],state,w);a.status='closed';
-    for(const r of a.rows)state.balances.delete(assetIdentity(a.id,r.unit));for(const i of a.items)state.inventory.delete(assetIdentity(a.id,i.item));return true;
-  }
-  const c=event.changes;
-  if(c.actors&&!readersOK(c.actors)||c.readers&&!readersOK(c.readers)||c.rows?.some(r=>r.readerIds&&!readersOK(r.readerIds)))return invalid('account_reader_invalid');
-  if(a.kind==='private'&&(c.label!==undefined||c.aliases!==undefined||c.actors!==undefined))return invalid('private_account_identity_immutable');
-  if(c.rows) {
-    if(new Set(c.rows.map(r=>r.unit)).size!==c.rows.length)return invalid('account_row_conflict');
-    let n=a.rows.length;
-    for(const change of c.rows){const old=a.rows.find(r=>r.unit===change.unit);
-      if(old&&change.opening!==undefined)return invalid('account_opening_immutable');
-      if(!old&&!change.remove&&change.opening===undefined)return invalid('account_opening_required');
-      n+=change.remove?(old?-1:0):old?0:1;}
-    if(n>256)return invalid('account_row_limit');
-  }
-  if(c.label!==undefined)a.label=c.label;if(c.aliases)a.aliases=[...c.aliases];if(c.actors)a.actors=[...c.actors];
-  if(c.readers){a.readers=[...c.readers];for(const r of a.rows){r.readerIds=[...c.readers];const row=state.balances.get(assetIdentity(a.id,r.unit));if(row)row.readerIds=new Set(c.readers);}
-    if(a.kind!=='private')for(const i of a.items){i.readerIds=[...c.readers];const row=state.inventory.get(assetIdentity(a.id,i.item));if(row)row.readerIds=new Set(c.readers);}}
-  for(const change of c.rows??[]) {
-    const at=a.rows.findIndex(r=>r.unit===change.unit),old=at>=0?a.rows[at]:undefined,key=assetIdentity(a.id,change.unit);
-    if(change.remove){if(at>=0)a.rows.splice(at,1);state.balances.delete(key);continue;}
-    if(old){if(change.tracked!==undefined){old.tracked=change.tracked;state.balances.get(key)!.tracked=change.tracked;}
-      if(change.readerIds){old.readerIds=[...change.readerIds];state.balances.get(key)!.readerIds=new Set(change.readerIds);}}
-    else{const row={unit:change.unit,value:change.opening!,tracked:change.tracked??true,readerIds:[...(change.readerIds??a.readers)]};a.rows.push(row);
-      state.balances.set(key,{ownerId:a.id,unit:row.unit,cents:decimalCents(row.value),tracked:row.tracked,readerIds:new Set(row.readerIds)});}
-  }
-  return true;
 }
-function applyLegs(result:Evaluated,state:LedgerMutableState,accounts:LedgerAccount[]):void {
-  if(!posted(result.detail))return;
-  // This is the single debit boundary, after all funding and stock checks.
-  for(const leg of result.legs.money)leg.row.cents+=leg.delta;
-  for(const leg of result.legs.goods) {
-    if(leg.row)leg.row.count+=leg.delta;
-    else if(leg.delta>0){const a=accounts.find(a=>a.id===leg.owner)!;
-      const ids=a.kind==='private'?[...new Set(a.rows.flatMap(r=>r.readerIds).concat(a.items.flatMap(i=>i.readerIds)))]:a.readers;
-      const readers=ids.length?ids:['player'];const row={ownerId:leg.owner,item:leg.item,count:leg.delta,readerIds:new Set(readers)};
-      state.inventory.set(assetIdentity(leg.owner,leg.item),row);a.items.push({item:leg.item,count:leg.delta,readerIds:[...readers]});}
-  }
+
+function applyLegs(result: Evaluated, state: LedgerMutableState, accounts: LedgerAccount[]): void {
+    if (!posted(result.detail))
+        return;
+    // This is the single debit boundary, after all funding and stock checks.
+    for (const leg of result.legs.money)
+        leg.row.cents += leg.delta;
+    for (const leg of result.legs.goods) {
+        if (leg.row)
+            leg.row.count += leg.delta;
+        else if (leg.delta > 0) {
+            const ledgerAccount = accounts.find(ledgerAccount => ledgerAccount.id === leg.owner)!;
+            const ids = ledgerAccount.kind === 'private'
+                ? [...new Set(ledgerAccount.rows.flatMap(ledgerRow => ledgerRow.readerIds)
+                        .concat(ledgerAccount.items.flatMap(item => item.readerIds)))]
+                : ledgerAccount.readers;
+            const visible = ids.length ? ids : ['player'];
+            const readers = result.detail.quoteReaderIds
+                ? visible.filter(reader => reader === 'player' || result.detail.quoteReaderIds!.item.includes(reader))
+                : visible;
+            const row = {
+                ownerId: leg.owner, item: leg.item, count: leg.delta, readerIds: new Set(readers)
+            };
+            state.inventory.set(assetIdentity(leg.owner, leg.item), row);
+            ledgerAccount.items.push({
+                item: leg.item, count: leg.delta, readerIds: [...readers]
+            });
+        }
+    }
 }
 function userEntry(c:LedgerCorrection,source:LedgerText,original?:StoredLedgerEntry):StoredLedgerEntry {
   const v=c.values!,mark=c.fromMark?{...c.fromMark,kind:c.fromMark.id[0]==='y'?'use' as const:'money' as const}:original?.mark??{id:'k0',kind:'money' as const,whole:true as const};
@@ -1335,15 +2392,106 @@ export interface LedgerFoldBridge {
   /** Internal running observer, called once at each complete source boundary. */
   step?:(position:number,timeMs:number,firstIssue:string|null)=>void;
 }
-/** Detects actual optional data; explicit undefined remains the legacy JSON trap. O(S). */
-export function hasLedgerData(sources:unknown,options:unknown):boolean {
-  try {if(record(options)&&['accountEvents','corrections'].some(k=>{const d=Object.getOwnPropertyDescriptor(options,k);
-      return !!d&&(!('value'in d)||d.value!=null&&(!Array.isArray(d.value)||d.value.length>0));}))return true;
-    return Array.isArray(sources)&&sources.some(s=>record(s)&&['ledger','ledgerMarks'].some(k=>{
-      const d=Object.getOwnPropertyDescriptor(s,k);return !!d&&(!('value'in d)||d.value!=null);}));}catch{return true;}
+interface SourceLayout {
+    positions: readonly number[];
+    length: number;
 }
-function emptyLedger(w:LedgerWork=work()):LedgerFold {return {accounts:[],entries:[],unbooked:[],unrecordedMarks:0,
-  open:{pending:[],unaffordable:[],committed:[],deposits:[],quoted:[]},director:{unpaid:[],unposted:[],committed:[],unbooked:[]},unmatchedVoids:[],unconfigured:[],diagnostics:[],work:w};}
+
+// Transient positions preserve source boundaries while the fold uses compact records.
+const sourceLayouts = new WeakMap<readonly WorldSourceEffects[], SourceLayout>();
+
+/** Enumerate present array indices in O(own properties + P log P), independent of declared length. */
+function sourceIndices(raw: unknown[]): number[] {
+    const length = raw.length;
+    const indices = Object.getOwnPropertyNames(raw)
+        .filter(key => INTEGER.test(key) && Number(key) < raw.length)
+        .map(Number)
+        .sort((left, right) => left - right);
+    if (raw.length !== length)
+        throw new Error('source_array_changed');
+    return indices;
+}
+
+/** Read transient source positions: zero-based original indices and original array length.
+ * Prepared arrays return their retained layout; ordinary arrays enumerate present positions.
+ * Unreadable arrays return an empty layout. No persistent state is changed. */
+export function ledgerSourceLayout(sources: readonly WorldSourceEffects[]): SourceLayout {
+    const prepared = sourceLayouts.get(sources);
+    if (prepared)
+        return prepared;
+    try {
+        return {positions: sourceIndices(sources as WorldSourceEffects[]), length: sources.length};
+    }
+    catch {
+        return {positions: [], length: 0};
+    }
+}
+
+/** Detect optional ledger data in O(own properties + P log P), without scanning absent indices.
+ * Missing source positions require a diagnostic, but never activate account folding.
+ * Unreadable array boundaries enter the guarded ledger path rather than escaping validation. */
+export function hasLedgerData(sources: unknown, options: unknown): boolean {
+    try {
+        if (record(options) && ['accountEvents', 'corrections'].some(key => {
+            const field = Object.getOwnPropertyDescriptor(options, key);
+            return Boolean(field && (!('value' in field) || field.value != null &&
+                (!Array.isArray(field.value) || field.value.length > 0)));
+        }))
+            return true;
+        if (!Array.isArray(sources))
+            return false;
+        const positions = sourceIndices(sources);
+        return positions.some(position => {
+            const source = sources[position];
+            return record(source) && ['ledger', 'ledgerMarks'].some(key => {
+                const field = Object.getOwnPropertyDescriptor(source, key);
+                return Boolean(field && (!('value' in field) || field.value != null));
+            });
+        });
+    }
+    catch {
+        return true;
+    }
+}
+
+function emptyLedger(ledgerWork: LedgerWork = work()): LedgerFold {
+    return {
+        accounts: [], entries: [], unbooked: [], unrecordedMarks: 0,
+        open: {
+            pending: [], unaffordable: [], committed: [], deposits: [], quoted: []
+        }, director: {
+            unpaid: [], unposted: [], committed: [], unbooked: []
+        }, unmatchedVoids: [], unconfigured: [], diagnostics: [], work: ledgerWork
+    };
+}
+
+/** Create an empty ledger carrying only a missing-source diagnostic in O(1).
+ * holeCount is the positive number of missing array positions, supplied by the source layout.
+ * No accounts or entries are created; the result has zero work and does not validate its internal count. */
+export function createSourceHoleLedger(holeCount: number): LedgerFold {
+    // Missing source positions create no ledger work, including no purchase-visit counter.
+    const ledger = emptyLedger({
+        jsonNodes: 0,
+        text: 0,
+        scans: 0,
+        entries: 0,
+        pairs: 0,
+        events: 0,
+        sourceVisits: 0,
+        rowCopies: 0,
+    });
+    ledger.diagnostics.push({code: 'ledger_source_holes', id: null, reason: String(holeCount)});
+    return ledger;
+}
+
+/** Identify an empty container carrying exactly one missing-source diagnostic in O(1).
+ * Accepts a folded ledger or an absent value; returns false for absent values and real ledgers with accounts.
+ * This internal classification does not validate persisted ledger records. */
+export function isSourceHoleLedger(ledger: LedgerFold | undefined): boolean {
+    return ledger?.accounts.length === 0 && ledger.diagnostics.length === 1
+        && ledger.diagnostics[0]?.code === 'ledger_source_holes';
+}
+
 function safeReaders(bridge:LedgerFoldBridge,source:WorldSourceEffects,region:LedgerRegion):string[] {
   try {const ids=bridge.readers(source,region);return stringList(ids)?[...new Set(ids)].sort():[];}catch{return [];}
 }
@@ -1358,26 +2506,77 @@ function legacyDetail(source:WorldSourceEffects,raw:unknown,code:string,bridge:L
     readerIds:safeReaders(bridge,source,entryRegion(e)),due:null,unitPrice:null,unaffordable:null,candidates:[],causedByCorrection:true};
 }
 
-/** Detach the new path's source boundary without invoking getters. Invalid JSON remains
- * an invalid source for the existing validator, with safely readable identity retained. */
-export function prepareLedgerSources(raw:unknown):WorldSourceEffects[] {
-  if(!Array.isArray(raw))return [];
-  const out:WorldSourceEffects[]=[];
-  for(let i=0;i<raw.length;i++)try{
-    if(!record(raw[i])){out.push(raw[i] as WorldSourceEffects);continue;}
-    const fields=Object.getOwnPropertyDescriptors(raw[i]),base:Record<string,unknown>={};
-    for(const [key,d] of Object.entries(fields))if(key!=='ledger'&&key!=='ledgerMarks'){
-      if(!('value'in d))throw 0;Object.defineProperty(base,key,{value:d.value,enumerable:true});}
-    const detached=snapshot(base) as Record<string,unknown>;
-    for(const key of ['ledger','ledgerMarks']){const d=fields[key];if(!d)continue;if('value'in d&&d.value===undefined)throw 0;
-      let value:unknown={};try{if(!('value'in d))throw 0;value=snapshot(d.value);}catch{/* Invalid optional data is a ledger diagnostic, never a source issue. */}
-      Object.defineProperty(detached,key,{value,enumerable:true});}
-    out.push(detached as unknown as WorldSourceEffects);
-  }catch{
-    let id='',revision=0;try{const d=Object.getOwnPropertyDescriptors(raw[i]);if(textId(d.sourceId?.value))id=d.sourceId.value;if(safeInt(d.revision?.value,1))revision=d.revision.value;}catch{/* Keep invalid identity bounded. */}
-    out.push({sourceId:id,revision,invalid:NaN} as unknown as WorldSourceEffects);
-  }
-  return out;
+/** Detach source records without invoking their accessors. Invalid JSON remains
+ * an invalid source for the existing validator, with safely readable identity retained.
+ * O(present records and their JSON); original positions are retained without visiting holes. */
+export function prepareLedgerSources(raw: unknown): WorldSourceEffects[] {
+    let layout: SourceLayout;
+    let positions: number[];
+    // A proxy can throw even while reading length, before any per-source guard runs.
+    try {
+        if (!Array.isArray(raw))
+            return [];
+        positions = sourceIndices(raw);
+        layout = sourceLayouts.get(raw) ?? {positions, length: raw.length};
+    }
+    catch {
+        return [];
+    }
+    const out: WorldSourceEffects[] = [];
+    // Enumerated positions remain bounded even when the array contains billions of holes.
+    for (const i of positions)
+        try {
+            if (!record(raw[i])) {
+                out.push(raw[i] as WorldSourceEffects);
+                continue;
+            }
+            const fields = Object.getOwnPropertyDescriptors(raw[i]);
+            const base: Record<string, unknown> = {};
+            for (const [key, decodedValue] of Object.entries(fields))
+                if (key !== 'ledger' && key !== 'ledgerMarks') {
+                    if (!('value' in decodedValue))
+                        throw 0;
+                    Object.defineProperty(base, key, {
+                        value: decodedValue.value, enumerable: true
+                    });
+                }
+            const detached = snapshot(base) as Record<string, unknown>;
+            for (const key of ['ledger', 'ledgerMarks']) {
+                const decodedValue = fields[key];
+                if (!decodedValue)
+                    continue;
+                if ('value' in decodedValue && decodedValue.value === undefined)
+                    throw 0;
+                let value: unknown = {};
+                try {
+                    if (!('value' in decodedValue))
+                        throw 0;
+                    value = snapshot(decodedValue.value);
+                }
+                catch { /* Invalid optional data is a ledger diagnostic, never a source issue. */ }
+                Object.defineProperty(detached, key, {
+                    value, enumerable: true
+                });
+            }
+            out.push(detached as unknown as WorldSourceEffects);
+        }
+        catch {
+            let id = '';
+            let revision = 0;
+            try {
+                const decodedValue = Object.getOwnPropertyDescriptors(raw[i]);
+                if (textId(decodedValue.sourceId?.value))
+                    id = decodedValue.sourceId.value;
+                if (safeInt(decodedValue.revision?.value, 1))
+                    revision = decodedValue.revision.value;
+            }
+            catch { /* Keep invalid identity bounded. */ }
+            out.push({
+                sourceId: id, revision, invalid: NaN
+            } as unknown as WorldSourceEffects);
+        }
+    sourceLayouts.set(out, layout);
+    return out;
 }
 /** Detach the options boundary before the host reads clocks or correction arrays. O(J).
  * Bad optional data becomes a visible ledger diagnostic, without invoking accessors. */
@@ -1400,7 +2599,7 @@ function rawLedgerOptions(raw:unknown,diagnostics:LedgerDiagnostic[]):LedgerFold
   try {if(!record(raw))throw 0;const out:LedgerFoldOptions={};
     for(const k of ['accountEvents','corrections'] as const){const d=Object.getOwnPropertyDescriptor(raw,k);if(d){if(!('value'in d))throw 0;if(d.value!==undefined)Object.defineProperty(out,k,{value:d.value,enumerable:true});}}
     return out;
-  }catch{diagnostics.push({code:'ledger_options_invalid',id:null});return {};}
+  }catch{appendDiagnostics(diagnostics, {code:'ledger_options_invalid',id:null});return {};}
 }
 function regionSame(a:LedgerRegion,b:LedgerRegion):boolean {return 'whole'in a?'whole'in b:'span'in b&&overlaps(a.span,b.span);}
 function closeLedger(ledger:LedgerFold,sources:readonly WorldSourceEffects[]):void {
@@ -1459,130 +2658,403 @@ export function foldLedgerWorld(settings:WorldSettings,sources:readonly WorldSou
     if(['initial','validSources','issues','legacy','readers','serialize'].some(k=>!fields[k]||!('value'in fields[k]!)))throw 0;
     return foldLedgerWorldUnchecked(settings,sources,rawOptions,bridge);
   }catch {
-    const ledger=emptyLedger();ledger.diagnostics.push({code:'ledger_bridge_invalid',id:null});
+    const ledger=emptyLedger();appendDiagnostics(ledger.diagnostics, {code:'ledger_bridge_invalid',id:null});
     return {state:{mode:'story',timeMs:0,publicTime:false,actorIds:[],balances:[],inventory:[]},receipts:[],issues:[],ledger};
   }
 }
-function foldLedgerWorldUnchecked(settings:WorldSettings,sources:readonly WorldSourceEffects[],rawOptions:unknown,bridge:LedgerFoldBridge):WorldFoldResult {
-  const ledger=emptyLedger(),w=ledger.work,issues=[...bridge.issues],receipts:WorldEffectReceipt[]=[];
-  let state=bridge.initial;
-  try {
-    const options=rawLedgerOptions(rawOptions,ledger.diagnostics),events=decodeEvents(options.accountEvents,ledger.diagnostics),corrections=decodeCorrections(options.corrections,ledger.diagnostics,w);
-    const accounts=implicitAccounts(settings,state);ledger.accounts=accounts;
-    let sideEffects=false;
-    for(const event of events)if(event.kind==='create')sideEffects=applyAccountEvent(event,accounts,state,ledger.diagnostics,w)||sideEffects;
-    const valid=new Set(bridge.validSources),validIds=new Set(bridge.validSources.map(identity)),activeCorrections=corrections.filter(c=>c.action==='adjustment'||validIds.has(identity(c as LedgerSourceRef)));
-    const correctionsBySource=new Map<string,LedgerCorrection[]>();
-    for(const c of activeCorrections.filter(c=>c.action!=='adjustment')){const id=identity(c as LedgerSourceRef),list=correctionsBySource.get(id)??[];list.push(c);correctionsBySource.set(id,list);}
-    const userPostKeys=new Set<string>();
-    if(Array.isArray(options.corrections))for(const raw of options.corrections){const c=decodeLedgerCorrection(raw);if(c.ok&&c.value.action==='post')userPostKeys.add(identity(c.value as LedgerSourceRef)+'/'+`user:${c.value.id}`);}
-    const positioned=new Map<number,(LedgerAccountEvent|LedgerCorrection)[]>();
-    const positions=events.some(e=>e.kind!=='create')||activeCorrections.some(c=>c.action==='adjustment')?positionIndex(sources,w):{at:()=>0};
-    const at=(position:number,value:LedgerAccountEvent|LedgerCorrection)=>{const list=positioned.get(position)??[];list.push(value);positioned.set(position,list);};
-    for(const e of events)if(e.kind!=='create')at(positions.at(e.after),e);
-    for(const c of activeCorrections)if(c.action==='adjustment')at(positions.at(c.after??null),c);
-    const index=emptyIndex(),previous:WorldSourceEffects[]=[],seenSources=new Map<string,WorldSourceEffects>();let lastUser:WorldSourceEffects|undefined;
-    const getCounterpart=(source:WorldSourceEffects):string|null=>{const reply=source.replyTo?seenSources.get(JSON.stringify([source.replyTo.id,source.replyTo.revision])):undefined;
-      const other=source.role==='user'?(previous.at(-1)?.role==='assistant'?previous.at(-1):undefined):source.replyTo?(reply?.role==='user'?reply:undefined):lastUser;return other?identity(other):null;};
-    const getContext=(source:WorldSourceEffects,entry:StoredLedgerEntry,forced:boolean,targetState=state):VerifyContext=>({accounts,source,previous:previous.slice(-6),counterpart:getCounterpart(source),index,state:targetState,
-      work:w,forced,mode:'fold',readers:safeReaders(bridge,source,entryRegion(entry))});
-    const applyUser=(c:LedgerCorrection,source:WorldSourceEffects,targetState=state,original?:StoredLedgerEntry):LedgerDetail=>{
-      const e=c.values?userEntry(c,source,original):original??fallbackEntry(source,{id:'k0',kind:'money',whole:true});
-      const legacyReplacement=typeof original?.key==='string'&&original.key.startsWith('legacy:');
-      if(c.action==='void')return {...e,origin:'user',role:source.role,laterSources:0,disposition:'void',category:null,layer:'inner',codes:legacyReplacement?['caused_by_correction']:[],readerIds:safeReaders(bridge,source,entryRegion(e)),due:null,unitPrice:e.unitPrice,unaffordable:null,candidates:[],causedByCorrection:false};
-      const codes=c.values?userValuesStateCodes(c.values,accounts,index):['ledger_correction_invalid'];
-      const evaluated=verifyEntry(e,getContext(source,e,true,targetState));
-      if(codes.length){evaluated.detail.disposition='pending';evaluated.detail.category='general';evaluated.detail.codes=codes;evaluated.detail.layer='outer';}
-      if(legacyReplacement){addCode(evaluated.detail.codes,'caused_by_correction');evaluated.detail.causedByCorrection=evaluated.detail.disposition==='unaffordable';}
-      applyLegs(evaluated,targetState,accounts);return evaluated.detail;
-    };
-    const append=(d:LedgerDetail)=>{ledger.entries.push(d);indexDetail(index,d);w.entries++;sideEffects=true;};
-    const boundary=(position:number,source:WorldSourceEffects|null,posts:LedgerCorrection[]=[])=>{
-      const items=correctionOrder([...(positioned.get(position)??[]),...posts],w);
-      for(const item of items)if('action'in item){const body=item.action==='adjustment'?{sourceId:'',revision:1,role:'user' as const,text:'',acceptedAtMs:0,plan:{observations:[],unresolved:[]},candidates:[]}:source??bridge.validSources.find(s=>identity(s)===identity(item as LedgerSourceRef));if(body)append(applyUser(item,body));}
-      else sideEffects=applyAccountEvent(item,accounts,state,ledger.diagnostics,w)||sideEffects;
-    };
-    boundary(0,null);
-    for(let position=0;position<sources.length;position++) {
-      const source=sources[position]!;w.sourceVisits++;
-      if(!valid.has(source)){boundary(position+1,null);bridge.step?.(position,state.timeMs,issues[0]?.code??null);continue;}
-      const local=correctionsBySource.get(identity(source))??[],legacyCorrections=new Map<string,LedgerCorrection>();
-      for(const c of local)if(typeof c.anchor==='string'&&c.anchor.startsWith('legacy:'))legacyCorrections.set(c.anchor,c);
-      const legacy=bridge.legacy(state,source,{work:w,sideEffects,corrections:legacyCorrections,
-        correct:(trial,raw,correction)=>applyUser(correction,source,trial,legacyDetail(source,raw,'',bridge)),
-        demote:(raw,code)=>legacyDetail(source,raw,code,bridge)});
-      state=legacy.state;receipts.push(...legacy.receipts);issues.push(...legacy.issues);for(const d of legacy.details)append(d);sideEffects ||= legacy.sideEffects;
-      syncAccounts(accounts,state,w);
-      const marks=source.ledgerMarks!=null?decodeLedgerMarks(source.ledgerMarks):null;
-      const book=source.ledger!=null?decodeLedger(source.ledger):null;
-      const modelEntries=book?.ok?book.value.entries.filter(e=>e.sourceId===source.sourceId&&e.revision===source.revision):[];
-      const matched=matchLedgerCorrections(modelEntries,local),claims=matched.ok?matched.value:{claims:[],posts:[],unmatchedVoids:[],blocked:[]};
-      ledger.unmatchedVoids.push(...claims.unmatchedVoids.filter(c=>!userPostKeys.has(identity(c as LedgerSourceRef)+'/'+String(c.anchor))));
-      const ordered=dependencyOrder(modelEntries);
-      for(const e of ordered.ordered) {
-        const claim=claims.claims.find(c=>keyText(c.key)===keyText(e.key));
-        if(claim){append(applyUser(claim.correction,source,state,e));continue;}
-        const evaluated=verifyEntry(e,getContext(source,e,e.origin==='user'));
-        const blocked=claims.blocked.find(b=>keyText(b.key)===keyText(e.key));
-        if(blocked||ordered.cycles.has(keyText(e.key))){evaluated.detail.disposition='pending';evaluated.detail.category='general';evaluated.detail.layer='outer';
-          for(const code of blocked?.codes??['relation_invalid'])addCode(evaluated.detail.codes,code);}
-        applyLegs(evaluated,state,accounts);append(evaluated.detail);
-      }
-      // Index voids once so independent posts cost O(C), including user posts.
-      const voidPostAnchors=new Set<string>();
-      for(const c of local){w.correctionVisits=(w.correctionVisits??0)+1;if(c.action==='void'&&typeof c.anchor==='string')voidPostAnchors.add(c.anchor);}
-      const posts=[...local.filter(c=>c.action==='post'&&!c.anchor&&!voidPostAnchors.has(`user:${c.id}`)),...claims.posts];boundary(position+1,source,posts);
-      const unbooked:LedgerUnbooked[]=book?.ok?[...book.value.unbooked]:[];
-      if(book&&!book.ok){ledger.diagnostics.push({code:book.code,id:source.sourceId});if(marks?.ok)for(let i=0;i<marks.value.money.length;i++){
-        const m=marks.value.money[i]!;unbooked.push({sourceId:source.sourceId,revision:source.revision,...('whole'in m?{whole:true as const}:{span:m}),mark:`k${i+1}`,reason:'ledger_record_invalid',by:'code'});}}
-      if(!book&&marks?.ok)ledger.unrecordedMarks+=marks.value.money.length;
-      if(marks&&!marks.ok)ledger.diagnostics.push({code:marks.code,id:source.sourceId});
-      for(const u of unbooked)if(u.sourceId===source.sourceId&&u.revision===source.revision) {
-        const anchor:LedgerUnbookedAnchor=[u.sourceId,u.revision,'whole'in u?{whole:true}:{span:u.span},u.reason];
-        const dismissed=local.some(c=>c.action==='void'&&c.anchor&&keyText(c.anchor)===keyText(anchor))
-          ||posts.some(c=>c.fromMark&&regionSame(c.fromMark,u));
-        ledger.unbooked.push({...u,readerIds:safeReaders(bridge,source,u),laterSources:0,dismissed,layer:u.by==='code'&&u.reason!=='entry_withdrawn'?'outer':'inner'});
-      }
-      previous.push(source);seenSources.set(identity(source),source);if(source.role==='user')lastUser=source;
-      bridge.step?.(position,state.timeMs,issues[0]?.code??null);
+
+function foldLedgerWorldUnchecked(settings: WorldSettings, sources: readonly WorldSourceEffects[], rawOptions:
+    unknown, bridge: LedgerFoldBridge): WorldFoldResult {
+    const ledger = emptyLedger();
+    const ledgerWork = ledger.work;
+    const layout = ledgerSourceLayout(sources);
+    const holes = layout.length - layout.positions.length;
+    if (holes > 0)
+        appendDiagnostics(ledger.diagnostics, {
+            code: 'ledger_source_holes', id: null, reason: String(holes)
+        });
+    const issues = [...bridge.issues];
+    const receipts: WorldEffectReceipt[] = [];
+    let state = bridge.initial;
+    try {
+        const correctionHistory: LedgerCorrection[] = [];
+        const options = rawLedgerOptions(rawOptions, ledger.diagnostics);
+        const events = decodeEvents(options.accountEvents, ledger.diagnostics);
+        const corrections = decodeCorrections(options.corrections, ledger.diagnostics, ledgerWork, correctionHistory);
+        const accounts = implicitAccounts(settings, state, ledger.diagnostics);
+        ledger.accounts = accounts;
+        let sideEffects = false;
+        for (const event of events)
+            if (event.kind === 'create')
+                sideEffects = applyAccountEvent(event, accounts, state, ledger.diagnostics, ledgerWork) || sideEffects;
+        const valid = new Set(bridge.validSources);
+        const validIds = new Set(bridge.validSources.map(identity));
+        const activeCorrections = corrections.filter(correction => correction.action === 'adjustment'
+            || validIds.has(identity(correction as LedgerSourceRef)));
+        const correctionsBySource = new Map<string, LedgerCorrection[]>();
+        for (const correction of activeCorrections.filter(correction => correction.action
+            !== 'adjustment')) {
+            const id = identity(correction as LedgerSourceRef);
+            const list = correctionsBySource.get(id) ?? [];
+            list.push(correction);
+            correctionsBySource.set(id, list);
+        }
+        const userPostKeys = new Set<string>();
+        for (const correction of correctionHistory)
+            if (correction.action === 'post') {
+                userPostKeys.add(identity(correction as LedgerSourceRef) + '/' + `user:${correction.id}`);
+            }
+        const positioned = new Map<number, (LedgerAccountEvent | LedgerCorrection)[]>();
+        const positions = ledgerEventPositions(sources, events, correctionHistory, ledgerWork);
+        if (!positions.ok)
+            throw 0;
+        const historicalBoundaries = new Set<number>();
+        const at = (position: number, value: LedgerAccountEvent | LedgerCorrection) => {
+            const list = positioned.get(position) ?? [];
+            list.push(value);
+            positioned.set(position, list);
+        };
+        for (const row of positions.value.accountEvents)
+            if (row.event.kind !== 'create')
+                at(row.position, row.event);
+        const activeAdjustmentIds = new Set(activeCorrections.filter(correction => correction.action
+            === 'adjustment').map(correction => correction.id));
+        for (const row of positions.value.adjustments) {
+            historicalBoundaries.add(row.position);
+            if (activeAdjustmentIds.has(row.correction.id))
+                at(row.position, row.correction);
+        }
+        const historicalSources = new Set(correctionHistory.filter(correction => correction.action
+            !== 'adjustment' && validIds.has(identity(correction as LedgerSourceRef)))
+            .map(correction => identity(correction as LedgerSourceRef)));
+        const index = emptyIndex();
+        const previous: WorldSourceEffects[] = [];
+        const seenSources = new Map<string, WorldSourceEffects>();
+        let lastUser: WorldSourceEffects | undefined;
+        const getCounterpart = (source: WorldSourceEffects): string | null => {
+            const reply = source.replyTo ? seenSources.get(JSON.stringify([source.replyTo.id,
+                source.replyTo.revision])) : undefined;
+            const other = source.role === 'user' ? (previous.at(-1)?.role === 'assistant' ? previous.at(-1) :
+                undefined) : source.replyTo ? (reply?.role === 'user' ? reply : undefined) : lastUser;
+            return other ? identity(other) : null;
+        };
+        const quoteReaders = (source: WorldSourceEffects, entry: StoredLedgerEntry):
+            NonNullable<LedgerDetail['quoteReaderIds']> => {
+            const partyReaders = (field: 'payer' | 'payee' | 'receiver'): string[] => {
+                const party = entry[field];
+                const quote = party && 'external' in party ? party.external : entry.externalQuotes?.[field];
+                return quote ? safeReaders(bridge, source, { span: quote.span }) : [];
+            };
+            const itemSource = entry.item &&
+                (identity(entry.item) === identity(source) ? source : seenSources.get(identity(entry.item)));
+            return {
+                payer: partyReaders('payer'), payee: partyReaders('payee'), receiver: partyReaders('receiver'),
+                item: itemSource && entry.item ? safeReaders(bridge, itemSource, { span: entry.item.span }) : [],
+            };
+        };
+        const getContext = (source: WorldSourceEffects, entry: StoredLedgerEntry, forced: boolean, targetState =
+            state): VerifyContext => ({
+            accounts, source, previous: previous.slice(-6), counterpart: getCounterpart(source), index,
+            state: targetState,
+            work: ledgerWork, forced, mode: 'fold', readers: safeReaders(bridge, source, entryRegion(entry)),
+            quoteReaderIds: quoteReaders(source, entry)
+        });
+        const applyUser = (correction: LedgerCorrection, source: WorldSourceEffects, targetState = state,
+            original?: StoredLedgerEntry): LedgerDetail => {
+            const storedEntry = correction.values ? userEntry(correction, source, original) : original
+                ?? fallbackEntry(source, {
+                id: 'k0', kind: 'money', whole: true
+            });
+            const legacyReplacement = typeof original?.key === 'string' && original.key.startsWith('legacy:');
+            if (correction.action === 'void')
+                return {
+                    ...storedEntry, origin: 'user', role: source.role, laterSources: 0, disposition: 'void',
+                    category: null, layer: 'inner',
+                    codes: legacyReplacement ? ['caused_by_correction'] : [],
+                    readerIds: safeReaders(bridge, source, entryRegion(storedEntry)), due: null,
+                    unitPrice: storedEntry.unitPrice, unaffordable: null, candidates: [], causedByCorrection: false
+                };
+            const codes = correction.values ? userValuesStateCodes(correction.values, accounts, index) :
+                ['ledger_correction_invalid'];
+            const evaluated = verifyEntry(storedEntry, getContext(source, storedEntry, true, targetState));
+            if (codes.length) {
+                evaluated.detail.disposition = 'pending';
+                evaluated.detail.category = 'general';
+                evaluated.detail.codes = codes;
+                evaluated.detail.layer = 'outer';
+            }
+            if (legacyReplacement) {
+                addCode(evaluated.detail.codes, 'caused_by_correction');
+                evaluated.detail.causedByCorrection = evaluated.detail.disposition === 'unaffordable';
+            }
+            applyLegs(evaluated, targetState, accounts);
+            return evaluated.detail;
+        };
+        const append = (decodedValue: LedgerDetail) => {
+            ledger.entries.push(decodedValue);
+            indexDetail(index, decodedValue);
+            ledgerWork.entries++;
+            sideEffects = true;
+        };
+        const boundary = (position: number, source: WorldSourceEffects | null, posts: LedgerCorrection[] = []) => {
+            // Withdrawal changes balances, but cannot remove an earlier ledger-side event from history.
+            sideEffects ||= historicalBoundaries.has(position) || source !== null &&
+                historicalSources.has(identity(source));
+            const items = correctionOrder([...(positioned.get(position) ?? []), ...posts], ledgerWork);
+            for (const item of items)
+                if ('action' in item) {
+                    const body = item.action === 'adjustment' ? {
+                        sourceId: '', revision: 1, role: 'user' as const, text: '', acceptedAtMs: 0, plan: {
+                            observations: [], unresolved: []
+                        }, candidates: []
+                    } : source ?? bridge.validSources.find(currentSource => identity(currentSource) === identity(
+                        item as LedgerSourceRef));
+                    if (body)
+                        append(applyUser(item, body));
+                }
+                else
+                    sideEffects = applyAccountEvent(item, accounts, state, ledger.diagnostics, ledgerWork) ||
+                        sideEffects;
+        };
+        boundary(0, null);
+        for (let position = 0; position < sources.length; position++) {
+            const source = sources[position]!;
+            ledgerWork.sourceVisits++;
+            if (!valid.has(source)) {
+                boundary(position + 1, null);
+                bridge.step?.(position, state.timeMs, issues[0]?.code ?? null);
+                continue;
+            }
+            const local = correctionsBySource.get(identity(source)) ?? [];
+            const legacyCorrections = new Map<string, LedgerCorrection>();
+            for (const correction of local)
+                if (typeof correction.anchor === 'string' && correction.anchor.startsWith('legacy:'))
+                    legacyCorrections.set(correction.anchor, correction);
+            const legacy = bridge.legacy(state, source, {
+                work: ledgerWork, sideEffects, corrections: legacyCorrections,
+                correct: (trial, raw, correction) => applyUser(correction, source, trial, legacyDetail(source, raw,
+                    '', bridge)),
+                demote: (raw, code) => legacyDetail(source, raw, code, bridge)
+            });
+            state = legacy.state;
+            receipts.push(...legacy.receipts);
+            issues.push(...legacy.issues);
+            for (const decodedValue of legacy.details)
+                append(decodedValue);
+            sideEffects ||= legacy.sideEffects;
+            syncAccounts(accounts, state, ledgerWork);
+            const marks = source.ledgerMarks != null ? decodeLedgerMarks(source.ledgerMarks) : null;
+            const book = source.ledger != null ? decodeLedger(source.ledger) : null;
+            const modelEntries = book?.ok ? book.value.entries.filter(storedEntry => storedEntry.sourceId === source
+                .sourceId && storedEntry.revision === source.revision) : [];
+            const matched = matchLedgerCorrections(modelEntries, local);
+            const claims = matched.ok ? matched.value : {
+                claims: [], posts: [], unmatchedVoids: [], blocked: []
+            };
+            ledger.unmatchedVoids.push(...claims.unmatchedVoids.filter(correction => !userPostKeys.has(
+                identity(correction as LedgerSourceRef) + '/' + String(correction.anchor))));
+            const ordered = dependencyOrder(modelEntries);
+            for (const storedEntry of ordered.ordered) {
+                const claim = claims.claims.find(correction => keyText(correction.key) === keyText(
+                    storedEntry.key));
+                if (claim) {
+                    append(applyUser(claim.correction, source, state, storedEntry));
+                    continue;
+                }
+                const evaluated = verifyEntry(storedEntry, getContext(source, storedEntry, storedEntry.origin
+                    === 'user'));
+                const blocked = claims.blocked.find(blockedClaim =>
+                    keyText(blockedClaim.key) === keyText(storedEntry.key));
+                if (blocked || ordered.cycles.has(keyText(storedEntry.key))) {
+                    evaluated.detail.disposition = 'pending';
+                    evaluated.detail.category = 'general';
+                    evaluated.detail.layer = 'outer';
+                    for (const code of blocked?.codes ?? ['relation_invalid'])
+                        addCode(evaluated.detail.codes, code);
+                }
+                applyLegs(evaluated, state, accounts);
+                append(evaluated.detail);
+            }
+            // Index voids once so independent posts cost O(C), including user posts.
+            const voidPostAnchors = new Set<string>();
+            for (const correction of local) {
+                ledgerWork.correctionVisits = (ledgerWork.correctionVisits ?? 0) + 1;
+                if (correction.action === 'void' && typeof correction.anchor === 'string')
+                    voidPostAnchors.add(correction.anchor);
+            }
+            const posts = [...local.filter(correction => correction.action === 'post' &&
+                    !correction.anchor && !voidPostAnchors.has(`user:${correction.id}`)), ...claims.posts];
+            boundary(position + 1, source, posts);
+            const unbooked: LedgerUnbooked[] = book?.ok ? [...book.value.unbooked] : [];
+            if (book && !book.ok) {
+                appendDiagnostics(ledger.diagnostics, {
+                    code: book.code, id: source.sourceId
+                });
+                if (marks?.ok)
+                    for (let i = 0; i < marks.value.money.length; i++) {
+                        const markedRegion = marks.value.money[i]!;
+                        unbooked.push({
+                            sourceId: source.sourceId, revision: source.revision,
+                            ...('whole' in markedRegion ? { whole: true as const } : { span: markedRegion }),
+                            mark: `k${i + 1}`, reason: 'ledger_record_invalid', by: 'code'
+                        });
+                    }
+            }
+            if (!book && marks?.ok)
+                ledger.unrecordedMarks += marks.value.money.length;
+            if (marks && !marks.ok)
+                appendDiagnostics(ledger.diagnostics, {
+                    code: marks.code, id: source.sourceId
+                });
+            for (const u of unbooked)
+                if (u.sourceId === source.sourceId && u.revision === source.revision) {
+                    const anchor: LedgerUnbookedAnchor = [u.sourceId, u.revision,
+                        'whole' in u ? { whole: true } : { span: u.span }, u.reason];
+                    const dismissed = local.some(correction => correction.action === 'void' &&
+                        correction.anchor && keyText(correction.anchor) === keyText(anchor))
+                        || posts.some(correction => correction.fromMark &&
+                            regionSame(correction.fromMark, u));
+                    ledger.unbooked.push({
+                        ...u, readerIds: safeReaders(bridge, source, u), laterSources: 0, dismissed,
+                        layer: u.by === 'code' && u.reason !== 'entry_withdrawn' ? 'outer' : 'inner'
+                    });
+                }
+            previous.push(source);
+            seenSources.set(identity(source), source);
+            if (source.role === 'user')
+                lastUser = source;
+            bridge.step?.(position, state.timeMs, issues[0]?.code ?? null);
+        }
+        syncAccounts(accounts, state, ledgerWork);
+        // Closed accounts are unavailable during the fold and retain their closing values in the final view.
+        for (const ledgerAccount of accounts)
+            if (ledgerAccount.status === 'closed') {
+                for (const ledgerRow of ledgerAccount.rows)
+                    state.balances.set(assetIdentity(ledgerAccount.id, ledgerRow.unit), {
+                        ownerId: ledgerAccount.id, unit: ledgerRow.unit, cents: decimalCents(ledgerRow.value),
+                        tracked: ledgerRow.tracked, readerIds: new Set(ledgerRow.readerIds)
+                    });
+                for (const i of ledgerAccount.items)
+                    state.inventory.set(assetIdentity(ledgerAccount.id, i.item), {
+                        ownerId: ledgerAccount.id, item: i.item, count: i.count, readerIds: new Set(i.readerIds)
+                    });
+            }
+        closeLedger(ledger, bridge.validSources);
     }
-    syncAccounts(accounts,state,w);
-    // Closed accounts are unavailable during the fold and retain their closing values in the final view.
-    for(const a of accounts)if(a.status==='closed'){
-      for(const r of a.rows)state.balances.set(assetIdentity(a.id,r.unit),{ownerId:a.id,unit:r.unit,cents:decimalCents(r.value),tracked:r.tracked,readerIds:new Set(r.readerIds)});
-      for(const i of a.items)state.inventory.set(assetIdentity(a.id,i.item),{ownerId:a.id,item:i.item,count:i.count,readerIds:new Set(i.readerIds)});
+    catch {
+        appendDiagnostics(ledger.diagnostics, {
+            code: 'ledger_input_invalid', id: null
+        });
     }
-    closeLedger(ledger,bridge.validSources);
-  }catch{ledger.diagnostics.push({code:'ledger_input_invalid',id:null});}
-  let serialized:WorldState;
-  try{serialized=bridge.serialize(state);}catch{serialized={mode:settings.mode,timeMs:state.timeMs,publicTime:settings.publicTime,actorIds:Object.keys(settings.actorLabels).sort(),balances:[],inventory:[]};ledger.diagnostics.push({code:'ledger_serialize_failed',id:null});}
-  return {state:serialized,receipts,issues,ledger};
+    let serialized: WorldState;
+    try {
+        serialized = bridge.serialize(state);
+    }
+    catch {
+        serialized = {
+            mode: settings.mode, timeMs: state.timeMs, publicTime: settings.publicTime,
+            actorIds: Object.keys(settings.actorLabels).sort(), balances: [], inventory: []
+        };
+        appendDiagnostics(ledger.diagnostics, {
+            code: 'ledger_serialize_failed', id: null
+        });
+    }
+    return {
+        state: serialized, receipts, issues, ledger
+    };
 }
 
 /** Prefix positions are resolved against the complete list before any slicing. The
  * injected fold is the public world-state fold; invalid settings keep its exception. */
-export function foldLedgerPrefix(settings:WorldSettings,rawSources:unknown,count:number,rawOptions:unknown,
-  fold:(settings:WorldSettings,sources:readonly WorldSourceEffects[],options?:LedgerFoldOptions)=>WorldFoldResult):LedgerDecoded<WorldFoldResult> {
-  try {
-    if(!Array.isArray(rawSources)||!safeInt(count)||count>rawSources.length)return {ok:false,code:'ledger_prefix_invalid'};
-    const sources=rawSources as WorldSourceEffects[],diagnostics:LedgerDiagnostic[]=[],options=rawLedgerOptions(rawOptions,diagnostics),positions=positionIndex(sources);
-    const events=decodeEvents(options.accountEvents,diagnostics).filter(e=>e.kind==='create'||positions.at(e.after)<=count);
-    const corrections=decodeCorrections(options.corrections,diagnostics).filter(c=>{
-      const position=positions.exact.get(identity(c as LedgerSourceRef))??0;
-      return c.action==='adjustment'?positions.at(c.after??null)<=count:position>0&&position<=count;
-    });
-    const clock:LedgerFoldOptions={};
-    if(record(rawOptions))for(const k of ['nowMs','monotonicFloorMs'] as const){const d=Object.getOwnPropertyDescriptor(rawOptions,k);if(d&&'value'in d&&safeInt(d.value))clock[k]=d.value;}
-    const value=fold(settings,sources.slice(0,count),{...clock,accountEvents:events,corrections});
-    if(value.ledger)value.ledger.diagnostics.push(...diagnostics);return {ok:true,value};
-  }catch(error){if(error instanceof Error&&error.message==='invalid_world_settings')throw error;return {ok:false,code:'ledger_prefix_invalid'};}
+export function foldLedgerPrefix(settings: WorldSettings, rawSources: unknown, count: number, rawOptions: unknown,
+    fold: (settings: WorldSettings, sources: readonly WorldSourceEffects[], options?: LedgerFoldOptions) =>
+    WorldFoldResult): LedgerDecoded<WorldFoldResult> {
+    try {
+        if (!Array.isArray(rawSources) || !safeInt(count) || count > ledgerSourceLayout(rawSources).length)
+            return {
+                ok: false, code: 'ledger_prefix_invalid'
+            };
+        const sources = prepareLedgerSources(rawSources);
+        const layout = ledgerSourceLayout(sources);
+        const presentCount = layout.positions.filter(position => position < count).length;
+        const diagnostics: LedgerDiagnostic[] = [];
+        const options = rawLedgerOptions(rawOptions, diagnostics);
+        const positions = positionIndex(sources);
+        const events = decodeEvents(options.accountEvents, diagnostics).filter(storedEntry => storedEntry.kind
+            === 'create' ||
+            positions.at(storedEntry.after) <= presentCount);
+        const correctionHistory: LedgerCorrection[] = [];
+        decodeCorrections(options.corrections, diagnostics, work(), correctionHistory);
+        const adjustmentPositions = new Map(correctionHistory.filter(correction => correction.action
+            === 'adjustment')
+            .map(correction => [`user:${correction.id}`, positions.at(correction.after ?? null)]));
+        const corrections = correctionHistory.filter(correction => {
+            const position = positions.exact.get(identity(correction as LedgerSourceRef)) ?? 0;
+            if (correction.action === 'adjustment')
+                return (adjustmentPositions.get(`user:${correction.id}`) ?? 0) <= presentCount;
+            if (correction.action === 'clear' && typeof correction.anchor === 'string' &&
+                adjustmentPositions.has(correction.anchor)) {
+                return adjustmentPositions.get(correction.anchor)! <= presentCount;
+            }
+            return position > 0 && position <= presentCount;
+        });
+        const clock: LedgerFoldOptions = {};
+        if (record(rawOptions))
+            for (const k of ['nowMs', 'monotonicFloorMs'] as const) {
+                const decodedValue = Object.getOwnPropertyDescriptor(rawOptions, k);
+                if (decodedValue && 'value' in decodedValue && safeInt(decodedValue.value))
+                    clock[k] = decodedValue.value;
+            }
+        const prefixSources = sources.slice(0, presentCount);
+        sourceLayouts.set(prefixSources, {positions: layout.positions.slice(0, presentCount), length: count});
+        const value = fold(settings, prefixSources, {
+            ...clock, accountEvents: events, corrections
+        });
+        if (value.ledger) {
+            const merged: LedgerDiagnostic[] = [];
+            appendDiagnostics(merged, ...value.ledger.diagnostics);
+            const seen = new Set(value.ledger.diagnostics.map(decodedValue => JSON.stringify(decodedValue)));
+            appendDiagnostics(merged, ...diagnostics.filter(decodedValue => !seen.has(JSON.stringify(decodedValue))));
+            value.ledger.diagnostics = merged;
+        }
+        return {
+            ok: true, value
+        };
+    }
+    catch (error) {
+        if (error instanceof Error && error.message === 'invalid_world_settings')
+            throw error;
+        return {
+            ok: false, code: 'ledger_prefix_invalid'
+        };
+    }
 }
-/** Query account state at a prefix boundary; checkers include closed accounts, model inputs omit them. */
-export function accountsAt(settings:WorldSettings,sources:unknown,count:number,options:unknown,
-  fold:(settings:WorldSettings,sources:readonly WorldSourceEffects[],options?:LedgerFoldOptions)=>WorldFoldResult,includeClosed=false):LedgerDecoded<LedgerAccount[]> {
-  try {const result=foldLedgerPrefix(settings,sources,count,options,fold);if(!result.ok)return result;
-    const a=result.value.ledger?.accounts??implicitAccounts(settings,stateFromWorld(result.value.state));return {ok:true,value:a.filter(a=>includeClosed||a.status==='active')};
-  }catch(error){if(error instanceof Error&&error.message==='invalid_world_settings')throw error;return {ok:false,code:'ledger_prefix_invalid'};}
+/** Query accounts at a zero-based prefix boundary measured in source positions.
+ * Closed accounts are omitted unless requested. Invalid prefixes return ledger_prefix_invalid;
+ * invalid settings retain the injected fold's exception. Source-hole diagnostics create no accounts. */
+export function accountsAt(
+  settings: WorldSettings,
+  sources: unknown,
+  count: number,
+  options: unknown,
+  fold: (settings: WorldSettings, sources: readonly WorldSourceEffects[], options?: LedgerFoldOptions) => WorldFoldResult,
+  includeClosed = false,
+): LedgerDecoded<LedgerAccount[]> {
+  try {
+    const result = foldLedgerPrefix(settings, sources, count, options, fold);
+    if (!result.ok) return result;
+
+    const ledger = result.value.ledger;
+    const diagnosticOnly = isSourceHoleLedger(ledger);
+    // A diagnostic-only fold retains the same implicit account query as an ordinary legacy fold.
+    const accounts = ledger && !diagnosticOnly
+      ? ledger.accounts
+      : implicitAccounts(settings, stateFromWorld(result.value.state));
+    return {ok: true, value: accounts.filter(account => includeClosed || account.status === 'active')};
+  } catch (error) {
+    if (error instanceof Error && error.message === 'invalid_world_settings') throw error;
+    return {ok: false, code: 'ledger_prefix_invalid'};
+  }
 }
 function stateFromWorld(s:WorldState):LedgerMutableState {return {timeMs:s.timeMs,
   balances:new Map(s.balances.map(r=>[assetIdentity(r.ownerId,r.unit),{ownerId:r.ownerId,unit:r.unit,cents:decimalCents(r.value),readerIds:new Set(r.readerIds)}])),
@@ -1600,20 +3072,44 @@ export function markLedgerCorrections(result:WorldFoldResult,withoutCorrections:
 }
 
 function accountVisible(a:LedgerAccount,readerId:string):boolean {return a.readers.includes(readerId)||a.actors.includes(readerId);}
-function ledgerFact(e:LedgerDetail,ledger:LedgerFold,readerId:string):LedgerFact {
-  const visible=(p:LedgerParty|null)=>{const id=partyAccount(p),a=ledger.accounts.find(a=>a.id===id);return a&&accountVisible(a,readerId)?a.id:null;};
-  const payer=visible(e.payer),payee=visible(e.payee),receiver=visible(e.receiver),m=moneyOf(e);
-  const quote=(field:'payer'|'payee'|'receiver')=>{const party=e[field];return party&&'external'in party&&party.external?party.external.quote:e.externalQuotes?.[field]?.quote;};
-  const actor=e.actor.id==='player'||ledger.accounts.some(a=>a.kind==='private'&&a.id===e.actor.id)?e.actor.id:null;
-  return {sourceId:e.sourceId,revision:e.revision,kind:e.kind,status:e.status,time:e.time,actor,
-    item:e.item?.quote??null,quantity:e.quantity?.count??null,cents:m?.cents??null,unit:e.row,
-    ...(payer?{payer}:{}),...(payee?{payee}:{}),...(receiver?{receiver}:{}),
-    ...(quote('payer')?{payerQuote:quote('payer')}:{}),
-    ...(quote('payee')?{payeeQuote:quote('payee')}:{}),
-    ...(quote('receiver')?{receiverQuote:quote('receiver')}:{}),...(e.due!==null?{due:e.due}:{}),
-    ...(e.unaffordable&&!e.causedByCorrection?{unaffordable:e.unaffordable}:{})};
+
+function ledgerFact(storedEntry: LedgerDetail, ledger: LedgerFold, readerId: string, allQuotes = false): LedgerFact {
+    const visible = (proposedEntry: LedgerParty | null) => {
+        const id = partyAccount(proposedEntry);
+        const ledgerAccount = ledger.accounts.find(account => account.id === id);
+        return ledgerAccount && accountVisible(ledgerAccount, readerId) ? ledgerAccount.id : null;
+    };
+    const payer = visible(storedEntry.payer);
+    const payee = visible(storedEntry.payee);
+    const receiver = visible(storedEntry.receiver);
+    const moneyValue = moneyOf(storedEntry);
+    const canRead = (field: 'payer' | 'payee' | 'receiver' | 'item') => allQuotes || readerId === 'player' ||
+        storedEntry.quoteReaderIds?.[field].includes(readerId);
+    const quote = (field: 'payer' | 'payee' | 'receiver') => {
+        if (!canRead(field))
+            return undefined;
+        const party = storedEntry[field];
+        return party && 'external' in party &&
+            party.external ? party.external.quote : storedEntry.externalQuotes?.[field]?.quote;
+    };
+    const actor = storedEntry.actor.id === 'player' ||
+        ledger.accounts.some(ledgerAccount => ledgerAccount.kind === 'private' &&
+            ledgerAccount.id === storedEntry.actor.id) ? storedEntry.actor.id : null;
+    return {
+        sourceId: storedEntry.sourceId, revision: storedEntry.revision, kind: storedEntry.kind,
+        status: storedEntry.status, time: storedEntry.time, actor,
+        item: canRead('item') ? storedEntry.item?.quote ?? null : null,
+        quantity: storedEntry.quantity?.count ?? null, cents: moneyValue?.cents ?? null, unit: storedEntry.row,
+        ...(payer ? { payer } : {}), ...(payee ? { payee } : {}), ...(receiver ? { receiver } : {}),
+        ...(quote('payer') ? { payerQuote: quote('payer') } : {}),
+        ...(quote('payee') ? { payeeQuote: quote('payee') } : {}),
+        ...(quote('receiver') ? { receiverQuote: quote('receiver') } : {}),
+        ...(storedEntry.due !== null ? { due: storedEntry.due } : {}),
+        ...(storedEntry.unaffordable &&
+            !storedEntry.causedByCorrection ? { unaffordable: storedEntry.unaffordable } : {})
+    };
 }
-/** Data-only character projection: no codes, doubts, proofs, raw quotes, or hidden account IDs.
+/** Data-only character projection: no codes, doubts, proofs, unobserved quotes, or hidden account IDs.
  * O(J + entries * bounded accounts). Private totals remain in world-state's row projection. */
 export function projectLedger(raw:unknown,readerId:string,w:LedgerWork=work()):{ledger:LedgerProjection;accounts:{id:string;kind:'organisation'|'shared';label:string}[]} {
   const empty=()=>({ledger:{entries:[],open:{pending:[],unaffordable:[],committed:[],deposits:[],quoted:[]}},accounts:[]});

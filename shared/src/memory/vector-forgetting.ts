@@ -14,8 +14,10 @@ export function salienceTier({memory,view}:SalienceSubject):0|1|2 {
 }
 
 /** The memory's time on the retention (memory) clock, which a grounded rehearsal advances; else when it was learned. */
-export function memoryClockTimeMs(memory:Memory):number {
-  return memory.retentionAtMs??memory.source.knownAtMs;
+export function memoryClockTimeMs(memory: Memory): number {
+  const full = memory.retentionAtMs ?? memory.source.knownAtMs;
+  const gist = memory.gistRetentionAtMs;
+  return typeof gist === 'number' && Number.isFinite(gist) ? Math.max(full, gist) : full;
 }
 
 /**

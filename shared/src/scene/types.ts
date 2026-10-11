@@ -34,6 +34,18 @@ export interface SceneEnvelope {
   mode: SceneInputMode;
   presentIds: string[];
 }
+
+/** One accepted assistant recall. UTF-16 ranges are half-open; time comes from the carrying message. */
+export interface SceneRecall {
+  character: string;
+  source: string;
+  revision: number;
+  identity: string;
+  /** Omission is strong; only weak recalls store a strength. */
+  strength?: 'weak';
+  details?: {start: number; end: number; stray?: true}[];
+}
+
 export interface SceneMessage extends AcceptedMessage {
   /** IANA zone captured at first acceptance; legacy sources without one replay in UTC. */
   acceptedTimeZone?: string;
@@ -45,6 +57,8 @@ export interface SceneMessage extends AcceptedMessage {
   dependencies?: { id: string; revision: number }[];
   /** Actual conversational antecedent, distinct from the full knowledge dependency set. */
   replyTo?: {id:string;revision:number};
+  /** Server-produced recalls, stored only when this assistant message is accepted. */
+  recalled?: SceneRecall[];
 }
 export type KnowledgeKind = 'observed' | 'heard' | 'private' | 'thought' | 'inferred';
 /** A model candidate. Recipients cannot exceed the user-controlled envelope. */

@@ -6,11 +6,12 @@ import { foldRelationships, relationshipAnchor as foldedRelationshipAnchor, vali
 import type { FoldedRelationship } from '../emotion/relationships.ts';
 import { scopeKey } from '../core/types.ts';
 import type { Preference } from '../core/store.ts';
-import type { Memory, MemorySnapshot, Access } from '../memory/access.ts';
+import type { Memory, MemorySnapshot, MemoryView, Access, RecallDetailRange } from '../memory/access.ts';
+import {foldCue, foldedCues, TRACE_RECORD_LIMIT, TRACE_STRONG_CUES} from '../memory/trace.ts';
 import { projectMemories } from '../memory/access.ts';
 import {retentionSnapshot} from '../memory/retention.ts';
 import { emotionIdentitySeed, npcScope } from './types.ts';
-import type { SceneScope, SceneRoster, SceneMessage, SceneSource, SceneState, SceneAnalysis, SceneWriteGuard, SceneProfileCandidate } from './types.ts';
+import type { SceneScope, SceneRoster, SceneMessage, SceneSource, SceneState, SceneAnalysis, SceneWriteGuard, SceneProfileCandidate, SceneRecall } from './types.ts';
 import {foldWorldState,foldWorldStateRunning,projectWorldState} from './world-state.ts';
 import type {WorldFoldResult,WorldProjection,WorldRunningStep,WorldSettings,WorldSourceEffects} from './world-state.ts';
 import {SceneLifecycle,MESSAGE_CHECKPOINT_REASON} from './lifecycle.ts';
@@ -246,105 +247,224 @@ export class SceneAuthority {
   }
 
   /** Accepted raw text is durable independently of whether background analysis succeeds. */
-  reconcile(scope: SceneScope, messages: SceneMessage[], replace = true, now = Date.now(), guard?:SceneWriteGuard) {
-    return this.transaction(() => {
-      const state = this.state(scope);
-      if (!state.version) throw new Error('invalid_scene_not_configured');
-      if (new Set(messages.map(message => message.id)).size !== messages.length) throw new Error('duplicate_message_id');
-      const requestHash=createHash('sha256').update(JSON.stringify([messages,replace,guard?.expectedVersion,guard?.reconfirmIds??[]])).digest('hex');
-      if(guard){
-        if(!Number.isSafeInteger(guard.expectedVersion)||guard.expectedVersion<0||!guard.operationId||guard.operationId.length>200)throw new Error('invalid_scene_operation');
-        const previous=this.db.prepare('SELECT request_hash,sources_hash FROM scene_write_operations WHERE scope=? AND id=?')
-          .get(scopeKey(scope),guard.operationId) as {request_hash:string;sources_hash:string}|undefined;
-        if(previous){
-          if(previous.request_hash!==requestHash)throw new Error('invalid_scene_operation');
-          if(previous.sources_hash!==sourcesHash(state))throw new Error('context_changed_retry');
-          return {removed:0,changed:false,duplicate:true,...this.syncState(scope)};
+  reconcile(
+    scope: SceneScope,
+    messages: SceneMessage[],
+    replace = true,
+    now = Date.now(),
+    guard?: SceneWriteGuard
+  ) {
+    return this.transaction(
+      () => {
+        const state = this.state(scope);
+        if (!state.version)
+          throw new Error('invalid_scene_not_configured');
+        if (new Set(messages.map(message => message.id)).size !== messages.length)
+          throw new Error('duplicate_message_id');
+        // Validate every message before hashing, checkpointing or writing. Unknown entry fields survive round trips.
+        for (const message of messages) {
+          try {
+            if (!Object.hasOwn(message, 'recalled'))
+              continue;
+            const recalled = message.recalled;
+            if (message.role !== 'assistant' || !Array.isArray(recalled) || recalled.length > TRACE_RECORD_LIMIT) {
+              throw new Error('invalid_scene_recall');
+            }
+            for (const entry of recalled) {
+              if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+                typeof entry.character !== 'string' || entry.character.length < 1 || entry.character.length > 200 ||
+                typeof entry.source !== 'string' || entry.source.length < 1 || entry.source.length > 200 ||
+                !Number.isSafeInteger(entry.revision) || entry.revision < 1 ||
+                typeof entry.identity !== 'string' || !/^[0-9a-f]{64}$/.test(entry.identity) ||
+                (Object.hasOwn(entry, 'strength') && entry.strength !== 'weak'))
+                throw new Error('invalid_scene_recall');
+              if (!Object.hasOwn(entry, 'details'))
+                continue;
+              if (!Array.isArray(entry.details) || entry.details.length < 1 || entry.details.length > 3) {
+                throw new Error('invalid_scene_recall');
+              }
+              let previousEnd = 0;
+              let strayCount = 0;
+              for (const range of entry.details) {
+                if (!range || typeof range !== 'object' || Array.isArray(range) ||
+                  Object.keys(range).some(key => !['start', 'end', 'stray'].includes(key)) ||
+                  !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end) ||
+                  range.start < previousEnd || range.start < 0 || range.start >= range.end || range.end > 20000 ||
+                  (Object.hasOwn(range, 'stray') && range.stray !== true))
+                  throw new Error('invalid_scene_recall');
+                previousEnd = range.end;
+                if (Object.hasOwn(range, 'stray') && range.stray === true && ++strayCount > 1)
+                  throw new Error('invalid_scene_recall');
+              }
+            }
+          }
+          catch {
+            throw new Error('invalid_scene_recall');
+          }
         }
-        if(state.version!==guard.expectedVersion)throw new Error('context_changed_retry');
-      }
-      let changed = false;
-      let userActivityChanged = false;
-      let removed = 0;
-      const causalChanges:{index:number;characters:Set<string>}[]=[];
-      const deletedSourceIds = new Set(state.sources.filter(source=>source.status==='deleted').map(source=>source.id));
-      const incoming = new Map(messages.map(message => [message.id,message]));
-      const changing=messages.some(message=>guard?.reconfirmIds?.includes(message.id)||!state.sources.some(source=>source.id===message.id&&sameContent(source,message)))
-        || (replace&&state.sources.some(source=>source.status!=='deleted'&&!incoming.has(source.id)));
-      if(changing)this.lifecycle.checkpoint(scope,MESSAGE_CHECKPOINT_REASON,{automatic:true});
-      // The zone of the new sources of this call: read on first use, at most once, and never kept beyond the call.
-      let newSourceTimeZone:string|undefined;
-      for (const message of messages) {
-        const previous = state.sources.find(source => source.id === message.id);
-        if (previous?.status === 'deleted') throw new Error('invalid_scene_deleted_source');
-        const reconfirm=guard?.reconfirmIds?.includes(message.id)===true;
-        if (previous && sameContent(previous,message) && !reconfirm) continue;
-        if(previous&&(message.revision<previous.revision||message.revision>previous.revision+1))throw new Error('context_changed_retry');
-        const revision = previous ? previous.revision + 1 : 1;
-        const acceptedAtMs = previous?.acceptedAtMs ?? Math.min(message.acceptedAtMs,now);
-        // Editing an existing source is an explicit user correction, not a replay of its old derivation.
-        const replyTo=message.replyTo??previous?.replyTo;
-        const acceptedTimeZone=previous?previous.acceptedTimeZone:(newSourceTimeZone??=this.interactions.isTavernRoleplay(scope)
-          ?this.interactions.get(scope,'sillytavern').timeZone
-          :this.interactions.modeOf(scope)?this.interactions.clock(scope).timeZone??'UTC':'UTC');
-        const next: SceneMessage = {...message,revision,acceptedAtMs,acceptedTimeZone,
-          dependencies:message.dependencies??previous?.dependencies??[],...(replyTo?{replyTo}:{})};
-        if(replyTo){
-          const current=this.state(scope).sources,origin=current.find(source=>source.id===replyTo.id);
-          if(next.role!=='assistant'||!origin||origin.status!=='accepted'||origin.revision!==replyTo.revision||origin.id===next.id||
-            (previous&&current.indexOf(origin)>=current.findIndex(source=>source.id===previous.id)))throw new Error('invalid_scene_reply_to');
-          if(!next.dependencies!.some(item=>item.id===replyTo.id&&item.revision===replyTo.revision))next.dependencies=[...next.dependencies!,replyTo];
+        const requestHash = createHash('sha256').update(JSON.stringify([messages, replace, guard?.expectedVersion, guard?.reconfirmIds ?? []])).digest('hex');
+        if (guard) {
+          if (!Number.isSafeInteger(guard.expectedVersion) || guard.expectedVersion < 0 || !guard.operationId || guard.operationId.length > 200)
+            throw new Error('invalid_scene_operation');
+          const previous = this.db.prepare('SELECT request_hash,sources_hash FROM scene_write_operations WHERE scope=? AND id=?')
+            .get(scopeKey(scope), guard.operationId) as {
+              request_hash: string;
+              sources_hash: string;
+            } | undefined;
+          if (previous) {
+            if (previous.request_hash !== requestHash)
+              throw new Error('invalid_scene_operation');
+            if (previous.sources_hash !== sourcesHash(state))
+              throw new Error('context_changed_retry');
+            return {removed: 0, changed: false, duplicate: true, ...this.syncState(scope)};
+          }
+          if (state.version !== guard.expectedVersion)
+            throw new Error('context_changed_retry');
         }
-        if(previous){
-          this.processing.clearSources(scope,[previous.id]);
-          const characters=new Set([
-            ...Object.keys(previous.analysis?.characters??{}),message.envelope.targetId,...message.envelope.presentIds,
-            ...(message.speakerId?[message.speakerId]:[]),
-          ]);
-          causalChanges.push({index:state.sources.indexOf(previous),characters});
-        }
-        const retained=previous?.analysis?withoutUserModelCandidates(withoutEmotionStates({...previous.analysis,plan:null,controlRevision:previous.analysis.controlRevision??previous.revision})):null;
-        this.db.prepare(`INSERT INTO scene_sources VALUES(?,?,?,?,?,'accepted','pending',?)
+        let changed = false;
+        let userActivityChanged = false;
+        let removed = 0;
+        const causalChanges: {
+          index: number;
+          characters: Set<string>;
+        }[] = [];
+        const deletedSourceIds = new Set(state.sources.filter(source => source.status === 'deleted').map(source => source.id));
+        const incoming = new Map(messages.map(message => [message.id, message]));
+        const changing = messages.some(
+          message => guard?.reconfirmIds?.includes(message.id) || !state.sources.some(source => source.id === message.id && sameContent(source, message))
+        )
+          || (replace && state.sources.some(source => source.status !== 'deleted' && !incoming.has(source.id)));
+        if (changing)
+          this.lifecycle.checkpoint(scope, MESSAGE_CHECKPOINT_REASON, {automatic: true});
+        // The zone of the new sources of this call: read on first use, at most once, and never kept beyond the call.
+        let newSourceTimeZone: string | undefined;
+        for (const message of messages) {
+          const previous = state.sources.find(source => source.id === message.id);
+          if (previous?.status === 'deleted')
+            throw new Error('invalid_scene_deleted_source');
+          const reconfirm = guard?.reconfirmIds?.includes(message.id) === true;
+          if (previous && sameContent(previous, message) && !reconfirm)
+            continue;
+          if (previous && (message.revision < previous.revision || message.revision > previous.revision + 1))
+            throw new Error('context_changed_retry');
+          const revision = previous ? previous.revision + 1 : 1;
+          const acceptedAtMs = previous?.acceptedAtMs ?? Math.min(message.acceptedAtMs, now);
+          // Editing an existing source is an explicit user correction, not a replay of its old derivation.
+          const replyTo = message.replyTo ?? previous?.replyTo;
+          const acceptedTimeZone = previous ? previous.acceptedTimeZone : (newSourceTimeZone ??= this.interactions.isTavernRoleplay(scope)
+            ? this.interactions.get(scope, 'sillytavern').timeZone
+            : this.interactions.modeOf(scope) ? this.interactions.clock(scope).timeZone ?? 'UTC' : 'UTC');
+          const next: SceneMessage = {
+            ...message,
+            revision,
+            acceptedAtMs,
+            acceptedTimeZone,
+            dependencies: message.dependencies ?? previous?.dependencies ?? [],
+            ...(replyTo ? {replyTo} : {})
+          };
+          if (replyTo) {
+            const current = this.state(scope).sources, origin = current.find(source => source.id === replyTo.id);
+            if (next.role !== 'assistant' || !origin || origin.status !== 'accepted' || origin.revision !== replyTo.revision || origin.id === next.id ||
+              (previous && current.indexOf(origin) >= current.findIndex(source => source.id === previous.id)))
+              throw new Error('invalid_scene_reply_to');
+            if (!next.dependencies!.some(item => item.id === replyTo.id && item.revision === replyTo.revision))
+              next.dependencies = [...next.dependencies!, replyTo];
+          }
+          if (previous) {
+            this.processing.clearSources(scope, [previous.id]);
+            const characters = new Set(
+              [
+                ...Object.keys(previous.analysis?.characters ?? {}),
+                message.envelope.targetId,
+                ...message.envelope.presentIds,
+                ...(message.speakerId ? [message.speakerId] : []),
+              ]
+            );
+            causalChanges.push({index: state.sources.indexOf(previous), characters});
+          }
+          const retained = previous?.analysis ? withoutUserModelCandidates(
+            withoutEmotionStates(
+              {
+                ...previous.analysis,
+                plan: null,
+                controlRevision: previous.analysis.controlRevision ?? previous.revision
+              }
+            )
+          ) : null;
+          this.db.prepare(
+            `INSERT INTO scene_sources VALUES(?,?,?,?,?,'accepted','pending',?)
           ON CONFLICT(scope,id) DO UPDATE SET revision=excluded.revision,message=excluded.message,
-          observed=excluded.observed,status='accepted',processing='pending',analysis=excluded.analysis`)
-          .run(scopeKey(scope),next.id,revision,JSON.stringify(next),now,retained?JSON.stringify(retained):null);
-        if(next.role==='user')userActivityChanged=true;
-        changed = true;
+          observed=excluded.observed,status='accepted',processing='pending',analysis=excluded.analysis`
+          )
+            .run(
+              scopeKey(scope),
+              next.id,
+              revision,
+              JSON.stringify(next),
+              now,
+              retained ? JSON.stringify(retained) : null
+            );
+          if (next.role === 'user')
+            userActivityChanged = true;
+          changed = true;
+        }
+        if (replace)
+          for (const source of state.sources) {
+            if (source.status === 'deleted' || incoming.has(source.id))
+              continue;
+            this.processing.clearSources(scope, [source.id]);
+            causalChanges.push(
+              {
+                index: state.sources.indexOf(source),
+                characters: new Set(Object.keys(source.analysis?.characters ?? {}))
+              }
+            );
+            const erased = {...source, text: '', dependencies: [], revision: source.revision + 1};
+            delete (erased as Partial<SceneSource>).analysis;
+            delete erased.recalled;
+            this.db.prepare(
+              "UPDATE scene_sources SET revision=revision+1,message=?,observed=?,status='deleted',processing='ready',analysis=NULL WHERE scope=? AND id=?"
+            )
+              .run(JSON.stringify(erased), now, scopeKey(scope), source.id);
+            this.hooks.onSourceErased(scope, source);
+            const preferences = this.db.prepare('SELECT character,id FROM scene_preference_controls WHERE scope=?').all(scopeKey(scope)) as {
+              character: string;
+              id: string;
+            }[];
+            for (const preference of preferences)
+              if (preferenceSourceId(preference.id) === source.id)
+                this.db.prepare('DELETE FROM scene_preference_controls WHERE scope=? AND character=? AND id=?').run(scopeKey(scope), preference.character, preference.id);
+            eraseWorldLedgerSource(this.db, scope, source.id);
+            deletedSourceIds.add(source.id);
+            changed = true;
+            removed++;
+          }
+        this.lifecycle.redactUnsafeCheckpoints(scope, deletedSourceIds);
+        if (changed) {
+          const dependentChanges = this.invalidateDependents(scope);
+          this.invalidateCausalSuffix(scope, [...causalChanges, ...dependentChanges]);
+          // N16 after the two invalidations (they decide which source is now the opening), before the single bump.
+          // Then the OpenHer snapshots, only when this call edited, reconfirmed, deleted or invalidated a source or re-queued
+          // the opening: a call whose new sources all stay valid only adds pending sources, which change no snapshot.
+          const openingRequeued = this.requeueOpening(scope);
+          if (causalChanges.length > 0 || dependentChanges.length > 0 || openingRequeued)
+            this.rebuildEmotionStatesGuarded(scope);
+          this.bump(scope);
+          if (userActivityChanged)
+            this.hooks.onUserActivity(scope, now);
+          this.rebuildDerived(scope);
+        }
+        const next = this.state(scope);
+        if (removed)
+          for (const character of state.roster.characters)
+            this.db.prepare('INSERT OR REPLACE INTO scene_index_cleanup VALUES(?,?,?)').run(scopeKey(scope), character.id, next.version);
+        if (guard?.reconfirmIds?.some(id => next.sources.find(source => source.id === id)?.status !== 'accepted'))
+          throw new Error('invalid_scene_dependencies');
+        if (guard)
+          this.db.prepare('INSERT INTO scene_write_operations VALUES(?,?,?,?)').run(scopeKey(scope), guard.operationId, requestHash, sourcesHash(next));
+        return {removed, changed, duplicate: false, ...this.syncState(scope)};
       }
-      if (replace) for (const source of state.sources) {
-        if (source.status === 'deleted' || incoming.has(source.id)) continue;
-        this.processing.clearSources(scope,[source.id]);
-        causalChanges.push({index:state.sources.indexOf(source),characters:new Set(Object.keys(source.analysis?.characters??{}))});
-        const erased = {...source,text:'',dependencies:[],revision:source.revision+1};
-        delete (erased as Partial<SceneSource>).analysis;
-        this.db.prepare("UPDATE scene_sources SET revision=revision+1,message=?,observed=?,status='deleted',processing='ready',analysis=NULL WHERE scope=? AND id=?")
-          .run(JSON.stringify(erased),now,scopeKey(scope),source.id);
-        this.hooks.onSourceErased(scope,source);
-        const preferences=this.db.prepare('SELECT character,id FROM scene_preference_controls WHERE scope=?').all(scopeKey(scope)) as {character:string;id:string}[];
-        for(const preference of preferences)if(preferenceSourceId(preference.id)===source.id)this.db.prepare('DELETE FROM scene_preference_controls WHERE scope=? AND character=? AND id=?').run(scopeKey(scope),preference.character,preference.id);
-        eraseWorldLedgerSource(this.db,scope,source.id);
-        deletedSourceIds.add(source.id);
-        changed = true; removed++;
-      }
-      this.lifecycle.redactUnsafeCheckpoints(scope, deletedSourceIds);
-      if (changed) {
-        const dependentChanges=this.invalidateDependents(scope);
-        this.invalidateCausalSuffix(scope,[...causalChanges,...dependentChanges]);
-        // N16 after the two invalidations (they decide which source is now the opening), before the single bump.
-        // Then the OpenHer snapshots, only when this call edited, reconfirmed, deleted or invalidated a source or re-queued
-        // the opening: a call whose new sources all stay valid only adds pending sources, which change no snapshot.
-        const openingRequeued=this.requeueOpening(scope);
-        if(causalChanges.length>0||dependentChanges.length>0||openingRequeued)this.rebuildEmotionStatesGuarded(scope);
-        this.bump(scope);
-        if(userActivityChanged)this.hooks.onUserActivity(scope,now);
-        this.rebuildDerived(scope);
-      }
-      const next = this.state(scope);
-      if(removed)for(const character of state.roster.characters)this.db.prepare('INSERT OR REPLACE INTO scene_index_cleanup VALUES(?,?,?)').run(scopeKey(scope),character.id,next.version);
-      if(guard?.reconfirmIds?.some(id=>next.sources.find(source=>source.id===id)?.status!=='accepted'))throw new Error('invalid_scene_dependencies');
-      if(guard)this.db.prepare('INSERT INTO scene_write_operations VALUES(?,?,?,?)').run(scopeKey(scope),guard.operationId,requestHash,sourcesHash(next));
-      return {removed,changed,duplicate:false,...this.syncState(scope)};
-    });
+    );
   }
 
   syncState(scope:SceneScope) {
@@ -574,57 +694,325 @@ export class SceneAuthority {
     });
   }
 
-  snapshot(scope: SceneScope, characterId: string, state = this.state(scope)): MemorySnapshot {
-    if (!state.roster.characters.some(character => character.id === characterId)) throw new Error('invalid_scene_character');
-    const roleScope = npcScope(scope,characterId);
+  /**
+   * Build server-owned recall entries in visible-row order. Positions outside the storage limit are omitted.
+   * The snapshot and weak ids come from that exact context; no host-supplied recall data is consulted.
+   */
+  recallRecords(
+    characterId: string,
+    snapshot: MemorySnapshot,
+    views: readonly MemoryView[],
+    weakIds: ReadonlySet<string> = new Set()
+  ): SceneRecall[] {
+    const entries: SceneRecall[] = [];
+    const seen = new Set<string>();
+    for (const view of views) {
+      if (view.reactivated !== true)
+        continue;
+      if (![view.detail, view.gist, view.feeling, view.anchor].some(value => value?.trim()) &&
+        !view.protectedFacts.length && !view.emotionalReaction && !view.rememberedFragments?.length)
+        continue;
+      const memory = snapshot.memories.get(view.id);
+      if (!memory)
+        continue;
+      const identity = memoryIdentity(memory);
+      const key = JSON.stringify([memory.source.messageId, memory.source.revision, identity]);
+      if (seen.has(key))
+        continue;
+      seen.add(key);
+      const details = (memory.selectedRecallDetails ?? [])
+        .filter(
+          range => {
+            if (range.end > 20000)
+              return false;
+            const shown = memory.detail.slice(range.start, range.end).trim();
+            return range.stray === true ? view.strayDetail === shown : view.recalledDetails?.includes(shown);
+          }
+        )
+        .map(
+          range => ({
+            start: range.start,
+            end: range.end,
+            ...(range.stray === true ? {stray: true as const} : {}),
+          })
+        );
+      entries.push(
+        {
+          character: characterId,
+          source: memory.source.messageId,
+          revision: memory.source.revision,
+          identity,
+          ...(weakIds.has(memory.id) ? {strength: 'weak' as const} : {}),
+          ...(details.length ? {details} : {}),
+        }
+      );
+      if (entries.length === TRACE_RECORD_LIMIT)
+        break;
+    }
+    return entries;
+  }
+
+  /** Derive retention origins and turn counts from accepted rows; the optional reply source cannot rehearse itself. */
+  snapshot(
+    scope: SceneScope,
+    characterId: string,
+    state = this.state(scope),
+    currentSource?: {
+      id: string;
+      revision: number;
+    }
+  ): MemorySnapshot {
+    if (!state.roster.characters.some(character => character.id === characterId)) {
+      throw new Error('invalid_scene_character');
+    }
+    const roleScope = npcScope(scope, characterId);
     const sources = state.sources.filter(source => source.status === 'accepted' && source.processing === 'ready' && source.analysis);
-    const controls = this.db.prepare('SELECT id,revision,access FROM scene_controls WHERE scope=? AND character=?').all(scopeKey(scope),characterId) as {id:string;revision:number;access:Access}[];
-    const memories = new Map<string,Memory>();
-    // One fold of the final timeline; null for a scope without a story clock (companion, unbound without story settings).
-    const reading=this.storyClock.read(scope,state);
-    for (const source of sources) {
-      const plan=source.analysis!.plan;
-      if(!plan)continue;
-      const observations = plan.observations.filter(observation => observation.readers.includes(characterId));
-      const analysis = source.analysis!.characters[characterId];
-      if (!analysis) continue;
-      for (const [index,candidate] of analysis.memories.entries()) {
-        const observation = observations.find(item => item.quote.includes(candidate.detail));
-        if (!observation) continue;
-        const id = `${source.id}:${characterId}#${index}`;
-        const controlId=memoryControlId(source.id,characterId,candidate);
-        const control = controls.find(control=>control.id===controlId&&control.revision===0) ?? controls.find(control => control.id === id && control.revision === source.revision);
-        const access=control?.access??'clear';
-        const rehearsed=candidate.retention?.cues.length?state.sources.slice(state.sources.indexOf(source)+1).filter(later=>
-          later.status==='accepted'&&later.processing==='ready'&&later.analysis?.plan?.observations.some(item=>
-            item.readers.includes(characterId)&&candidate.retention!.cues.some(cue=>item.quote.includes(cue)))).at(-1):undefined;
-        const retentionSource=rehearsed??source;
-        // The per-source state on the final timeline, so a relabel, year fill or re-anchor moves both ends together.
-        const retentionAtMs=reading
-          ?this.storyClock.atSource(reading,{sourceId:retentionSource.id,revision:retentionSource.revision})??reading.result.state.atMs
-          :retentionSource.acceptedAtMs;
-        memories.set(id,{...candidate,id,scope:roleScope,status:'accepted',access,accessOverride:control!==undefined,retentionAtMs,
-          source:{messageId:source.id,revision:source.revision,occurredAtMs:source.acceptedAtMs,knownAtMs:Math.max(source.acceptedAtMs,source.observedAtMs),
-            author:{role:source.role,actorId:source.role==='user'?'player':source.automatic?'narrator':source.speakerId!},
-            knowledge:{kind:observation.kind,...(source.role==='user'&&source.envelope.mode==='direct'
-              ?{actorId:'player'}:observation.actorId?{actorId:observation.actorId}:{}),
-              observationId:observation.id,start:observation.start,end:observation.end}}});
+    const controls = this.db.prepare('SELECT id,revision,access FROM scene_controls WHERE scope=? AND character=?')
+      .all(scopeKey(scope), characterId) as {
+        id: string;
+        revision: number;
+        access: Access;
+      }[];
+    const memories = new Map<string, Memory>();
+    const reading = this.storyClock.read(scope, state);
+    const timeOf = (source: SceneSource) => reading
+      ? this.storyClock.atSource(reading, {sourceId: source.id, revision: source.revision}) ?? reading.result.state.atMs
+      : source.acceptedAtMs;
+    // Each visible excerpt and each candidate cue is folded once per snapshot. Matching uses those cached strings.
+    // Sources are visited once for the lookup; each memory matches only its cues and its own recorded entries.
+    const foldedSources = new Map<number, string[]>();
+    const records = new Map<string, Map<number, {
+      weak: boolean;
+      details?: RecallDetailRange[];
+    }>>();
+    // Invalid detail locations cannot erase a rehearsal that otherwise matches the memory.
+    // At most three ranges are visited; checking their own keys is linear in the imported key count.
+    const rangesOf = (entry: SceneRecall): RecallDetailRange[] | undefined => {
+      try {
+        if (!Object.hasOwn(entry, 'details'))
+          return undefined;
+
+        const value = entry.details;
+        if (!Array.isArray(value) || value.length < 1 || value.length > 3)
+          return undefined;
+
+        const ranges: RecallDetailRange[] = [];
+        let previousEnd = 0;
+        let strayCount = 0;
+        for (const item of value) {
+          if (!item || typeof item !== 'object' || Array.isArray(item) ||
+            Object.keys(item).some(key => !['start', 'end', 'stray'].includes(key)) ||
+            !Number.isSafeInteger(item.start) || !Number.isSafeInteger(item.end) ||
+            item.start < previousEnd || item.start < 0 || item.start >= item.end || item.end > 20000 ||
+            (Object.hasOwn(item, 'stray') && item.stray !== true))
+            return undefined;
+
+          previousEnd = item.end;
+          if (Object.hasOwn(item, 'stray') && item.stray === true && ++strayCount > 1)
+            return undefined;
+
+          ranges.push({
+            start: item.start,
+            end: item.end,
+            ...(Object.hasOwn(item, 'stray') && item.stray === true ? {stray: true} : {})
+          });
+        }
+
+        return ranges;
+      }
+      catch {
+        return undefined;
+      }
+    };
+    for (const [sourceIndex, source] of sources.entries()) {
+      if (source.id === currentSource?.id && source.revision === currentSource.revision)
+        continue;
+      const excerpts = source.analysis?.plan?.observations
+        .filter(observation => observation.readers.includes(characterId)).map(observation => foldCue(observation.quote));
+      if (excerpts?.length)
+        foldedSources.set(sourceIndex, excerpts);
+      // Malformed imported lists do not affect reads; the write path remains strict.
+      try {
+        if (source.role !== 'assistant' || !Array.isArray(source.recalled) ||
+          source.recalled.length > TRACE_RECORD_LIMIT)
+          continue;
+        for (const entry of source.recalled) {
+          try {
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry) || entry.character !== characterId ||
+              typeof entry.source !== 'string' || !Number.isSafeInteger(entry.revision) ||
+              typeof entry.identity !== 'string' || (Object.hasOwn(entry, 'strength') && entry.strength !== 'weak'))
+              continue;
+            const details = rangesOf(entry);
+            const key = JSON.stringify([entry.source, entry.revision, entry.identity]);
+            const bySource = records.get(key) ?? new Map();
+            const weak = Object.hasOwn(entry, 'strength') && entry.strength === 'weak';
+            const previous = bySource.get(sourceIndex);
+            // Strong is sticky within one source; within one strength the first entry owns its details.
+            if (!previous || (previous.weak && !weak)) {
+              bySource.set(sourceIndex, {weak, ...(details ? {details} : {})});
+              records.set(key, bySource);
+            }
+          }
+          catch {
+            // One corrupt imported entry must not hide the other valid entries.
+          }
+        }
+      }
+      catch {
+        // A malformed recalled member is absent for this read.
       }
     }
-    const references=this.transfer.projection(scope,characterId,state);
-    for(const [id,memory] of references.memories)memories.set(id,memory);
-    const messages=new Map<string,{revision:number;status:'accepted'|'deleted'}>(sources.map(source => [source.id,{revision:source.revision,status:'accepted' as const}]));
-    for(const [id,message] of references.messages)messages.set(id,message);
-    const replyParents=new Map<string,{assistantRevision:number;parentMessageId:string;parentRevision:number}>();
-    for(const [index,assistant] of sources.entries()){
-      if(assistant.role!=='assistant'||!assistant.replyTo)continue;
-      const parent=sources.slice(0,index).find(candidate=>candidate.id===assistant.replyTo!.id&&
-        candidate.revision===assistant.replyTo!.revision&&candidate.role==='user');
-      if(parent)replyParents.set(assistant.id,{assistantRevision:assistant.revision,parentMessageId:parent.id,parentRevision:parent.revision});
+    for (const [sourceIndex, source] of sources.entries()) {
+      const plan = source.analysis!.plan;
+      if (!plan)
+        continue;
+      const observations = plan.observations.filter(observation => observation.readers.includes(characterId));
+      const analysis = Object.hasOwn(source.analysis!.characters, characterId)
+        ? source.analysis!.characters[characterId] : undefined;
+      if (!analysis)
+        continue;
+      for (const [index, candidate] of analysis.memories.entries()) {
+        const observation = observations.find(item => item.quote.includes(candidate.detail));
+        if (!observation)
+          continue;
+        const id = `${source.id}:${characterId}#${index}`;
+        const controlId = memoryControlId(source.id, characterId, candidate);
+        const control = controls.find(control => control.id === controlId && control.revision === 0) ??
+          controls.find(control => control.id === id && control.revision === source.revision);
+        const access = control?.access ?? 'clear';
+        const cues = foldedCues(candidate.retention?.cues ?? []);
+        const recorded = records.get(JSON.stringify([source.id, source.revision, memoryIdentity(candidate)]));
+        const refreshes = new Map<number, {
+          kind: 'full' | 'gist' | 'weak';
+          details?: RecallDetailRange[];
+        }>();
+        if (cues.length) {
+          for (const [laterIndex, excerpts] of foldedSources) {
+            if (laterIndex <= sourceIndex)
+              continue;
+            const found = cues.filter(cue => excerpts.some(excerpt => excerpt.includes(cue)));
+            const count = found.filter(cue => !found.some(other => other !== cue && other.includes(cue))).length;
+            if (count)
+              refreshes.set(laterIndex, {kind: count >= TRACE_STRONG_CUES ? 'full' : 'gist'});
+          }
+        }
+        if (recorded) {
+          for (const [laterIndex, entry] of recorded) {
+            if (laterIndex <= sourceIndex)
+              continue;
+            const kind = refreshes.get(laterIndex)?.kind ?? (entry.weak ? 'weak' : 'gist');
+            refreshes.set(laterIndex, {kind, ...(entry.details ? {details: entry.details} : {})});
+          }
+        }
+        let retentionSource = source;
+        let gistSource: SceneSource | undefined;
+        let weakSource: SceneSource | undefined;
+        let recallDetails: Memory['recallDetails'];
+        const strongTurns = new Set<string>();
+        const weakTurns = new Set<string>();
+        const ownTurn = source.replyTo?.id ?? source.id;
+        for (const [laterIndex, refresh] of [...refreshes].sort(([left], [right]) => left - right)) {
+          const later = sources[laterIndex]!;
+          if (refresh.kind === 'full')
+            retentionSource = later;
+          else if (refresh.kind === 'gist')
+            gistSource = later;
+          else
+            weakSource = later;
+          recallDetails = refresh.details ? {atMs: timeOf(later), ranges: refresh.details} : undefined;
+          const turn = later.replyTo?.id ?? later.id;
+          if (turn === ownTurn)
+            continue;
+          if (refresh.kind === 'weak')
+            weakTurns.add(turn);
+          else
+            strongTurns.add(turn);
+        }
+        for (const turn of strongTurns)
+          weakTurns.delete(turn);
+        const retentionAtMs = timeOf(retentionSource);
+        const gistAtMs = gistSource ? timeOf(gistSource) : undefined;
+        const weakAtMs = weakSource ? timeOf(weakSource) : undefined;
+        const gistRetentionAtMs = gistAtMs !== undefined && gistAtMs > retentionAtMs ? gistAtMs : undefined;
+        const weakRetentionAtMs = weakAtMs !== undefined && weakAtMs > retentionAtMs &&
+          (gistRetentionAtMs === undefined || weakAtMs > gistRetentionAtMs) ? weakAtMs : undefined;
+        memories.set(
+          id,
+          {
+            ...candidate,
+            id,
+            scope: roleScope,
+            status: 'accepted',
+            access,
+            accessOverride: control !== undefined,
+            retentionAtMs,
+            ...(gistRetentionAtMs === undefined ? {} : {gistRetentionAtMs}),
+            ...(weakRetentionAtMs === undefined ? {} : {weakRetentionAtMs}),
+            ...(strongTurns.size ? {rehearsalSources: strongTurns.size} : {}),
+            ...(weakTurns.size ? {weakRehearsalSources: weakTurns.size} : {}),
+            ...(recallDetails ? {recallDetails} : {}),
+            source: {
+              messageId: source.id,
+              revision: source.revision,
+              occurredAtMs: source.acceptedAtMs,
+              knownAtMs: Math.max(source.acceptedAtMs, source.observedAtMs),
+              author: {
+                role: source.role,
+                actorId: source.role === 'user' ? 'player' : source.automatic ? 'narrator' : source.speakerId!,
+              },
+              knowledge: {
+                kind: observation.kind,
+                ...(source.role === 'user' && source.envelope.mode === 'direct'
+                  ? {actorId: 'player'} : observation.actorId ? {actorId: observation.actorId} : {}),
+                observationId: observation.id,
+                start: observation.start,
+                end: observation.end,
+              },
+            },
+          }
+        );
+      }
     }
-    return {scope:roleScope,version:state.version,messages,memories,
-      ...(replyParents.size?{replyParents}:{}),
-      ...(reading?{memoryTimeMs:reading.result.state.atMs}:{})};
+    const references = this.transfer.projection(scope, characterId, state);
+    for (const [id, memory] of references.memories)
+      memories.set(id, memory);
+    const messages = new Map<string, {
+      revision: number;
+      status: 'accepted' | 'deleted';
+    }>(sources.map(source => [source.id, {revision: source.revision, status: 'accepted' as const}]));
+    for (const [id, message] of references.messages)
+      messages.set(id, message);
+    const replyParents = new Map<string, {
+      assistantRevision: number;
+      parentMessageId: string;
+      parentRevision: number;
+    }>();
+    const previousUsers = new Map<string, SceneSource>();
+    for (const source of sources) {
+      if (source.role === 'user')
+        previousUsers.set(source.id, source);
+      if (source.role !== 'assistant' || !source.replyTo)
+        continue;
+      const parent = previousUsers.get(source.replyTo.id);
+      if (parent?.revision === source.replyTo.revision) {
+        replyParents.set(
+          source.id,
+          {
+            assistantRevision: source.revision,
+            parentMessageId: parent.id,
+            parentRevision: parent.revision,
+          }
+        );
+      }
+    }
+    return {
+      scope: roleScope,
+      version: state.version,
+      messages,
+      memories,
+      ...(replyParents.size ? {replyParents} : {}),
+      ...(reading ? {memoryTimeMs: reading.result.state.atMs} : {}),
+    };
   }
 
   emotion(scope: SceneScope, characterId: string, now = Date.now(), state = this.state(scope), timeline?:SceneSource[]) {
@@ -1439,10 +1827,22 @@ function sameContent(left: SceneMessage, right: SceneMessage) {
 function sourcesHash(state:SceneState) {
   return createHash('sha256').update(JSON.stringify(state.sources.map(source=>[source.id,source.revision,source.status]))).digest('hex');
 }
-function memoryControlId(sourceId:string,characterId:string,memory:{kind?:string;detail:string}) {
-  const identity=createHash('sha256').update(JSON.stringify([memory.kind??'legacy',memory.detail])).digest('hex');
+/** Stable identity binds stored ranges to the exact detail and kind, independently of extraction order. */
+function memoryIdentity(memory: {
+  kind?: string;
+  detail: string;
+}): string {
+  return createHash('sha256').update(JSON.stringify([memory.kind ?? 'legacy', memory.detail])).digest('hex');
+}
+
+function memoryControlId(sourceId: string, characterId: string, memory: {
+  kind?: string;
+  detail: string;
+}) {
+  const identity = memoryIdentity(memory);
   return `${sourceId}:${characterId}#@${identity}`;
 }
+
 function preferenceControlId(sourceId:string,preference:{category:string;quote:string}) {
   return `${sourceId}:pref:@${createHash('sha256').update(JSON.stringify([preference.category,preference.quote])).digest('hex')}`;
 }

@@ -610,24 +610,49 @@ function removeAndTidy(layer:string,codeSpans:readonly [number,number][],factSpa
 
 const DAY=86_400_000;
 
-/** A view-only time decision; it neither changes history nor writes on recall. */
-export function retainedAccess(memory:Memory,nowMs:number,cueText=''): {access:Access;reactivated?:true} {
-  if(memory.accessOverride||memory.access!=='clear'||memory.source.reference||memory.retention?.kind!=='peripheral')return {access:memory.access};
-  if(memory.reactivated)return {access:memory.access,reactivated:true};
-  const since=memory.retentionAtMs??memory.source.knownAtMs;
-  const age=Math.max(0,nowMs-since);
-  // Only explicitly peripheral memories participate. Anchors and protected
-  // facts survive every stage, and absence of a safe classification retains.
-  const first=memory.kind==='episode'?30*DAY:60*DAY;
-  if(age<first)return {access:'clear'};
-  const tier:Access=age<180*DAY?'gist':'feeling';
-  // A cue of the memory in the text restores one stage; two or more restore to clear. The cue need not be in a
-  // visible layer: the trace is a reminder key, never text shown to anyone.
-  if(cueText&&restorableStage(memory,nowMs,tier)){
-    const hits=visibleCueHits(memory.retention.cues,foldCue(cueText));
-    if(hits>0)return {access:restoredAccess(tier,hits>=TRACE_STRONG_CUES),reactivated:true};
+/** User-set detail window: two story days, tunable from one to three; no kind multiplier. */
+export const RECALL_DETAIL_DAYS = 2;
+
+/** User-set weak rehearsal lifetime in story days; weak rehearsal never restores clear access. */
+export const WEAK_EFFECT_DAYS = 5;
+
+/** Read-only clarity and detail-window projection at a supplied memory-clock time in milliseconds. */
+export function retainedAccess(memory: Memory, nowMs: number, cueText = ''): {
+  access: Access;
+  reactivated?: true;
+  recallDetails?: NonNullable<Memory['recallDetails']>['ranges'];
+} {
+  if (memory.accessOverride || memory.access !== 'clear' || memory.source.reference ||
+    memory.retention?.kind !== 'peripheral')
+    return {access: memory.access};
+  if (memory.reactivated)
+    return {access: memory.access, reactivated: true};
+  const since = memory.retentionAtMs ?? memory.source.knownAtMs;
+  const age = Math.max(0, nowMs - since);
+  const first = memory.kind === 'episode' ? 30 * DAY : 60 * DAY;
+  if (age < first)
+    return {access: 'clear'};
+  let tier: Access = age < 180 * DAY ? 'gist' : 'feeling';
+  // A clock correction before a valid origin clamps rehearsal age to zero, as the full schedule does.
+  // Malformed optional origins are absent, so they can never make the full schedule less clear.
+  const gistSince = memory.gistRetentionAtMs;
+  const weakSince = memory.weakRetentionAtMs;
+  if ((typeof gistSince === 'number' && Number.isFinite(gistSince) &&
+    Math.max(0, nowMs - gistSince) < 180 * DAY) ||
+    (typeof weakSince === 'number' && Number.isFinite(weakSince) &&
+      Math.max(0, nowMs - weakSince) < WEAK_EFFECT_DAYS * DAY))
+    tier = 'gist';
+  if (cueText && restorableStage(memory, nowMs, tier)) {
+    const hits = visibleCueHits(memory.retention.cues, foldCue(cueText));
+    if (hits > 0)
+      return {access: hits >= TRACE_STRONG_CUES ? 'clear' : 'gist', reactivated: true};
   }
-  return {access:tier};
+  const details = memory.recallDetails;
+  if (tier === 'gist' && details && typeof details.atMs === 'number' && Number.isFinite(details.atMs) &&
+    nowMs >= details.atMs && nowMs - details.atMs < RECALL_DETAIL_DAYS * DAY) {
+    return {access: tier, recallDetails: details.ranges};
+  }
+  return {access: tier};
 }
 
 function restorableStage(_memory:Memory,_nowMs:number,tier:Access):tier is TraceTier {
@@ -667,19 +692,40 @@ export function cueRecalls(snapshot:MemorySnapshot,nowMs:number,cueText:string):
   return recalls;
 }
 
-/**
- * The staged snapshot with the given recalls applied: each of their records moves one stage back from its own stage,
- * or to clear for a strong recall. An id that names no restorable record is left at its stage.
- */
-export function restoredSnapshot(snapshot:MemorySnapshot,nowMs:number,recalls:readonly Pick<CueRecall,'strong'|'ids'>[]):MemorySnapshot {
-  const clock=snapshot.memoryTimeMs??nowMs;
-  const recalled=new Map<string,boolean>();
-  for(const recall of recalls)for(const id of recall.ids)recalled.set(id,recall.strong);
-  return {...snapshot,memories:new Map([...snapshot.memories].map(([id,memory])=>{
-    const result=retainedAccess(memory,clock);
-    if(!recalled.has(id)||memory.status!=='accepted'||!traceEligible(memory,clock))return [id,{...memory,access:result.access,...(result.reactivated?{reactivated:true}:{})}];
-    return [id,{...memory,access:restoredAccess(result.access as TraceTier,recalled.get(id)!),reactivated:true}];
-  }))};
+/** Restore cue events to gist for one cue or clear for two; preserve all other authority records at their read tier. */
+export function restoredSnapshot(snapshot: MemorySnapshot, nowMs: number, recalls: readonly Pick<CueRecall, 'strong' | 'ids'>[]): MemorySnapshot {
+  const clock = snapshot.memoryTimeMs ?? nowMs;
+  const recalled = new Map<string, boolean>();
+  for (const recall of recalls) {
+    for (const id of recall.ids)
+      recalled.set(id, recall.strong);
+  }
+  return {
+    ...snapshot,
+    memories: new Map(
+      [...snapshot.memories].map(
+        ([id, memory]) => {
+          const result=retainedAccess(memory,clock);
+          if (!recalled.has(id) || memory.status !== 'accepted' || !traceEligible(memory, clock)) {
+            return [
+              id,
+              {...memory, access: result.access, ...(result.reactivated ? {reactivated: true} : {})}
+            ];
+          }
+          const access = recalled.get(id) ? 'clear' : 'gist';
+          return [
+            id,
+            {
+              ...memory,
+              access,
+              reactivated: true,
+              ...(result.access === 'gist' && access === 'gist' ? {recallSameTier: {newDetails: false}} : {}),
+            }
+          ];
+        }
+      )
+    )
+  };
 }
 
 /** Use the same effective granularity for retrieval and foreground context. */

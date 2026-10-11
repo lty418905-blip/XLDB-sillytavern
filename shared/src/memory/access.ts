@@ -1,8 +1,8 @@
 import {currentMemory,sameScope} from './current-record.ts';
 import type {CueRecall,Retention} from './retention.ts';
 import {retainedAccess,visibleLayer,isLegacyTemplate,protectedEmotionalReaction,rememberedFragmentsOf,traceEligible} from './retention.ts';
-import {eventKey,restoredAccess} from './trace.ts';
-import type {TraceHit,TraceTier} from './trace.ts';
+import {eventKey} from './trace.ts';
+import type {TraceHit} from './trace.ts';
 export {visibleLayer} from './retention.ts';
 
 export interface Scope {
@@ -27,6 +27,18 @@ export interface EpisodeMemory {
   evidenceQuotes?: string[];
 }
 
+/** Half-open UTF-16 positions in a memory's detail; only a random item carries stray. */
+export interface RecallDetailRange {
+  start: number;
+  end: number;
+  stray?: true;
+}
+
+/** A context-only detail selection. New distinguishes this recall from a stored window item. */
+export interface RecallDetailSelection extends RecallDetailRange {
+  new: boolean;
+}
+
 export interface Memory {
   id: string;
   scope: Scope;
@@ -40,9 +52,19 @@ export interface Memory {
   accessOverride?:boolean;
   retention?:Retention;
   retentionAtMs?:number;
+  /** Last mainline rehearsal on the memory clock, in milliseconds; never replaces the full origin. */
+  gistRetentionAtMs?: number;
+  /** Last weak-only rehearsal on the memory clock, in milliseconds. */
+  weakRetentionAtMs?: number;
   rehearsalSources?:number;
+  weakRehearsalSources?: number;
+  recallDetails?: {atMs: number; ranges: RecallDetailRange[]};
+  /** Set only during context assembly; never persisted or indexed. */
+  selectedRecallDetails?: RecallDetailSelection[];
   reactivated?:boolean;
   reactivation?:{kind:'semantic'};
+  /** Same-tier recall marks only newly displayed details; never rendered as context metadata. */
+  recallSameTier?: {newDetails: boolean};
   detail: string;
   gist: string;
   feeling: string;
@@ -74,6 +96,8 @@ export interface MemoryView {
   emotionalReaction?:NonNullable<ReturnType<typeof protectedEmotionalReaction>>;
   reactivated?:boolean;
   reactivation?:{kind:'semantic'};
+  /** Same-tier recall marks only newly displayed details; never rendered as context metadata. */
+  recallSameTier?: {newDetails: boolean};
   id: string;
   source: Memory['source'];
   access: Access;
@@ -88,6 +112,10 @@ export interface MemoryView {
   anchor?: string;
   /** Short verbatim scene and sensory fragments of a faded, emotionally protected episode. Absent at clear. */
   rememberedFragments?: string[];
+  /** Selected source text, in start order; context-only, absent outside gist or on a blocked gist. */
+  recalledDetails?: string[];
+  /** One selected random source fragment without its localized rendering prefix. */
+  strayDetail?: string;
   /** What has faded, as a code; contextFrom renders it in the story language. Absent at clear. */
   forgottenMarker?: ForgottenMarker;
 }
@@ -101,17 +129,29 @@ export type ForgottenMarker = 'details_faded' | 'gist_faded' | 'scene_faded' | '
  */
 export function projectMemories(
   snapshot: MemorySnapshot,
-  request: { scope: Scope; asOfMs: number; ids: readonly string[] },
-): { scope: Scope; version: number; memories: MemoryView[] } {
-  if (!sameScope(snapshot.scope, request.scope)) throw new Error('scope_mismatch');
-  if (!Number.isSafeInteger(request.asOfMs) || request.asOfMs < 0) throw new Error('invalid_time');
-
+  request: {
+    scope: Scope;
+    asOfMs: number;
+    ids: readonly string[];
+  }
+): {
+  scope: Scope;
+  version: number;
+  memories: MemoryView[];
+} {
+  if (!sameScope(snapshot.scope, request.scope))
+    throw new Error('scope_mismatch');
+  if (!Number.isSafeInteger(request.asOfMs) || request.asOfMs < 0)
+    throw new Error('invalid_time');
   const memories: MemoryView[] = [];
   for (const id of new Set(request.ids)) {
     let memory = currentMemory(snapshot, id, request.asOfMs);
-    if (!memory) continue;
-    memory={...memory,access:retainedAccess(memory,snapshot.memoryTimeMs??request.asOfMs).access};
-
+    if (!memory)
+      continue;
+    memory = {
+      ...memory,
+      access: retainedAccess(memory, snapshot.memoryTimeMs ?? request.asOfMs).access
+    };
     // Construct an allow-listed result: spreading the record would copy hidden text.
     const view: MemoryView = {
       id,
@@ -120,16 +160,27 @@ export function projectMemories(
         revision: memory.source.revision,
         occurredAtMs: memory.source.occurredAtMs,
         knownAtMs: memory.source.knownAtMs,
-        ...(memory.source.author ? {author:{role:memory.source.author.role,actorId:memory.source.author.actorId}} : {}),
-        ...(memory.source.reference ? {reference:{fileHash:memory.source.reference.fileHash,table:memory.source.reference.table,row:memory.source.reference.row}} : {}),
-        ...(memory.source.knowledge ? {knowledge:{
-          kind:memory.source.knowledge.kind,...(memory.source.knowledge.actorId?{actorId:memory.source.knowledge.actorId}:{}),
-          observationId:memory.source.knowledge.observationId,start:memory.source.knowledge.start,end:memory.source.knowledge.end,
-        }} : {}),
+        ...(memory.source.author ? {author: {role: memory.source.author.role, actorId: memory.source.author.actorId}} : {}),
+        ...(memory.source.reference ? {
+          reference: {
+            fileHash: memory.source.reference.fileHash,
+            table: memory.source.reference.table,
+            row: memory.source.reference.row
+          }
+        } : {}),
+        ...(memory.source.knowledge ? {
+          knowledge: {
+            kind: memory.source.knowledge.kind,
+            ...(memory.source.knowledge.actorId ? {actorId: memory.source.knowledge.actorId} : {}),
+            observationId: memory.source.knowledge.observationId,
+            start: memory.source.knowledge.start,
+            end: memory.source.knowledge.end,
+          }
+        } : {}),
       },
       access: memory.access,
-      ...(memory.reactivated?{reactivated:true}:{}),
-      ...(memory.reactivation?{reactivation:memory.reactivation}:{}),
+      ...(memory.reactivated ? {reactivated: true} : {}),
+      ...(memory.reactivation ? {reactivation: memory.reactivation} : {}),
       kind: memory.kind ?? 'legacy',
       protectedFacts: [...memory.protectedFacts],
     };
@@ -140,7 +191,9 @@ export function projectMemories(
       case 'clear':
         view.detail = memory.detail;
         // Layers are raw at clear; only a stored legacy template is withheld.
-        for (const layer of ['gist','feeling','anchor'] as const) if (!isLegacyTemplate(memory[layer])) view[layer] = memory[layer];
+        for (const layer of ['gist', 'feeling', 'anchor'] as const)
+          if (!isLegacyTemplate(memory[layer]))
+            view[layer] = memory[layer];
         if (memory.kind === 'episode' && memory.episode) {
           view.episode = {
             scene: memory.episode.scene,
@@ -154,29 +207,52 @@ export function projectMemories(
         }
         break;
       case 'gist':
-        coarseLayers(view,memory,['gist','feeling','anchor']);
+        coarseLayers(view, memory, ['gist', 'feeling', 'anchor']);
         view.forgottenMarker = 'details_faded';
         break;
       case 'feeling':
-        coarseLayers(view,memory,['feeling','anchor']);
+        coarseLayers(view, memory, ['feeling', 'anchor']);
         view.forgottenMarker = 'gist_faded';
         break;
       case 'anchor':
-        coarseLayers(view,memory,['anchor']);
+        coarseLayers(view, memory, ['anchor']);
         view.forgottenMarker = 'scene_faded';
         break;
       case 'hidden':
-        if (view.protectedFacts.length === 0) continue;
+        if (view.protectedFacts.length === 0)
+          continue;
         view.forgottenMarker = 'rest_inaccessible';
         break;
       default:
         throw new Error('invalid_access');
     }
-    const reaction=protectedEmotionalReaction(memory);
+    const reaction = protectedEmotionalReaction(memory);
     // The reaction stays structured next to the model's own feeling; a fallback phrase exists only in the context copy.
-    if(reaction)view.emotionalReaction=reaction;
-    const fragments=rememberedFragmentsOf(memory);
-    if(fragments.length)view.rememberedFragments=fragments;
+    if (reaction)
+      view.emotionalReaction = reaction;
+    const fragments = rememberedFragmentsOf(memory);
+    if (fragments.length)
+      view.rememberedFragments = fragments;
+    // Only contextFrom supplies these positions. Projection never selects or reactivates details itself.
+    if (memory.access === 'gist' && !memory.accessOverride && visibleLayer(memory, 'gist').state !== 'blocked') {
+      const selections = memory.selectedRecallDetails ?? [];
+      const details = selections.filter(item => item.stray !== true)
+        .map(item => memory.detail.slice(item.start, item.end).trim()).filter(Boolean);
+      if (details.length) {
+        view.recalledDetails = details;
+        const stray = selections.find(item => item.stray === true);
+        if (stray)
+          view.strayDetail = memory.detail.slice(stray.start, stray.end).trim();
+      }
+      if (memory.recallSameTier) {
+        Object.defineProperty(view, 'recallSameTier', {
+          value: {newDetails: details.length > 0 && selections.some(item => item.new)},
+        });
+      }
+    }
+    else if (memory.recallSameTier) {
+      Object.defineProperty(view, 'recallSameTier', {value: {newDetails: false}});
+    }
     memories.push(view);
   }
   return {
@@ -212,24 +288,36 @@ function hitEvents(raw:MemorySnapshot,nowMs:number,hits:readonly unknown[]):Map<
   }
   return events;
 }
-/** Applies decided recall hits on top of the cue-restored snapshot. Stages and text come from the authority record. */
-export function recallSnapshot(raw:MemorySnapshot,cued:MemorySnapshot,nowMs:number,hits:readonly unknown[]):MemorySnapshot {
-  const decided=hitEvents(raw,nowMs,hits);
-  if(!decided.size)return cued;
-  const clock=raw.memoryTimeMs??nowMs;
-  const memories=new Map(cued.memories);
-  for(const [id,memory] of raw.memories){
-    const current=cued.memories.get(id);
-    if(!current||memory.status!=='accepted'||!traceEligible(memory,clock))continue;
-    const strong=decided.get(eventKey(memory))?.strong;
-    if(strong===undefined)continue;
-    const restored=restoredAccess(retainedAccess(memory,clock).access as TraceTier,strong);
-    const byCue=current.reactivated===true;
-    const access=byCue&&CLARITY.indexOf(current.access)>CLARITY.indexOf(restored)?current.access:restored;
-    memories.set(id,{...current,access,reactivated:true,...(byCue?{}:{reactivation:{kind:'semantic' as const}})});
+/** Apply semantic hits at gist; a cue that already restored clear retains precedence. Input time is milliseconds. */
+export function recallSnapshot(raw: MemorySnapshot, cued: MemorySnapshot, nowMs: number, hits: readonly unknown[]): MemorySnapshot {
+  const decided = hitEvents(raw, nowMs, hits);
+  if (!decided.size)
+    return cued;
+  const clock = raw.memoryTimeMs ?? nowMs;
+  const memories = new Map(cued.memories);
+  for (const [id, memory] of raw.memories) {
+    const current = cued.memories.get(id);
+    if (!current || memory.status !== 'accepted' || !traceEligible(memory, clock))
+      continue;
+    if (!decided.has(eventKey(memory)))
+      continue;
+    const byCue = current.reactivated === true;
+    const access = byCue && current.access === 'clear' ? 'clear' : 'gist';
+    const sameTier = access === 'gist' && retainedAccess(memory, clock).access === 'gist';
+    memories.set(
+      id,
+      {
+        ...current,
+        access,
+        reactivated: true,
+        ...(byCue ? {} : {reactivation: {kind: 'semantic' as const}}),
+        ...(sameTier ? {recallSameTier: {newDetails: false}} : {}),
+      }
+    );
   }
-  return {...cued,memories};
+  return {...cued, memories};
 }
+
 /**
  * The recalls one context applies: at most `limit` events, twins being one event. The cue recalls come first, in this
  * order: a strong recall (two cues of one record); then an event one of whose records the search returned, in the
