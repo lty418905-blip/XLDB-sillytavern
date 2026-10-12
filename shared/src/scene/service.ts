@@ -435,6 +435,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
   }
 
   /** Native host generation uses the same authority, without running our front model. */
+  // Keep async so the returned promise still reports an unhandled rejection to the host.
   async nativeContext(
     scope: SceneScope,
     envelopeValue: unknown,
@@ -445,28 +446,28 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     const action = async function nativeContext(this: SceneCore) {
       this.prune();
       if (this.nativeTickets.size >= 100)
-
         throw new Error('invalid_scene_too_many_drafts');
       if (regenerateId) {
         const current = this.authority.state(scope);
         const last = current.sources.filter(source => source.status === 'accepted').at(-1);
         if (last?.id !== regenerateId || last.role !== 'assistant' ||
           JSON.stringify(last.envelope) !== JSON.stringify(envelopeOf(envelopeValue, current.roster)))
-
           throw new Error('invalid_scene_regeneration');
       }
-      if (this.authority.state(scope).sources.some(source => source.status === 'accepted' && source.processing !== 'ready')) {
+      if (this.authority.state(scope).sources.some(
+        source => source.status === 'accepted' && source.processing !== 'ready'
+      )) {
         const pending = await this.processPending(scope, configs);
         if (pending.status !== 'ready')
-
           throw new Error(pending.error ?? 'invalid_scene_processing');
       }
       const modelRevision = this.modelRevision;
       const acceptedStamp = sourceStamp(this.authority.state(scope));
       const skippedStages: SkippedStage[] = [];
-      const source = this.authority.state(scope).sources.find(item => item.id === sourceIdValue && item.status === 'accepted' && item.role === 'user');
+      const source = this.authority.state(scope).sources.find(
+        item => item.id === sourceIdValue && item.status === 'accepted' && item.role === 'user'
+      );
       if (!source)
-
         throw new Error('invalid_scene_native_source');
       const contextVersion = this.authority.state(scope).version;
       const packet = await withModelAddress(
@@ -485,27 +486,21 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
           () => {
             this.assertVersion(scope, contextVersion);
             if (this.modelRevision !== modelRevision)
-
               throw new Error('context_changed_retry');
           }
         )
       );
       if (sourceStamp(this.authority.state(scope)) !== acceptedStamp)
-
         throw new Error('context_changed_retry');
       this.assertVersion(scope, packet.version);
       if (modelRevision !== this.modelRevision)
-
         throw new Error('context_changed_retry');
       const contextTicket = randomUUID();
       const state = this.authority.state(scope);
       const antecedent = state.sources.find(
-
         source => source.id === sourceIdValue && source.status === 'accepted' && source.role === 'user'
-
       );
       if (!antecedent)
-
         throw new Error('invalid_scene_native_source');
       const last = state.sources.filter(source => source.status === 'accepted').at(-1);
       const replaces = regenerateId && last?.id === regenerateId && last.role === 'assistant'
@@ -513,7 +508,6 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         last.replyTo?.id === antecedent.id && last.replyTo.revision === antecedent.revision
         ? { id: last.id, revision: last.revision } : undefined;
       if (regenerateId && !replaces)
-
         throw new Error('invalid_scene_regeneration');
       this.nativeTickets.set(
         contextTicket,
@@ -526,7 +520,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
           envelope: packet.envelope,
           dependencies: packet.dependencies,
           automatic: 'automatic' in packet && packet.automatic === true,
-          speakerId: 'speakerId' in packet && typeof packet.speakerId === 'string' ? packet.speakerId : packet.envelope.targetId,
+          speakerId: 'speakerId' in packet && typeof packet.speakerId === 'string'
+            ? packet.speakerId : packet.envelope.targetId,
           ...(this.packetRecalls.get(packet)?.length ? { recalled: this.packetRecalls.get(packet)! } : {}),
           ...(replaces ? { replaces } : {})
         }
@@ -537,22 +532,21 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         skippedStages: [...(source.analysis?.skippedStages ?? []), ...skippedStages],
         ...(replaces ? { replaces } : {})
       };
-
     }.bind(this);
     try {
       return this.authority.withReadStep(action);
     } catch (error) {
-      // Preserve async rejection when ownership or scope lookup fails before the original body runs.
+      // Ownership lookup can throw before action runs; keep the same rejected-promise timing.
       return Promise.reject(error);
     }
   }
 
+  // Keep async so the returned promise still reports an unhandled rejection to the host.
   async acceptNative(scope: SceneScope, ticketId: string, value: unknown, configs: Configurations) {
     const action = async function acceptNative(this: SceneCore) {
       this.prune();
       const ticket = this.nativeTickets.get(ticketId);
       if (!ticket || scopeKey(ticket.scope) !== scopeKey(scope))
-
         throw new Error('invalid_scene_ticket');
       // Remove the host field by descriptor so even an enumerable getter cannot supply or inspect recall data.
       const descriptors = Object.getOwnPropertyDescriptors(object(value));
@@ -560,7 +554,6 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       const supplied = sceneMessageOf(Object.defineProperties({}, descriptors), this.authority.state(scope).roster);
       if (supplied.replyTo
         && JSON.stringify(supplied.replyTo) !== JSON.stringify(ticket.replyTo))
-
         throw new Error('invalid_scene_candidate_changed');
       const message = {
         ...supplied,
@@ -569,24 +562,18 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       };
       if (this.authority.interactions.modeOf(scope) === 'companion') {
         const user = this.authority.state(scope).sources.find(
-
-
           source => source.id === ticket.replyTo.id && source.role === 'user'
             && source.status === 'accepted'
-
-
         );
-        const current = user?.analysis?.plan ? visibleText(user.analysis.plan, ticket.speakerId ?? ticket.envelope.targetId) : user?.text ?? null;
+        const current = user?.analysis?.plan
+          ? visibleText(user.analysis.plan, ticket.speakerId ?? ticket.envelope.targetId) : user?.text ?? null;
         if (this.companion.identityIssue(message.text, current))
-
           throw new Error('companion_identity_expression_invalid');
       }
       if (ticket.modelRevision !== this.modelRevision)
-
         throw new Error('context_changed_retry');
       if (ticket.accepted) {
         if (!sameMessage(ticket.accepted, message))
-
           throw new Error('invalid_scene_candidate_changed');
       }
       else {
@@ -594,20 +581,18 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         if (message.role !== 'assistant'
           || message.revision !== (ticket.replaces ? ticket.replaces.revision + 1 : 1)
           || Boolean(message.automatic) !== ticket.automatic ||
-          (!ticket.automatic && message.speakerId !== ticket.speakerId) || JSON.stringify(message.envelope) !== JSON.stringify(ticket.envelope) ||
+          (!ticket.automatic && message.speakerId !== ticket.speakerId) ||
+          JSON.stringify(message.envelope) !== JSON.stringify(ticket.envelope) ||
           JSON.stringify(message.dependencies ?? []) !== JSON.stringify(ticket.dependencies))
-
           throw new Error('invalid_scene_candidate_changed');
         if (ticket.replaces) {
           const last = this.authority.state(scope).sources.filter(source => source.status === 'accepted').at(-1);
           if (message.id !== ticket.replaces.id || last?.id !== ticket.replaces.id
             || last.revision !== ticket.replaces.revision
             || last.processing !== 'ready')
-
             throw new Error('invalid_scene_candidate_changed');
         }
         else if (this.authority.state(scope).sources.some(source => source.id === message.id))
-
           throw new Error('invalid_scene_candidate_changed');
       }
       this.authority.reconcile(
@@ -621,15 +606,13 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       const acceptedStamp = sourceStamp(this.authority.state(scope));
       const result = await this.processPending(scope, configs);
       if (sourceStamp(this.authority.state(scope)) !== acceptedStamp)
-
         throw new Error('context_changed_retry');
       return { ...result, ...this.syncState(scope) };
-
     }.bind(this);
     try {
       return this.authority.withReadStep(action);
     } catch (error) {
-      // Preserve async rejection when ownership or scope lookup fails before the original body runs.
+      // Ownership lookup can throw before action runs; keep the same rejected-promise timing.
       return Promise.reject(error);
     }
   }
@@ -1354,14 +1337,13 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     };
   }
 
+  // Keep async so the returned promise still reports an unhandled rejection to the host.
   async accept(scope: SceneScope, draftId: string, value: unknown, configs: Configurations) {
     const action = async function accept(this: SceneCore) {
       const draft = this.draft(scope, draftId);
       if (draft.modelRevision !== this.modelRevision)
-
         throw new Error('context_changed_retry');
       if (!Array.isArray(value) || value.length !== 2)
-
         throw new Error('invalid_scene_messages');
       const roster = this.authority.state(scope).roster;
       const messages = value.map(item => {
@@ -1371,22 +1353,16 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       });
       if (!sameMessage(messages[0]!, draft.userMessage)
         || !sameMessage(messages[1]!, draft.assistantMessage))
-
         throw new Error('invalid_scene_candidate_changed');
       if (draft.complete) {
         const state = this.authority.state(scope);
         if (!messages.every(
           message => state.sources.some(
-
-
             source => source.id === message.id && source.revision === message.revision
               && source.status === 'accepted'
               && sameMessage(source, message)
-
-
           )
         ))
-
           throw new Error('context_changed_retry');
         return { status: 'duplicate', ...this.syncState(scope) };
       }
@@ -1403,37 +1379,33 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         const sources = this.authority.state(scope).sources;
         if (!messages.every(
           message => sources.some(
-
-
             source => source.id === message.id && source.revision === message.revision
               && source.status === 'accepted'
               && source.text === message.text
-
-
           )
         ))
-
           throw new Error('context_changed_retry');
       }
       const acceptedStamp = sourceStamp(this.authority.state(scope));
-      const result = await this.processPending(scope, configs, new Map([[draft.assistantMessage.id, draft.assistantPlan]]));
+      const result = await this.processPending(
+        scope,
+        configs,
+        new Map([[draft.assistantMessage.id, draft.assistantPlan]])
+      );
       if (sourceStamp(this.authority.state(scope)) !== acceptedStamp)
-
         throw new Error('context_changed_retry');
       if (result.status === 'ready')
-
         draft.complete = true;
       return {
         ...result,
         ...this.syncState(scope),
         status: result.status === 'ready' ? 'committed' : 'failed'
       };
-
     }.bind(this);
     try {
       return this.authority.withReadStep(action);
     } catch (error) {
-      // Preserve async rejection when ownership or scope lookup fails before the original body runs.
+      // Ownership lookup can throw before action runs; keep the same rejected-promise timing.
       return Promise.reject(error);
     }
   }

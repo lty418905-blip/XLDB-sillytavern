@@ -63,7 +63,7 @@ const READ_FOLD_KEY_UNIT_LIMIT = 8_000_000;
 export class SceneAuthority {
   private db: DatabaseSync;
   declare private readonly readSteps: AsyncLocalStorage<SceneReadStep>;
-  /** Counts optional fold-sharing failures without retaining their inputs or errors. */
+  /** Tests and diagnostics read this count; no failed input or error is retained. */
   declare private readSharingFailures: number;
   private emotionReplayCache=new Map<string,EmotionState>();
   private savepointSequence=0;
@@ -138,13 +138,16 @@ export class SceneAuthority {
       tavernRoleplay: scope => this.interactions.isTavernRoleplay(scope),
       worldFold: (scope, sources, settings, timeline) => {
         const input = this.ledgerViewInput(scope, sources, settings, timeline);
-        return Object.keys(input.options).length ? this.foldWorldForStep(settings, input.sources, input.options) : this.foldWorldForStep(settings, input.sources);
+        return Object.keys(input.options).length
+          ? this.foldWorldForStep(settings, input.sources, input.options)
+          : this.foldWorldForStep(settings, input.sources);
       },
       // One running fold of this view's sources and selected rows, aligned to the original source array.
       worldRunning: (scope, sources, settings, timeline) => {
         const input = this.ledgerViewInput(scope, sources, settings, timeline);
         const steps = this.foldWorldRunningForStep(settings, input.sources, input.options);
-        let position = -1, last: WorldRunningStep = { timeMs: settings.startTimeMs, issue: null };
+        let position = -1;
+        let last: WorldRunningStep = { timeMs: settings.startTimeMs, issue: null };
         return sources.map(source => {
           if (source.status === 'accepted' && source.processing === 'ready'
             && source.analysis?.plan)
@@ -192,25 +195,34 @@ export class SceneAuthority {
     this.commitments = new Commitments(db);
     this.calendar = new SceneCalendarStore(db, this);
     this.geography = new GeographyStore(db, {
-      state: scope => this.state(scope), modeOf: scope => this.interactions.modeOf(scope), fullRoleplay: scope => this.interactions.isTavernRoleplay(scope), transaction: action => this.transaction(action),
+      state: scope => this.state(scope),
+      modeOf: scope => this.interactions.modeOf(scope),
+      fullRoleplay: scope => this.interactions.isTavernRoleplay(scope),
+      transaction: action => this.transaction(action),
       checkpoint: (scope, reason) => {
         this.lifecycle.checkpoint(scope, reason, { automatic: true });
-      }, bump: scope => this.bump(scope),
+      },
+      bump: scope => this.bump(scope),
     });
     this.physiology = new PhysiologyStore(db, {
-      state: scope => this.state(scope), modeOf: scope => this.interactions.modeOf(scope), fullRoleplay: scope => this.interactions.isTavernRoleplay(scope),
+      state: scope => this.state(scope),
+      modeOf: scope => this.interactions.modeOf(scope),
+      fullRoleplay: scope => this.interactions.isTavernRoleplay(scope),
       clock: (scope, now) => {
         const clock = this.interactions.clock(scope, now);
         return { ...clock, timeMs: typeof clock.timeMs === 'number' ? clock.timeMs : null };
       },
-      // Physiology keeps its own state type; both callers of status pass a full SceneState (the stored one or a generation view's).
+      // Physiology has its own state type, but both status callers pass a full SceneState.
+      // They use either the stored state or a generation view.
       storyTime:(scope,state)=>{
         const now = storyNow(this, scope, state as unknown as SceneState);
         if (now === null)
           return null;
         let entries: Map<string, { revision: number; atMs: number }> | undefined;
         return {
-          nowMs: now.atMs, originMs: now.originAtMs, at: (sourceId, revision) => {
+          nowMs: now.atMs,
+          originMs: now.originAtMs,
+          at: (sourceId, revision) => {
             entries ??= new Map(
               now.sources.map(entry => [entry.sourceId, { revision: entry.revision, atMs: entry.state.atMs }])
             );
@@ -228,7 +240,9 @@ export class SceneAuthority {
     const hooks = defaultSceneHooks();
     if (extension) {
       const built = extension(db, {
-        scene: this, transaction: action => this.transaction(action), bump: scope => this.bump(scope),
+        scene: this,
+        transaction: action => this.transaction(action),
+        bump: scope => this.bump(scope),
         rebuildDerived: (scope, nowMs) => this.rebuildDerived(scope, nowMs),
         configure: (scope, roster, nowMs) => this.configure(scope, roster, nowMs, false)
       });
@@ -341,9 +355,10 @@ export class SceneAuthority {
     const step = this.readSteps.getStore();
     if (!step?.active || step.saturated)
       return action();
-    // Once a budget is exhausted, later calls bypass even key construction. Retained entries are not evicted.
+    // Once a budget is exhausted, drop results that later calls cannot use and stop building keys.
     if (step.folds.size >= READ_FOLD_ENTRY_LIMIT || step.keyUnits >= READ_FOLD_KEY_UNIT_LIMIT) {
       step.saturated = true;
+      step.folds.clear();
       return action();
     }
 
@@ -360,6 +375,7 @@ export class SceneAuthority {
           return structuredClone(cached) as T;
         if (key.length > READ_FOLD_KEY_UNIT_LIMIT - step.keyUnits) {
           step.saturated = true;
+          step.folds.clear();
           key = undefined;
         }
       }
@@ -1410,7 +1426,8 @@ export class SceneAuthority {
     state = this.state(scope),
     timeline?: SceneSource[]
   ):
-    (WorldFoldResult & { storyClock?: StoryClockSummary }) | (WorldProjection & { storyClock?: StoryClockView | null }) | null {
+    (WorldFoldResult & { storyClock?: StoryClockSummary }) |
+    (WorldProjection & { storyClock?: StoryClockView | null }) | null {
     const originalSettings = this.worldSettings(scope);
     return this.withLedgerRows(scope, () => {
       const rows = this.ledgerRowsForCall(scope);
@@ -1426,7 +1443,8 @@ export class SceneAuthority {
         return null;
       }
       const input = this.ledgerViewInput(scope, state.sources, settings, timeline);
-      const row = this.db.prepare('SELECT clock_floor FROM scene_world_settings WHERE scope=?').get(scopeKey(scope)) as { clock_floor: number } | undefined;
+      const row = this.db.prepare('SELECT clock_floor FROM scene_world_settings WHERE scope=?')
+        .get(scopeKey(scope)) as { clock_floor: number } | undefined;
       const options = {
         nowMs: now,
         monotonicFloorMs: row?.clock_floor ?? settings.startTimeMs,
@@ -1434,18 +1452,21 @@ export class SceneAuthority {
       };
       const folded = this.foldWorldForStep(settings, input.sources, options);
       if (settings.mode === 'companion' && row && folded.state.timeMs > row.clock_floor)
-        this.db.prepare('UPDATE scene_world_settings SET clock_floor=? WHERE scope=?').run(folded.state.timeMs, scopeKey(scope));
+        this.db.prepare('UPDATE scene_world_settings SET clock_floor=? WHERE scope=?')
+          .run(folded.state.timeMs, scopeKey(scope));
       if (settings.mode !== 'story')
         return readerId === undefined ? folded : projectWorldState(folded, readerId);
       // A story world carries the unified clock beside the legacy one.
-      // @deprecated folded.state.timeMs and the projection's timeMs remain the legacy Unix-domain clock for host displays.
+      // @deprecated folded.state.timeMs and the projection's timeMs still use the legacy Unix clock.
+      // Host displays read these values.
       // These compatibility values stay until the host readers move to `storyClock`.
       const summary = this.storyClock.summary(scope, state);
       if (readerId === undefined)
         return summary ? { ...folded, storyClock: summary } : folded;
       const projection = projectWorldState(folded, readerId);
       // The same visibility rule as timeMs: the player, or everyone when the time is public.
-      return readerId === 'player' || folded.state.publicTime ? { ...projection, storyClock: summary?.view ?? null } : projection;
+      return readerId === 'player' || folded.state.publicTime
+        ? { ...projection, storyClock: summary?.view ?? null } : projection;
     });
   }
 
@@ -2161,6 +2182,7 @@ function plainReadInput(value: unknown, objects: WeakSet<object>): boolean {
     const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
     if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value'))
       return false;
+    // JSON omits named array properties; index keys must preserve every input member.
     if (array && !/^(0|[1-9][0-9]*)$/.test(key))
       return false;
     if (!plainReadInput(descriptor.value, objects))

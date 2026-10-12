@@ -110,7 +110,23 @@ export interface LedgerCorrection {
   anchorAmount?:string|null;
 }
 export interface LedgerFoldOptions {accountEvents?:readonly LedgerAccountEvent[]; corrections?:readonly LedgerCorrection[]; nowMs?:number; monotonicFloorMs?:number}
-export interface LedgerWork {jsonNodes:number; text:number; scans:number; entries:number; pairs:number; events:number; sourceVisits:number; rowCopies:number; purchaseVisits?:number; correctionVisits?:number; positionVisits?:number}
+/** Deterministic operation counts; optional counters appear only when their work runs.
+ * Paired visits cover <= J(J-1)/2 + 9J steps per proposal (2,592 at J=64), and <= 2E per folded source.
+ * J and E are the proposal and source entry counts, each limited to 64 by the ledger contract. */
+export interface LedgerWork {
+    jsonNodes: number;
+    text: number;
+    scans: number;
+    entries: number;
+    pairs: number;
+    events: number;
+    sourceVisits: number;
+    rowCopies: number;
+    purchaseVisits?: number;
+    correctionVisits?: number;
+    positionVisits?: number;
+    pairedVisits?: number;
+}
 /** A diagnostic identifies a rejected row; a truncation summary also counts omitted diagnostics. */
 export interface LedgerDiagnostic {
   code:string;
@@ -1042,6 +1058,8 @@ interface VerifyContext {
   accounts:LedgerAccount[];source:LedgerText;previous:LedgerText[];counterpart:string|null;index:BookIndex;
   state:LedgerMutableState;work:LedgerWork;forced:boolean;mode:'proposal'|'fold';readers:string[];
   quoteReaderIds?:LedgerDetail['quoteReaderIds'];
+  /** Only a resolved mutual pair's leader skips relation checks in a batch. */
+  pairedLeader?:boolean;
 }
 interface Evaluated {detail:LedgerDetail;legs:LedgerLegs;returns:string[]}
 function emptyIndex():BookIndex {return {keys:new Map(),sources:new Map(),refunds:new Map()};}
@@ -1225,7 +1243,7 @@ function verifyEntry(originalStoredEntry: StoredLedgerEntry, proposalContext: Ve
                     flag('possible_duplicate');
             }
         }
-        if (storedEntry.relation) {
+        if (storedEntry.relation && !proposalContext.pairedLeader) {
             const k = storedEntry.relation.kind;
             if (!target || target.disposition === 'void') {
                 if (proposalContext.mode === 'fold' && storedEntry.relation.target !== null) {
@@ -1439,11 +1457,156 @@ function proofUnitPrice(e:StoredLedgerEntry,values:ReferenceValues):string|null 
   if(side<0)return null;
   const r=replayCalculation(t.operands[1-side],values);return r.result.ok&&r.result.money&&r.amounts?r.amounts.cents.toString():null;
 }
-function dependencyOrder<T extends StoredLedgerEntry>(entries:T[]):{ordered:T[];cycles:Set<string>} {
-  const byKey=new Map(entries.map(e=>[keyText(e.key),e])),done=new Set<string>(),active=new Set<string>(),cycles=new Set<string>(),ordered:T[]=[];
-  const visit=(e:T):void=>{const key=keyText(e.key);if(done.has(key))return;if(active.has(key)){for(const k of active)cycles.add(k);return;}
-    active.add(key);if(e.relation?.target){const target=byKey.get(keyText(e.relation.target));if(target)visit(target);}active.delete(key);done.add(key);ordered.push(e);};
-  for(const e of entries)visit(e);return {ordered,cycles};
+/** Count one bounded graph or comparison visit without adding the optional counter to unrelated work. */
+function countPairedVisit(ledgerWork: LedgerWork): void {
+    ledgerWork.pairedVisits = (ledgerWork.pairedVisits ?? 0) + 1;
+}
+
+/** Order at most 64 entries by their stored dependencies, preserving the existing cycle walk.
+ * A mutual pair cuts only its leader's outgoing edge; all other edges retain their original order. */
+function dependencyOrder<T extends StoredLedgerEntry>(entries: T[], ledgerWork: LedgerWork): {
+    ordered: T[];
+    cycles: Set<string>;
+    leaders: Set<StoredLedgerEntry>;
+} {
+    const byKey = new Map(entries.map(entry => [keyText(entry.key), entry]));
+    const leaders = new Set<StoredLedgerEntry>();
+    // Presence detection is bounded by one source's 64 entries and does not count unrelated work.
+    if (entries.some(entry => entry.relation?.kind === 'paired_with')) {
+        const positions = new Map<T, number>();
+        for (const [position, entry] of entries.entries()) {
+            countPairedVisit(ledgerWork);
+            positions.set(entry, position);
+        }
+
+        for (const entry of entries) {
+            countPairedVisit(ledgerWork);
+            if (entry.relation?.kind !== 'paired_with' || entry.relation.target === null) continue;
+            const target = byKey.get(keyText(entry.relation.target));
+            // Distinct resolved entries must both use paired links and point back to each other.
+            if (!target || target === entry) continue;
+            if (target.relation?.kind !== 'paired_with' || target.relation.target === null) continue;
+            if (byKey.get(keyText(target.relation.target)) !== entry) continue;
+
+            const entryHasMoney = moneyOf(entry) !== null;
+            const targetHasMoney = moneyOf(target) !== null;
+            // The sole money-bearing leg leads; equal money availability uses the earlier array position.
+            let leader: T;
+            if (entryHasMoney !== targetHasMoney) {
+                leader = entryHasMoney ? entry : target;
+            } else {
+                leader = positions.get(entry)! < positions.get(target)! ? entry : target;
+            }
+            leaders.add(leader);
+        }
+    }
+
+    const done = new Set<string>();
+    const active = new Set<string>();
+    const cycles = new Set<string>();
+    const ordered: T[] = [];
+    const visit = (entry: T): void => {
+        const key = keyText(entry.key);
+        if (done.has(key)) return;
+        if (active.has(key)) {
+            for (const activeKey of active) cycles.add(activeKey);
+            return;
+        }
+
+        active.add(key);
+        if (entry.relation?.target && !leaders.has(entry)) {
+            const target = byKey.get(keyText(entry.relation.target));
+            if (target) visit(target);
+        }
+        active.delete(key);
+        done.add(key);
+        ordered.push(entry);
+    };
+
+    for (const entry of entries) visit(entry);
+    return {ordered, cycles, leaders};
+}
+
+/** A current proposal row carries its stored entry and the occurrence feedback that grouping may relax. */
+interface PairedProposalRow {
+    id: string;
+    entry: StoredLedgerEntry;
+    proposal: NormalizedLedgerProposedEntry | null;
+    returns: string[];
+    sourceActExhausted?: boolean;
+}
+
+/** Only valid current rows form undirected components; first-id resolution includes malformed rows.
+ * O(J) graph visits followed by at most J*(J-1)/2 occurrence comparisons, J <= 64 per proposal. */
+function relaxPairedOccurrences(rows: PairedProposalRow[], ledgerWork: LedgerWork): void {
+    // This uncounted presence scan visits at most 64 rows and leaves unrelated proposals untouched.
+    if (!rows.some(row => row.proposal?.relation?.kind === 'paired_with')) return;
+
+    const firstById = new Map<string, PairedProposalRow>();
+    const neighbours = new Map<PairedProposalRow, PairedProposalRow[]>();
+    for (const row of rows) {
+        countPairedVisit(ledgerWork);
+        if (!firstById.has(row.id)) firstById.set(row.id, row);
+        if (row.proposal) neighbours.set(row, []);
+    }
+
+    for (const row of rows) {
+        countPairedVisit(ledgerWork);
+        if (row.proposal?.relation?.kind !== 'paired_with') continue;
+        const target = firstById.get(row.proposal.relation.entry);
+        if (!target?.proposal || target === row) continue;
+
+        neighbours.get(row)!.push(target);
+        neighbours.get(target)!.push(row);
+    }
+
+    const groups = new Map<PairedProposalRow, PairedProposalRow>();
+    for (const row of rows) {
+        countPairedVisit(ledgerWork);
+        if (!row.proposal || groups.has(row)) continue;
+        const waiting = [row];
+        groups.set(row, row);
+        while (waiting.length) {
+            countPairedVisit(ledgerWork);
+            const current = waiting.pop()!;
+            for (const neighbour of neighbours.get(current)!) {
+                countPairedVisit(ledgerWork);
+                if (groups.has(neighbour)) continue;
+                groups.set(neighbour, row);
+                waiting.push(neighbour);
+            }
+        }
+    }
+
+    for (let i = 0; i < rows.length; i++) {
+        countPairedVisit(ledgerWork);
+        const current = rows[i]!;
+        if (!current.sourceActExhausted || !current.proposal || !current.entry.act) continue;
+        let firstOccupant: PairedProposalRow | null = null;
+        let identicalMember = false;
+        for (let j = 0; j < i; j++) {
+            countPairedVisit(ledgerWork);
+            const previous = rows[j]!;
+            if (!previous.proposal || previous.proposal.mark !== current.proposal.mark
+                || previous.entry.act?.start !== current.entry.act.start
+                || previous.entry.act.end !== current.entry.act.end) continue;
+
+            firstOccupant ??= previous;
+            if (groups.get(previous) === groups.get(current)
+                && JSON.stringify(leadingKey(previous.entry)) === JSON.stringify(leadingKey(current.entry))
+                && entryCompare({...previous.entry, relation: null}, {...current.entry, relation: null}) === 0) {
+                identicalMember = true;
+            }
+        }
+        if (!firstOccupant || groups.get(firstOccupant) !== groups.get(current) || identicalMember) continue;
+
+        // Static validation is the only producer of these marks so far; later duplicate checks still run.
+        current.sourceActExhausted = false;
+        current.returns = current.returns.filter(code => code !== 'identical_entries');
+        current.entry.checks.codes = current.entry.checks.codes.filter(code =>
+            code !== 'identical_entries' && code !== 'identical_in_source');
+        current.entry.checks.pending = current.entry.checks.pending.filter(category => category !== 'restated');
+    }
 }
 /** After one semantic question, the model's final settled version is authoritative. */
 function acceptSemanticDecision(e:StoredLedgerEntry,prior:readonly string[]):void {
@@ -1463,7 +1626,8 @@ function acceptSemanticDecision(e:StoredLedgerEntry,prior:readonly string[]):voi
 }
 
 /** Validate a complete proposal without consulting balances or stock quantities.
- * O(J + 64*L + 64^2 + H*64); H <= 4096, at most seven source texts, no I/O. */
+ * O(J + 64*L + 64^2 + H*64); H <= 4096, at most seven source texts, no I/O.
+ * Paired graphs add <= 6J grouping visits, <= J^2 occurrence visits and <= 2J leader visits, J <= 64. */
 export function checkLedgerProposal(raw: unknown, rawContext: unknown): LedgerProposalResult {
     const ledgerWork = work();
     const empty = (): LedgerProposalResult => ({
@@ -1594,6 +1758,7 @@ export function checkLedgerProposal(raw: unknown, rawContext: unknown): LedgerPr
         link();
         assignKeys(rows.map(ledgerRow => ledgerRow.entry), proposalContext.keptEntries);
         link();
+        relaxPairedOccurrences(rows, ledgerWork);
         for (let i = 0; i < rows.length; i++)
             for (let j = 0; j < i; j++) {
                 ledgerWork.pairs++;
@@ -1613,7 +1778,7 @@ export function checkLedgerProposal(raw: unknown, rawContext: unknown): LedgerPr
         for (const decodedValue of proposalContext.before?.entries ?? [])
             indexDetail(index, decodedValue);
         const mutable = stateFromAccounts(proposalContext.accounts);
-        const order = dependencyOrder(rows.map(ledgerRow => ledgerRow.entry));
+        const order = dependencyOrder(rows.map(ledgerRow => ledgerRow.entry), ledgerWork);
         const checks = new Map<StoredLedgerEntry, LedgerCheckedEntry>();
         const reply = proposalContext.source.role === 'assistant' &&
             proposalContext.source.replyTo ? JSON.stringify([proposalContext.source.replyTo.id,
@@ -1641,7 +1806,7 @@ export function checkLedgerProposal(raw: unknown, rawContext: unknown): LedgerPr
             const verified = verifyEntry(storedEntry, {
                 source: proposalContext.source, previous: proposalContext.previous,
                 accounts: proposalContext.accounts, index, state: mutable, counterpart, work: ledgerWork,
-                forced: false, mode: 'proposal', readers: []
+                forced: false, mode: 'proposal', readers: [], pairedLeader: order.leaders.has(storedEntry)
             });
             if (verified.detail.row !== null)
                 storedEntry.row = verified.detail.row;
@@ -2853,7 +3018,7 @@ function foldLedgerWorldUnchecked(settings: WorldSettings, sources: readonly Wor
             };
             ledger.unmatchedVoids.push(...claims.unmatchedVoids.filter(correction => !userPostKeys.has(
                 identity(correction as LedgerSourceRef) + '/' + String(correction.anchor))));
-            const ordered = dependencyOrder(modelEntries);
+            const ordered = dependencyOrder(modelEntries, ledgerWork);
             for (const storedEntry of ordered.ordered) {
                 const claim = claims.claims.find(correction => keyText(correction.key) === keyText(
                     storedEntry.key));
@@ -2861,8 +3026,10 @@ function foldLedgerWorldUnchecked(settings: WorldSettings, sources: readonly Wor
                     append(applyUser(claim.correction, source, state, storedEntry));
                     continue;
                 }
-                const evaluated = verifyEntry(storedEntry, getContext(source, storedEntry, storedEntry.origin
-                    === 'user'));
+                const evaluated = verifyEntry(storedEntry, {
+                    ...getContext(source, storedEntry, storedEntry.origin === 'user'),
+                    pairedLeader: ordered.leaders.has(storedEntry)
+                });
                 const blocked = claims.blocked.find(blockedClaim =>
                     keyText(blockedClaim.key) === keyText(storedEntry.key));
                 if (blocked || ordered.cycles.has(keyText(storedEntry.key))) {
@@ -3238,7 +3405,9 @@ export function settleLedgerEntries(rawEntries:unknown,rawNewPosts:unknown):Ledg
   }catch{return {ok:false,code:'ledger_settlement_invalid'};}
 }
 
-/** Finish one proposal run using UTF-16 source regions and the existing storage budgets.
+/** Write merged entries and unbooked rows for uncovered marks and previously accepted entries
+ * that disappeared, whether dropped or confirmed withdrawn. Regions use UTF-16 offsets.
+ * A disappeared entry's invalid mark id is omitted: retaining it would make the decoder reject the record.
  * Returns detached entries and unbooked rows, or the existing validation/limit error code.
  * O(J + 64^2 + H); accepted-ID history H is capped at the existing 4096-row budget.
  * Exceeding either 64-row storage budget requires callers to retain the prior valid record. */
@@ -3323,7 +3492,7 @@ export function finalizeLedgerRun(raw:unknown):LedgerDecoded<LedgerFinalized> {
             const entry = previous.entry;
             if (identity(entry) !== identity(source)) return {ok: false, code: 'ledger_source_mismatch'};
 
-            // Reuse the decoder's grammar: entry IDs may contain a whole-source fallback.
+            // Reuse the decoder's grammar: mark ids may contain a whole-source fallback.
             // Matching is linear in the ID length, already bounded by storedEntryOK.
             unbooked.push({
                 sourceId: source.sourceId,
