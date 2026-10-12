@@ -35,12 +35,17 @@ export type Reading = {
  * An amount candidate with a half-open original UTF-16 span and its written unit, or null for a bare unit.
  * readings retains every alternative in integer hundredths; range uses null for an unknown/open bound.
  * approx describes estimation, not transaction evidence. Parsers return null or omit a failed candidate.
+ * setAsideLeftNumerals marks an additional scan-only reading: one/two omit adjacent field characters;
+ * acrossWhitespace omits numerals across inline blanks; beforeYenSign omits numerals before a yen sign;
+ * beforeFullWidthComma omits the first grouped section; beforeClockPoint omits a clock hour before 点.
  */
 export type AmountExpression = {
   start: number;
   end: number;
   unit: AmountUnit;
   bare: boolean;
+  setAsideLeftNumerals?: 'one' | 'two' | 'acrossWhitespace' | 'beforeYenSign'
+    | 'beforeFullWidthComma' | 'beforeClockPoint';
 } & ({
   kind: 'readings';
   readings: Reading[];
@@ -257,7 +262,7 @@ const TIME_OF_DAY_WORDS = new Set([
   '午夜'
 ]);
 
-// Day words also identify clock hours only in rates; neither list changes monetary readings.
+// Day words identify clock hours in rates and in scan-only monetary alternatives.
 const DAY_WORDS = new Set([
   '今天',
   '明天',
@@ -2694,8 +2699,14 @@ function blocksReleasedCapitalConnection(readerContext: ReaderContext, core: Amo
  * Neighbor checks precede parsing; the isolated zero exception uses the cached inline-whitespace jump.
  * releasedStart marks a start whose left numeral character was already released as an ordinary letter;
  * the numeral check below is skipped there, while the sign and currency-chain checks still apply.
+ * afterClockPoint releases only a directly preceding 点 after a numeral, without releasing other punctuation.
  */
-function allowsAmountLeftNeighbor(readerContext: ReaderContext, start: number, releasedStart = false): boolean {
+function allowsAmountLeftNeighbor(
+  readerContext: ReaderContext,
+  start: number,
+  releasedStart = false,
+  afterClockPoint = false
+): boolean {
   const text = readerContext.text;
   const position = readerContext.previousNonWhitespaceEnd[start]!;
   const previousCharacter = text[position - 1];
@@ -2710,8 +2721,7 @@ function allowsAmountLeftNeighbor(readerContext: ReaderContext, start: number, r
   // scanAmounts("找零 五块") returns one 500-cent reading at [3, 5).
   if (!released && (previousCharacter === '第'
     || previousCharacter !== undefined && NUMERIC_FIELD_CHARACTERS.has(previousCharacter))) {
-    if (!(previousCharacter === '零' && !isNumberCharacter(text[position - 2])
-      && !isCurrencyAt(readerContext, position - 2))) {
+    if (!isIsolatedZero(readerContext, position)) {
       return false;
     }
   }
@@ -2731,7 +2741,8 @@ function allowsAmountLeftNeighbor(readerContext: ReaderContext, start: number, r
 
   // ASCII/fullwidth dots, comma and 点 keep the numeric continuation attached to its left side.
   // The additional leading-dot guard keeps parseAmount(".5元") null.
-  if (immediate && '.．,点'.includes(immediate) && isNumberCharacter(text[start - 2])) {
+  if (immediate && '.．,点'.includes(immediate) && isNumberCharacter(text[start - 2])
+    && !(afterClockPoint && immediate === '点')) {
     return false;
   }
 
@@ -3157,6 +3168,7 @@ function mayCarryWrittenUnit(readerContext: ReaderContext, start: number): boole
  * deferChain leaves a chain member's continuation to the chain walk, exactly as readAmountCore explains.
  * standalone ignores only left context for a chain member. joining reads at most one right endpoint;
  * that endpoint retains deferChain, so the chain walk cannot re-enter itself through a connector.
+ * afterClockPoint changes only the numeric-point left-neighbor check for a scan-only alternative.
  */
 function readAmountAt(
   readerContext: ReaderContext,
@@ -3164,14 +3176,16 @@ function readAmountAt(
   joining = false,
   releasedCapitalStart = false,
   deferChain = false,
-  standalone = false
+  standalone = false,
+  afterClockPoint = false
 ): AmountCore | null {
   if (!joining && !standalone && LATIN_CHARACTER.test(readerContext.text[start - 1] ?? '')
     && !mayCarryWrittenUnit(readerContext, start)) {
     return null;
   }
 
-  if (!joining && !standalone && !allowsAmountLeftNeighbor(readerContext, start, releasedCapitalStart)) {
+  if (!joining && !standalone
+    && !allowsAmountLeftNeighbor(readerContext, start, releasedCapitalStart, afterClockPoint)) {
     return null;
   }
 
@@ -3444,6 +3458,374 @@ export function parseAmount(fragment: string, options?: Options): AmountExpressi
   return parseAmountWithWork(fragment, options).result;
 }
 
+/**
+ * Makes one full read with a fresh chain cache while sharing immutable lexical and position tables.
+ * The two releases affect only their specified left-neighbor checks; null retains the charged work.
+ * No cache entry from the ordinary scan or another alternative can influence this read.
+ */
+function readMarkedAmount(
+  readerContext: ReaderContext,
+  start: number,
+  releasedNumerals: boolean,
+  afterClockPoint = false
+): AmountCore | null {
+  const independentContext = {
+    ...readerContext,
+    chainedAmounts: new Map<number, AmountCore | null>(),
+    work: 0
+  };
+
+  const found = readAmountAt(independentContext, start, false, releasedNumerals, false, false, afterClockPoint);
+  // Charge the independent parser's visits plus one call to the alternative reader.
+  readerContext.work += independentContext.work + 1;
+
+  return found;
+}
+
+/**
+ * Tests the isolated-zero exception at an exclusive UTF-16 left boundary.
+ * Alternative reads charge two boundary probes; ordinary reads retain their existing accounting.
+ */
+function isIsolatedZero(readerContext: ReaderContext, boundary: number, accountForBoundary = false): boolean {
+  if (accountForBoundary) {
+    // Count the zero and preceding-character probes; currency probes charge their own work.
+    readerContext.work += 2;
+  }
+
+  return readerContext.text[boundary - 1] === '零'
+    && !isNumberCharacter(readerContext.text[boundary - 2])
+    && !isCurrencyAt(readerContext, boundary - 2);
+}
+
+/** Holds the ordinary-span indexes and accumulating alternatives for one scan, using UTF-16 positions. */
+type MarkedAmountContext = {
+  readerContext: ReaderContext;
+  ordinary: AmountExpression[];
+  covering: Int32Array;
+  starting: Int32Array;
+  startPrefix: Int32Array;
+  candidates: Map<number, AmountExpression>;
+  blockedTails: Set<number>;
+};
+
+/** Records currency tails that must not become the omitted numeral of a later whitespace alternative. */
+function recordMarkedAmountTail(context: MarkedAmountContext, expression: AmountExpression): void {
+  const {readerContext, blockedTails} = context;
+
+  // Count one candidate's eligibility for the later numeric-tail exclusion.
+  readerContext.work++;
+
+  if (expression.bare) {
+    return;
+  }
+
+  const word = namedUnitWord(expression);
+  const registeredEnding = word !== null
+    && matchesWordAt(readerContext, expression.end - word.length, word);
+
+  // A registered unit is an indivisible word, so its final numeral is not an amount's numeric tail.
+  if (!registeredEnding) {
+    blockedTails.add(expression.end);
+  }
+}
+
+/** Offers one currency-bearing alternative; returns false for unreadable, bare or duplicate-start results. */
+function offerMarkedAmount(
+  context: MarkedAmountContext,
+  core: AmountCore | null,
+  mark: NonNullable<AmountExpression['setAsideLeftNumerals']>
+): boolean {
+  const {readerContext, candidates} = context;
+
+  // Count one candidate admission check, including unsuccessful reads.
+  readerContext.work++;
+
+  if (core === null || core.expression.bare || candidates.has(core.expression.start)) {
+    return false;
+  }
+
+  const expression = {...core.expression, setAsideLeftNumerals: mark};
+  candidates.set(expression.start, expression);
+
+  // Grouped-number and clock alternatives do not establish numeric tails for later whitespace fields.
+  if (mark !== 'beforeFullWidthComma' && mark !== 'beforeClockPoint') {
+    recordMarkedAmountTail(context, expression);
+  }
+
+  return true;
+}
+
+/** Offers a whitespace-separated amount without falling back to an in-field omission when excluded. */
+function addWhitespaceAmount(
+  context: MarkedAmountContext,
+  start: number,
+  candidateStart: number,
+  leftBoundary: number,
+  leftCharacter: string | undefined,
+  signStart: boolean
+): void {
+  const {readerContext, covering, blockedTails} = context;
+  const text = readerContext.text;
+
+  // A leading sign supplies the currency boundary, so only an isolated zero blocks that form.
+  const zeroExcluded = leftCharacter === '零'
+    && (!signStart || isIsolatedZero(readerContext, leftBoundary, true));
+  const coefficient = text[readerContext.previousNonWhitespaceEnd[leftBoundary - 1]! - 1];
+
+  // A coefficient and place value belong to the preceding number; a sign explicitly separates them.
+  const placedLeft = !signStart && '百千万亿佰仟'.includes(leftCharacter ?? '\0')
+    && isNumberCharacter(coefficient);
+
+  // The ordinary reader already admits this Arabic start, so an alternative would repeat that reading.
+  const alreadyReleased = isArabicDigit(text[candidateStart])
+    && releasesArabicAfterChineseDigit(readerContext, candidateStart);
+
+  // Currency tails stay attached to the prior amount; a sign supplies an independent currency start.
+  const numericTail = !signStart && blockedTails.has(leftBoundary);
+
+  // A leading place value has no coefficient from which to read an independent amount.
+  const placedStart = '百千万亿佰仟'.includes(text[start] ?? '\0');
+
+  // These starts depend on the ordinary scanner's retries, which alternatives deliberately do not perform.
+  const unsupportedStart = '零半俩仨'.includes(text[start] ?? '\0');
+
+  // Count six exclusions, the coefficient lookup and the ordinary-span coverage check.
+  readerContext.work += 8;
+
+  if (covering[candidateStart] === 0 && !zeroExcluded && !placedLeft && !alreadyReleased
+    && !numericTail && !placedStart && !unsupportedStart) {
+    offerMarkedAmount(context, readMarkedAmount(readerContext, candidateStart, true), 'acrossWhitespace');
+  }
+}
+
+/** Offers a directly attached yen-sign amount, using only the sign variant's three exclusions. */
+function addYenSignAmount(context: MarkedAmountContext, start: number, candidateStart: number): void {
+  const {readerContext, covering} = context;
+  const text = readerContext.text;
+
+  // An isolated change marker is already handled by the ordinary reader.
+  const isolatedZero = isIsolatedZero(readerContext, candidateStart, true);
+
+  // The independent read cannot supply a missing coefficient for a leading place value.
+  const placedStart = '百千万亿佰仟'.includes(text[start] ?? '\0');
+
+  // Alternatives make one full read and cannot use the ordinary scanner's zero/half retries.
+  const unsupportedStart = '零半俩仨'.includes(text[start] ?? '\0');
+
+  // Count three exclusions and the ordinary-span coverage check.
+  readerContext.work += 4;
+
+  if (covering[candidateStart] === 0 && !isolatedZero && !placedStart && !unsupportedStart) {
+    offerMarkedAmount(context, readMarkedAmount(readerContext, candidateStart, true), 'beforeYenSign');
+  }
+}
+
+/** Offers the shortest successful omission of one or two leading characters within a numeric field. */
+function addInFieldAmount(context: MarkedAmountContext, start: number, end: number): void {
+  const {readerContext, ordinary, covering, starting, startPrefix} = context;
+  const text = readerContext.text;
+  const coveringIndex = covering[start]!;
+  const coveredInside = coveringIndex > 0 && ordinary[coveringIndex - 1]!.start < start;
+  const possibleOmission = end - start > 1 && (SMALL_DIGITS.includes(text[start] ?? '\0')
+    || text[start] === '十' || text.slice(start, start + 2) === '万一');
+
+  // Count the coverage lookup, strict-inside check and closed omission-prefix check.
+  readerContext.work += 3;
+
+  // Reject impossible prefixes before probing long registered-unit tables.
+  if (possibleOmission && !coveredInside && allowsAmountLeftNeighbor(readerContext, start)) {
+    const pair = text.slice(start, start + 2);
+    const adjacentPair = ADJACENT_DIGIT_PAIRS.has(pair)
+      && (pair !== '一两' || '百千万亿'.includes(text[start + 2] ?? '\0'));
+    const hasOrdinaryStart = startPrefix[end]! !== startPrefix[start]!;
+    const unreadableWhole = !hasOrdinaryStart && readNumberAt(readerContext, start) === null;
+
+    // Count the pair, its place-value proviso, the start-index query and unreadable-whole condition.
+    readerContext.work += 4;
+
+    if (unreadableWhole || adjacentPair) {
+      // The shorter omission wins; these are two closed grammar choices, never an arbitrary search.
+      for (const omittedLength of [1, 2]) {
+        const dropped = text.slice(start, start + omittedLength);
+        const next = text[start + omittedLength];
+        const allowedDrop = omittedLength === 1
+          ? SMALL_DIGITS.includes(dropped) || dropped === '十'
+          : SMALL_DIGITS.includes(dropped[0] ?? '\0') && SMALL_DIGITS.includes(dropped[1] ?? '\0')
+            || dropped[0] === '十' && SMALL_DIGITS.includes(dropped[1] ?? '\0') || dropped === '万一';
+
+        // Count the dropped prefix, remaining length, Arabic start, unsupported start and duplicate start checks.
+        readerContext.work += 5;
+
+        // An omission must leave a readable Chinese start and preserve every ordinary candidate's start.
+        if (!allowedDrop || end - start <= omittedLength || isArabicDigit(next)
+          || '零半俩仨'.includes(next ?? '\0') || starting[start + omittedLength] !== 0) {
+          continue;
+        }
+
+        const found = readMarkedAmount(readerContext, start + omittedLength, true);
+
+        if (offerMarkedAmount(context, found, omittedLength === 1 ? 'one' : 'two')) {
+          break;
+        }
+      }
+    }
+  }
+}
+
+/** Offers the complete suffix after the first full-width comma inside an already grouped numeric field. */
+function addGroupedAmount(context: MarkedAmountContext, start: number, end: number): void {
+  const {readerContext, candidates} = context;
+  const text = readerContext.text;
+  let firstComma = -1;
+
+  // Only a comma inside the cached field represents a complete grouped spelling.
+  for (let position = start; position < end; position++) {
+    // Count each visited character, including the first comma when one is found.
+    readerContext.work++;
+
+    if (text[position] === '，') {
+      firstComma = position;
+      break;
+    }
+  }
+
+  if (firstComma >= 0 && !candidates.has(firstComma + 1)) {
+    offerMarkedAmount(context, readMarkedAmount(readerContext, firstComma + 1, false), 'beforeFullWidthComma');
+  }
+}
+
+/** Offers an amount after a time word's numeric hour and point, excluding the two minute-unit spellings. */
+function addClockAmount(context: MarkedAmountContext, start: number, end: number): void {
+  const {readerContext, candidates} = context;
+  const text = readerContext.text;
+  const timeWord = text.slice(start - 2, start);
+
+  // Count the preceding-word lookup and membership condition, even when no time word matches.
+  readerContext.work += 2;
+
+  // Requiring an adjacent time word distinguishes this interpretation from an arbitrary decimal point.
+  if (start >= 2 && (TIME_OF_DAY_WORDS.has(timeWord) || DAY_WORDS.has(timeWord))) {
+    let allNumerals = true;
+
+    for (let position = start; position < end; position++) {
+      // Count each hour-field character checked against the closed numeral alphabet.
+      readerContext.work++;
+
+      if (!NUMERIC_FIELD_CHARACTERS.has(text[position]!)) {
+        allNumerals = false;
+        break;
+      }
+    }
+
+    const target = end + 1;
+
+    // Count the clock-point boundary and duplicate-start checks.
+    readerContext.work += 2;
+
+    if (allNumerals && text[end] === '点' && !candidates.has(target)) {
+      const found = readMarkedAmount(readerContext, target, false, true);
+      const unit = found?.expression.unit;
+      const minuteUnit = unit?.kind === 'named' && foldForMatch(unit.word) === '分'
+        || unit?.kind === 'yuan' && text[found!.number.end] === '分';
+
+      // Count the registered-unit and built-in-unit minute exclusions.
+      readerContext.work += 2;
+
+      // Minutes are a common clock spelling; inspect the unit and the first number's own boundary.
+      if (!minuteUnit) {
+        offerMarkedAmount(context, found, 'beforeClockPoint');
+      }
+    }
+  }
+}
+
+/**
+ * Adds scan-only alternatives in O(n) character work for a fixed unit list.
+ * Position indexes replace per-field list searches; each field makes a bounded number of independent reads.
+ * Ordinary objects are retained verbatim. Alternative reads never extend the scan cursor or its unit chain.
+ */
+function addMarkedAmounts(readerContext: ReaderContext, ordinary: AmountExpression[]): AmountExpression[] {
+  const text = readerContext.text;
+  const covering = new Int32Array(text.length + 1);
+  const starting = new Int32Array(text.length + 1);
+  const startPrefix = new Int32Array(text.length + 1);
+  const candidates = new Map<number, AmountExpression>();
+  const blockedTails = new Set<number>();
+  const context: MarkedAmountContext = {
+    readerContext,
+    ordinary,
+    covering,
+    starting,
+    startPrefix,
+    candidates,
+    blockedTails
+  };
+
+  for (let index = 0; index < ordinary.length; index++) {
+    const expression = ordinary[index]!;
+    candidates.set(expression.start, expression);
+    starting[expression.start] = 1;
+    recordMarkedAmountTail(context, expression);
+
+    for (let position = expression.start; position < expression.end; position++) {
+      covering[position] = index + 1;
+
+      // Count one ordinary-span position entered into the coverage index.
+      readerContext.work++;
+    }
+  }
+
+  for (let position = 0; position < text.length; position++) {
+    startPrefix[position + 1] = startPrefix[position]! + starting[position]!;
+
+    // Count one position in the ordinary-start prefix index.
+    readerContext.work++;
+  }
+
+  for (const field of readerContext.fields) {
+    const start = field.start;
+    const end = field.end;
+    const signStart = text[start - 1] === '¥' || text[start - 1] === '￥';
+    const candidateStart = signStart ? start - 1 : start;
+    const leftBoundary = readerContext.previousNonWhitespaceEnd[candidateStart]!;
+    const leftCharacter = text[leftBoundary - 1];
+    const whitespaceVariant = isInlineWhitespace(text[candidateStart - 1])
+      && leftCharacter !== undefined && NUMERIC_FIELD_CHARACTERS.has(leftCharacter)
+      && (signStart || !isIsolatedZero(readerContext, leftBoundary, true));
+
+    // Count sign detection, start selection, boundary lookup, left character, whitespace and variant selection.
+    readerContext.work += 6;
+
+    if (whitespaceVariant) {
+      addWhitespaceAmount(context, start, candidateStart, leftBoundary, leftCharacter, signStart);
+    } else if (signStart && NUMERIC_FIELD_CHARACTERS.has(text[candidateStart - 1] ?? '\0')) {
+      addYenSignAmount(context, start, candidateStart);
+    } else if (!signStart) {
+      addInFieldAmount(context, start, end);
+    }
+
+    // These interpretations inspect each field independently, after the mutually exclusive first three variants.
+    addGroupedAmount(context, start, end);
+    addClockAmount(context, start, end);
+  }
+
+  const merged: AmountExpression[] = [];
+
+  // A position walk gives source order in linear time even when alternatives overlap ordinary spans.
+  for (let position = 0; position < text.length; position++) {
+    const expression = candidates.get(position);
+    // Count one source position visited to merge ordinary and alternative starts.
+    readerContext.work++;
+
+    if (expression !== undefined) {
+      merged.push(expression);
+    }
+  }
+
+  return merged;
+}
+
+/** Reads the original nonoverlapping list first, then merges additional readings without moving its cursor. */
 function scanAmountsWithWork(input: string, options?: Options): WorkResult<AmountExpression[]> {
   if (typeof input !== 'string') {
     return {
@@ -3536,16 +3918,18 @@ function scanAmountsWithWork(input: string, options?: Options): WorkResult<Amoun
   }
 
   return {
-    result,
+    result: addMarkedAmounts(readerContext, result),
     work: readerContext.work
   };
 }
 
 /**
- * Lists amount candidates in source order with nonoverlapping half-open original UTF-16 spans.
+ * Lists amount candidates with strictly increasing starts in original UTF-16 coordinates.
+ * Unmarked spans remain nonoverlapping; marked, written-unit alternatives may overlap any span.
  * Values are integer hundredths of the written unit; scans have no text/Arabic-number length cap.
  * Invalid input or no readable candidates returns []; a read does not establish a transaction.
  * O(n) character work for a fixed unit list; bigint arithmetic cost depends on the size of the numeric value.
+ * Character work also grows with the number of registered units.
  */
 export function scanAmounts(text: string, options?: Options): AmountExpression[] {
   return scanAmountsWithWork(text, options).result;

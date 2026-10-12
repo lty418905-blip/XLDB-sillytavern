@@ -2,8 +2,8 @@ import {compact} from './text-units.ts';
 import type {Access,Memory} from './access.ts';
 
 export const TRACE_POLICY_VERSION=1;
-// This is a planned value; the calibration run sets the final one.
-export const TRACE_CANDIDATE_CEILING=0.50;
+// Selected value; verify again with product samples after integration.
+export const TRACE_CANDIDATE_CEILING=0.55;
 // This is a planned value; the calibration run sets the final one.
 export const TRACE_CANDIDATE_LIMIT=3;
 export const TRACE_STRONG_CUES=2;

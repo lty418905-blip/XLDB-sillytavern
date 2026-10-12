@@ -3238,36 +3238,106 @@ export function settleLedgerEntries(rawEntries:unknown,rawNewPosts:unknown):Ledg
   }catch{return {ok:false,code:'ledger_settlement_invalid'};}
 }
 
-/** Finish one proposal run, including uncovered use marks and confirmed withdrawals.
- * O(J+64^2+H); accepted-ID history H <= 4096. Exceeding either 64-record storage
- * budget is an explicit result; callers must retain the prior valid record. */
+/** Finish one proposal run using UTF-16 source regions and the existing storage budgets.
+ * Returns detached entries and unbooked rows, or the existing validation/limit error code.
+ * O(J + 64^2 + H); accepted-ID history H is capped at the existing 4096-row budget.
+ * Exceeding either 64-row storage budget requires callers to retain the prior valid record. */
 export function finalizeLedgerRun(raw:unknown):LedgerDecoded<LedgerFinalized> {
-  try {
-    const input=snapshot(raw) as LedgerFinalizationInput,{source,marks,last}=input,w=work();
-    if(!sourceOK(source)||typeof source.text!=='string'||!marksOK(marks))return {ok:false,code:'ledger_finalization_invalid'};
-    const frozen=input.frozen;
-    if(frozen&&(!entriesOK(frozen.keptEntries)||!Array.isArray(frozen.keptUnbooked)||!frozen.keptUnbooked.every(unbookedOK)||!marksOK(frozen.frozenMarks)||identity(frozen.source)!==identity(source)))return {ok:false,code:'ledger_freeze_invalid'};
-    if(frozen?.skip)return {ok:true,value:{entries:frozen.keptEntries,unbooked:frozen.keptUnbooked,skip:true,outcome:'complete',stop:'frozen',work:w}};
-    if(last&&(!Array.isArray(last.entries)||last.entries.length>64||!last.entries.every(r=>textId(r.id)&&storedEntryOK(r.entry))
-      ||!Array.isArray(last.unbooked)||!last.unbooked.every(unbookedOK)))return {ok:false,code:'ledger_finalization_invalid'};
-    const fresh=last?.entries.map(r=>r.entry)??[],merged=mergeLedgerEntries(frozen?.keptEntries??[],fresh);
-    if(!merged.ok)return merged;w.pairs+=merged.value.work.pairs;
-    if(merged.value.entries.some(e=>identity(e)!==identity(source)))return {ok:false,code:'ledger_source_mismatch'};
-    const unbooked=[...(frozen?.keptUnbooked??[]),...(last?.unbooked??[])];
-    const covered=new Set([...merged.value.entries.map(e=>e.mark.id),...unbooked.map(u=>u.mark),...(frozen?.frozenMarks??[]).map(m=>m.id)]);
-    for(const mark of marks)if(!covered.has(mark.id)) {
-      const reason=input.uncoveredReasons?.[mark.id]??input.defaultReason??'not_covered';
-      if(!CODE_UNBOOKED.includes(reason)||['entry_dropped','entry_withdrawn'].includes(reason))return {ok:false,code:'ledger_uncovered_reason_invalid'};
-      unbooked.push({sourceId:source.sourceId,revision:source.revision,...('whole'in mark?{whole:true as const}:{span:mark.span}),mark:mark.id,by:'code',reason});
+    try {
+        const input = snapshot(raw) as LedgerFinalizationInput;
+        const {source, marks, last} = input;
+        const ledgerWork = work();
+        if (!sourceOK(source) || typeof source.text !== 'string' || !marksOK(marks)) {
+            return {ok: false, code: 'ledger_finalization_invalid'};
+        }
+
+        const frozen = input.frozen;
+        if (frozen && (!entriesOK(frozen.keptEntries) || !Array.isArray(frozen.keptUnbooked) ||
+            !frozen.keptUnbooked.every(unbookedOK) || !marksOK(frozen.frozenMarks) ||
+            identity(frozen.source) !== identity(source))) {
+            return {ok: false, code: 'ledger_freeze_invalid'};
+        }
+        if (frozen?.skip) {
+            return {ok: true, value: {
+                entries: frozen.keptEntries,
+                unbooked: frozen.keptUnbooked,
+                skip: true,
+                outcome: 'complete',
+                stop: 'frozen',
+                work: ledgerWork
+            }};
+        }
+        if (last && (!Array.isArray(last.entries) || last.entries.length > 64 ||
+            !last.entries.every(checked => textId(checked.id) && storedEntryOK(checked.entry)) ||
+            !Array.isArray(last.unbooked) || !last.unbooked.every(unbookedOK))) {
+            return {ok: false, code: 'ledger_finalization_invalid'};
+        }
+
+        const fresh = last?.entries.map(checked => checked.entry) ?? [];
+        const merged = mergeLedgerEntries(frozen?.keptEntries ?? [], fresh);
+        if (!merged.ok) return merged;
+        ledgerWork.pairs += merged.value.work.pairs;
+        if (merged.value.entries.some(entry => identity(entry) !== identity(source))) {
+            return {ok: false, code: 'ledger_source_mismatch'};
+        }
+
+        const unbooked = [...(frozen?.keptUnbooked ?? []), ...(last?.unbooked ?? [])];
+        // Historical dropped rows must not change which delivered marks are uncovered.
+        const covered = new Set([
+            ...merged.value.entries.map(entry => entry.mark.id),
+            ...unbooked.map(item => item.mark),
+            ...(frozen?.frozenMarks ?? []).map(mark => mark.id)
+        ]);
+        for (const mark of marks) {
+            if (covered.has(mark.id)) continue;
+
+            const reason = input.uncoveredReasons?.[mark.id] ?? input.defaultReason ?? 'not_covered';
+            if (!CODE_UNBOOKED.includes(reason) || ['entry_dropped', 'entry_withdrawn'].includes(reason)) {
+                return {ok: false, code: 'ledger_uncovered_reason_invalid'};
+            }
+            unbooked.push({
+                sourceId: source.sourceId,
+                revision: source.revision,
+                ...('whole' in mark ? {whole: true as const} : {span: mark.span}),
+                mark: mark.id,
+                by: 'code',
+                reason
+            });
+        }
+
+        const passed = input.passed ?? last?.state.everAccepted ?? [];
+        const withdrawn = input.withdrawn ?? last?.state.confirmedWithdrawn ?? [];
+        if (!Array.isArray(passed) || passed.length > 4096 ||
+            !passed.every(previous => textId(previous.id) && storedEntryOK(previous.entry)) ||
+            !stringList(withdrawn, 4096)) {
+            return {ok: false, code: 'ledger_history_invalid'};
+        }
+
+        const present = new Set(last?.entries.map(checked => checked.id) ?? []);
+        const confirmed = new Set(withdrawn);
+        const seen = new Set<string>();
+        for (const previous of passed) {
+            if (present.has(previous.id) || seen.has(previous.id)) continue;
+
+            seen.add(previous.id);
+            const entry = previous.entry;
+            if (identity(entry) !== identity(source)) return {ok: false, code: 'ledger_source_mismatch'};
+
+            // Reuse the decoder's grammar: entry IDs may contain a whole-source fallback.
+            // Matching is linear in the ID length, already bounded by storedEntryOK.
+            unbooked.push({
+                sourceId: source.sourceId,
+                revision: source.revision,
+                ...entryRegion(entry),
+                ...(MARK.test(entry.mark.id) ? {mark: entry.mark.id} : {}),
+                by: 'code',
+                reason: confirmed.has(previous.id) ? 'entry_withdrawn' : 'entry_dropped'
+            });
+        }
+        if (unbooked.length > 64) return {ok: false, code: 'ledger_rerun_limit'};
+
+        return {ok: true, value: {entries: merged.value.entries, unbooked, skip: false, work: ledgerWork}};
+    } catch {
+        return {ok: false, code: 'ledger_finalization_invalid'};
     }
-    const passed=input.passed??last?.state.everAccepted??[],withdrawn=input.withdrawn??last?.state.confirmedWithdrawn??[];
-    if(!Array.isArray(passed)||passed.length>4096||!passed.every(p=>textId(p.id)&&storedEntryOK(p.entry))||!stringList(withdrawn,4096))return {ok:false,code:'ledger_history_invalid'};
-    const present=new Set(last?.entries.map(r=>r.id)??[]),confirmed=new Set(withdrawn),seen=new Set<string>();
-    for(const p of passed)if(!present.has(p.id)&&!seen.has(p.id)) {
-      seen.add(p.id);const e=p.entry;if(identity(e)!==identity(source))return {ok:false,code:'ledger_source_mismatch'};
-      unbooked.push({sourceId:source.sourceId,revision:source.revision,...entryRegion(e),mark:e.mark.id,by:'code',reason:confirmed.has(p.id)?'entry_withdrawn':'entry_dropped'});
-    }
-    if(unbooked.length>64)return {ok:false,code:'ledger_rerun_limit'};
-    return {ok:true,value:{entries:merged.value.entries,unbooked,skip:false,work:w}};
-  }catch{return {ok:false,code:'ledger_finalization_invalid'};}
 }

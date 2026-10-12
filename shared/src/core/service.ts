@@ -1,6 +1,10 @@
 import { Authority } from './store.ts';
 import { ModelTasks } from './models.ts';
 import { Retrieval } from '../memory/retrieval.ts';
+import {recallJudgeInput, RECALL_JUDGE_TEXT_LIMITS} from '../memory/recall-judge-input.ts';
+import {recallTurnKey, reserveRecallTurn} from '../memory/recall-judge.ts';
+import type {RecallJudgeStep, RecallJudgeOutcome} from '../memory/recall-judge.ts';
+import type {RecallDetailCall, RecallDetailDistances} from '../memory/recall-judge-details.ts';
 import {contextMemories,checkCurrentSource,type CurrentSource} from '../memory/context.ts';
 import {cueRecalls,restoredSnapshot,retainedAccess,visibleLayer,rememberedFragmentsOf} from '../memory/retention.ts';
 import {limitRecalls,recallSnapshot,projectMemories} from '../memory/access.ts';
@@ -84,6 +88,8 @@ export interface CoreOptions<M extends object,C extends SceneCompanionPort> {
   sceneCompanion?:(scene:SceneAuthority&M,core:Core<M,C>,models:ModelTasks)=>C;
   /** The host's local judge (AgentJev) for schedule conflicts and emotion ranking; without it the scene uses its own. */
   sceneJudge?:SceneJudge;
+  /** Optional recall decision step; without injection all existing context behavior is preserved. */
+  recallJudge?: RecallJudgeStep;
 }
 
 export class Core<M extends object = {},C extends SceneCompanionPort = SceneCompanionPort> {
@@ -93,8 +99,14 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
   private models: ModelTasks;
   private rewriteCache = new Map<string,string[]>();
   readonly scene: SceneCore<C>;
+  private readonly recallJudge?: RecallJudgeStep;
+  private readonly recallJudgeTurns = new Map<string, number>();
+  private readonly recallDetailTurns = new Map<string, number>();
   constructor(authority: Authority<M>, retrieval: Retrieval, models = new ModelTasks(), options: CoreOptions<M,C> = {}) {
-    this.authority = authority; this.retrieval = retrieval; this.models = models;
+    this.authority = authority;
+    this.retrieval = retrieval;
+    this.models = models;
+    this.recallJudge = options.recallJudge;
     this.scene = new SceneCore<C>(authority.scene,this as Core,models,undefined,
       {companion:options.sceneCompanion?.(authority.scene,this,models),judge:options.sceneJudge});
   }
@@ -170,7 +182,20 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
     assertCurrent();
     const cues = cueRecalls(snapshot, now, query);
     const scope = snapshot.scope;
-    const result = await this.retrieval.search(snapshot, query, configs, now, {currentSource: options.currentSource});
+    const judge = this.recallJudge;
+    const judgeModel = judge?.available() ?? null;
+    const judgeAvailable = judgeModel !== null && options.currentSource !== undefined;
+    const searchOptions = {
+      currentSource: options.currentSource,
+      ...(judge ? {
+        recallTrace: {
+          enabled: judgeAvailable,
+          // An unavailable step keeps the constructor's count so existing trace-off cache entries remain reusable.
+          ...(judgeAvailable ? {limit: RECALL_JUDGE_TEXT_LIMITS.search} : {}),
+        },
+      } : {}),
+    };
+    const result = await this.retrieval.search(snapshot, query, configs, now, searchOptions);
     try {
       assertCurrent();
     }
@@ -180,7 +205,31 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
     }
     // One context recalls at most RECALL_EVENT_LIMIT events: the cue recalls first, then the hits decided outside the
     // search. An event beyond the limit stays at its stage: no mark, no seed and no place in front.
-    const recalls = limitRecalls(snapshot, now, cues, options.recallHits ?? [], result.ids, RECALL_EVENT_LIMIT);
+    let judgment: RecallJudgeOutcome = {outcome: 'not_needed', hits: []};
+    const turnKey = options.currentSource ? recallTurnKey(scope, options.currentSource) : '';
+    if (judge && judgeAvailable && options.currentSource && options.recallHits == null &&
+      cues.length < RECALL_EVENT_LIMIT && result.traceCandidates?.length) {
+      const input = recallJudgeInput(
+        snapshot, query, now, options.currentSource, result.traceCandidates, result.ids,
+        new Set(cues.map(cue => cue.event))
+      );
+      if (input.candidates.length) {
+        const decision = judge.decide(input, scope, judgeModel!, () => reserveRecallTurn(this.recallJudgeTurns, turnKey));
+        if (decision instanceof Promise) {
+          judgment = await decision;
+          try {
+            assertCurrent();
+          } catch (error) {
+            await this.clearProjection(scope);
+            throw error;
+          }
+        } else {
+          judgment = decision;
+        }
+      }
+    }
+    const recalls = limitRecalls(snapshot, now, cues, options.recallHits ?? judgment.hits, result.ids, RECALL_EVENT_LIMIT);
+    judgment.recordUsed?.(recalls.hits);
     const originalSnapshot = snapshot;
     const memoryClock = snapshot.memoryTimeMs ?? now;
     snapshot = recallSnapshot(snapshot, restoredSnapshot(snapshot, now, recalls.cues), now, recalls.hits);
@@ -214,8 +263,33 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
     );
     let distances: (readonly number[] | undefined)[] = [];
     if (requests.length) {
+      let response: unknown;
+      let waited = false;
       try {
-        const response = this.recallDetailDistances(requests);
+        response = judgeAvailable ? this.recallDetailDistances(requests, {
+          embedding: configs.embedding,
+          currentSource: options.currentSource,
+          ...(result.degraded == null ? {} : {degraded: result.degraded}),
+          judgment: judgment.outcome,
+          turnKey,
+        }) : this.recallDetailDistances(requests);
+        if (response instanceof Promise) {
+          waited = true;
+          response = await response;
+        }
+      } catch {
+        response = undefined;
+      }
+      // This assertion must be outside the distance-validation catch: a stale context cannot use any fallback.
+      if (waited) {
+        try {
+          assertCurrent();
+        } catch (error) {
+          await this.clearProjection(scope);
+          throw error;
+        }
+      }
+      try {
         if (!Array.isArray(response) || response.length !== requests.length)
           throw new Error('invalid_detail_distances');
         distances = requests.map(
@@ -648,16 +722,21 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
       };
     };
   }
-  /** One ordered distance batch; the default returns absent distances synchronously for seeded fallback. */
+  /** Ordered detail distances; absent call data stays synchronous, while an actual request returns a safe Promise. */
   private recallDetailDistances(
     requests: readonly {
       id: string;
       gist: string;
       feeling?: string;
       candidates: readonly string[];
-    }[]
-  ): (readonly number[] | undefined)[] {
-    return requests.map(() => undefined);
+    }[],
+    call?: RecallDetailCall
+  ): RecallDetailDistances | Promise<RecallDetailDistances> {
+    if (!call || !call.currentSource || !this.recallJudge || call.judgment === 'failed' ||
+      call.degraded?.stage === 'embedding') return requests.map(() => undefined);
+    return this.retrieval.recallDetailDistances(
+      requests, call.embedding, () => reserveRecallTurn(this.recallDetailTurns, call.turnKey)
+    );
   }
 
   async generate(scope: Scope, input: string, persona: string, configs: Configurations, currentReplySourceId?:string) {

@@ -510,7 +510,7 @@ export function buildRecallDetailPool(input: DetailPoolInput): DetailPool {
       }
       // scanAmounts is O(n) with fixed lexical tables; charge 256 passes of its expanded text, plus folding.
       textWork(text, work, 256);
-      if (scanAmounts(text).some(amount => !amount.bare)) return;
+      if (scanAmounts(text).some(amount => !amount.bare && !('setAsideLeftNumerals' in amount))) return;
       if (key.length >= FRAGMENT_TOTAL_RATIO * detailKey.length) return;
       if (accepted.overlaps(key)) return;
       accepted.add(key);

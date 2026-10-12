@@ -1,5 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import {createHash} from 'node:crypto';
+import {AsyncLocalStorage} from 'node:async_hooks';
+import {isPromise, isProxy} from 'node:util/types';
 import { createEmotion, advanceEmotion, emotionAt, emotionSummary, emotionSettingsOf, validateEmotionState } from '../emotion/openher.ts';
 import type { EmotionState } from '../emotion/openher.ts';
 import { foldRelationships, relationshipAnchor as foldedRelationshipAnchor, validateRelationships } from '../emotion/relationships.ts';
@@ -44,9 +46,25 @@ import type {ContactEmotionProjection,SceneAuthorityExtensionFactory,SceneAuthor
 
 export type {SceneSubjectBinding} from './extension.ts';
 
+/** Pure fold work owned by one outer call; code-unit and entry budgets apply to the entire call. */
+interface SceneReadStep {
+  active: boolean;
+  saturated: boolean;
+  keyUnits: number;
+  folds: Map<string, WorldFoldResult | WorldRunningStep[]>;
+}
+
+// Measured public paths retain at most four entries. Sixteen leaves twelve entries of headroom.
+const READ_FOLD_ENTRY_LIMIT = 16;
+// Measured keys total at most 2,300,431 UTF-16 units per call; eight million leaves over threefold capacity.
+const READ_FOLD_KEY_UNIT_LIMIT = 8_000_000;
+
 /** World sources and all NPC projections share the existing SQLite transaction. */
 export class SceneAuthority {
   private db: DatabaseSync;
+  declare private readonly readSteps: AsyncLocalStorage<SceneReadStep>;
+  /** Counts optional fold-sharing failures without retaining their inputs or errors. */
+  declare private readSharingFailures: number;
   private emotionReplayCache=new Map<string,EmotionState>();
   private savepointSequence=0;
   declare private ledgerReadFrame?: {
@@ -82,7 +100,15 @@ export class SceneAuthority {
    * `extension` adds members and hooks (the Agent companion); without it every hook is a no-op, subject() is null and
    * no companion table is created. The authority is then typed `SceneAuthority & M` by its owner (Authority<M>).
    */
-  constructor(db: DatabaseSync, migrateEmotionStates = true, extension?:SceneAuthorityExtensionFactory<object>) {
+  constructor(
+    db: DatabaseSync,
+    migrateEmotionStates = true,
+    extension?: SceneAuthorityExtensionFactory<object>
+  ) {
+    Object.defineProperties(this, {
+      readSteps: { value: new AsyncLocalStorage<SceneReadStep>() },
+      readSharingFailures: { value: 0, writable: true },
+    });
     this.db = db;
     db.exec(`CREATE TABLE IF NOT EXISTS scene_worlds (
       key TEXT PRIMARY KEY, scope TEXT NOT NULL, roster TEXT NOT NULL, version INTEGER NOT NULL, created INTEGER NOT NULL);
@@ -104,33 +130,37 @@ export class SceneAuthority {
       CREATE TABLE IF NOT EXISTS scene_index_cleanup (
       scope TEXT NOT NULL, character TEXT NOT NULL, version INTEGER NOT NULL, PRIMARY KEY(scope,character));`);
     this.initializeLedgerSourceRevision();
-    this.processing=new Processing(db);
-    this.transfer=new SceneTransfer(db,this);
-    this.storyClock=new StoryClockStore(db,{
-      state:scope=>this.state(scope),
-      isStoryScope:scope=>this.isStoryScope(scope),
-      tavernRoleplay:scope=>this.interactions.isTavernRoleplay(scope),
-      worldFold:(scope,sources,settings,timeline)=>{
-        const input=this.ledgerViewInput(scope,sources,settings,timeline);
-        return Object.keys(input.options).length?foldWorldState(settings,input.sources,input.options):foldWorldState(settings,input.sources);
+    this.processing = new Processing(db);
+    this.transfer = new SceneTransfer(db, this);
+    this.storyClock = new StoryClockStore(db, {
+      state: scope => this.state(scope),
+      isStoryScope: scope => this.isStoryScope(scope),
+      tavernRoleplay: scope => this.interactions.isTavernRoleplay(scope),
+      worldFold: (scope, sources, settings, timeline) => {
+        const input = this.ledgerViewInput(scope, sources, settings, timeline);
+        return Object.keys(input.options).length ? this.foldWorldForStep(settings, input.sources, input.options) : this.foldWorldForStep(settings, input.sources);
       },
       // One running fold of this view's sources and selected rows, aligned to the original source array.
-      worldRunning:(scope,sources,settings,timeline)=>{
-        const input=this.ledgerViewInput(scope,sources,settings,timeline);
-        const steps=foldWorldStateRunning(settings,input.sources,input.options);
-        let position=-1,last:WorldRunningStep={timeMs:settings.startTimeMs,issue:null};
-        return sources.map(source=>{
-          if(source.status==='accepted'&&source.processing==='ready'&&source.analysis?.plan)last=steps[++position]!;
+      worldRunning: (scope, sources, settings, timeline) => {
+        const input = this.ledgerViewInput(scope, sources, settings, timeline);
+        const steps = this.foldWorldRunningForStep(settings, input.sources, input.options);
+        let position = -1, last: WorldRunningStep = { timeMs: settings.startTimeMs, issue: null };
+        return sources.map(source => {
+          if (source.status === 'accepted' && source.processing === 'ready'
+            && source.analysis?.plan)
+            last = steps[++position]!;
           return last;
         });
       },
-      withLedgerRows:(scope,action)=>this.withLedgerRows(scope,action),
-      ledgerReader:scope=>this.ledgerReader(scope),
-      ledgerTimeline:(scope,sources,timeline)=>this.ledgerTimelineForCall(scope,sources,timeline),
+      withLedgerRows: (scope, action) => this.withLedgerRows(scope, action),
+      ledgerReader: scope => this.ledgerReader(scope),
+      ledgerTimeline: (scope, sources, timeline) => this.ledgerTimelineForCall(scope, sources, timeline),
       ledgerData: (scope, sources = this.state(scope).sources, timeline) => {
         const rows = this.ledgerRowsForCall(scope);
-        if (!this.usableLedgerRows(rows)) return null;
-        if (timeline !== undefined) this.checkLedgerPrefix(sources, timeline);
+        if (!this.usableLedgerRows(rows))
+          return null;
+        if (timeline !== undefined)
+          this.checkLedgerPrefix(sources, timeline);
 
         // Row bytes and connection metadata validate a memo without decoding the source table.
         const frame = this.ledgerReadFrame;
@@ -144,59 +174,78 @@ export class SceneAuthority {
         return JSON.stringify([raw, timelineIdentity]);
       },
       ledgerVersion: () => this.ledgerDatabaseStamp(),
-      legacySettings:(scope,sources)=>this.legacyWorldSettings(scope,sources),
-      frozenRoleplayTime:scope=>this.interactions.frozenRoleplayTime(scope),
-      afterCorrection:scope=>{this.rebuildEmotionStates(scope);this.bump(scope);this.rebuildDerived(scope);},
+      legacySettings: (scope, sources) => this.legacyWorldSettings(scope, sources),
+      frozenRoleplayTime: scope => this.interactions.frozenRoleplayTime(scope),
+      afterCorrection: scope => {
+        this.rebuildEmotionStates(scope);
+        this.bump(scope);
+        this.rebuildDerived(scope);
+      },
     });
-    this.interactions=new SceneInteractions(db,(scope,now)=>this.world(scope,undefined,now),scope=>{
-      const summary=this.storyClock.summary(scope);
-      return summary&&{status:summary.status,pending:summary.pending,view:summary.view};
+    this.interactions = new SceneInteractions(db, (scope, now) => this.world(scope, undefined, now), scope => {
+      const summary = this.storyClock.summary(scope);
+      return summary && { status: summary.status, pending: summary.pending, view: summary.view };
     });
-    this.npcResources=new NpcResourceController(db);
-    this.initialization=new SceneInitialization(db,this);
-    this.director=new SceneDirector(db);
-    this.commitments=new Commitments(db);
-    this.calendar=new SceneCalendarStore(db,this);
-    this.geography=new GeographyStore(db,{
-      state:scope=>this.state(scope),modeOf:scope=>this.interactions.modeOf(scope),fullRoleplay:scope=>this.interactions.isTavernRoleplay(scope),transaction:action=>this.transaction(action),
-      checkpoint:(scope,reason)=>{this.lifecycle.checkpoint(scope,reason,{automatic:true});},bump:scope=>this.bump(scope),
+    this.npcResources = new NpcResourceController(db);
+    this.initialization = new SceneInitialization(db, this);
+    this.director = new SceneDirector(db);
+    this.commitments = new Commitments(db);
+    this.calendar = new SceneCalendarStore(db, this);
+    this.geography = new GeographyStore(db, {
+      state: scope => this.state(scope), modeOf: scope => this.interactions.modeOf(scope), fullRoleplay: scope => this.interactions.isTavernRoleplay(scope), transaction: action => this.transaction(action),
+      checkpoint: (scope, reason) => {
+        this.lifecycle.checkpoint(scope, reason, { automatic: true });
+      }, bump: scope => this.bump(scope),
     });
-    this.physiology=new PhysiologyStore(db,{
-      state:scope=>this.state(scope),modeOf:scope=>this.interactions.modeOf(scope),fullRoleplay:scope=>this.interactions.isTavernRoleplay(scope),
-      clock:(scope,now)=>{const clock=this.interactions.clock(scope,now);return {...clock,timeMs:typeof clock.timeMs==='number'?clock.timeMs:null};},
+    this.physiology = new PhysiologyStore(db, {
+      state: scope => this.state(scope), modeOf: scope => this.interactions.modeOf(scope), fullRoleplay: scope => this.interactions.isTavernRoleplay(scope),
+      clock: (scope, now) => {
+        const clock = this.interactions.clock(scope, now);
+        return { ...clock, timeMs: typeof clock.timeMs === 'number' ? clock.timeMs : null };
+      },
       // Physiology keeps its own state type; both callers of status pass a full SceneState (the stored one or a generation view's).
       storyTime:(scope,state)=>{
-        const now=storyNow(this,scope,state as unknown as SceneState);
-        if(now===null)return null;
-        let entries:Map<string,{revision:number;atMs:number}>|undefined;
-        return {nowMs:now.atMs,originMs:now.originAtMs,at:(sourceId,revision)=>{
-          entries??=new Map(now.sources.map(entry=>[entry.sourceId,{revision:entry.revision,atMs:entry.state.atMs}]));
-          const entry=entries.get(sourceId);
-          return entry!==undefined&&(revision===undefined||entry.revision===revision)?entry.atMs:null;
-        }};
+        const now = storyNow(this, scope, state as unknown as SceneState);
+        if (now === null)
+          return null;
+        let entries: Map<string, { revision: number; atMs: number }> | undefined;
+        return {
+          nowMs: now.atMs, originMs: now.originAtMs, at: (sourceId, revision) => {
+            entries ??= new Map(
+              now.sources.map(entry => [entry.sourceId, { revision: entry.revision, atMs: entry.state.atMs }])
+            );
+            const entry = entries.get(sourceId);
+            return entry !== undefined && (revision === undefined || entry.revision === revision) ? entry.atMs : null;
+          }
+        };
       },
-      transaction:action=>this.transaction(action),
-      checkpoint:(scope,reason)=>{this.lifecycle.checkpoint(scope,reason,{automatic:true});},
-      bump:scope=>this.bump(scope),
+      transaction: action => this.transaction(action),
+      checkpoint: (scope, reason) => {
+        this.lifecycle.checkpoint(scope, reason, { automatic: true });
+      },
+      bump: scope => this.bump(scope),
     });
-    const hooks=defaultSceneHooks();
-    if(extension){
-      const built=extension(db,{scene:this,transaction:action=>this.transaction(action),bump:scope=>this.bump(scope),
-        rebuildDerived:(scope,nowMs)=>this.rebuildDerived(scope,nowMs),
-        configure:(scope,roster,nowMs)=>this.configure(scope,roster,nowMs,false)});
-      Object.assign(hooks,built.hooks??{});
+    const hooks = defaultSceneHooks();
+    if (extension) {
+      const built = extension(db, {
+        scene: this, transaction: action => this.transaction(action), bump: scope => this.bump(scope),
+        rebuildDerived: (scope, nowMs) => this.rebuildDerived(scope, nowMs),
+        configure: (scope, roster, nowMs) => this.configure(scope, roster, nowMs, false)
+      });
+      Object.assign(hooks, built.hooks ?? {});
       // Descriptors, not values: an accessor member (personalModelIdentity) stays a single accessor.
-      Object.defineProperties(this,Object.getOwnPropertyDescriptors(built.members));
+      Object.defineProperties(this, Object.getOwnPropertyDescriptors(built.members));
     }
-    this.hooks=hooks;
-    this.lifecycle=new SceneLifecycle(db,scope=>{
+    this.hooks = hooks;
+    this.lifecycle = new SceneLifecycle(db, scope => {
       // N16 first: it decides which sources are 'ready', which both rebuilds read.
       this.requeueOpening(scope);
       this.rebuildEmotionStates(scope);
       this.rebuildDerived(scope);
       this.invalidateDirector(scope);
-    },hooks.checkpoint);
-    if(migrateEmotionStates)this.migrateEmotionStates();
+    }, hooks.checkpoint);
+    if (migrateEmotionStates)
+      this.migrateEmotionStates();
   }
 
   state(scope: SceneScope, includeEmotionStates = false): SceneState {
@@ -209,6 +258,130 @@ export class SceneAuthority {
       ...JSON.parse(source.message), revision:source.revision, observedAtMs:source.observed, status:source.status,
       processing:source.processing, analysis:source.analysis ? JSON.parse(source.analysis) : null,
     }))};
+  }
+
+  /**
+   * Share pure folds until the outer call returns or its native promise settles; nested calls keep the owner.
+   * Results and errors pass through unchanged. A continuation inherited from a closed call never reopens it.
+   */
+  withReadStep<T>(action: () => T): T {
+    const inherited = this.readSteps.getStore();
+    if (inherited !== undefined)
+      return action();
+
+    const step: SceneReadStep = {
+      active: true,
+      saturated: false,
+      keyUnits: 0,
+      folds: new Map(),
+    };
+    const close = () => {
+      step.active = false;
+      step.folds.clear();
+      step.keyUnits = 0;
+    };
+
+    return this.readSteps.run(
+      step,
+      () => {
+        let result: T;
+        try {
+          result = action();
+        } catch (error) {
+          close();
+          throw error;
+        }
+
+        if (isPromise(result)) {
+          try {
+            // Observe settlement without replacing the promise or touching a caller's overridden then getter.
+            Promise.prototype.then.call(result, close, close);
+          } catch {
+            // A promise subclass can reject observation through its species getter. Sharing is optional.
+            close();
+          }
+        } else {
+          close();
+        }
+        return result;
+      }
+    );
+  }
+
+  /** Delegate the full world fold; inputs and output retain the original fold's units and failure semantics. */
+  private foldWorldForStep(
+    settings: WorldSettings,
+    sources: WorldSourceEffects[],
+    options: LedgerFoldOptions = {},
+  ): WorldFoldResult {
+    return this.foldForReadStep('full', settings, sources, options, () => foldWorldState(settings, sources, options));
+  }
+
+  private foldWorldRunningForStep(
+    settings: WorldSettings,
+    sources: WorldSourceEffects[],
+    options: LedgerFoldOptions,
+  ): WorldRunningStep[] {
+    return this.foldForReadStep(
+      'running',
+      settings,
+      sources,
+      options,
+      () => foldWorldStateRunning(settings, sources, options)
+    );
+  }
+
+  private foldForReadStep<T extends WorldFoldResult | WorldRunningStep[]>(
+    kind: 'full' | 'running',
+    settings: WorldSettings,
+    sources: WorldSourceEffects[],
+    options: LedgerFoldOptions,
+    action: () => T,
+  ): T {
+    const step = this.readSteps.getStore();
+    if (!step?.active || step.saturated)
+      return action();
+    // Once a budget is exhausted, later calls bypass even key construction. Retained entries are not evicted.
+    if (step.folds.size >= READ_FOLD_ENTRY_LIMIT || step.keyUnits >= READ_FOLD_KEY_UNIT_LIMIT) {
+      step.saturated = true;
+      return action();
+    }
+
+    const objects = new WeakSet<object>();
+    let key: string | undefined;
+    try {
+      if (plainReadInput([settings, sources, options], objects)) {
+        // Both world folds ignore these bounds in story mode. Companion mode retains both exact values.
+        const { nowMs: _now, monotonicFloorMs: _floor, ...storyOptions } = options;
+        const foldOptions = settings.mode === 'story' ? storyOptions : options;
+        key = JSON.stringify([kind, settings, sources, foldOptions]);
+        const cached = step.folds.get(key);
+        if (cached !== undefined)
+          return structuredClone(cached) as T;
+        if (key.length > READ_FOLD_KEY_UNIT_LIMIT - step.keyUnits) {
+          step.saturated = true;
+          key = undefined;
+        }
+      }
+    } catch {
+      // Deep or otherwise uncopyable data must retain the original fold's result and failure behavior.
+      this.readSharingFailures++;
+      key = undefined;
+    }
+
+    const result = action();
+    // Some invalid inputs can be returned inside diagnostics. Such aliases must still point at the caller's input.
+    if (key !== undefined) {
+      try {
+        if (detachedReadResult(result, objects)) {
+          step.folds.set(key, structuredClone(result));
+          step.keyUnits += key.length;
+        }
+      } catch {
+        this.readSharingFailures++;
+      }
+    }
+    return result;
   }
 
   /** The bound real user of an active Agent companion scope; always null without the companion extension. */
@@ -1230,31 +1403,49 @@ export class SceneAuthority {
     });
   }
 
-  world(scope:SceneScope,readerId?:string,now=Date.now(),state=this.state(scope),timeline?:SceneSource[]):
-    (WorldFoldResult&{storyClock?:StoryClockSummary})|(WorldProjection&{storyClock?:StoryClockView|null})|null {
-    const originalSettings=this.worldSettings(scope);
-    return this.withLedgerRows(scope,()=>{
-    const rows=this.ledgerRowsForCall(scope);
-    let settings=originalSettings;
-    if(this.usableLedgerRows(rows)){
-      const derived=this.legacyWorldSettings(scope,state.sources);
-      if(!derived.stored)settings=derived.settings;
-    }
-    if(!settings){if(this.usableLedgerRows(rows)&&timeline!==undefined)this.checkLedgerPrefix(state.sources,timeline);return null;}
-    const input=this.ledgerViewInput(scope,state.sources,settings,timeline);
-    const row=this.db.prepare('SELECT clock_floor FROM scene_world_settings WHERE scope=?').get(scopeKey(scope)) as {clock_floor:number}|undefined;
-    const options={nowMs:now,monotonicFloorMs:row?.clock_floor??settings.startTimeMs,...input.options};
-    const folded=foldWorldState(settings,input.sources,options);
-    if(settings.mode==='companion'&&row&&folded.state.timeMs>row.clock_floor)this.db.prepare('UPDATE scene_world_settings SET clock_floor=? WHERE scope=?').run(folded.state.timeMs,scopeKey(scope));
-    if(settings.mode!=='story')return readerId===undefined?folded:projectWorldState(folded,readerId);
-    // A story world carries the unified clock beside the legacy one.
-    // @deprecated folded.state.timeMs and the projection's timeMs remain the legacy Unix-domain clock for host displays.
-    // These compatibility values stay until the host readers move to `storyClock`.
-    const summary=this.storyClock.summary(scope,state);
-    if(readerId===undefined)return summary?{...folded,storyClock:summary}:folded;
-    const projection=projectWorldState(folded,readerId);
-    // The same visibility rule as timeMs: the player, or everyone when the time is public.
-    return readerId==='player'||folded.state.publicTime?{...projection,storyClock:summary?.view??null}:projection;
+  world(
+    scope: SceneScope,
+    readerId?: string,
+    now = Date.now(),
+    state = this.state(scope),
+    timeline?: SceneSource[]
+  ):
+    (WorldFoldResult & { storyClock?: StoryClockSummary }) | (WorldProjection & { storyClock?: StoryClockView | null }) | null {
+    const originalSettings = this.worldSettings(scope);
+    return this.withLedgerRows(scope, () => {
+      const rows = this.ledgerRowsForCall(scope);
+      let settings = originalSettings;
+      if (this.usableLedgerRows(rows)) {
+        const derived = this.legacyWorldSettings(scope, state.sources);
+        if (!derived.stored)
+          settings = derived.settings;
+      }
+      if (!settings) {
+        if (this.usableLedgerRows(rows) && timeline !== undefined)
+          this.checkLedgerPrefix(state.sources, timeline);
+        return null;
+      }
+      const input = this.ledgerViewInput(scope, state.sources, settings, timeline);
+      const row = this.db.prepare('SELECT clock_floor FROM scene_world_settings WHERE scope=?').get(scopeKey(scope)) as { clock_floor: number } | undefined;
+      const options = {
+        nowMs: now,
+        monotonicFloorMs: row?.clock_floor ?? settings.startTimeMs,
+        ...input.options
+      };
+      const folded = this.foldWorldForStep(settings, input.sources, options);
+      if (settings.mode === 'companion' && row && folded.state.timeMs > row.clock_floor)
+        this.db.prepare('UPDATE scene_world_settings SET clock_floor=? WHERE scope=?').run(folded.state.timeMs, scopeKey(scope));
+      if (settings.mode !== 'story')
+        return readerId === undefined ? folded : projectWorldState(folded, readerId);
+      // A story world carries the unified clock beside the legacy one.
+      // @deprecated folded.state.timeMs and the projection's timeMs remain the legacy Unix-domain clock for host displays.
+      // These compatibility values stay until the host readers move to `storyClock`.
+      const summary = this.storyClock.summary(scope, state);
+      if (readerId === undefined)
+        return summary ? { ...folded, storyClock: summary } : folded;
+      const projection = projectWorldState(folded, readerId);
+      // The same visibility rule as timeMs: the player, or everyone when the time is public.
+      return readerId === 'player' || folded.state.publicTime ? { ...projection, storyClock: summary?.view ?? null } : projection;
     });
   }
 
@@ -1939,4 +2130,65 @@ function withoutUserModelCandidates<T extends {userModelCandidates?:SceneProfile
 function validateStoredEmotionStates(value:unknown):void {
   if(!value||typeof value!=='object'||Array.isArray(value))throw new TypeError('invalid_scene_emotion_states');
   for(const state of Object.values(value as Record<string,unknown>))validateEmotionState(state);
+}
+
+/** Plain data can be keyed without invoking getters, toJSON, proxies, or user iterators; work is O(data bytes). */
+function plainReadInput(value: unknown, objects: WeakSet<object>): boolean {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean')
+    return true;
+  if (typeof value === 'number')
+    return Number.isFinite(value) && !Object.is(value, -0);
+  if (typeof value !== 'object' || isProxy(value) || objects.has(value))
+    return false;
+
+  const prototype = Object.getPrototypeOf(value);
+  const array = Array.isArray(value);
+  if (prototype !== (array ? Array.prototype : Object.prototype))
+    return false;
+  if (Object.hasOwn(Object.prototype, 'toJSON')
+    || (array && Object.hasOwn(Array.prototype, 'toJSON')))
+    return false;
+  objects.add(value);
+
+  const keys = Reflect.ownKeys(value);
+  if (array && keys.length !== value.length + 1)
+    return false;
+  for (const key of keys) {
+    if (array && key === 'length')
+      continue;
+    if (typeof key !== 'string')
+      return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+    if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value'))
+      return false;
+    if (array && !/^(0|[1-9][0-9]*)$/.test(key))
+      return false;
+    if (!plainReadInput(descriptor.value, objects))
+      return false;
+  }
+  return true;
+}
+
+/** A shared fold snapshot may preserve its internal aliases, but may not copy an alias into a caller's input. */
+function detachedReadResult(value: unknown, inputs: WeakSet<object>, visited = new WeakSet<object>()): boolean {
+  if (value === null || typeof value !== 'object')
+    return typeof value !== 'function' && typeof value !== 'symbol';
+  if (inputs.has(value) || isProxy(value))
+    return false;
+  if (visited.has(value))
+    return true;
+  visited.add(value);
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== Array.prototype)
+    return false;
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string')
+      return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+    if (!Object.hasOwn(descriptor, 'value')
+      || !detachedReadResult(descriptor.value, inputs, visited))
+      return false;
+  }
+  return true;
 }

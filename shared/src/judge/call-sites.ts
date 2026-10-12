@@ -11,7 +11,7 @@
  *    核心自動改以 choice 送出並自行計算期望值(§2.2 轉接), 呼叫點不必分辨.
  */
 export const JUDGE_CALL_SITES = Object.freeze(['quiet-exception', 'contact-decision', 'dependence-audit',
-  'relationship-assessment', 'schedule-conflict', 'emotion-rank'] as const);
+  'relationship-assessment', 'schedule-conflict', 'emotion-rank', 'memory-reactivation'] as const);
 export type JudgeCallSite = typeof JUDGE_CALL_SITES[number];
 export type JudgeSiteGroup = 'scene' | 'companion';
 export type JudgeLane = 'foreground' | 'background';
@@ -53,6 +53,9 @@ export const JUDGE_CALL_SITE_SPECS: Readonly<Record<JudgeCallSite, JudgeCallSite
     [question(/^decline$/, 'choice', ['A', 'B', 'neither'])]),
   'emotion-rank': site('emotion-rank', 'scene', 'foreground', 6, 80, false, true,
     [question(/^change$/, 'choice', ['none', 'small', 'medium', 'large'])]),
+  // Selected priority above schedule conflicts; foreground quota shedding starts at ninety percent.
+  'memory-reactivation': site('memory-reactivation', 'scene', 'foreground', 7, 90, true, false,
+    [question(/^c[1-3]$/, 'choice', ['this', 'other', 'unclear'])]),
 });
 export const JUDGE_LANE_TIMEOUT_MS: Readonly<Record<JudgeLane, number>> = Object.freeze({foreground: 3000, background: 10000});
 export function judgeQuestionSpec(site: unknown, questionId: unknown): JudgeQuestionSpec | null {

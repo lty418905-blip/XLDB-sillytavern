@@ -4,6 +4,8 @@ import path from 'node:path';
 import { connect, Index } from '../../../.local/runtime/node_modules/@lancedb/lancedb/dist/index.js';
 import { currentMemory, projectMemories } from './access.ts';
 import {retainedAccess,retentionSnapshot,traceEligible} from './retention.ts';
+import {recallDetailEmbedding, RECALL_DETAIL_EMBEDDING} from './recall-judge-details.ts';
+import type {RecallDetailRequest, RecallDetailDistances} from './recall-judge-details.ts';
 import {TRACE_POLICY_VERSION,TRACE_CANDIDATE_CEILING,TRACE_CANDIDATE_LIMIT,
   clampDistance,clearKeyText,eventKey,traceCandidates,cosineDistance as keyDistance} from './trace.ts';
 import type {TraceCandidate,TraceHolder,TraceKeyDistance,TraceTier} from './trace.ts';
@@ -109,6 +111,8 @@ export class Retrieval {
   private readonly traceEnabled:boolean;
   private readonly traceCeiling:number;
   private readonly traceLimit:number;
+  // Independent of scope projections: retries and clears keep reusable detail vectors.
+  private readonly recallDetailVectors = new Map<string, readonly number[]>();
 
   constructor(directory: string,options:RetrievalOptions={}) {
     this.directory = directory;
@@ -142,6 +146,8 @@ export class Retrieval {
     nowMs: number,
     options: {
       currentSource?: CurrentSource;
+      /** Per-call overrides; absent values preserve the constructor settings and cache key. */
+      recallTrace?: Pick<RecallTraceOptions, 'enabled' | 'limit'>;
     } = {}
   ): Promise<RetrievalResult> {
     if (typeof query !== 'string' || query.length > 20000)
@@ -151,6 +157,11 @@ export class Retrieval {
       throw new Error('invalid_time');
 
     const currentSource = options.currentSource;
+    const effectiveTrace = recallTraceOf({
+      enabled: options.recallTrace?.enabled ?? this.traceEnabled,
+      ceiling: this.traceCeiling,
+      limit: options.recallTrace?.limit ?? this.traceLimit,
+    });
 
     checkCurrentSource(currentSource);
     // The index and the ranking read the stages without any cue. The cue recalls only feed the gate.
@@ -232,7 +243,7 @@ export class Retrieval {
           admission: [],
           traceCandidates: [],
           trace: {
-            status: this.traceEnabled ? 'idle' : 'off',
+            status: effectiveTrace.enabled ? 'idle' : 'off',
             keys: 0,
             missing: 0
           },
@@ -329,7 +340,7 @@ export class Retrieval {
           // Time is read only through current membership, access and cue/trace eligibility. Visit records once;
           // hashing is O(records + projected text bytes). clearKeyText retains its per-record bound in trace.ts.
 
-          const traceRows = this.traceEnabled
+          const traceRows = effectiveTrace.enabled
             ? [...raw.memories.keys()].flatMap(
               id => {
                 const memory = currentMemory(raw, id, nowMs);
@@ -373,10 +384,10 @@ export class Retrieval {
                 providerDegradation?.httpStatus,
                 // The candidates depend on the answered source; a search with the trace switched off does not.
                 TRACE_POLICY_VERSION,
-                this.traceEnabled,
+                effectiveTrace.enabled,
                 this.traceCeiling,
-                this.traceLimit,
-                ...(this.traceEnabled ? [currentSource?.id, currentSource?.revision] : [])
+                effectiveTrace.limit,
+                ...(effectiveTrace.enabled ? [currentSource?.id, currentSource?.revision] : [])
               ]
             )
           );
@@ -404,7 +415,7 @@ export class Retrieval {
           // Recall trace, decision: hashing, loading and distances, no provider call. A failure stays inside.
 
           let trace: RetrievalResult['trace'] = {
-            status: this.traceEnabled ? 'idle' : 'off',
+            status: effectiveTrace.enabled ? 'idle' : 'off',
             keys: 0,
             missing: 0
           };
@@ -415,7 +426,7 @@ export class Retrieval {
 
           let traceCacheable = true;
 
-          if (this.traceEnabled && activeEmbedding) {
+          if (effectiveTrace.enabled && activeEmbedding) {
             try {
               tracePlan = await this.traceDecision(
                 key,
@@ -424,7 +435,8 @@ export class Retrieval {
                 nowMs,
                 currentSource,
                 activeEmbedding,
-                () => this.queryVector(key, queries[0], activeEmbedding, deadline)
+                () => this.queryVector(key, queries[0], activeEmbedding, deadline),
+                effectiveTrace.limit
               );
 
               if (tracePlan) {
@@ -794,6 +806,42 @@ export class Retrieval {
     this.tables.clear();
     this.traces.clear();
     this.queryVectors.clear();
+    this.recallDetailVectors.clear();
+  }
+
+  /**
+   * Embed an ordered detail batch outside the search queue, using a deadline fixed at entry.
+   * No uncached text means a synchronous result; requests settle to distances or a logged fallback, never rejection.
+   */
+  recallDetailDistances(
+    requests: readonly RecallDetailRequest[],
+    config: ModelConfig,
+    reserve: () => boolean
+  ): RecallDetailDistances | Promise<RecallDetailDistances> {
+    const deadline = Date.now() + RECALL_DETAIL_EMBEDDING.timeoutMs;
+    try {
+      const provider = configured(config, 'embedding');
+      if (!provider) return requests.map(() => undefined);
+      return recallDetailEmbedding(requests, {
+        identity: JSON.stringify([identity(provider), digest(provider.key)]),
+        cache: this.recallDetailVectors,
+        deadline,
+        reserve,
+        embed: (texts, end) => embed(provider, texts, end),
+        distance: keyDistance,
+        failure: error => providerFailure(error) ?? {
+          failure: error instanceof Error && error.message === 'recall_detail_timeout' ? 'timeout' : 'provider_error',
+          attention: 'transient',
+        },
+      });
+    } catch {
+      recordRetrievalFallback('recall_details_fallback', {
+        stage: 'recall_details',
+        failure: 'configuration',
+        attention: 'configuration',
+      });
+      return requests.map(() => undefined);
+    }
   }
 
   async clear(scope: Scope): Promise<void> {
@@ -1118,7 +1166,7 @@ export class Retrieval {
    * distance per target. On an incomplete projection the plan carries decide for the build.
    */
   private async traceDecision(key:string,raw:MemorySnapshot,cued:MemorySnapshot,nowMs:number,currentSource:CurrentSource|undefined,
-    embedding:Provider,query:()=>Promise<readonly number[]>):Promise<TracePlan|undefined>{
+    embedding: Provider, query: () => Promise<readonly number[]>, limit: number): Promise<TracePlan | undefined> {
     const clock=raw.memoryTimeMs??nowMs;
     const records:Memory[]=[],holders:TraceHolder[]=[];
     for(const id of raw.memories.keys()){
@@ -1162,7 +1210,7 @@ export class Retrieval {
         const distance=distances.get(reference.hash);
         if(distance!==undefined)keys.push({id:reference.id,distance});
       }
-      return traceCandidates(holders,keys,{ceiling:this.traceCeiling,limit:this.traceLimit,exclude});
+      return traceCandidates(holders, keys, {ceiling: this.traceCeiling, limit, exclude});
     };
     // A missing key: no decision yet. The build calls decide when it has completed the projection.
     if([...needed.keys()].some(hash=>!scope.vectors.has(hash)))return {scope,needed,live,candidates:[],status:'building',decide};

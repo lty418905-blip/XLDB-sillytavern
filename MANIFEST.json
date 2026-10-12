@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "da6836b3e6188255e86e2a07f3cb77584af1e26181899e68f8d741ec6f825eb4",
+  "sourceManifestSha256": "946f7bb672fa9d02e24a10f85ff17e604ecf6e9e78ebcfa273d68f3a51863102",
   "files": [
     {
       "file": ".gitattributes",
@@ -99,8 +99,8 @@
     },
     {
       "file": "shared/src/common/amount-expressions.ts",
-      "sha256": "8f05e9cdc1fb88f6deb291ed4a76635793c97fa2524aa4e2c25e3258c0918773",
-      "bytes": 154577
+      "sha256": "a992cb6e7fadbed378409fbdaa2b82272df6a79d4c4200b1d9f23839531dc4eb",
+      "bytes": 170751
     },
     {
       "file": "shared/src/common/geography-background.ts",
@@ -199,8 +199,8 @@
     },
     {
       "file": "shared/src/core/service.ts",
-      "sha256": "348e73796bb91765e849dfc942cf42aff9dbe6c62977c410f4625ff3637f5ade",
-      "bytes": 39216
+      "sha256": "cbc2a8b9956a3cb0759559884b0a7c22b3492439ab8c260de8de199964b9261c",
+      "bytes": 42639
     },
     {
       "file": "shared/src/core/store.ts",
@@ -254,8 +254,8 @@
     },
     {
       "file": "shared/src/judge/call-sites.ts",
-      "sha256": "bc2bc36b5950ed1e4e1fd83adbc20a3608e876da76fc7b9230e5999e964eddbf",
-      "bytes": 4272
+      "sha256": "25e40f0861db4f6113ad95a3912fced15a8e87f50576781bb8277036cd419a6a",
+      "bytes": 4561
     },
     {
       "file": "shared/src/judge/provider.ts",
@@ -304,8 +304,23 @@
     },
     {
       "file": "shared/src/memory/recall-details.ts",
-      "sha256": "987bd3ecdc71f0c7873001940243e82accc878d4c17602b24d837ddedafd16b0",
-      "bytes": 37152
+      "sha256": "3ae2ec61392a8868147a3eb5908648dd9628c67a98e54352e6a3e76a8df5eda9",
+      "bytes": 37191
+    },
+    {
+      "file": "shared/src/memory/recall-judge-details.ts",
+      "sha256": "df0160321409150085b9e18c25f477b1cb14caf8c12e638fcabce253ccb490c3",
+      "bytes": 7015
+    },
+    {
+      "file": "shared/src/memory/recall-judge-input.ts",
+      "sha256": "f0bacf0bd4fefe2145c2323f6fab75e3f55c669230254a6cd0a17404931941ff",
+      "bytes": 9307
+    },
+    {
+      "file": "shared/src/memory/recall-judge.ts",
+      "sha256": "9dee6e277a40f54d794a262d754b3528dd710f1945d1c567d0cc2d3ba15f718e",
+      "bytes": 21118
     },
     {
       "file": "shared/src/memory/relevance.ts",
@@ -324,8 +339,8 @@
     },
     {
       "file": "shared/src/memory/retrieval.ts",
-      "sha256": "4fac0b30f391eb72f2bad425ad4e71ad011c96cb0807e3f97cb9c9cf5fbd1a6d",
-      "bytes": 70271
+      "sha256": "7c059c8daddd512b55dcf5f41cd71e92fcb4aebff0b85b34b264d8399adf7910",
+      "bytes": 72481
     },
     {
       "file": "shared/src/memory/text-units.ts",
@@ -339,8 +354,8 @@
     },
     {
       "file": "shared/src/memory/trace.ts",
-      "sha256": "365fe2d321598d5a8821fa1d0556474c57d32ff06cc43e3f06a4f48b94f16952",
-      "bytes": 6885
+      "sha256": "df523f9657d84d408142544487a796408ebf86f526f382ef3d1f202484a59a71",
+      "bytes": 6889
     },
     {
       "file": "shared/src/memory/vector-forgetting.ts",
@@ -449,13 +464,13 @@
     },
     {
       "file": "shared/src/scene/service.ts",
-      "sha256": "ebd7ac1159105888b5889aa3a35bb4d748ac55b5c8f4f2448f9b10544d29726b",
-      "bytes": 133721
+      "sha256": "ae6f69ce3720f810df15ceeb27297412c98075246b98bd69b808fa1a5ac458db",
+      "bytes": 135238
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "c7a9c1dcfe50e77056207401b684d98c82b56fdffbd1a1eccc4a7803d3deb856",
-      "bytes": 116109
+      "sha256": "65f2b44aaa714d6e827458fdd4b180a14d7d69755d07fd086322228ea4fb36f7",
+      "bytes": 124534
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
@@ -519,8 +534,8 @@
     },
     {
       "file": "shared/src/scene/world-ledger.ts",
-      "sha256": "fabc9b26f5c1c1bff7184a76c276f3626e4d5178018e0acc44efedfff4c6ede9",
-      "bytes": 203277
+      "sha256": "3dc9e32af0c40fda676a1a2fcb5bb8df64728ffb17ba569c1cb01839d6fe5c23",
+      "bytes": 205041
     },
     {
       "file": "shared/src/scene/world-state.ts",
@@ -634,12 +649,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "af2cc4b7fd81def962b56a42147118a002980401f154847aa0fdbcce615733f1",
+      "sha256": "562f823471a3a478694829344cb913a8e5b7c9fa58206c28bb49c157933a719d",
       "bytes": 351441
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "9c2c73afe799ed331cd4bbc68680dad2fb8911bbabc99148169ee420698f2388",
+      "sha256": "22313d83022d5e4316d9f2b184e0c2b4cf863ecb0bc6e0cc17b81c701e8a630d",
       "bytes": 356564
     }
   ]
