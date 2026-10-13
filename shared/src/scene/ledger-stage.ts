@@ -50,6 +50,7 @@ import {
   ledgerEntryView,
   ledgerNumberReading,
   ledgerValueTable,
+  LEDGER_RECENT_MESSAGE_COUNT,
   type LedgerInputBundle,
   type LedgerInputRequest,
   type LedgerSelection,
@@ -63,10 +64,22 @@ import {
   LEDGER_CORRECTIONS,
 } from './ledger-stage-tools.ts';
 
-/** Ledger-only contract. The world-stage default remains version 3 until the later wiring change. */
+// Match the same local message spellings as the accepted-history window.
+const MESSAGE_CONTAINER_PATTERN = new RegExp(`^m(?:0|-[1-${LEDGER_RECENT_MESSAGE_COUNT}])$`);
+// Ruled quote-search cap per read call, bounding repeated-occurrence parser work.
+const READ_QUOTE_MATCH_COUNT = 64;
+// Ruled readable-row and nearby-reference limits per read call; update the tool description with this cap.
+const READ_RESULT_COUNT = 6;
+// Ruled default entry count per lookup; the tool description states this value and must change with it.
+const LOOKUP_DEFAULT_ENTRIES = 5;
+// Ruled default source count per lookup; the tool description states this value and must change with it.
+const LOOKUP_DEFAULT_SOURCES = 50;
+
+/** Ledger-only contract, independent of the default world-stage version 3. */
 export const LEDGER_STAGE_CONTRACT = 4;
 
-/** Explicit L4 limits: first nine provisional pending acceptance calibration; last two are L4 hardening defaults. */
+/** Explicit loop limits: the first nine are provisional pending acceptance calibration.
+ * The last two use the loop's hardened UTF-16 result limits. */
 export const LEDGER_STAGE_LIMITS = Object.freeze(
   {
     requests: 8,
@@ -181,7 +194,8 @@ export function decideLedgerRun(
   }
 }
 
-/** Stored fact with an L1 tree and current-prose UTF-16 regions. Whole marks retain their explicit whole identity. */
+/** Stored fact with a calculation tree and current-prose UTF-16 regions.
+ * Whole marks retain their explicit whole identity. */
 export interface LedgerStageFact {
   tree: JsonValue;
   forSpan: LedgerSpan | null;
@@ -276,7 +290,7 @@ function proposalReferences(
 function proposalInput(
   args: ToolObject,
   bundle: LedgerInputBundle): ToolObject {
-  // L2 binds item.in by persistent source id; the model sees only these local message aliases.
+  // The world-ledger proposal checker binds item.in by persistent source id; the model sees local message aliases.
   const sources = new Map<string, string>([['m0', bundle.source.sourceId]]);
   bundle.previous.forEach((source, index) => sources.set(`m-${bundle.previous.length - index}`, source.sourceId));
   return {
@@ -293,10 +307,19 @@ function proposalInput(
 function readSource(
   tables: LedgerTables,
   container: string): LedgerText | null {
-  if (/^m(?:0|-[1-6])$/.test(container)) return tables.sources.get(container) ?? null;
+  if (MESSAGE_CONTAINER_PATTERN.test(container)) return tables.sources.get(container) ?? null;
   if (!/^e[1-9]\d*$/.test(container)) return null;
   const entry = tables.entries.get(container);
-  return entry ? tables.sources.get(JSON.stringify([entry.sourceId, entry.revision])) ?? null : null;
+  if (!entry) return null;
+  const current = tables.sources.get('m0');
+  if (current?.sourceId === entry.sourceId && current.revision === entry.revision) return null;
+
+  // History aliases and folded distance can disagree; only the visible source identity grants access.
+  for (let index = 1; index <= LEDGER_RECENT_MESSAGE_COUNT; index++) {
+    const source = tables.sources.get(`m-${index}`);
+    if (source?.sourceId === entry.sourceId && source.revision === entry.revision) return source;
+  }
+  return null;
 }
 
 function nearbyReadings(
@@ -315,7 +338,7 @@ function nearbyReadings(
     if (reading.source.sourceId !== source.sourceId || reading.source.revision !== source.revision) continue;
     const span = reading.type === 'number' ? reading.span : reading.expression;
     if (span.start < end && start < span.end) result.push(ref);
-    if (result.length === 6) break;
+    if (result.length === READ_RESULT_COUNT) break;
   }
   return result;
 }
@@ -328,7 +351,7 @@ function readAmount(
   const quote = args.quote as string;
   if (quote.trim() === '') return {ok: false, error: 'quote_not_found'};
   // Ruled bounded search: repeated quote occurrences cannot multiply parser scans.
-  const matches = scriptQuoteSearch(source.text, quote, 64);
+  const matches = scriptQuoteSearch(source.text, quote, READ_QUOTE_MATCH_COUNT);
   if (!matches.matches.length) return {ok: false, error: 'quote_not_found'};
   const kind = args.kind as string;
   if (!['amount', 'quantity', 'rate', 'number'].includes(kind)) return {ok: false, error: 'unsupported_kind'};
@@ -344,7 +367,7 @@ function readAmount(
     }
   }
   const found: ToolObject[] = [];
-  for (const expression of [...candidates.values()].sort((left, right) => left.start - right.start).slice(0, 6)) {
+  for (const expression of [...candidates.values()].sort((left, right) => left.start - right.start)) {
     const reading = kind === 'number'
       ? ledgerNumberReading(source, expression)
       : {
@@ -357,6 +380,7 @@ function readAmount(
     if (!row) continue;
     const {in: _container, ...feedback} = row;
     found.push(feedback);
+    if (found.length === READ_RESULT_COUNT) break;
   }
   if (!found.length) return {
     ok: false,
@@ -384,7 +408,9 @@ function matchesParty(
     party => 'external' in party
       ? party.external?.quote ?? ''
       : 'unconfigured' in party ? party.unconfigured.label?.quote ?? '' : '');
-  for (const quote of Object.values(entry.externalQuotes ?? {})) if (quote) quotes.push(quote.quote);
+  for (const quote of Object.values(entry.externalQuotes ?? {})) {
+    if (quote) quotes.push(quote.quote);
+  }
   return quotes.some(quote => foldForMatch(quote).includes(folded));
 }
 
@@ -392,28 +418,33 @@ function ledgerLookup(
   tables: LedgerTables,
   bundle: LedgerInputBundle,
   args: ToolObject): ToolObject {
-  if (!['party', 'item', 'account', 'kind', 'state'].some(key => Object.hasOwn(args, key))) {
+  const party = args.party === '' ? null : args.party;
+  const item = args.item === '' ? null : args.item;
+  const kind = (args.kind as string[] | null)?.length ? args.kind as string[] : null;
+  const state = (args.state as string[] | null)?.length ? args.state as string[] : null;
+  if ([party, item, args.account, kind, state].every(value => value == null)) {
     return {ok: false, error: 'no_filter'};
   }
   const accounts = bundle.view.accounts.filter(account => account.status !== 'closed');
   if (args.account != null && !accounts.some(account => account.id === args.account)) {
     return {ok: false, error: 'unknown_account'};
   }
-  const limit = args.limit as number ?? 5;
-  const lastSources = args.lastSources as number ?? 50;
+  const limit = args.limit as number ?? LOOKUP_DEFAULT_ENTRIES;
+  const lastSources = args.lastSources as number ?? LOOKUP_DEFAULT_SOURCES;
   const entries = (bundle.view.before?.entries ?? []).filter(
     entry => {
       if (entry.kind === 'adjustment' || entry.laterSources >= lastSources) return false;
-      if (args.account != null && !parties(entry).some(party => 'account' in party && party.account === args.account)) {
+      if (args.account != null && !parties(entry).some(entryParty =>
+        'account' in entryParty && entryParty.account === args.account)) {
         return false;
       }
-      if (args.party != null && !matchesParty(entry, args.party as string, bundle)) return false;
-      if (args.item != null && !foldForMatch(entry.item?.quote ?? '').includes(foldForMatch(args.item as string))) {
+      if (party != null && !matchesParty(entry, party as string, bundle)) return false;
+      if (item != null && !foldForMatch(entry.item?.quote ?? '').includes(foldForMatch(item as string))) {
         return false;
       }
-      if (args.kind != null && !(args.kind as string[]).includes(entry.kind)) return false;
-      const state = entry.status === 'committed' || entry.status === 'quoted' ? entry.status : entry.disposition;
-      return args.state == null || (args.state as string[]).includes(state);
+      if (kind != null && !kind.includes(entry.kind)) return false;
+      const entryState = entry.status === 'committed' || entry.status === 'quoted' ? entry.status : entry.disposition;
+      return state == null || state.includes(entryState);
     }).reverse();
   const rows = entries.slice(0, limit).map(entry => ledgerEntryView(tables, entry, true));
   if (rows.some(row => row === null)) return {ok: false, error: 'ledger_internal'};
@@ -436,8 +467,8 @@ function factsFrom(
       ignored.push(ref);
       continue;
     }
-    const money = bundle.allMarks.find(mark => mark.id === fact.mark);
-    const math = bundle.selection.math.find(mark => mark.id === fact.mark);
+    const money = bundle.allMarks.find(mark => mark.id.startsWith('k') && mark.id === fact.mark);
+    const math = bundle.selection.math.find(mark => mark.id.startsWith('j') && mark.id === fact.mark);
     const mark = money ? ('whole' in money ? {whole: true as const} : {...money.span}) : math?.position ?? null;
     facts.push(
       {
@@ -462,202 +493,203 @@ function validRecord(
   return decoded.ok ? record : null;
 }
 
-/** Creates synchronous tools and a finish closure. Optional checker injection preserves the L2 contract in tests.
- * Input tables are copied. Checker errors follow the proposal failure rules; construction failure returns null. */
+interface LedgerToolState {
+  bundle: LedgerInputBundle;
+  pin: string;
+  checkProposal: typeof checkLedgerProposal;
+  tables: LedgerTables;
+  calculations: CalculationExecution;
+  calculationSpans: Map<string, LedgerSpan>;
+  last: LedgerProposalResult | null;
+  lastContext: LedgerProposalContext | null;
+  previousItems: {id: string; passed: boolean}[];
+  confirmationUsed: boolean;
+  finished: boolean;
+  finishedValue: LedgerFinished | null;
+}
+
+function calculateLedgerTool(runtime: LedgerToolState, args: ToolObject): ToolObject {
+  const used = selectedReadings(runtime.tables, args.operands as string[], runtime.calculations);
+  const values = ledgerValueTable(runtime.tables, used.readings);
+  if (!values) return {ok: false, error: 'ledger_values_invalid'};
+
+  const step = executeCalculation({op: args.op, operands: args.operands}, values, runtime.calculations);
+  if (step.result.ok) {
+    runtime.calculations = step.state;
+    const span = locate(runtime.bundle.source.text, args.for);
+    if (span) runtime.calculationSpans.set(step.result.ref, span);
+  }
+  return {...step.result};
+}
+
+function proposalContext(runtime: LedgerToolState, args: ToolObject): LedgerProposalContext {
+  const {bundle, tables, calculations, last} = runtime;
+  const used = selectedReadings(tables, proposalReferences(args), calculations);
+  return {
+    source: bundle.source,
+    previous: bundle.previous,
+    marks: bundle.selection.marks,
+    readings: used.readings,
+    calculations,
+    settings: bundle.view.settings,
+    accounts: bundle.view.accounts,
+    before: bundle.view.before,
+    ...(last ? {state: last.state} : {}),
+    entryRefs: used.entryRefs,
+    ...(bundle.frozen ? {keptEntries: bundle.frozen.keptEntries} : {}),
+  };
+}
+
+function postLedgerEntries(runtime: LedgerToolState, args: ToolObject): ProposalReply {
+  const compute = (args.compute ?? []) as ToolObject[];
+  const operands = compute.flatMap(item => item.operands as string[]);
+  const selected = selectedReadings(runtime.tables, operands, runtime.calculations);
+  const values = ledgerValueTable(runtime.tables, selected.readings);
+  if (!values) throw new Error('ledger_values_invalid');
+
+  const computed = computeCalculations(compute, values, runtime.calculations);
+  runtime.calculations = computed.state;
+  const context = proposalContext(runtime, args);
+  const checked = runtime.checkProposal(proposalInput(args, runtime.bundle), context);
+  if (checked.error) throw new Error(checked.error);
+
+  const items = checked.entries.map(entry => ({
+    id: entry.id,
+    passed: entry.verdict === 'accepted' || entry.verdict === 'flagged',
+  }));
+  const settled = checked.entries.every(entry => entry.verdict !== 'returned') && checked.uncovered.length === 0;
+  const present = new Set(items.map(item => item.id));
+  const confirmation = settled && !runtime.confirmationUsed
+    && runtime.previousItems.some(item => item.passed && !present.has(item.id));
+  const result = ledgerProposalFeedback(checked, computed.steps.map(step => step.result), !settled || confirmation);
+
+  // Feedback can still be rejected by the loop; finish discards all versions on failure.
+  runtime.last = checked;
+  runtime.lastContext = context;
+  runtime.previousItems = items;
+  if (confirmation) runtime.confirmationUsed = true;
+  return {result, items, settled};
+}
+
+function finishLedgerRecord(runtime: LedgerToolState, result: ToolLoopResult): LedgerFinished | null {
+  const {bundle, last, calculations, calculationSpans, pin} = runtime;
+  const defaultReason = result.stop === 'done' || result.stop === 'kept'
+    ? 'not_covered'
+    : result.stop === 'requests' || result.stop === 'time' ? 'stage_cap' : 'stage_unavailable';
+  const finalized = finalizeLedgerRun({
+    source: bundle.source,
+    marks: bundle.allMarks,
+    last: result.lastProposal ? last : null,
+    ...(bundle.frozen ? {frozen: bundle.frozen} : {}),
+    withdrawn: result.withdrawn,
+    defaultReason,
+  });
+  if (!finalized.ok) return null;
+
+  // Facts resolve against the final calculation state, including results produced after the last proposal.
+  const facts = result.lastProposal
+    ? factsFrom(result.lastProposal.args, calculations, bundle, calculationSpans)
+    : {facts: [], ignored: []};
+  const record = validRecord({
+    schema: 1,
+    contract: LEDGER_STAGE_CONTRACT,
+    pin,
+    outcome: result.outcome,
+    stop: result.stop,
+    entries: finalized.value.entries,
+    unbooked: finalized.value.unbooked,
+    facts: facts.facts as unknown as JsonValue,
+    trace: traceOf(result),
+  });
+  if (!record) return null;
+
+  return {
+    ledger: record,
+    payload: {conversation: result.conversation, ignoredFactRefs: facts.ignored},
+  };
+}
+
+function finishLedgerState(runtime: LedgerToolState, result: ToolLoopResult): LedgerFinished | null {
+  if (runtime.finished) return runtime.finishedValue;
+  runtime.finished = true;
+  try {
+    if (result.state === 'cancelled' || result.state === 'failed') return null;
+    if (result.stop === 'kept') {
+      const {last, lastContext, bundle, calculations} = runtime;
+      if (!last || !lastContext || !result.lastProposal) return null;
+
+      // The loop skipped execution for this answer; recheck without recomputing or recording another request.
+      runtime.last = runtime.checkProposal(proposalInput(result.lastProposal.args, bundle), {
+        ...lastContext,
+        calculations,
+        state: last.state,
+      });
+      if (runtime.last.error) return null;
+    }
+    runtime.finishedValue = finishLedgerRecord(runtime, result);
+    return runtime.finishedValue;
+  } catch {
+    return null;
+  }
+}
+
+function ordinaryLedgerTool(execute: (args: ToolObject) => ToolObject): (args: ToolObject) => ToolObject {
+  return args => {
+    try {
+      return execute(args);
+    } catch {
+      return {ok: false, error: 'ledger_internal'};
+    }
+  };
+}
+
+/** Creates four synchronous tools and a memoized finish closure with copied per-run tables.
+ * Checker errors and proposal exceptions escape to the loop; invalid construction returns null. */
 export function createLedgerTools(
   bundle: LedgerInputBundle,
   pin: string,
   checkProposal: typeof checkLedgerProposal = checkLedgerProposal,
-): {
-  tools: ToolDefinition[];
-  handle: LedgerRunHandle;
-} | null {
+): {tools: ToolDefinition[]; handle: LedgerRunHandle} | null {
   try {
-    const tables = cloneTables(bundle.tables);
-    let calculations = createCalculationExecution();
-    const calculationSpans = new Map<string, LedgerSpan>();
-    let last: LedgerProposalResult | null = null;
-    let lastContext: LedgerProposalContext | null = null;
-    let previousItems: {id: string; passed: boolean}[] = [];
-    let confirmationUsed = false;
-    let finished = false;
-    let finishedValue: LedgerFinished | null = null;
-
-    const calculate = (
-      args: ToolObject): ToolObject => {
-      const used = selectedReadings(tables, args.operands as string[], calculations);
-      const values = ledgerValueTable(tables, used.readings);
-      if (!values) return {ok: false, error: 'ledger_values_invalid'};
-      const step = executeCalculation({op: args.op, operands: args.operands}, values, calculations);
-      if (step.result.ok) {
-        calculations = step.state;
-        const span = locate(bundle.source.text, args.for);
-        if (span) calculationSpans.set(step.result.ref, span);
-      }
-      return {...step.result};
+    const runtime: LedgerToolState = {
+      bundle,
+      pin,
+      checkProposal,
+      tables: cloneTables(bundle.tables),
+      calculations: createCalculationExecution(),
+      calculationSpans: new Map(),
+      last: null,
+      lastContext: null,
+      previousItems: [],
+      confirmationUsed: false,
+      finished: false,
+      finishedValue: null,
     };
-
-    const post = (
-      args: ToolObject): ProposalReply => {
-      const compute = (args.compute ?? []) as ToolObject[];
-      const operands = compute.flatMap(item => item.operands as string[]);
-      const values = ledgerValueTable(tables, selectedReadings(tables, operands, calculations).readings);
-      if (!values) return {result: {ok: false, error: 'ledger_values_invalid'}, items: [], settled: false};
-      const computed = computeCalculations(compute, values, calculations);
-      calculations = computed.state;
-      const used = selectedReadings(tables, proposalReferences(args), calculations);
-      const context: LedgerProposalContext = {
-        source: bundle.source,
-        previous: bundle.previous,
-        marks: bundle.selection.marks,
-        readings: used.readings,
-        calculations,
-        settings: bundle.view.settings,
-        accounts: bundle.view.accounts,
-        before: bundle.view.before,
-        ...(last ? {state: last.state} : {}),
-        entryRefs: used.entryRefs,
-        ...(bundle.frozen ? {keptEntries: bundle.frozen.keptEntries} : {}),
-      };
-      const checked = checkProposal(proposalInput(args, bundle), context);
-      if (checked.error) {
-        if (['context_invalid', 'history_invalid', 'history_limit'].includes(checked.error)) {
-          throw new Error(checked.error);
-        }
-        return {result: {ok: false, error: 'ledger_internal'}, items: [], settled: false};
-      }
-      const items = checked.entries.map(
-        entry => ({
-          id: entry.id,
-          passed: entry.verdict === 'accepted' || entry.verdict === 'flagged',
-        }));
-      const settled = checked.entries.every(entry => entry.verdict !== 'returned') && checked.uncovered.length === 0;
-      const present = new Set(items.map(item => item.id));
-      const confirmation = settled && !confirmationUsed
-        && previousItems.some(item => item.passed && !present.has(item.id));
-      const result = ledgerProposalFeedback(checked, computed.steps.map(step => step.result), !settled || confirmation);
-      // The loop can still reject feedback. finish discards everything in that case rather than storing this candidate.
-      last = checked;
-      lastContext = context;
-      previousItems = items;
-      if (confirmation) confirmationUsed = true;
-      return {result, items, settled};
-    };
-
-    const ordinary = (
-      execute: (args: ToolObject) => ToolObject) => (
-        args: ToolObject): ToolObject => {
-        try {
-          return execute(args);
-        } catch {
-          return {ok: false, error: 'ledger_internal'};
-        }
-      };
     const tools: ToolDefinition[] = [
-      {name: 'calculate', check: args => checkLedgerTool('calculate', args), execute: ordinary(calculate)},
+      {
+        name: 'calculate',
+        check: args => checkLedgerTool('calculate', args),
+        execute: ordinaryLedgerTool(args => calculateLedgerTool(runtime, args)),
+      },
       {
         name: 'read_amount',
         check: args => checkLedgerTool('read_amount', args),
-        execute: ordinary(args => readAmount(tables, args))
+        execute: ordinaryLedgerTool(args => readAmount(runtime.tables, args)),
       },
       {
         name: 'ledger_lookup',
         check: args => checkLedgerTool('ledger_lookup', args),
-        execute: ordinary(args => ledgerLookup(tables, bundle, args))
+        execute: ordinaryLedgerTool(args => ledgerLookup(runtime.tables, bundle, args)),
       },
       {
         name: 'post_entries',
         proposal: true,
         check: args => checkLedgerTool('post_entries', args),
-        execute(
-          args) {
-          try {
-            return post(args);
-          } catch (error) {
-            if (error instanceof Error && [
-              'context_invalid',
-              'history_invalid',
-              'history_limit',
-              'ledger_result_oversized',
-            ].includes(
-              error.message
-            )) throw error;
-            return {result: {ok: false, error: 'ledger_internal'}, items: [], settled: false};
-          }
-        },
+        // Proposal failure must end the loop rather than count as a processed version.
+        execute: args => postLedgerEntries(runtime, args),
       },
     ];
-    const handle: LedgerRunHandle = {
-      finish(
-        result) {
-        if (finished) return finishedValue;
-        finished = true;
-        try {
-          if (result.state === 'cancelled' || result.state === 'failed') return null;
-          if (result.stop === 'kept') {
-            if (!last || !lastContext || !result.lastProposal) return null;
-            const args = result.lastProposal.args;
-            // L4 did not execute this answer. Recheck with the final state, without computing a second time.
-            last = checkProposal(
-              proposalInput(args, bundle),
-              {
-                ...lastContext,
-                calculations,
-                state: last.state,
-              }
-            );
-            if (last.error) return null;
-          }
-          const defaultReason = result.stop === 'done' || result.stop === 'kept'
-            ? 'not_covered'
-            : result.stop === 'requests' || result.stop === 'time' ? 'stage_cap' : 'stage_unavailable';
-          const finalized = finalizeLedgerRun(
-            {
-              source: bundle.source,
-              marks: bundle.allMarks,
-              last: result.lastProposal ? last : null,
-              ...(bundle.frozen ? {frozen: bundle.frozen} : {}),
-              withdrawn: result.withdrawn,
-              defaultReason,
-            }
-          );
-          if (!finalized.ok) return null;
-          const facts = result.lastProposal
-            ? factsFrom(
-              result.lastProposal.args,
-              calculations,
-              bundle,
-              calculationSpans
-            )
-            : {facts: [], ignored: []};
-          const record = validRecord(
-            {
-              schema: 1,
-              contract: LEDGER_STAGE_CONTRACT,
-              pin,
-              outcome: result.outcome,
-              stop: result.stop,
-              entries: finalized.value.entries,
-              unbooked: finalized.value.unbooked,
-              facts: facts.facts as unknown as JsonValue,
-              trace: traceOf(result),
-            }
-          );
-          if (!record) return null;
-          finishedValue = {
-            ledger: record,
-            payload: {
-              conversation: result.conversation,
-              ignoredFactRefs: facts.ignored
-            }
-          };
-          return finishedValue;
-        } catch {
-          return null;
-        }
-      },
-    };
-    return {tools, handle};
+    return {tools, handle: {finish: result => finishLedgerState(runtime, result)}};
   } catch {
     return null;
   }
@@ -809,7 +841,8 @@ export function ledgerDeferred(
   }
 }
 
-/** Serializes a fully frozen L2 selection with no requests; non-skippable or invalid frozen data returns null. */
+/** Serializes a fully frozen authority selection with no requests.
+ * Non-skippable or invalid frozen data returns null. */
 export function ledgerFrozen(
   frozen: LedgerFreeze,
   pin: string): StoredLedger | null {
@@ -841,7 +874,7 @@ export function ledgerPin(
     return processingFingerprint(
       {
         source: {id: request.source.id, revision: request.source.revision, text: request.source.text},
-        recent: request.history.filter(message => message.status === 'accepted').slice(-6)
+        recent: request.history.filter(message => message.status === 'accepted').slice(-LEDGER_RECENT_MESSAGE_COUNT)
           .map(message => [message.id, message.revision]),
         roster: [
           {id: 'player', names: [request.playerName]},
@@ -880,98 +913,93 @@ export interface LedgerBaseInput {
   corrections: readonly {body: string; correction: LedgerCorrection}[];
 }
 
-/** Hashes only prefix authority data using L2 event positions. Invalid positions/body data return null, never
- * guessed positions.
- */
-export function ledgerBase(
-  input: LedgerBaseInput): string | null {
+// Use authority event positions rather than deriving a second ordering for account and correction rows.
+function ledgerBaseAuthorityRows(input: LedgerBaseInput) {
+  const positions = ledgerEventPositions(
+    input.sources,
+    input.accountEvents.map(row => row.event),
+    input.corrections.map(row => row.correction)
+  );
+  if (!positions.ok) return null;
+  const accountPositions = new Map(positions.value.accountEvents.map(row => [row.event.id, row.position]));
+  const adjustmentPositions = new Map(positions.value.adjustments.map(row => [
+    `user:${row.correction.id}`,
+    row.position,
+  ]));
+  const sourcePositions = new Map(input.sources.map((source, index) => [
+    JSON.stringify([source.sourceId, source.revision]),
+    index + 1,
+  ]));
+  const correctionPosition = (correction: LedgerCorrection): number | null => {
+    if (correction.action === 'adjustment') return adjustmentPositions.get(`user:${correction.id}`) ?? null;
+    if (correction.action === 'clear' && typeof correction.anchor === 'string'
+      && adjustmentPositions.has(correction.anchor)) return adjustmentPositions.get(correction.anchor)!;
+    return sourcePositions.get(JSON.stringify([correction.sourceId, correction.revision])) ?? null;
+  };
+
+  return {
+    accountEvents: input.accountEvents.filter(row => {
+      const position = accountPositions.get(row.event.id);
+      return position !== undefined && position <= input.position;
+    }).slice().sort((left, right) => left.event.seq - right.event.seq)
+      .map(row => [row.event.id, row.event.seq, row.event.kind, processingFingerprint(row.body)]),
+    corrections: input.corrections.filter(row => {
+      const position = correctionPosition(row.correction);
+      return position !== null && position <= input.position;
+    }).slice().sort((left, right) => left.correction.seq - right.correction.seq)
+      .map(row => [row.correction.seq, processingFingerprint(row.body)]),
+  };
+}
+
+function sortBaseRows(rows: [string, string, string | number, readonly string[] | null][]) {
+  return rows.sort((left, right) => {
+    if (left[0] !== right[0]) return left[0] < right[0] ? -1 : 1;
+    return left[1] < right[1] ? -1 : left[1] > right[1] ? 1 : 0;
+  });
+}
+
+/** Hashes only authority data before the source position, including original serialized event bodies.
+ * Invalid positions or body data return null. */
+export function ledgerBase(input: LedgerBaseInput): string | null {
   try {
-    if (!Number.isSafeInteger(
-      input.position
-    ) || input.position < 0 || input.position > input.sources.length) return null;
+    if (!Number.isSafeInteger(input.position) || input.position < 0 || input.position > input.sources.length) {
+      return null;
+    }
     if (!input.accountEvents.every(row => typeof row.body === 'string')
       || !input.corrections.every(row => typeof row.body === 'string')) return null;
-    const positions = ledgerEventPositions(
-      input.sources,
-      input.accountEvents.map(row => row.event),
-      input.corrections.map(row => row.correction)
-    );
-    if (!positions.ok) return null;
-    const accountPositions = new Map(positions.value.accountEvents.map(row => [row.event.id, row.position]));
-    const adjustmentPositions = new Map(positions.value.adjustments.map(
-      row => [
-        `user:${row.correction.id}`,
-        row.position
-      ]));
-    const sourcePositions = new Map(input.sources.map((
-      source,
-      index) => [
-        JSON.stringify([source.sourceId, source.revision]),
-        index + 1,
-      ]));
-    const correctionPosition = (
-      correction: LedgerCorrection): number | null => {
-      if (correction.action === 'adjustment') return adjustmentPositions.get(`user:${correction.id}`) ?? null;
-      if (correction.action === 'clear' && typeof correction.anchor === 'string'
-        && adjustmentPositions.has(correction.anchor)) return adjustmentPositions.get(correction.anchor)!;
-      return sourcePositions.get(JSON.stringify([correction.sourceId, correction.revision])) ?? null;
-    };
-    const sortRows = (
-      rows: [string, string, string | number, readonly string[] | null][]) => rows.sort((
-        left,
-        right) => {
-        if (left[0] !== right[0]) return left[0] < right[0] ? -1 : 1;
-        return left[1] < right[1] ? -1 : left[1] > right[1] ? 1 : 0;
-      });
-    return processingFingerprint(
-      {
-        balances: sortRows(
-          (input.settings?.balances ?? []).map(
-            row => [
-              row.ownerId,
-              row.unit,
-              row.value,
-              row.readerIds ?? null,
-            ])
-        ),
-        inventory: sortRows(
-          (input.settings?.inventory ?? []).map(
-            row => [
-              row.ownerId,
-              row.item,
-              row.count,
-              row.readerIds ?? null,
-            ])
-        ),
-        sources: input.sources.slice(0, input.position).map(
-          source => [
-            source.sourceId,
-            source.revision,
-            processingFingerprint(source.candidates ?? []),
-            source.ledger == null
-              ? null
-              : processingFingerprint(
-                {
-                  outcome: source.ledger.outcome,
-                  entries: source.ledger.entries,
-                  unbooked: source.ledger.unbooked,
-                }
-              ),
-          ]),
-        accountEvents: input.accountEvents.filter(
-          row => {
-            const position = accountPositions.get(row.event.id);
-            return position !== undefined && position <= input.position;
-          }).slice().sort((left, right) => left.event.seq - right.event.seq)
-          .map(row => [row.event.id, row.event.seq, row.event.kind, processingFingerprint(row.body)]),
-        corrections: input.corrections.filter(
-          row => {
-            const position = correctionPosition(row.correction);
-            return position !== null && position <= input.position;
-          }).slice().sort((left, right) => left.correction.seq - right.correction.seq)
-          .map(row => [row.correction.seq, processingFingerprint(row.body)]),
-      }
-    );
+    const authority = ledgerBaseAuthorityRows(input);
+    if (!authority) return null;
+    return processingFingerprint({
+      balances: sortBaseRows((input.settings?.balances ?? []).map(row => [
+        row.ownerId,
+        row.unit,
+        row.value,
+        row.readerIds ?? null,
+      ])),
+      inventory: sortBaseRows((input.settings?.inventory ?? []).map(row => [
+        row.ownerId,
+        row.item,
+        row.count,
+        row.readerIds ?? null,
+      ])),
+      sources: input.sources.slice(0, input.position).map(
+        source => [
+          source.sourceId,
+          source.revision,
+          processingFingerprint(source.candidates ?? []),
+          source.ledger == null
+            ? null
+            : processingFingerprint(
+              {
+                outcome: source.ledger.outcome,
+                entries: source.ledger.entries,
+                unbooked: source.ledger.unbooked,
+              }
+            ),
+        ]),
+      accountEvents: authority.accountEvents,
+      corrections: authority.corrections,
+    });
   } catch {
     return null;
   }

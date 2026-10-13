@@ -29,6 +29,25 @@ import {foldWorldState, type WorldSettings, type WorldSourceEffects} from './wor
 import type {ReferenceValues, ReferenceValue, JsonValue} from '../core/calculation-requests.ts';
 import type {SceneCharacter} from './types.ts';
 
+// Ruled context on each side of a reading, in Unicode code points.
+const READING_CONTEXT_CODE_POINTS = 12;
+// Ruled maximum transaction quote in an input or lookup row, in Unicode code points.
+const ENTRY_QUOTE_CODE_POINTS = 60;
+// Ruled recent-message display threshold, in Unicode code points.
+const RECENT_TEXT_CODE_POINTS = 600;
+// Ruled retained head and tail of each shortened recent message, in Unicode code points.
+const RECENT_TEXT_SIDE_CODE_POINTS = 300;
+/** Ruled count of accepted messages shared by input selection, container access and the pin.
+ * The model's recent-input explanation, read_amount container list and unknown_source condition,
+ * and the ago hint also state this count; update their wording when the count changes. */
+export const LEDGER_RECENT_MESSAGE_COUNT = 6;
+// Ruled cap on previous-message amount rows; current-message rows remain unbounded.
+const PREVIOUS_AMOUNT_ROW_COUNT = 24;
+// Ruled limit on posted or flagged entry rows per model input.
+const ENTRY_ROW_COUNT = 12;
+// Ruled combined limit on all open groups per model input.
+const OPEN_ROW_COUNT = 12;
+
 /** Accepted-message identity and full prose; optional status is required for selection from history. Offsets
  * are UTF-16.
  */
@@ -168,6 +187,7 @@ function textOf(
 
 function normalizedSettings(
   request: Pick<LedgerInputRequest, 'settings' | 'playerName' | 'characters'>): WorldSettings {
+  // Empty authority settings allow arithmetic without inventing balance or inventory rows.
   return request.settings ?? {
     mode: 'story',
     startTimeMs: 0,
@@ -259,7 +279,7 @@ function surrounding(
   before: boolean): string {
   let boundary = position;
   // At most 12 code points per side, including surrogate pairs; never rescan the preceding source prefix.
-  for (let count = 0;count < 12;count++) {
+  for (let count = 0; count < READING_CONTEXT_CODE_POINTS; count++) {
     if (before) {
       if (boundary <= 0) break;
       boundary--;
@@ -276,6 +296,51 @@ function surrounding(
   return before ? text.slice(boundary, position) : text.slice(position, boundary);
 }
 
+function ledgerReadingDisplay(reading: Exclude<LedgerReading, {type: 'money' | 'integer'}>) {
+  let values: string[] = [];
+  let range: LedgerReadingRow['range'] = null;
+  let unit = '';
+  let approx = false;
+  let bare = true;
+  if (reading.type === 'amount') {
+    const amount = reading.expression;
+    values = amount.kind === 'readings' ? amount.readings.map(value => ledgerDecimal(value.cents)!) : [];
+    range = amount.kind === 'range'
+      ? {
+        min: amount.min === null ? null : ledgerDecimal(amount.min),
+        max: amount.max === null ? null : ledgerDecimal(amount.max),
+      }
+      : null;
+    unit = ledgerUnitDisplay(amount.unit);
+    approx = amount.approx;
+    bare = amount.bare;
+  } else if (reading.type === 'quantity') {
+    const quantity = reading.expression;
+    if (quantity.kind === 'exact') values = [String(quantity.count)];
+    if (quantity.kind === 'range') {
+      range = {
+        min: quantity.min === null ? null : String(quantity.min),
+        max: quantity.max === null ? null : String(quantity.max)
+      };
+      approx = true;
+    }
+  } else if (reading.type === 'rate') {
+    const rate = reading.expression;
+    // The parser's rate denominator is exactly 100; formatting is integer hundredths, never float arithmetic.
+    if (rate.denominator !== 100n) return null;
+    values = rate.kind === 'exact' ? [ledgerDecimal(rate.numerator)!] : [];
+    range = rate.kind === 'range'
+      ? {
+        min: rate.min === null ? null : ledgerDecimal(rate.min),
+        max: rate.max === null ? null : ledgerDecimal(rate.max),
+      }
+      : null;
+    approx = rate.kind === 'range';
+  } else values = [reading.value];
+
+  return {values, range, unit, approx, bare};
+}
+
 /** Appends one parser expression under a fresh family ref. O(expression text); inaccessible input returns null. */
 export function appendLedgerReading(
   tables: LedgerTables,
@@ -288,46 +353,9 @@ export function appendLedgerReading(
     if (reading.type === 'quantity' && reading.expression.kind === 'unsupported') return null;
     const family = {amount: 'a', quantity: 'q', rate: 'r', number: 'u'}[reading.type] as 'a' | 'q' | 'r' | 'u';
     const expression = reading.type === 'number' ? reading.span : reading.expression;
-    let values: string[] = [];
-    let range: LedgerReadingRow['range'] = null;
-    let unit = '';
-    let approx = false;
-    let bare = true;
-    if (reading.type === 'amount') {
-      const amount = reading.expression;
-      values = amount.kind === 'readings' ? amount.readings.map(value => ledgerDecimal(value.cents)!) : [];
-      range = amount.kind === 'range'
-        ? {
-          min: amount.min === null ? null : ledgerDecimal(amount.min),
-          max: amount.max === null ? null : ledgerDecimal(amount.max),
-        }
-        : null;
-      unit = ledgerUnitDisplay(amount.unit);
-      approx = amount.approx;
-      bare = amount.bare;
-    } else if (reading.type === 'quantity') {
-      const quantity = reading.expression;
-      if (quantity.kind === 'exact') values = [String(quantity.count)];
-      if (quantity.kind === 'range') {
-        range = {
-          min: quantity.min === null ? null : String(quantity.min),
-          max: quantity.max === null ? null : String(quantity.max)
-        };
-        approx = true;
-      }
-    } else if (reading.type === 'rate') {
-      const rate = reading.expression;
-      // The parser's rate denominator is exactly 100; formatting is integer hundredths, never float arithmetic.
-      if (rate.denominator !== 100n) return null;
-      values = rate.kind === 'exact' ? [ledgerDecimal(rate.numerator)!] : [];
-      range = rate.kind === 'range'
-        ? {
-          min: rate.min === null ? null : ledgerDecimal(rate.min),
-          max: rate.max === null ? null : ledgerDecimal(rate.max),
-        }
-        : null;
-      approx = rate.kind === 'range';
-    } else values = [reading.value];
+    const display = ledgerReadingDisplay(reading);
+    if (!display) return null;
+    const {values, range, unit, approx, bare} = display;
 
     const ref = `${family}${tables.counters[family] + 1}`;
     const row: LedgerReadingRow = {
@@ -517,17 +545,7 @@ export function ledgerEntryView(
       ago: entry.laterSources + 1,
       quote: entry.act === null || !source
         ? null
-        : [
-          ...source.text.slice(
-            entry.act.start,
-            entry.act.end
-          )
-        ].slice(
-          0,
-          60
-        ).join(
-          ''
-        ),
+        : [...source.text.slice(entry.act.start, entry.act.end)].slice(0, ENTRY_QUOTE_CODE_POINTS).join(''),
     };
     if (typeof entry.key === 'string' && entry.key.startsWith('legacy:')) row.legacy = true;
     return row;
@@ -539,7 +557,10 @@ export function ledgerEntryView(
 function recentText(
   text: string): string {
   const points = [...text];
-  return points.length <= 600 ? text : points.slice(0, 300).join('') + '\n…\n' + points.slice(-300).join('');
+  return points.length <= RECENT_TEXT_CODE_POINTS
+    ? text
+    : points.slice(0, RECENT_TEXT_SIDE_CODE_POINTS).join('')
+      + '\n…\n' + points.slice(-RECENT_TEXT_SIDE_CODE_POINTS).join('');
 }
 
 function speaker(
@@ -550,225 +571,234 @@ function speaker(
   return request.characters.find(character => character.id === message.speakerId)?.name ?? null;
 }
 
+function createLedgerTables(
+  request: LedgerInputRequest,
+  source: LedgerText,
+  previous: LedgerText[],
+  accounts: LedgerAccount[],
+): LedgerTables {
+  const tables: LedgerTables = {
+    readings: Object.create(null),
+    rows: new Map(),
+    sources: new Map(),
+    entries: new Map(),
+    entryRefs: Object.create(null),
+    entryNumbers: new Map(),
+    identities: new Map(),
+    counters: {a: 0, q: 0, r: 0, u: 0, e: 0},
+    units: [...new Set(accounts.flatMap(account => account.rows.map(row => foldForMatch(row.unit))))],
+    work: {textUnits: 0, candidates: 0, searchWork: 0, rows: 0},
+  };
+  for (const item of request.sources) tables.sources.set(sourceKey(item), item);
+  tables.sources.set(sourceKey(source), source);
+  tables.sources.set('m0', source);
+  previous.forEach((item, index) => {
+    tables.sources.set(sourceKey(item), item);
+    tables.sources.set(`m-${previous.length - index}`, item);
+  });
+  return tables;
+}
+
+function scanLedgerExpressions(tables: LedgerTables, source: LedgerText, type: 'amount' | 'quantity' | 'rate') {
+  tables.work.textUnits += source.text.length;
+  const expressions = type === 'amount'
+    ? scanAmounts(source.text, {units: tables.units})
+    : type === 'quantity' ? scanQuantities(source.text) : scanRates(source.text);
+  tables.work.candidates += expressions.length;
+  return expressions;
+}
+
+function addLedgerExpression(
+  tables: LedgerTables,
+  container: string,
+  source: LedgerText,
+  type: 'amount' | 'quantity' | 'rate',
+  expression: unknown,
+): LedgerReadingRow | null {
+  return appendLedgerReading(tables, container, source, {
+    type,
+    source: {sourceId: source.sourceId, revision: source.revision},
+    expression,
+  } as LedgerReading);
+}
+
+function collectLedgerReadings(tables: LedgerTables, source: LedgerText, previous: LedgerText[]) {
+  const amounts: LedgerReadingRow[] = [];
+  const quantities: LedgerReadingRow[] = [];
+  const rates: LedgerReadingRow[] = [];
+  for (const expression of scanLedgerExpressions(tables, source, 'amount')) {
+    const row = addLedgerExpression(tables, 'm0', source, 'amount', expression);
+    if (row) amounts.push(row);
+  }
+  const previousAmounts = previous.flatMap((item, index) =>
+    scanLedgerExpressions(tables, item, 'amount').map(expression => ({
+      container: `m-${previous.length - index}`,
+      item,
+      expression,
+    }))).slice(-PREVIOUS_AMOUNT_ROW_COUNT);
+  for (const {container, item, expression} of previousAmounts) {
+    const row = addLedgerExpression(tables, container, item, 'amount', expression);
+    if (row) amounts.push(row);
+  }
+  for (const [type, target] of [['quantity', quantities], ['rate', rates]] as const) {
+    for (const expression of scanLedgerExpressions(tables, source, type)) {
+      const row = addLedgerExpression(tables, 'm0', source, type, expression);
+      if (row) target.push(row);
+    }
+  }
+  return {amounts, quantities, rates};
+}
+
+function appendLedgerBalances(tables: LedgerTables, accounts: LedgerAccount[]): boolean {
+  for (const account of accounts) {
+    for (const row of account.rows) {
+      if (!row.tracked) continue;
+      const parsed = parseAmount(row.value);
+      // The parser deliberately omits zero. The authority's canonical zero still supplies a valid balance leaf.
+      const cents = row.value === '0.00'
+        ? '0'
+        : parsed?.kind === 'readings' && parsed.readings.length === 1 ? parsed.readings[0].cents : null;
+      if (cents === null) return false;
+      const unit = moneyUnit(row.unit, null);
+      if (unit === null) return false;
+      const ref = `b:${account.id}:${row.unit}`;
+      tables.readings[ref] = {type: 'money', cents, unit};
+      tables.identities.set(ref, {account: account.id, unit: row.unit});
+    }
+  }
+  return true;
+}
+
+function ledgerDetailLists(tables: LedgerTables, view: LedgerStageView) {
+  const details = view.before?.entries ?? [];
+  const entries = details.filter(entry => entry.kind !== 'adjustment'
+    && (entry.disposition === 'posted' || entry.disposition === 'flagged'))
+    .slice(-ENTRY_ROW_COUNT).reverse()
+    .map(entry => ledgerEntryView(tables, entry));
+  const open: Record<string, unknown[]> = {pending: [], unaffordable: [], committed: [], deposits: [], quoted: []};
+  const order = new Map(details.map((entry, index) => [JSON.stringify(entry.key), index]));
+  const openItems = Object.entries(view.before?.open ?? {}).flatMap(([group, rows]) => rows
+    .filter(entry => entry.kind !== 'adjustment')
+    .map(entry => ({group, entry})))
+    .sort((left, right) => (order.get(JSON.stringify(right.entry.key)) ?? -1)
+      - (order.get(JSON.stringify(left.entry.key)) ?? -1))
+    .slice(0, OPEN_ROW_COUNT);
+  for (const {group, entry} of openItems) {
+    const row = ledgerEntryView(tables, entry);
+    if (!row || !Object.hasOwn(open, group)) return null;
+    open[group].push({
+      ...row,
+      state: entry.status === 'committed' || entry.status === 'quoted' ? entry.status : entry.disposition,
+      codes: entry.codes,
+      ...(entry.due === null ? {} : {due: ledgerDecimal(entry.due)}),
+    });
+  }
+  return {entries, open};
+}
+
+function keptLedgerRows(tables: LedgerTables, frozen: LedgerFreeze | null) {
+  return (frozen?.keptEntries ?? []).map((entry, index) => {
+    const entrySource = tables.sources.get(sourceKey(entry));
+    const money = entry.stated ?? entry.amount;
+    return {
+      ref: `x${index + 1}`,
+      kind: entry.kind,
+      payer: partyView(entry.payer),
+      payee: partyView(entry.payee),
+      item: entry.item?.quote ?? null,
+      quantity: entry.quantity?.count ?? null,
+      amount: money ? ledgerDecimal(money.cents) : null,
+      unit: entry.row ?? ledgerUnitDisplay(money?.unit ?? null),
+      quote: entry.act === null || !entrySource ? null : entrySource.text.slice(entry.act.start, entry.act.end),
+    };
+  });
+}
+
+function ledgerAccountRows(accounts: LedgerAccount[]) {
+  return accounts.map(account => ({
+    id: account.id,
+    kind: account.kind,
+    label: account.label,
+    aliases: account.aliases,
+    actors: account.actors,
+    rows: account.rows.map(row => row.tracked
+      ? {unit: row.unit, balance: row.value}
+      : {unit: row.unit, tracked: false}),
+    items: account.items.map(item => ({item: item.item, count: item.count})),
+  }));
+}
+
+function ledgerModelMarks(source: LedgerText, selection: LedgerSelection) {
+  const rows = (kind: 'money' | 'use') => selection.marks.filter(mark => mark.kind === kind).map(mark => ({
+    ref: mark.id,
+    quote: 'whole' in mark ? null : source.text.slice(mark.span.start, mark.span.end),
+  }));
+  return {
+    money: rows('money'),
+    math: selection.math.map(({id, position}) => ({
+      ref: id,
+      quote: 'whole' in position ? null : source.text.slice(position.start, position.end),
+    })),
+    use: rows('use'),
+  };
+}
+
+function ledgerModelInput(
+  request: LedgerInputRequest,
+  bundle: Pick<LedgerInputBundle, 'tables' | 'view' | 'source' | 'selection' | 'frozen'>,
+  recent: readonly LedgerStageMessage[],
+  accounts: LedgerAccount[],
+  readings: ReturnType<typeof collectLedgerReadings>,
+  details: NonNullable<ReturnType<typeof ledgerDetailLists>>,
+): Record<string, unknown> {
+  const {tables, view, source, selection, frozen} = bundle;
+  const kept = keptLedgerRows(tables, frozen);
+  return {
+    message: {ref: 'm0', role: source.role, speaker: speaker(request.source, request), text: source.text},
+    marks: ledgerModelMarks(source, selection),
+    recent: recent.map((message, index) => ({
+      ref: `m-${recent.length - index}`,
+      role: message.role,
+      speaker: speaker(message, request),
+      text: recentText(message.text),
+    })),
+    amounts: readings.amounts,
+    quantities: readings.quantities,
+    rates: readings.rates,
+    roster: [
+      {id: 'player', names: [request.playerName]},
+      ...request.characters.map(character => ({id: character.id, names: [character.name, ...character.aliases]})),
+    ],
+    accounts: ledgerAccountRows(accounts),
+    entries: details.entries,
+    open: details.open,
+    unconfigured: view.before?.unconfigured ?? [],
+    ...(kept.length ? {kept} : {}),
+    mode: {...selection.mode},
+  };
+}
+
 /** Assembles the sole model input and full-source read tables. O(prose + candidate rows), plus the authority's
- * prefix fold cost.
- */
-export function buildLedgerInput(
-  request: LedgerInputRequest): LedgerInputBundle | null {
+ * prefix fold cost; invalid input or unavailable authority data returns null. */
+export function buildLedgerInput(request: LedgerInputRequest): LedgerInputBundle | null {
   try {
     const view = ledgerStageView(request);
     if (!view || !Array.isArray(request.history) || !Array.isArray(request.characters)) return null;
+
     const source = textOf(request.source);
-    const recent = request.history.filter(message => message.status === 'accepted').slice(-6);
+    const recent = request.history.filter(message => message.status === 'accepted').slice(-LEDGER_RECENT_MESSAGE_COUNT);
     const previous = recent.map(textOf);
     const accounts = view.accounts.filter(account => account.status !== 'closed');
-    const tables: LedgerTables = {
-      readings: Object.create(null),
-      rows: new Map(),
-      sources: new Map(),
-      entries: new Map(),
-      entryRefs: Object.create(null),
-      entryNumbers: new Map(),
-      identities: new Map(),
-      counters: {a: 0, q: 0, r: 0, u: 0, e: 0},
-      units: [...new Set(accounts.flatMap(account => account.rows.map(row => foldForMatch(row.unit))))],
-      work: {textUnits: 0, candidates: 0, searchWork: 0, rows: 0},
-    };
-    for (const item of request.sources) tables.sources.set(sourceKey(item), item);
-    tables.sources.set(sourceKey(source), source);
-    tables.sources.set('m0', source);
-    previous.forEach((
-      item,
-      index) => {
-      tables.sources.set(sourceKey(item), item);
-      tables.sources.set(`m-${previous.length - index}`, item);
-    });
-
-    const amounts: LedgerReadingRow[] = [];
-    const quantities: LedgerReadingRow[] = [];
-    const rates: LedgerReadingRow[] = [];
-    const scan = (
-      item: LedgerText,
-      family: 'amount' | 'quantity' | 'rate') => {
-      tables.work.textUnits += item.text.length;
-      const expressions = family === 'amount'
-        ? scanAmounts(item.text, {units: tables.units})
-        : family === 'quantity' ? scanQuantities(item.text) : scanRates(item.text);
-      tables.work.candidates += expressions.length;
-      return expressions;
-    };
-    const add = (
-      container: string,
-      item: LedgerText,
-      type: 'amount' | 'quantity' | 'rate',
-      expression: unknown) => {
-      return appendLedgerReading(
-        tables,
-        container,
-        item,
-        {
-          type,
-          source: {sourceId: item.sourceId, revision: item.revision},
-          expression,
-        } as LedgerReading
-      );
-    };
-    for (const expression of scan(source, 'amount')) {
-      const row = add('m0', source, 'amount', expression);
-      if (row) amounts.push(row);
-    }
-    const previousAmounts = previous.flatMap((
-      item,
-      index) => scan(item, 'amount').map(
-        expression => ({
-          container: `m-${previous.length - index}`,
-          item,
-          expression,
-        }))).slice(
-          -24
-        );
-    for (const {container, item, expression} of previousAmounts) {
-      const row = add(container, item, 'amount', expression);
-      if (row) amounts.push(row);
-    }
-    for (const [type, target] of [['quantity', quantities], ['rate', rates]] as const) {
-      for (const expression of scan(source, type)) {
-        const row = add('m0', source, type, expression);
-        if (row) target.push(row);
-      }
-    }
-
-    for (const account of accounts) {
-      for (const row of account.rows) {
-        if (!row.tracked) continue;
-        const parsed = parseAmount(row.value);
-        // The parser deliberately omits zero. The authority's canonical zero still supplies a valid balance leaf.
-        const cents = row.value === '0.00'
-          ? '0'
-          : parsed?.kind === 'readings' && parsed.readings.length === 1 ? parsed.readings[0].cents : null;
-        if (cents === null) return null;
-        const unit = moneyUnit(row.unit, null);
-        if (unit === null) return null;
-        const ref = `b:${account.id}:${row.unit}`;
-        tables.readings[ref] = {type: 'money', cents, unit};
-        tables.identities.set(ref, {account: account.id, unit: row.unit});
-      }
-    }
-
-    const details = view.before?.entries ?? [];
-    const entries = details.filter(
-      entry => entry.kind !== 'adjustment'
-        && (entry.disposition === 'posted' || entry.disposition === 'flagged')).slice(
-          -12
-        ).reverse()
-      .map(entry => ledgerEntryView(tables, entry));
-    const open: Record<string, unknown[]> = {pending: [], unaffordable: [], committed: [], deposits: [], quoted: []};
-    const order = new Map(details.map((entry, index) => [JSON.stringify(entry.key), index]));
-    const openItems = Object.entries(view.before?.open ?? {}).flatMap((
-      [group, rows]) => rows
-        .filter(entry => entry.kind !== 'adjustment' && (group !== 'quoted' || entry.laterSources < 20))
-        .map(entry => ({group, entry})))
-      .sort((
-        left,
-        right) => (order.get(JSON.stringify(right.entry.key)) ?? -1)
-        - (order.get(JSON.stringify(left.entry.key)) ?? -1)).slice(
-          0,
-          12
-        );
-    for (const {group, entry} of openItems) {
-      const row = ledgerEntryView(tables, entry);
-      if (!row || !Object.hasOwn(open, group)) return null;
-      open[group].push(
-        {
-          ...row,
-          state: entry.status === 'committed' || entry.status === 'quoted' ? entry.status : entry.disposition,
-          codes: entry.codes,
-          ...(entry.due === null ? {} : {due: ledgerDecimal(entry.due)}),
-        }
-      );
-    }
+    const tables = createLedgerTables(request, source, previous, accounts);
+    const readings = collectLedgerReadings(tables, source, previous);
+    if (!appendLedgerBalances(tables, accounts)) return null;
+    const details = ledgerDetailLists(tables, view);
+    if (!details) return null;
 
     const frozen = request.frozen ?? null;
-    const sendMarks = frozen ? frozen.sendMarks : request.selection.marks;
-    const selection = {...request.selection, marks: sendMarks};
-    const markRows = (
-      kind: 'money' | 'use') => sendMarks.filter(mark => mark.kind === kind).map(
-        mark => ({
-          ref: mark.id,
-          quote: 'whole' in mark ? null : source.text.slice(mark.span.start, mark.span.end),
-        }));
-    const kept = (frozen?.keptEntries ?? []).map((
-      entry,
-      index) => {
-      const entrySource = tables.sources.get(sourceKey(entry));
-      const money = entry.stated ?? entry.amount;
-      return {
-        ref: `x${index + 1}`,
-        kind: entry.kind,
-        payer: partyView(entry.payer),
-        payee: partyView(entry.payee),
-        item: entry.item?.quote ?? null,
-        quantity: entry.quantity?.count ?? null,
-        amount: money ? ledgerDecimal(money.cents) : null,
-        unit: entry.row ?? ledgerUnitDisplay(money?.unit ?? null),
-        quote: entry.act === null || !entrySource ? null : entrySource.text.slice(entry.act.start, entry.act.end),
-      };
-    });
-    const input = {
-      message: {ref: 'm0', role: source.role, speaker: speaker(request.source, request), text: source.text},
-      marks: {
-        money: markRows('money'),
-        math: selection.math.map((
-          {id, position}) => ({
-            ref: id,
-            quote: 'whole' in position ? null : source.text.slice(position.start, position.end),
-          })),
-        use: markRows('use'),
-      },
-      recent: recent.map((
-        message,
-        index) => ({
-          ref: `m-${recent.length - index}`,
-          role: message.role,
-          speaker: speaker(message, request),
-          text: recentText(message.text),
-        })),
-      amounts,
-      quantities,
-      rates,
-      roster: [
-        {id: 'player', names: [request.playerName]},
-        ...request.characters.map(
-          character => ({
-            id: character.id,
-            names: [character.name, ...character.aliases],
-          }))
-      ],
-      accounts: accounts.map(
-        account => ({
-          id: account.id,
-          kind: account.kind,
-          label: account.label,
-          aliases: account.aliases,
-          actors: account.actors,
-          rows: account.rows.map(
-            row => row.tracked
-              ? {
-                unit: row.unit,
-                balance: row.value
-              }
-              : {
-                unit: row.unit,
-                tracked: false
-              }),
-          items: account.items.map(item => ({item: item.item, count: item.count})),
-        })),
-      entries,
-      open,
-      unconfigured: view.before?.unconfigured ?? [],
-      ...(kept.length ? {kept} : {}),
-      mode: {...selection.mode},
-    };
+    const selection = {...request.selection, marks: frozen ? frozen.sendMarks : request.selection.marks};
+    const context = {tables, view, source, selection, frozen};
+    const input = ledgerModelInput(request, context, recent, accounts, readings, details);
     return {input, tables, view, source, previous, selection, allMarks: request.selection.marks, frozen};
   } catch {
     return null;

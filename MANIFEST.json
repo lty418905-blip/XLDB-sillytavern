@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "6dbaa0b01167cce16d1fe272429c514ce60c882771ee43cc6903078512cd4d0f",
+  "sourceManifestSha256": "cf33c7da5c308c36b59bc93d7af4f7077832da658e6bc6ddd7353b1049a03725",
   "files": [
     {
       "file": ".gitattributes",
@@ -429,18 +429,18 @@
     },
     {
       "file": "shared/src/scene/ledger-stage-input.ts",
-      "sha256": "ce886e6573f9ea411c243518bb444e12acff6a6ee3c63a3f26769bb9c5166e06",
-      "bytes": 27493
+      "sha256": "39b97eda329f4594544176c6e80c54a1dabf573b0ce0465b912c32e6c6cf1bdd",
+      "bytes": 30149
     },
     {
       "file": "shared/src/scene/ledger-stage-tools.ts",
-      "sha256": "09c8430e4edb56dbc6d3ddb03d4fc0b4a8c277ad6348f439185c8dc8a0f7c115",
-      "bytes": 37152
+      "sha256": "e5f8adf1ff907c814fef23f57f602cea3a3279a9d0f6b4771216ab013de99d96",
+      "bytes": 39437
     },
     {
       "file": "shared/src/scene/ledger-stage.ts",
-      "sha256": "1ce55ae12868562ecbae058c7cc8f435df3edd5efbe1d130ef28a965cbf1ed38",
-      "bytes": 36347
+      "sha256": "6391e5858083b2a997c522898fed134725ed3536083529cd606eabd49d75583e",
+      "bytes": 37932
     },
     {
       "file": "shared/src/scene/lifecycle.ts",
@@ -539,8 +539,8 @@
     },
     {
       "file": "shared/src/scene/world-extraction.ts",
-      "sha256": "d3f25c3f0e0b2d038441624c700c84f4d574066a3bb45a8ad9c0dfa462536a63",
-      "bytes": 54930
+      "sha256": "841f2d22347f4d3fe667e52b8706be13ececa5576493fe1b38b7b3c2b6abd1b8",
+      "bytes": 55358
     },
     {
       "file": "shared/src/scene/world-ledger-store.ts",
@@ -549,8 +549,8 @@
     },
     {
       "file": "shared/src/scene/world-ledger.ts",
-      "sha256": "8467f018da88222886272072e7d1b33e8db37a6d3b580aa74100afe35090ee66",
-      "bytes": 212243
+      "sha256": "7e68cdbea929b9756dfcecdf245129c550d7beec7463e08cf788a342e22557e0",
+      "bytes": 219077
     },
     {
       "file": "shared/src/scene/world-state.ts",
@@ -664,12 +664,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "6840dbcc0ccfa3d87b18fffcd523f8368fe8ff904f3900bcd4f151d798ddc9c8",
+      "sha256": "ba87b503f4fea2f053159eb4805e2eb943aea2e65d3f4132557ad2baac67eec8",
       "bytes": 351441
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "ae186f7f8414a30a27f851f3b8ab42ea4d2adafa2027736b6b27bca128557f53",
+      "sha256": "d7343c45f72dc57ec2d25c3e0d8b1c3705196bffaacf71c373cc0d6d62d9af34",
       "bytes": 356564
     }
   ]

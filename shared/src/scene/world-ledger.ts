@@ -112,7 +112,9 @@ export interface LedgerCorrection {
 export interface LedgerFoldOptions {accountEvents?:readonly LedgerAccountEvent[]; corrections?:readonly LedgerCorrection[]; nowMs?:number; monotonicFloorMs?:number}
 /** Deterministic operation counts; optional counters appear only when their work runs.
  * Paired visits cover <= J(J-1)/2 + 9J steps per proposal (2,592 at J=64), and <= 2E per folded source.
- * J and E are the proposal and source entry counts, each limited to 64 by the ledger contract. */
+ * J and E are the proposal and source entry counts, each limited to 64 by the ledger contract.
+ * Marked amount comparisons count valid unmarked/marked same-source pairs, at most floor(R^2/4)
+ * (4,194,304 at R=4,096 readings), and appear only when at least one pair is examined. */
 export interface LedgerWork {
     jsonNodes: number;
     text: number;
@@ -126,6 +128,7 @@ export interface LedgerWork {
     correctionVisits?: number;
     positionVisits?: number;
     pairedVisits?: number;
+    markedAmountComparisons?: number;
 }
 /** A diagnostic identifies a rejected row; a truncation summary also counts omitted diagnostics. */
 export interface LedgerDiagnostic {
@@ -1009,42 +1012,198 @@ function staticEntry(proposedEntry: NormalizedLedgerProposedEntry, proposalConte
         entry: storedEntry, returns, sourceActExhausted
     };
 }
-/** O(source quantity candidates * bounded proposal proof leaves). A candidate is
- * a quantity only when a proposal row actually references it as one. */
-function checkAmountOverlaps(rows:{entry:StoredLedgerEntry;returns:string[]}[],readings:LedgerReadings,
-  scans:Map<string,{quantities:QuantityExpression[];numbers:LedgerSpan[]}>,w:LedgerWork):void {
-  const references=new Map<string,{entry:StoredLedgerEntry;span:LedgerSpan}[]>();
-  for(const {entry} of rows){
-    const ref=entry.quantity?.ref,reading=ref&&QUANTITY_REF.test(ref)&&Object.hasOwn(readings,readingBase(ref))?readings[readingBase(ref)]:undefined;
-    if(!entry.quantity?.proof&&reading?.type==='quantity'&&spanOK(reading.expression)){
-      const key=identity(reading.source),list=references.get(key)??[];list.push({entry,span:{start:reading.expression.start,end:reading.expression.end}});references.set(key,list);
+type AmountConfirmationRule = {direct: boolean; overlapping: 'confirm' | 'unlessContains'};
+
+// Keep the direct column explicit so each marker's two policies can change independently.
+// The comma containment exception is provisional until usage data is available.
+const AMOUNT_CONFIRMATION_RULES = {
+    known: new Map<string, AmountConfirmationRule>([
+        ['one', {direct: true, overlapping: 'confirm'}],
+        ['two', {direct: true, overlapping: 'confirm'}],
+        ['acrossWhitespace', {direct: true, overlapping: 'confirm'}],
+        ['beforeYenSign', {direct: true, overlapping: 'confirm'}],
+        ['beforeFullWidthComma', {direct: true, overlapping: 'unlessContains'}],
+        ['beforeClockPoint', {direct: true, overlapping: 'confirm'}]
+    ]),
+    unknown: {direct: true, overlapping: 'confirm'} satisfies AmountConfirmationRule
+};
+
+function amountComparisonShape(
+    reading: LedgerReading | undefined
+): reading is Extract<LedgerReading, {type: 'amount'}> {
+    if (reading?.type !== 'amount' || !record(reading.source) || !record(reading.expression)) return false;
+
+    const {source, expression} = reading;
+    return typeof source.sourceId === 'string' && Number.isSafeInteger(source.revision)
+        && Number.isSafeInteger(expression.start) && Number.isSafeInteger(expression.end)
+        && expression.start >= 0 && expression.start < expression.end;
+}
+
+/** Index only detached readings. Each unmarked base is compared once to valid same-source markers.
+ * With U unmarked and M marked readings, comparisons are <= U*M <= floor(R^2/4),
+ * or 4,194,304 at the existing R=4,096 table limit, regardless of proof leaf duplication. */
+function checkMarkedAmountReferences(
+    rows: {entry: StoredLedgerEntry; returns: string[]}[],
+    readings: LedgerReadings,
+    ledgerWork: LedgerWork
+): void {
+    const markers = new Map<string, string>();
+    const bySource = new Map<string, Extract<LedgerReading, {type: 'amount'}>[]>();
+    for (const [base, reading] of Object.entries(readings)) {
+        const marker = markedAmountValue(reading);
+        if (marker === null) continue;
+
+        markers.set(base, marker);
+        if (!amountComparisonShape(reading)) continue;
+
+        const key = identity(reading.source);
+        const candidates = bySource.get(key) ?? [];
+        candidates.push(reading);
+        bySource.set(key, candidates);
     }
-    for(const proof of [entry.quantity?.proof,entry.amount?.proof,entry.stated?.proof,entry.tendered?.proof])for(const leaf of proof?.leaves??[]){
-    if(leaf.kind!=='quantity'||!leaf.source||!leaf.span)continue;
-    const key=identity(leaf.source),list=references.get(key)??[];list.push({entry,span:leaf.span});references.set(key,list);
+    if (!markers.size) return;
+
+    const confirmed = new Map<string, boolean>();
+    for (const row of rows) {
+        for (const money of [row.entry.amount, row.entry.stated, row.entry.tendered]) {
+            for (const leaf of money?.proof?.leaves ?? []) {
+                if (leaf.kind !== 'amount') continue;
+
+                const confirm = markedLeafConfirmation(leaf, readings, markers, bySource, confirmed, ledgerWork);
+                if (!confirm) continue;
+
+                addCode(row.entry.checks.codes, 'amount_left_numeral_confirm');
+                addCode(row.returns, 'amount_left_numeral_confirm');
+            }
+        }
     }
-  }
-  for(const row of rows)for(const money of [row.entry.amount,row.entry.stated,row.entry.tendered])for(const leaf of money?.proof?.leaves??[]){
-    if(leaf.kind!=='amount'||!leaf.source||!leaf.span)continue;
-    const key=identity(leaf.source),reading=Object.hasOwn(readings,leaf.base)?readings[leaf.base]:undefined;
-    const expression=reading?.type==='amount'?reading.expression:null;
-    const shortest=expression?.kind==='readings'?Math.min(...expression.readings.map(r=>r.end)):expression?.end;
-    const direct=(references.get(key)??[]).filter(reference=>overlaps(leaf.span!,reference.span)
-      &&!(scans.get(key)?.quantities??[]).some(q=>overlaps(q,reference.span)));
-    if(direct.length){
-      const own=direct.some(reference=>reference.entry===row.entry),code=own?'span_double_use':'amount_not_grounded';
-      addCode(row.entry.checks.codes,code);pending(row.entry.checks,'general');addCode(row.returns,code);
-      if(!own)addCode(row.entry.checks.codes,'amount_unreadable');
+}
+
+/** Cache a detached amount leaf's confirmation by candidate, not by reference spelling.
+ * Visit every valid same-source marker, even after a match, to keep the work count exact. */
+function markedLeafConfirmation(
+    leaf: LedgerProofLeaf,
+    readings: LedgerReadings,
+    markers: Map<string, string>,
+    bySource: Map<string, Extract<LedgerReading, {type: 'amount'}>[]>,
+    confirmed: Map<string, boolean>,
+    ledgerWork: LedgerWork
+): boolean {
+    let confirm = confirmed.get(leaf.base);
+    if (confirm !== undefined) return confirm;
+
+    const marker = markers.get(leaf.base);
+    confirm = false;
+    if (marker !== undefined) {
+        confirm = (AMOUNT_CONFIRMATION_RULES.known.get(marker) ?? AMOUNT_CONFIRMATION_RULES.unknown).direct;
+    } else {
+        const reading = Object.hasOwn(readings, leaf.base) ? readings[leaf.base] : undefined;
+        if (amountComparisonShape(reading)) {
+            for (const candidate of bySource.get(identity(reading.source)) ?? []) {
+                ledgerWork.markedAmountComparisons = (ledgerWork.markedAmountComparisons ?? 0) + 1;
+                if (!overlaps(reading.expression, candidate.expression)) continue;
+
+                const rule = AMOUNT_CONFIRMATION_RULES.known.get(markedAmountValue(candidate)!)
+                    ?? AMOUNT_CONFIRMATION_RULES.unknown;
+                const contains = reading.expression.start <= candidate.expression.start
+                    && reading.expression.end >= candidate.expression.end;
+                if (rule.overlapping === 'confirm' || !contains) confirm = true;
+            }
+        }
     }
-    for(const q of scans.get(key)?.quantities??[]){
-      w.pairs++;if(!overlaps(leaf.span,q))continue;
-      const referenced=(references.get(key)??[]).filter(r=>overlaps(r.span,q));
-      if(!referenced.length&&expression&&q.start>=expression.start&&q.end<=shortest!)continue;
-      const own=referenced.some(r=>r.entry===row.entry),code=own?'span_double_use':'amount_not_grounded';
-      addCode(row.entry.checks.codes,code);pending(row.entry.checks,'general');addCode(row.returns,code);
-      if(!own)addCode(row.entry.checks.codes,'amount_unreadable');
+    confirmed.set(leaf.base, confirm);
+    return confirm;
+}
+
+function leftQuantityAllowed(marker: string | null, start: number, quantityStart: number): boolean {
+    // Inline markers set aside exactly one or two UTF-16 code units; comma and clock have no left bound.
+    switch (marker) {
+        case 'one': return quantityStart === start - 1;
+        case 'two': return quantityStart === start - 2;
+        case 'beforeFullWidthComma':
+        case 'beforeClockPoint': return quantityStart < start;
+        default: return false;
     }
-  }
+}
+
+function markedAmountValue(reading: LedgerReading | undefined): string | null {
+    if (reading?.type !== 'amount' || !record(reading.expression)) return null;
+
+    const marker = reading.expression.setAsideLeftNumerals;
+    return typeof marker === 'string' ? marker : null;
+}
+
+/** Each money leaf visits each same-source quantity once, including quantities later allowed.
+ * A count becomes a referenced quantity only when a proposal row uses it as one. */
+function checkAmountOverlaps(
+    rows: {entry: StoredLedgerEntry; returns: string[]}[],
+    readings: LedgerReadings,
+    scans: Map<string, {quantities: QuantityExpression[]; numbers: LedgerSpan[]}>,
+    ledgerWork: LedgerWork
+): void {
+    const references = new Map<string, {entry: StoredLedgerEntry; span: LedgerSpan}[]>();
+    for (const {entry} of rows) {
+        const ref = entry.quantity?.ref;
+        const reading = ref && QUANTITY_REF.test(ref) && Object.hasOwn(readings, readingBase(ref))
+            ? readings[readingBase(ref)] : undefined;
+        if (!entry.quantity?.proof && reading?.type === 'quantity' && spanOK(reading.expression)) {
+            const key = identity(reading.source);
+            const list = references.get(key) ?? [];
+            list.push({entry, span: {start: reading.expression.start, end: reading.expression.end}});
+            references.set(key, list);
+        }
+
+        for (const proof of [entry.quantity?.proof, entry.amount?.proof, entry.stated?.proof, entry.tendered?.proof]) {
+            for (const leaf of proof?.leaves ?? []) {
+                if (leaf.kind !== 'quantity' || !leaf.source || !leaf.span) continue;
+
+                const key = identity(leaf.source);
+                const list = references.get(key) ?? [];
+                list.push({entry, span: leaf.span});
+                references.set(key, list);
+            }
+        }
+    }
+
+    const block = (row: {entry: StoredLedgerEntry; returns: string[]}, own: boolean) => {
+        const code = own ? 'span_double_use' : 'amount_not_grounded';
+        addCode(row.entry.checks.codes, code);
+        pending(row.entry.checks, 'general');
+        addCode(row.returns, code);
+        if (!own) addCode(row.entry.checks.codes, 'amount_unreadable');
+    };
+    for (const row of rows) {
+        for (const money of [row.entry.amount, row.entry.stated, row.entry.tendered]) {
+            for (const leaf of money?.proof?.leaves ?? []) {
+                if (leaf.kind !== 'amount' || !leaf.source || !leaf.span) continue;
+
+                const key = identity(leaf.source);
+                const reading = Object.hasOwn(readings, leaf.base) ? readings[leaf.base] : undefined;
+                const expression = reading?.type === 'amount' ? reading.expression : null;
+                const shortest = expression?.kind === 'readings'
+                    ? Math.min(...expression.readings.map(candidate => candidate.end)) : expression?.end;
+                const marker = markedAmountValue(reading);
+                const direct = (references.get(key) ?? []).filter(reference => overlaps(leaf.span!, reference.span)
+                    && !(scans.get(key)?.quantities ?? []).some(quantity => overlaps(quantity, reference.span)));
+                // References not found by scanning keep their original treatment.
+                if (direct.length) block(row, direct.some(reference => reference.entry === row.entry));
+
+                for (const quantity of scans.get(key)?.quantities ?? []) {
+                    ledgerWork.pairs++;
+                    if (!overlaps(leaf.span, quantity)) continue;
+
+                    const referenced = (references.get(key) ?? []).filter(reference =>
+                        overlaps(reference.span, quantity));
+                    if (!referenced.length && expression && quantity.end <= shortest! &&
+                        (quantity.start >= expression.start ||
+                            leftQuantityAllowed(marker, expression.start, quantity.start))) {
+                        continue;
+                    }
+                    block(row, referenced.some(reference => reference.entry === row.entry));
+                }
+            }
+        }
+    }
 }
 
 export interface LedgerMutableBalance {ownerId:string;unit:string;cents:bigint;readerIds:Set<string>;tracked?:boolean}
@@ -1738,6 +1897,7 @@ export function checkLedgerProposal(raw: unknown, rawContext: unknown): LedgerPr
             ledgerWork.entries++;
         }
         checkAmountOverlaps(rows, proposalContext.readings, scans, ledgerWork);
+        checkMarkedAmountReferences(rows, proposalContext.readings, ledgerWork);
         checkQuantityWindows(rows.map(ledgerRow => ledgerRow.entry), texts, scans, ledgerWork);
         if (proposalContext.keptEntries && !entriesOK(proposalContext.keptEntries))
             return {

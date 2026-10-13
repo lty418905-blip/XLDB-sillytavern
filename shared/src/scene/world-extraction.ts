@@ -598,6 +598,13 @@ function buildWorldStageV4Prompts(request: WorldStageRequest): Prompt[] {
 }
 
 // The contract caps model marks at 8/4/4 plus an overflow sentinel, and quotes at 200 code points.
+// Ruled marks limits for contract 4; quote lengths use Unicode code points.
+// Update the approved marks prompt together with these caps.
+const WORLD_STAGE_V4_QUOTE_CODE_POINTS = 200;
+const WORLD_STAGE_V4_MONEY_MARK_COUNT = 8;
+const WORLD_STAGE_V4_MATH_MARK_COUNT = 4;
+const WORLD_STAGE_V4_USE_MARK_COUNT = 4;
+
 // Searches are independent and stop at the first match: O(text length + quote length) per bounded mark.
 function decodeWorldStageMark(value: unknown, text: string): WorldStageMark {
   try {
@@ -607,7 +614,7 @@ function decodeWorldStageMark(value: unknown, text: string): WorldStageMark {
     const quote = value.quote;
     let count = 0;
     for (const _point of quote) {
-      if (++count > 200) return {whole: true};
+      if (++count > WORLD_STAGE_V4_QUOTE_CODE_POINTS) return {whole: true};
     }
     const match = scriptQuoteSearch(text, quote, 1).matches[0];
     return match ? {start: match.start, end: match.end} : {whole: true};
@@ -633,9 +640,9 @@ function decodeWorldStageMarks(result: Record<string, unknown>, text: string): W
     };
     return {
       origin: 'model',
-      money: decode(raw.money, 8),
-      math: decode(raw.math, 4),
-      use: decode(Object.hasOwn(raw, 'use') ? raw.use as unknown[] : [], 4),
+      money: decode(raw.money, WORLD_STAGE_V4_MONEY_MARK_COUNT),
+      math: decode(raw.math, WORLD_STAGE_V4_MATH_MARK_COUNT),
+      use: decode(Object.hasOwn(raw, 'use') ? raw.use as unknown[] : [], WORLD_STAGE_V4_USE_MARK_COUNT),
     };
   } catch {
     return unavailable;
