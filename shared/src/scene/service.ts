@@ -1,3 +1,35 @@
+import {parseModelJson} from '../core/models.ts';
+import type {ModelConfig} from '../core/types.ts';
+import type {SceneSource} from './types.ts';
+import {
+  ledgerStageView,
+  selectLedgerMarks,
+  buildLedgerInput,
+  type LedgerStageMessage,
+} from './ledger-stage-input.ts';
+import {
+  ledgerMarkContext,
+  resolveLedgerMarks,
+  decideLedgerRun,
+  ledgerNotRun,
+  ledgerPin,
+  ledgerBase,
+  ledgerFingerprintInput,
+  startLedgerRun,
+  ledgerDeferred,
+} from './ledger-stage.ts';
+import {interruptDeferredLedgerAnalysis} from './world-ledger-store.ts';
+import {
+  LedgerRuns,
+  LEDGER_INPUT_UTF16_LIMIT,
+  LEDGER_CACHE_SCHEMA,
+  checkedLedger,
+  cachedLedger,
+  type LedgerStageOptions,
+  type LedgerTiming,
+  type LedgerStep,
+  type LedgerRunEntry,
+} from './ledger-runs.ts';
 import { randomUUID,createHash } from 'node:crypto';
 import {recordStage,traceStage,withModelAddress} from '../core/runtime-log.ts';
 import {roleObservationBatch} from '../core/role-observation.ts';
@@ -52,6 +84,8 @@ export interface SceneCoreOptions<C extends SceneCompanionPort> {
   companion?:C;
   /** The host's local judge for schedule conflicts and emotion ranking, so the scene never starts a second worker. */
   judge?:SceneJudge;
+  /** Internal ledger integration; only numeric gate 4 enables it, captured once at construction. */
+  ledgerStage?: LedgerStageOptions | null;
 }
 
 export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
@@ -69,12 +103,15 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
   private legacyEmotionRecovery=new Set<string>();
   private legacyEmotionConfigs=new Map<string,Configurations>();
   private modelRevision=0;
+  private readonly ledgerStageOptions: LedgerStageOptions | null;
+  private ledgerRuns?: LedgerRuns;
   private nativeTickets=new Map<string,{scope:SceneScope;version:number;modelRevision:number;expires:number;envelope:SceneEnvelope;dependencies:{id:string;revision:number}[];replyTo:{id:string;revision:number};automatic:boolean;speakerId?:string;replaces?:{id:string;revision:number};accepted?:SceneMessage;recalled?:SceneRecall[]}>();
   private packetRecalls = new WeakMap<object, SceneRecall[]>();
   constructor(authority:SceneAuthority, core:Core, models:ModelTasks,
     emotionRanker:(candidates:readonly EmotionRankCandidate[])=>Promise<EmotionRanking>=rankEmotionCandidates,
     options:SceneCoreOptions<C>={}) {
     this.authority=authority;this.core=core;this.models=models;
+    this.ledgerStageOptions = this.readLedgerStageOptions(options);
     const judge=options.judge;this.judge=judge;
     if(emotionRanker===rankEmotionCandidates&&judge){
       this.emotionRanker=candidates=>rankEmotionCandidates(candidates,
@@ -1650,10 +1687,10 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             ?{candidates:scanOriginCandidates(source.text,originScanEntries(this.authority.transfer.references(scope)))}:null;
           // One request object per source, passed unchanged to build and decode; its history is a copy, never `processed` itself.
           const worldRequest:WorldStageRequest|null=story?{source:{id:source.id,revision:source.revision,role:source.role,text:source.text},
-            history:worldHistory.slice(),settings:settings??null,opening}:null;
+            history:worldHistory.slice(),settings:settings??null,opening,...(this.ledgerStageOptions?{contract:4 as const}:{})}:null;
           const storyWorldWork=()=>worldRequest?this.stage(scope,source,'world',undefined,
-            {schema:3,contract:WORLD_STAGE_CONTRACT_VERSION,source:this.modelSource(source),settings:settings??null,
-              history:worldHistory.slice(-6).map(item=>this.modelSource(item)),purchaseRefs,opening,config:configs.world},
+            {schema:3,contract:this.ledgerStageOptions?4:WORLD_STAGE_CONTRACT_VERSION,source:this.modelSource(source),settings:settings??null,
+              history:worldHistory.slice(-6).map(item=>this.modelSource(item)),purchaseRefs:this.ledgerStageOptions?[]:purchaseRefs,opening,config:configs.world},
             ()=>this.worldStage(worldRequest,configs.world,shared?.('world'))):undefined;
           // Outside a story scope, settings enable the schema 2 worldEffects stage; without settings there is no world stage.
           const worldWork=()=>settings?this.stage(scope,source,'world',undefined,
@@ -1668,6 +1705,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             });
           const [plan,legacyEffects,world]=await settled([planWork(),Promise.resolve(story?undefined:worldWork()),Promise.resolve(storyWorldWork())] as const);
           this.assertVersion(scope,state.version);
+          const ledgerStep=this.ledgerStageOptions&&story?this.beginLedgerStage(scope,state,accepted,processed,source,plan,world,configs):null;
           // Story scope. A skipped world stage (SillyTavern roleplay) is the only case in which the stage's value is
           // replaced; otherwise the stored value is world.storyClock as decodeWorldStage returned it, a 'failed' marker
           // with its issues included (no retry, no skip, no rewrite). worldEffects is written only with world settings.
@@ -1677,7 +1715,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
           const clockPart=storyClock===undefined?{}:{storyClock};
           const worldEffects=world?(settings?world.effects:undefined):legacyEffects;
           if(this.authority.processing.skippedForSource(scope,source.id,source.revision).some(item=>item.stage==='perspective')){
-            const analysis:SceneAnalysis={plan,characters:{},...clockPart,skippedStages:this.authority.processing.skippedForSource(scope,source.id,source.revision)};
+            if(ledgerStep)this.finishLedgerStep(source,ledgerStep);
+            const analysis:SceneAnalysis={plan,characters:{},...clockPart,skippedStages:this.authority.processing.skippedForSource(scope,source.id,source.revision),...(ledgerStep?.marks?{ledgerMarks:ledgerStep.marks}:{}),...(ledgerStep?.ledger?{ledger:ledgerStep.ledger}:{})};
             processed.push({...source,processing:'ready',analysis});
             results.push({id:source.id,revision:source.revision,analysis});
             continue;
@@ -1938,7 +1977,9 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
            if(emotionSchedule&&skippedEmotionIds.size){
              emotionSchedule={...emotionSchedule,deferredIds:[...new Set([...emotionSchedule.deferredIds,...skippedEmotionIds])]};
            }
-           const completedAnalysis:SceneAnalysis={plan,characters,...(skippedStages.length?{skippedStages}:{}),
+           if(ledgerStep?.entry)await this.waitLedgerStep(ledgerStep);
+           if(ledgerStep)this.finishLedgerStep(source,ledgerStep);
+           const completedAnalysis:SceneAnalysis={plan,characters,...(skippedStages.length?{skippedStages}:{}),...(ledgerStep?.marks?{ledgerMarks:ledgerStep.marks}:{}),...(ledgerStep?.ledger?{ledger:ledgerStep.ledger}:{}),
              ...(emotionSchedule?{emotionSchedule,emotionPendingIds:emotionSchedule.deferredIds,
                emotionCandidateReadyIds:emotionSchedule.deferredIds.filter(id=>!skippedEmotionIds.has(id))}:{}),
              ...(contactResponseExpectation?{contactResponseExpectation}:{}),
@@ -1948,7 +1989,9 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
            processed[processed.length-1]={...processed.at(-1)!,analysis:completedAnalysis};
            results.push({id:source.id,revision:source.revision,analysis:completedAnalysis});
         }
-        return {status:'ready',version:this.authority.commit(scope,state.version,[...backfilled.values(),...results])};
+        const version=this.authority.commit(scope,state.version,[...backfilled.values(),...results]);
+        if(this.ledgerStageOptions&&story)this.commitLedgerRuns(scope,results);
+        return {status:'ready',version};
       } catch(error) {
         if(error instanceof TypeError&&error.message==='story_clock_prefix_mismatch')throw error;
         const message=error instanceof Error?error.message:'';
@@ -1960,7 +2003,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         this.authority.fail(scope,state.version,activeSource?[activeSource]:undefined,
           story?{reason:processingFailure(error).kind==='configuration'?'model_unset':'failed'}:undefined);
         return {status:'failed',version:this.authority.state(scope).version,error:/^(invalid_[a-z_]+|[a-z_]+_missing_source|unsafe_episode_projection|context_changed_retry|model_[a-z_0-9]+|host_(timeout|closed|worker_failed|invalid_result))$/.test(message)?message:'operation_failed'};
-      } finally { this.jobs.delete(key); }
+      } finally { if(this.ledgerStageOptions&&story)this.pruneLedgerRuns(scope); this.jobs.delete(key); }
     })();
     this.jobs.set(key,job);
     return job.then(result=>{
@@ -1968,6 +2011,512 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       if(result.status==='ready')this.queueLegacyEmotionRecovery(scope,configs);
       return result;
     });
+  }
+
+  /** Capture only the internal gate. A malformed or throwing option is disabled without reading other members. */
+  private readLedgerStageOptions(options: SceneCoreOptions<C>): LedgerStageOptions | null {
+
+    try {
+
+      const candidate = options.ledgerStage;
+
+      return candidate !== null && typeof candidate === 'object' && candidate.gate === 4 ? candidate : null;
+    } catch {
+
+      return null;
+    }
+  }
+
+  /** Select once for this source; returned objects are passed through without touching configuration getters. */
+  private selectLedgerConfig(configurations: Configurations): ModelConfig | null {
+
+    try {
+
+      const select = this.ledgerStageOptions?.selectConfig;
+      const selected = typeof select === 'function' ? select(configurations) : null;
+
+      return selected !== null && typeof selected === 'object' ? selected : null;
+    } catch {
+
+      return null;
+    }
+  }
+
+  /** Resolve only the loop's two timing callbacks. The reserved foreground timer callbacks remain unused. */
+  private ledgerTiming(): {now: () => number; wait: (milliseconds: number) => Promise<void>;} {
+
+    let timing: LedgerTiming | null = null;
+
+    try {
+
+      timing = this.ledgerStageOptions?.timing ?? null;
+    } catch {}
+
+    let now = () => performance.now();
+    let wait = (milliseconds: number) => new Promise<void>(resolve => setTimeout(resolve, milliseconds));
+
+    try {
+
+      const supplied = timing?.now;
+
+      if (typeof supplied === 'function')
+        now = supplied;
+    } catch {}
+
+    try {
+
+      const supplied = timing?.wait;
+
+      if (typeof supplied === 'function')
+        wait = supplied;
+    } catch {}
+
+    return {
+      now,
+      wait
+    };
+  }
+
+  /** Preserve accepted-message metadata for core history selection; null optionals are omitted. */
+  private ledgerMessage(source: SceneSource): LedgerStageMessage {
+
+    return {
+      id: source.id,
+      revision: source.revision,
+      role: source.role,
+      text: source.text,
+      status: source.status,
+      ...(source.automatic == null ? {} : {automatic: source.automatic}),
+      ...(source.speakerId == null ? {} : {speakerId: source.speakerId}),
+      ...(source.replyTo == null ? {} : {replyTo: source.replyTo}),
+    };
+  }
+
+  /** Synchronously snapshot the accepted timeline and choose/reuse/start one ledger operation.
+   * The current source is provisional: its old analysis must not influence its replacement record. */
+  private beginLedgerStage(
+    scope: SceneScope,
+    state: SceneState,
+    accepted: SceneSource[],
+    processed: SceneSource[],
+    source: SceneSource,
+    plan: PerspectivePlan,
+    world: WorldStageResult | undefined,
+    configurations: Configurations,
+
+  ): LedgerStep {
+
+    const earlier = new Map(processed.map(item => [item.id, item]));
+    const timeline = accepted.map(
+      item => item.id === source.id
+        ? {
+          ...item,
+          processing: 'ready' as const,
+          analysis: {
+            plan,
+            characters: {}
+          }
+        }
+        : earlier.get(item.id) ?? item
+    );
+    const rows = this.authority.worldLedgerRows(scope);
+    const input = this.authority.worldLedgerInput(scope, timeline, undefined, 'ledger', rows);
+    const position = input.sources.findIndex(item => item.sourceId === source.id && item.revision === source.revision);
+
+    if (position < 0)
+      return {issue: 'view'};
+
+    const first = state.sources[0];
+    const playerName = input.settings?.playerName
+      ?? (first?.status === 'accepted' ? first.envelope.playerName?.trim() || '玩家' : '玩家');
+    const request = {
+      source: this.ledgerMessage(source),
+      history: timeline.slice(0, accepted.indexOf(source)).map(item => this.ledgerMessage(item)),
+      sources: input.sources,
+      position,
+      options: input.options,
+      settings: input.settings,
+      playerName,
+      characters: state.roster.characters,
+    };
+    const view = ledgerStageView(request);
+
+    if (!view)
+      return {issue: 'view'};
+
+    const context = ledgerMarkContext(input.settings, view.accounts);
+
+    if (!context)
+      return {issue: 'mark_context'};
+
+    const skipped = this.authority.processing.skippedForSource(scope, source.id, source.revision);
+    const decoded = skipped.some(item => item.stage === 'world') ? null : world?.marks ?? null;
+    const marks = resolveLedgerMarks(
+      {
+        decoded,
+        text: source.text,
+        role: source.role,
+        ...context
+      }
+    );
+    const selection = selectLedgerMarks(marks, source.text, source.role, view.accounts, context.bookable);
+
+    if (!selection)
+      return {issue: 'selection'};
+
+    const step: LedgerStep = marks ? {marks} : {};
+    const config = this.selectLedgerConfig(configurations);
+    const decision = decideLedgerRun(
+      {
+        storyScope: true,
+        tavern: this.authority.interactions.isTavernRoleplay(scope),
+        perspectiveSkipped: skipped.some(item => item.stage === 'perspective'),
+        selection,
+        config,
+      }
+    );
+
+    if (decision.kind === 'none')
+      return step;
+
+    const text = {
+      sourceId: source.id,
+      revision: source.revision,
+      role: source.role,
+      text: source.text
+    };
+
+    if (decision.kind === 'not_run') {
+
+      const pin = ledgerPin(request, view.accounts);
+
+      if (!pin)
+        return {
+          ...step,
+          issue: 'pin'
+        };
+
+      const record = ledgerNotRun(decision.stop, text, selection.marks, pin);
+
+      if (!record)
+        return {
+          ...step,
+          issue: 'not_run'
+        };
+
+      const ledger = checkedLedger(record, source.id, source.revision);
+
+      return ledger
+        ? {
+          ...step,
+          ledger
+        }
+        : {
+          ...step,
+          issue: 'not_run_record'
+        };
+    }
+
+    const bundle = buildLedgerInput({
+      ...request,
+      selection
+    });
+    const pin = ledgerPin(request, view.accounts);
+
+    step.fallback = {
+      source: bundle?.source ?? text,
+      selection,
+      pin,
+      base: 'unavailable',
+      fingerprint: 'unavailable'
+    };
+
+    if (!pin)
+      return {
+        ...step,
+        issue: 'pin'
+      };
+
+    if (!bundle)
+      return {
+        ...step,
+        issue: 'input'
+      };
+
+    const base = ledgerBase(
+      {
+        settings: input.settings,
+        sources: input.sources,
+        position,
+        accountEvents: rows.accounts.map(row => ({
+          body: row.body,
+          event: row.value
+        })),
+        corrections: rows.corrections.map(row => ({
+          body: row.body,
+          correction: row.value
+        })),
+      }
+    );
+
+    if (!base)
+      return {
+        ...step,
+        issue: 'base'
+      };
+
+    step.fallback.base = base;
+
+    const fingerprint = processingFingerprint(ledgerFingerprintInput(bundle.input, config!));
+
+    step.fallback.fingerprint = fingerprint;
+
+    if (JSON.stringify(bundle.input).length > LEDGER_INPUT_UTF16_LIMIT)
+      return {
+        ...step,
+        issue: 'input_size'
+      };
+
+    const binding = {
+      revision: source.revision,
+      pin,
+      base,
+      marks
+    };
+    const registry = this.ledgerRuns ??= new LedgerRuns();
+    const previous = registry.reuse(scopeKey(scope), source.id, binding);
+
+    if (previous)
+      return {
+        ...step,
+        entry: previous
+      };
+
+    const address: ProcessingAddress = {
+      scope,
+      sourceId: source.id,
+      revision: source.revision,
+      stage: 'ledger'
+    };
+    const cached = cachedLedger(this.authority.processing.load(address, fingerprint), binding, source.id);
+
+    if (cached)
+      return {
+        ...step,
+        ledger: cached
+      };
+
+    const timing = this.ledgerTiming();
+    let started: ReturnType<typeof startLedgerRun> = null;
+
+    // The address wrapper invokes synchronously. Its asynchronous signature does not require yielding the snapshot.
+    void withModelAddress(
+      {
+        sourceId: source.id,
+        revision: source.revision,
+        stage: 'ledger'
+      },
+      () => {
+
+        started = startLedgerRun(
+          {
+            bundle,
+            pin,
+            provider: {
+              baseUrl: config!.baseUrl,
+              model: config!.model
+            },
+            send: (
+              messages,
+              json,
+              timeoutMs
+            ) => this.models.ledgerTurn(config!, messages, json, timeoutMs),
+            parse: parseModelJson,
+            now: timing.now,
+            wait: timing.wait,
+            alive: () => this.authority.isOpen(),
+          }
+        );
+
+        return Promise.resolve();
+      }
+    );
+
+    if (!started)
+      return {
+        ...step,
+        issue: 'start'
+      };
+
+    const active = started as NonNullable<ReturnType<typeof startLedgerRun>>;
+
+    try {
+
+      this.authority.processing.start(address, fingerprint);
+    } catch (error) {
+
+      active.run.cancel();
+
+      throw error;
+    }
+
+    step.entry = registry.register(
+      scopeKey(scope),
+      source.id,
+      binding,
+      fingerprint,
+      active,
+      entry => this.storeLedgerRun(scope, entry)
+    );
+
+    return step;
+  }
+
+  /** A completion may only write its cache row. Database, registry identity, then accepted revision are checked in order. */
+  private storeLedgerRun(scope: SceneScope, entry: LedgerRunEntry): void {
+
+    try {
+
+      if (!this.authority.isOpen())
+        return;
+
+      if (!this.ledgerRuns?.isCurrent(entry))
+        return;
+
+      const source = this.authority.state(scope).sources.find(item => item.id === entry.sourceId);
+
+      if (source?.status !== 'accepted' || source.revision !== entry.revision)
+        return;
+
+      const result = entry.result;
+
+      if (!result?.ledger || !result.finished)
+        return;
+
+      this.authority.processing.complete(
+        {
+          scope,
+          sourceId: entry.sourceId,
+          revision: entry.revision,
+          stage: 'ledger'
+        },
+        entry.fingerprint,
+        {
+          schema: LEDGER_CACHE_SCHEMA,
+          revision: entry.revision,
+          pin: entry.pin,
+          base: entry.base,
+          marks: entry.marks,
+          ledger: result.ledger,
+          conversation: result.finished.payload.conversation,
+          ignoredFactRefs: result.finished.payload.ignoredFactRefs,
+        }
+      );
+    } catch {
+      // Closing the authority or an unreadable cache must not reject a detached run's completion.
+    }
+  }
+
+  /** Wait only for a selected run's own completion; none, not-run and cache-hit steps never call this method. */
+  private async waitLedgerStep(step: LedgerStep): Promise<void> {
+
+    await step.entry!.done;
+
+    const result = step.entry!.result!;
+
+    if (result.ledger)
+      step.ledger = result.ledger;
+    else
+      step.issue = result.issue ?? 'finish';
+
+    if (result.loop) {
+
+      // Log-only code labels are capped at 48 ASCII characters; stored core strings remain untouched.
+      // The first letter plus up to 47 trailing characters is a provisional diagnostic format choice.
+      const code = (value: string) => /^[a-z][a-z0-9_]{0,47}$/.test(value) ? value : 'unknown';
+
+      step.details = [code(result.loop.state), code(result.loop.error ?? 'none')];
+    }
+  }
+
+  /** Finalize the interrupted substitute and emit one short diagnostic only when this job assembles its result. */
+  private finishLedgerStep(source: SceneSource, step: LedgerStep | null): void {
+
+    if (!step || !step.issue)
+      return;
+
+    const fallback = step.fallback;
+
+    if (fallback?.pin) {
+
+      const deferred = ledgerDeferred(
+        {
+          cause: 'timeout',
+          source: fallback.source,
+          base: fallback.base,
+          fingerprint: fallback.fingerprint,
+          marks: fallback.selection.marks,
+          pin: fallback.pin,
+          trace: step.entry?.result?.loop?.log
+            ?? {
+            transport: 'json',
+            requests: 0,
+            calls: []
+          },
+        }
+      );
+      const interrupted = interruptDeferredLedgerAnalysis(JSON.stringify({ledger: deferred}));
+      const record = interrupted ? JSON.parse(interrupted).ledger : null;
+      const ledger = record?.outcome === 'skipped' && record.stop === 'interrupted'
+        ? checkedLedger(record, source.id, source.revision)
+        : null;
+
+      if (ledger)
+        step.ledger = ledger;
+      else
+        step.details = [
+          ...(step.details ?? []),
+          !deferred
+            ? 'deferred'
+            : record?.outcome !== 'skipped' || record.stop !== 'interrupted' ? 'interrupt' : 'substitute_record'
+        ];
+    }
+
+    recordStage(
+      step.issue,
+      {
+        sourceId: source.id,
+        revision: source.revision,
+        stage: 'ledger',
+        ...(step.details?.length ? {parts: step.details} : {}),
+      }
+    );
+  }
+
+  /** Remove committed run results only after the authority commit has succeeded. */
+  private commitLedgerRuns(scope: SceneScope, results: readonly {id: string; revision: number;}[]): void {
+
+    this.ledgerRuns?.committed(scopeKey(scope), results);
+  }
+
+  /** Bound retained runs after a pending job without disrupting that job's existing close/error result. */
+  private pruneLedgerRuns(scope: SceneScope): void {
+
+    if (!this.ledgerRuns)
+      return;
+
+    try {
+
+      if (!this.authority.isOpen())
+        return;
+
+      const accepted = this.authority.state(scope).sources.filter(source => source.status === 'accepted');
+
+      this.ledgerRuns.prune(
+        scopeKey(scope),
+        new Map(accepted.map(source => [source.id, source.revision]))
+      );
+    } catch {}
   }
 
   /** The one call site of the world extraction stage: the same request object builds the prompts and decodes the answer. */

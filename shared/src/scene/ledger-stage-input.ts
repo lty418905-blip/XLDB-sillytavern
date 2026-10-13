@@ -39,7 +39,8 @@ const RECENT_TEXT_CODE_POINTS = 600;
 const RECENT_TEXT_SIDE_CODE_POINTS = 300;
 /** Ruled count of accepted messages shared by input selection, container access and the pin.
  * The model's recent-input explanation, read_amount container list and unknown_source condition,
- * and the ago hint also state this count; update their wording when the count changes. */
+ * and the ago hint also state this count; update their wording when the count changes.
+ * Container patterns use a digit range, so this count must be an integer from 1 through 9. */
 export const LEDGER_RECENT_MESSAGE_COUNT = 6;
 // Ruled cap on previous-message amount rows; current-message rows remain unbounded.
 const PREVIOUS_AMOUNT_ROW_COUNT = 24;

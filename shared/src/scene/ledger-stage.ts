@@ -64,7 +64,8 @@ import {
   LEDGER_CORRECTIONS,
 } from './ledger-stage-tools.ts';
 
-// Match the same local message spellings as the accepted-history window.
+// Accept m0 and m-1 through m-N without leading zeros; N is LEDGER_RECENT_MESSAGE_COUNT.
+// The character-class construction requires an integer N from 1 through 9.
 const MESSAGE_CONTAINER_PATTERN = new RegExp(`^m(?:0|-[1-${LEDGER_RECENT_MESSAGE_COUNT}])$`);
 // Ruled quote-search cap per read call, bounding repeated-occurrence parser work.
 const READ_QUOTE_MATCH_COUNT = 64;
@@ -866,7 +867,8 @@ export function ledgerFrozen(
   }
 }
 
-/** Pins current prose, six accepted identities, roster and active account metadata. Excludes balances/config/marks. */
+/** Pins current prose, accepted identities within LEDGER_RECENT_MESSAGE_COUNT, roster and active account metadata.
+ * Excludes balances/config/marks. */
 export function ledgerPin(
   request: Pick<LedgerInputRequest, 'source' | 'history' | 'playerName' | 'characters'>,
   accounts: readonly LedgerAccount[]): string | null {
