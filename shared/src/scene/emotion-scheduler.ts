@@ -273,6 +273,15 @@ function unmetDrive(serialized:string):number {
   } catch {return 0;}
 }
 
+/** Read-only terminal-skip test; work is O(P + R + K) in this source's pending, ready and skipped entries. */
+function hasCompletedEmotionSkip(analysis: SceneState['sources'][number]['analysis'], characterId: string): boolean {
+  return Boolean(
+    analysis?.emotionPendingIds?.includes(characterId)
+    && !analysis.emotionCandidateReadyIds?.includes(characterId)
+    && analysis.skippedStages?.some(skipped => skipped.stage === 'emotion' && skipped.characterId === characterId),
+  );
+}
+
 /** Read-only queue diagnostics. It exposes identifiers and counts, never another NPC's evidence. */
 export function emotionScheduleStatus(state:SceneState) {
   const windows=new Map<string,{eligible:Set<string>;selected:Set<string>;forced:Set<string>;method:string;reason?:string;modelIdentity?:string}>();
@@ -281,6 +290,7 @@ export function emotionScheduleStatus(state:SceneState) {
   for(const source of state.sources){
     if(source.status!=='accepted'||source.processing!=='ready'||!source.analysis)continue;
     for(const id of source.analysis.emotionPendingIds??[]){
+      if (hasCompletedEmotionSkip(source.analysis, id)) continue;
       pending.set(id,(pending.get(id)??0)+1);
       if(!source.analysis.emotionCandidateReadyIds?.includes(id)&&
         !source.analysis.skippedStages?.some(item=>item.stage==='emotion'&&item.characterId===id))

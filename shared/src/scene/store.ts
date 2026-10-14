@@ -49,6 +49,15 @@ import type {ContactEmotionProjection,SceneAuthorityExtensionFactory,SceneAuthor
 
 export type {SceneSubjectBinding} from './extension.ts';
 
+/** Read-only terminal-skip test; work is O(P + R + K) in this source's pending, ready and skipped entries. */
+function hasCompletedEmotionSkip(analysis: SceneState['sources'][number]['analysis'], characterId: string): boolean {
+  return Boolean(
+    analysis?.emotionPendingIds?.includes(characterId)
+    && !analysis.emotionCandidateReadyIds?.includes(characterId)
+    && analysis.skippedStages?.some(skipped => skipped.stage === 'emotion' && skipped.characterId === characterId),
+  );
+}
+
 /** Pure fold work owned by one outer call; code-unit and entry budgets apply to the entire call. */
 interface SceneReadStep {
   active: boolean;
@@ -778,6 +787,8 @@ export class SceneAuthority {
         for(const id of source.analysis.emotionPendingIds??[]){
           if(foregroundCharacterId&&id!==foregroundCharacterId)continue;
           if(blocked.has(id))continue;
+          // A terminal skip keeps its stored marker but cannot block later prepared experiences.
+          if (hasCompletedEmotionSkip(source.analysis, id)) continue;
           if(!source.analysis.emotionCandidateReadyIds?.includes(id)){
             blocked.add(id);continue;
           }

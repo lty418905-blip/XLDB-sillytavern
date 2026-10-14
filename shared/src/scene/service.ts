@@ -71,6 +71,15 @@ import type {WorldStageRequest,WorldStageResult,StoredStoryClock} from './world-
 import {scanOriginCandidates} from './time-expressions.ts';
 import {isStoryScope,storyNow,storyTimelineOf,commitmentStoryClock,directorClockOf,originScanEntries,contextLanguage} from './story-clock-consumers.ts';
 
+/** Read-only terminal-skip test; work is O(P + R + K) in this source's pending, ready and skipped entries. */
+function hasCompletedEmotionSkip(analysis: SceneState['sources'][number]['analysis'], characterId: string): boolean {
+  return Boolean(
+    analysis?.emotionPendingIds?.includes(characterId)
+    && !analysis.emotionCandidateReadyIds?.includes(characterId)
+    && analysis.skippedStages?.some(skipped => skipped.stage === 'emotion' && skipped.characterId === characterId),
+  );
+}
+
 interface Draft {
   id:string; scope:SceneScope; version:number; modelRevision:number; expires:number;
   userMessage:SceneMessage; assistantMessage:SceneMessage; assistantPlan:PerspectivePlan;
@@ -213,6 +222,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
           if(source.status!=='accepted'||source.processing!=='ready'||!source.analysis?.plan)continue;
           for(const id of source.analysis.emotionPendingIds??[]){
             if(blocked.has(id))continue;
+            if (hasCompletedEmotionSkip(source.analysis, id)) continue;
             blocked.add(id);
             if(source.analysis.emotionCandidateReadyIds?.includes(id)||
               source.analysis.skippedStages?.some(item=>item.stage==='emotion'&&item.characterId===id))continue;
@@ -1856,9 +1866,12 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             const currentSchedules=previousSchedules.filter(item=>item.windowId===windowId);
             const used=new Set(currentSchedules.flatMap(item=>item.selectedIds));
             const backlog=processed.slice(0,-1).filter(item=>item.status==='accepted'&&item.analysis?.emotionPendingIds?.length);
-            const candidates=visibleCharacters.filter(character=>!backlog.some(item=>
-              item.analysis?.emotionPendingIds?.includes(character.id)&&
-              !item.analysis.emotionCandidateReadyIds?.includes(character.id)));
+            // With fixed actor and stage counts per source, the existing backlog passes are O(N).
+            const candidates = visibleCharacters.filter(character => !backlog.some(item =>
+              item.analysis?.emotionPendingIds?.includes(character.id)
+              && !item.analysis.emotionCandidateReadyIds?.includes(character.id)
+              && !hasCompletedEmotionSkip(item.analysis, character.id)));
+
             const free=Math.max(0,EMOTION_NPC_BUDGET-used.size);
             const newCandidates=candidates.filter(character=>!used.has(character.id));
             let ranked=newCandidates.map(character=>character.id);
@@ -1875,7 +1888,9 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
                   currentTarget:character.id===source.envelope.targetId,present:source.envelope.presentIds.includes(character.id),
                   // Earlier accepted sources whose update for this NPC still waits in the background queue. This also
                   // enters the AgentJev input and so the rank-stage fingerprint.
-                  deferredEvents:backlog.filter(item=>item.analysis?.emotionPendingIds?.includes(character.id)).length};
+                  deferredEvents: backlog.filter(item =>
+                    item.analysis?.emotionPendingIds?.includes(character.id)
+                    && !hasCompletedEmotionSkip(item.analysis, character.id)).length};
               });
               const ranking=await this.stage(scope,source,'emotionRank',undefined,{
                 schema:4,windowId,modelIdentity:this.emotionRankIdentity(),
@@ -1898,12 +1913,15 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
               ...(reason?{reason}:{}),...(modelIdentity?{modelIdentity}:{})};
             // One foreground slot covers this NPC's prepared history in source order.
             for(const id of selectedEmotionIds){
-              if(!backlog.some(item=>item.analysis?.emotionPendingIds?.includes(id)))continue;
+              if (!backlog.some(item => item.analysis?.emotionPendingIds?.includes(id)
+                && !hasCompletedEmotionSkip(item.analysis, id))) continue;
               this.authority.completeDeferredEmotion(scope,id);
               const stored=new Map(this.authority.state(scope).sources.map(item=>[item.id,item]));
               for(let index=0;index<processed.length-1;index++){
                 const earlier=processed[index]!;
                 if(!earlier.analysis?.emotionPendingIds?.includes(id))continue;
+                // Preserve this job's skipped marker so its fallback never becomes an accepted experience.
+                if (hasCompletedEmotionSkip(earlier.analysis, id)) continue;
                 const original=accepted.find(item=>item.id===earlier.id&&item.revision===earlier.revision);
                 if(original?.processing==='ready'&&!results.some(item=>item.id===earlier.id)){
                   const refreshed=stored.get(earlier.id);

@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "47bbd6e6c998c25eb1acc8a9254996dd180133fbb81a1918fc4072288e49e1a0",
+  "sourceManifestSha256": "1505357091830a2ca1e3190cdedd6aa0313eb823ee440c30cdbe492451ed414c",
   "files": [
     {
       "file": ".gitattributes",
@@ -111,6 +111,16 @@
       "file": "shared/src/common/geography.ts",
       "sha256": "c375658b7a51b387b0dadc9b4fe08253e608e552c5f6ec7c37903e5dcb3cab8d",
       "bytes": 77606
+    },
+    {
+      "file": "shared/src/common/han-script-exclusions.ts",
+      "sha256": "7746cd39b75e0faf019ac47d28573bfcf51009fa13dfab1a36410dc027a7afc7",
+      "bytes": 2775
+    },
+    {
+      "file": "shared/src/common/han-script.ts",
+      "sha256": "35ae19c1dad5a4b3e62379b6864f462c64cea9b6f10d49e1634089fe0b6efb53",
+      "bytes": 2926
     },
     {
       "file": "shared/src/common/physiology.ts",
@@ -404,8 +414,8 @@
     },
     {
       "file": "shared/src/scene/emotion-scheduler.ts",
-      "sha256": "0ead43650bc0e1a12107beada73db034236604a1201e5fc8096c64e0daa7e725",
-      "bytes": 18061
+      "sha256": "f49d274179783b537c989af060727cb1e7e7476d897216b61eae938d984417bf",
+      "bytes": 18618
     },
     {
       "file": "shared/src/scene/extension.ts",
@@ -494,13 +504,13 @@
     },
     {
       "file": "shared/src/scene/service.ts",
-      "sha256": "65cdd9d44468690010fd6bc843f103740c41988bcce617315c18ae513bd42f44",
-      "bytes": 159046
+      "sha256": "71daddb95a427782847a1758c31dc80a4ed7e1b7bf2b63736d9e288bd9342a5b",
+      "bytes": 160138
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "3922426083186a19640d563817fce7dd7dcd38a86a3f8be1067f18d93ee69d46",
-      "bytes": 135920
+      "sha256": "c37b959ba1bca100ba4eb5201d41789aaa886eeef7a0a78e77cf889a8c003748",
+      "bytes": 136590
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
@@ -684,12 +694,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "26440b0e55d03f21f4a0649a7a83cfeb33b2d56ff970bc02f19f16c31a21cdf4",
+      "sha256": "4bd3e56033a9df5dd6f1a62e27992f6c7a316c071de15d01ce922c7f8e7aa3f4",
       "bytes": 357169
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "cc9575a899d53d8f1a7ca514413734a1cf31b96f06fb2e249043d7d950e9a977",
+      "sha256": "2a73a5efba73b9fc33c09174967cfcbed76d2a82e71899f6dd71f544fc9c556d",
       "bytes": 362436
     }
   ]
