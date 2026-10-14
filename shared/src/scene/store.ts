@@ -1,3 +1,5 @@
+import {limitWorldBlock,worldBlockOmissionLines} from './world-block-limit.ts';
+import type {WorldBlockOmissions,WorldBlockCoordinate,WorldBlockLink} from './world-block-limit.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import {createHash} from 'node:crypto';
 import {AsyncLocalStorage} from 'node:async_hooks';
@@ -34,9 +36,9 @@ import {readWorldLedgerRows,worldLedgerOptions,storedLedgerFields,ledgerOnlySett
   ensureWorldLedgerTables,prepareWorldLedgerWrites,guardWorldLedgerBindings,appendWorldLedgerRows,
   eraseWorldLedgerSource,sweepWorldLedgerTombstones} from './world-ledger-store.ts';
 import type {WorldLedgerWrite,WorldLedgerRows} from './world-ledger-store.ts';
-import type {LedgerAfter,LedgerFoldOptions} from './world-ledger.ts';
-import {StoryClockStore,storyClockLine} from './story-clock-store.ts';
-import type {StoryClockLegacySettings,StoryClockSummary} from './story-clock-store.ts';
+import type {LedgerAfter,LedgerFoldOptions,LedgerDetail} from './world-ledger.ts';
+import {StoryClockStore,storyClockLine,storyElapsedMs} from './story-clock-store.ts';
+import type {StoryClockLegacySettings,StoryClockSummary,StoryClockReading} from './story-clock-store.ts';
 import {STORY_CLOCK_DEGRADE_REASONS} from './story-clock-types.ts';
 import type {StoryClockDegradeReason,StoryClockIssue,StoryClockSourceRef,StoryClockView} from './story-clock-types.ts';
 import {commitmentStoryClock,storyNow} from './story-clock-consumers.ts';
@@ -1573,26 +1575,130 @@ export class SceneAuthority {
   }
 
   /**
-   * The character-facing world block and, for a story scope, the clock line. A story scope's block carries neither the
-   * legacy timeMs nor the structured clock: the line is the only time a character reads. `language` is the story
-   * language the caller renders memories in; without it the reader's own memories decide, as contextFrom does.
+   * Render one reader's world block. Story history and open lists are bounded per call; other modes retain their
+   * complete projection. The optional language controls only the existing clock line. Read errors propagate.
    */
-  worldContext(scope:SceneScope,readerId:string,state=this.state(scope),language?:StoryLanguage,timeline?:SceneSource[]) {
-    if(language!==undefined&&language!=='zh'&&language!=='en')throw new Error('invalid_story_language');
-    const world=this.world(scope,readerId,Date.now(),state,timeline) as (WorldProjection&{storyClock?:StoryClockView|null})|null;
-    const header='\n脚本确认的当前世界状态（仅此角色可见；不得自行改算或补全未知余额）：';
-    if(world&&world.mode!=='story')return header+JSON.stringify(world);
-    let worldPart='',view:StoryClockView|null;
-    if(world){
-      const {timeMs:_legacyTime,storyClock,...visible}=world;
-      worldPart=header+JSON.stringify(visible);
-      // Absent from the projection when this reader may not see the time.
-      view=storyClock??null;
-    }else view=this.storyClock.summary(scope,state)?.view??null;
-    if(!storyClockLine(view,'zh'))return worldPart;
-    const resolved=language??(state.roster.characters.some(character=>character.id===readerId)
-      ?storyLanguageOf(this.snapshot(scope,readerId,state)):'zh');
-    return worldPart+storyClockLine(view,resolved);
+  worldContext(
+    scope: SceneScope,
+    readerId: string,
+    state = this.state(scope),
+    language?: StoryLanguage,
+    timeline?: SceneSource[],
+  ) {
+    const block = this.readWorldBlock(scope, readerId, state, language, timeline);
+    const header = '\n脚本确认的当前世界状态（仅此角色可见；不得自行改算或补全未知余额）：';
+    if (block.projection && block.projection.mode !== 'story') {
+      return header + JSON.stringify(block.projection);
+    }
+
+    const worldPart = block.projection
+      ? header + JSON.stringify(block.projection) + worldBlockOmissionLines(block.omissions) : '';
+    if (!storyClockLine(block.view, 'zh')) {
+      return worldPart;
+    }
+
+    const resolved = language ?? (state.roster.characters.some(character => character.id === readerId)
+      ? storyLanguageOf(this.snapshot(scope, readerId, state)) : 'zh');
+    return worldPart + storyClockLine(block.view, resolved);
+  }
+
+  /**
+   * Read omitted row counts for the same arguments and defaults as worldContext. Counts are nonnegative integers;
+   * other modes return zeros. Validation errors and the existing companion clock-floor update are preserved.
+   */
+  worldContextOmissions(
+    scope: SceneScope,
+    readerId: string,
+    state = this.state(scope),
+    language?: StoryLanguage,
+    timeline?: SceneSource[],
+  ): WorldBlockOmissions {
+    return this.readWorldBlock(scope, readerId, state, language, timeline).omissions;
+  }
+
+  /** Share only this consumer's world and age reads; the no-world clock keeps its original separate read. */
+  private readWorldBlock(
+    scope: SceneScope,
+    readerId: string,
+    state: SceneState,
+    language?: StoryLanguage,
+    timeline?: SceneSource[],
+  ): {projection: WorldProjection | null; view: StoryClockView | null; omissions: WorldBlockOmissions} {
+    // Language validation precedes the companion floor update, including when the reader is also invalid.
+    if (language !== undefined && language !== 'zh' && language !== 'en') {
+      throw new Error('invalid_story_language');
+    }
+
+    const read = this.ledgerReader(scope);
+    const folded = read(() => this.world(scope, undefined, Date.now(), state, timeline)) as
+      (WorldFoldResult & {storyClock?: StoryClockSummary}) | null;
+    const omissions: WorldBlockOmissions = {history: 0, pending: 0, committed: 0};
+    if (!folded) {
+      return {projection: null, view: this.storyClock.summary(scope, state)?.view ?? null, omissions};
+    }
+
+    const projected = projectWorldState(folded, readerId);
+    if (projected.mode !== 'story') {
+      return {projection: projected, view: null, omissions};
+    }
+
+    const {timeMs: _legacyTime, ...projection} = projected;
+    const view = readerId === 'player' || folded.state.publicTime ? folded.storyClock?.view ?? null : null;
+    const reading = read(() => this.storyClock.read(scope, state));
+    const coordinates = this.worldBlockCoordinates(state, reading);
+    const locate = (rows: readonly {sourceId: string; revision: number}[]) => rows.map(row =>
+      coordinates.locations.get(JSON.stringify([row.sourceId, row.revision])) ?? {});
+    const links = this.worldBlockLinks(folded, readerId);
+    const limited = limitWorldBlock({
+      projection,
+      receiptCoordinates: locate(projection.receipts),
+      entryCoordinates: locate(projection.ledger?.entries ?? []),
+      lastPosition: coordinates.lastPosition,
+      ...links,
+    });
+    return {projection: limited.projection, view, omissions: limited.omissions};
+  }
+
+  /** O(S) identities and clock lookups per call. Duplicate revisions use their final source position. */
+  private worldBlockCoordinates(state: SceneState, reading: StoryClockReading | null) {
+    const locations = new Map<string, WorldBlockCoordinate>();
+    let lastPosition = -1;
+    for (let index = 0; index < state.sources.length; index++) {
+      const source = state.sources[index]!;
+      const sourceId = source.id;
+      const atMs = reading ? this.storyClock.atSource(reading, {sourceId, revision: source.revision}) : null;
+      locations.set(JSON.stringify([sourceId, source.revision]), {
+        position: index,
+        ageMs: atMs === null || !reading ? null : storyElapsedMs(atMs, reading.result.state.atMs),
+      });
+      // The fallback position is the last admitted world source, matching the ledger's source-index domain.
+      if (source.status === 'accepted' && source.processing === 'ready' && source.analysis?.plan) {
+        lastPosition = index;
+      }
+    }
+
+    return {locations, lastPosition};
+  }
+
+  /** O(C + D) folded rows; mirror only the projection filter for the two arrays that carry target relationships. */
+  private worldBlockLinks(folded: WorldFoldResult, readerId: string): {
+    committedLinks: WorldBlockLink[] | null;
+    depositLinks: WorldBlockLink[] | null;
+  } {
+    const open = folded.ledger?.open;
+    if (!open) {
+      return {committedLinks: null, depositLinks: null};
+    }
+
+    const visible = (row: LedgerDetail) => row.readerIds.includes(readerId) && !row.causedByCorrection &&
+      row.kind !== 'adjustment' && row.disposition !== 'void' && row.category !== 'untracked';
+    const links = (rows: LedgerDetail[]): WorldBlockLink[] => rows.filter(visible).map(row => ({
+      sourceId: row.sourceId,
+      revision: row.revision,
+      key: JSON.stringify(row.key),
+      target: row.relation ? JSON.stringify(row.relation.target) : null,
+    }));
+    return {committedLinks: links(open.committed), depositLinks: links(open.deposits)};
   }
 
   /** Administrative rows, including original body strings for fingerprints and rejected rows for the panel. */

@@ -399,6 +399,23 @@ function decodeOrigin(raw:unknown,text:string,candidates:readonly OriginCandidat
   return {kind:dateItem!==null?'absolute':'relative',date:dateItem,time:timeItem,timeOfDay:slotItem};
 }
 
+/**
+ * Test the bound quote's clause prefix for an adjacent time-reversal phrase; return false when absent.
+ * UTF-16 offsets refer to the unchanged source. Scan, folding and fixed-width matching cost O(n)
+ * time and space per cue, where n is the clause prefix length; the caller allows at most 20 cues.
+ */
+function hasTimeReversalInClause(text: string, match: ScriptQuoteMatch): boolean {
+  let clauseStart = match.start;
+
+  while (clauseStart > 0 && !'。！？；，、\r\n'.includes(text[clauseStart - 1]!)) {
+    clauseStart -= 1;
+  }
+
+  const clause = foldForMatch(text.slice(clauseStart, match.end));
+
+  return /(时间|时光|时空)(倒流|倒退|回溯)/.test(clause);
+}
+
 /** §2.3-§2.5: the stored clock value of one source, an analysis or the 'failed' marker; never throws. */
 function decodeStoryClock(raw:unknown,request:WorldStageRequest):StoredStoryClock {
   const {source,opening}=request,text=source.text;
@@ -430,6 +447,13 @@ function decodeStoryClock(raw:unknown,request:WorldStageRequest):StoredStoryCloc
     if(at===null){cueIssues.push(issue('quote_not_found',index,cue.quote));return;}
     const quote=at.quote,span:Span=[at.start,at.end];
     taken.push(span);
+    // Source context comes first so short and full quotes share the same recall exclusion.
+    if (hasTimeReversalInClause(text, at)) {
+      cueIssues.push(issue('guard_hit', index, quote));
+      guarded.push(span);
+      moved.push({quote, reason: 'recall', date: null, time: null, timeOfDay: null});
+      return;
+    }
     const parsed=parseNarrativeCue(quote);
     if(!parsed.ok) {
       if(parsed.reason==='guard') {

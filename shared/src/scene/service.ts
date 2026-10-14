@@ -2453,7 +2453,10 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
   }
 
   /** Wait for completion or this source's remaining foreground milliseconds, then inspect the settled entry.
-   * Invalid clock reads spend zero budget; timer installation failures preserve the original completion wait. */
+   * Remaining time is budget minus elapsed time since arrival, clamped to 0..budget; zero sets no timer.
+   * Expiry defers this source so the turn can continue while its run remains alive; an unbuildable record
+   * instead cancels and removes that run. Invalid clock reads spend zero budget; timer installation failures
+   * preserve the original completion wait. */
   private async waitLedgerStep(step: LedgerStep): Promise<void> {
 
     const entry = step.entry!;
@@ -2679,7 +2682,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     };
   }
 
-  /** Inspect each already-processed predecessor at most once per job; no fold, decode or storage read occurs. */
+  /** Read analysis.ledger.outcome from each held predecessor at most once per job and retain any deferred result.
+   * The cursor starts at zero and only advances; no fold, serialized-record decode or storage read occurs. */
   private ledgerHasDeferred(processed: readonly SceneSource[], progress: LedgerProgress): boolean {
 
     for (; progress.index < processed.length; progress.index++) {

@@ -22,12 +22,18 @@ export const LEDGER_RECORD_UTF16_LIMIT = 131072;
 /** Cache payload version for the eight caller-owned fields; older or unknown versions are misses. */
 export const LEDGER_CACHE_SCHEMA = 1;
 
-/** User-source foreground budget in milliseconds, inclusive of work after arrival at the ledger step.
- * Product policy selects 45 seconds independently of the run's request and duration limits. */
+/** User-source foreground budget in milliseconds, measured from arrival at the ledger step.
+ * Product policy selects 45 seconds independently of the run's request and duration limits.
+ * The timer uses budget minus elapsed time, clamped to 0..budget; zero expires without setting a timer.
+ * Expiry stores a deferred timeout record and lets the turn continue without cancelling the run.
+ * If that record cannot be built, the run is cancelled and its registry entry is removed instead. */
 export const LEDGER_FOREGROUND_USER_MS = 45000;
 
-/** Assistant-source foreground budget in milliseconds, inclusive of work after arrival at the ledger step.
- * Product policy selects 45 seconds independently of the user-source budget and the run's limits. */
+/** Assistant-source foreground budget in milliseconds, measured from arrival at the ledger step.
+ * Product policy selects 45 seconds independently of the user-source budget and the run's limits.
+ * The timer uses budget minus elapsed time, clamped to 0..budget; zero expires without setting a timer.
+ * Expiry stores a deferred timeout record and lets the turn continue without cancelling the run.
+ * If that record cannot be built, the run is cancelled and its registry entry is removed instead. */
 export const LEDGER_FOREGROUND_ASSISTANT_MS = 45000;
 
 /** Optional loop clock and wait in monotonic nonnegative milliseconds. Null/nonfunctions use platform defaults.
@@ -72,13 +78,15 @@ export interface LedgerRunContext {
 }
 
 /** Linear cursor over predecessors already processed in one job; the deferred flag is sticky within that job.
- * Index is a source count starting at zero; the cursor never reads storage or interprets record contents. */
+ * Index is a source count starting at zero; the cursor reads analysis.ledger.outcome from held source records,
+ * without reading storage or decoding serialized records. */
 export interface LedgerProgress {
   index: number;
   deferred: boolean;
 }
 
-/** Registry entry with process-local monotone identity; done never rejects and cancellation is sticky. */
+/** Registry entry with process-local monotone identity; done never rejects and cancellation is sticky.
+ * Retained context supports late substitutes; deferred records whether a source commit parked this run. */
 export interface LedgerRunEntry extends LedgerRunBinding {
   id: bigint;
   scope: string;
@@ -88,18 +96,24 @@ export interface LedgerRunEntry extends LedgerRunBinding {
   cancelled: boolean;
   done: Promise<void>;
   result: LedgerRunResult | null;
+  /** Source, selection and request count set at registration; never cleared, discarded with this entry. */
   context?: LedgerRunContext;
+  /** False at registration, true after a successful deferred commit; never cleared, discarded with this entry. */
   deferred: boolean;
 }
 
 /** Per-source step data, held only until the existing job assembles its analysis.
+ * Arrival sets its foreground budget; deferred and notice retain parking and timer-failure decisions.
  * Optional persisted keys are omitted, never explicitly undefined or null. */
 export interface LedgerStep {
   marks?: LedgerMarks;
   ledger?: StoredLedger;
   entry?: LedgerRunEntry;
+  /** Millisecond reading set on new or reused run arrival, null if invalid; never cleared, discarded with this step. */
   arrivedAt?: number | null;
+  /** Parking cause set when deferring this source; never cleared, discarded with this step. */
   deferred?: 'timeout' | 'waiting';
+  /** Diagnostic set if foreground timer installation fails; never cleared, discarded with this step. */
   notice?: string;
   fallback?: {
     source: LedgerText;
