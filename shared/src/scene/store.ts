@@ -2,7 +2,8 @@ import type { DatabaseSync } from 'node:sqlite';
 import {createHash} from 'node:crypto';
 import {AsyncLocalStorage} from 'node:async_hooks';
 import {isPromise, isProxy} from 'node:util/types';
-import { createEmotion, advanceEmotion, emotionAt, emotionSummary, emotionSettingsOf, validateEmotionState } from '../emotion/openher.ts';
+import { createEmotion, advanceEmotion, emotionAt, emotionSummary, emotionSettingsOf, emotionSettingsEqual, emotionStateVersionRecognized, validateEmotionState } from '../emotion/openher.ts';
+import {actorHasEmotion} from './actor-emotion.ts';
 import type { EmotionState } from '../emotion/openher.ts';
 import { foldRelationships, relationshipAnchor as foldedRelationshipAnchor, validateRelationships } from '../emotion/relationships.ts';
 import type { FoldedRelationship } from '../emotion/relationships.ts';
@@ -406,32 +407,95 @@ export class SceneAuthority {
   /** Needed after interaction inheritance, which occurs after lifecycle fork materialization. */
   refreshDerived(scope:SceneScope,nowMs=Date.now()):void {this.transaction(()=>this.rebuildDerived(scope,nowMs));}
 
-  configure(scope: SceneScope, roster: SceneRoster, now = Date.now(), captureCheckpoint=true) {
+  /** Saves a roster atomically; accepted emotion records replay locally under changed settings or identity. */
+  configure(
+    scope: SceneScope,
+    roster: SceneRoster,
+    now = Date.now(),
+    captureCheckpoint = true,
+    beforeWrite?: (state: SceneState, roster: SceneRoster) => void,
+  ) {
     return this.transaction(() => {
       const state = this.state(scope);
-      if (state.version && JSON.stringify(state.roster) === JSON.stringify(roster)) return {version:state.version,roster,
-        needsProcessing:state.sources.some(source=>source.status==='accepted'&&source.processing!=='ready')};
-      const ids=new Set(roster.characters.map(character=>character.id));
-      if (state.sources.some(source=>source.status!=='deleted' && [source.envelope.targetId,...source.envelope.presentIds,...(source.speakerId?[source.speakerId]:[])].some(id=>!ids.has(id)))) throw new Error('invalid_scene_character_in_use');
-      if(state.version&&captureCheckpoint)this.lifecycle.checkpoint(scope,'角色配置变更',{automatic:true});
-      if(state.version)this.processing.clearScope(scope);
-      this.db.prepare(`INSERT INTO scene_worlds VALUES(?,?,?,1,?)
-        ON CONFLICT(key) DO UPDATE SET roster=excluded.roster,version=scene_worlds.version+1`)
+      // Preserve opaque stored members before the equality check, including explicit null and member order.
+      const retainReserved = <T extends object>(incoming: T, stored: T | undefined, names: string[]): T => {
+        if (!names.some(name => Object.hasOwn(incoming, name) || stored && Object.hasOwn(stored, name))) {
+          return incoming;
+        }
+        const supplied = new Map(Object.entries(incoming));
+        const retained = new Map<string, unknown>();
+        for (const [name, value] of Object.entries(stored ?? {})) {
+          if (names.includes(name)) retained.set(name, value);
+          else if (supplied.has(name)) retained.set(name, supplied.get(name));
+        }
+        for (const [name, value] of supplied) {
+          if (!names.includes(name) && !retained.has(name)) retained.set(name, value);
+        }
+        return Object.fromEntries(retained) as T;
+      };
+      const storedCharacters = new Map(state.roster.characters.map(character => [character.id, character]));
+      const characters = roster.characters.map(character => retainReserved(
+        character,
+        storedCharacters.get(character.id),
+        ['calibration', 'emotionProvenance'],
+      ));
+      roster = retainReserved({...roster, characters}, state.roster, ['emotionControls']);
+      if (state.version && JSON.stringify(state.roster) === JSON.stringify(roster)) {
+        return {
+          version: state.version,
+          roster,
+          needsProcessing: state.sources.some(source => source.status === 'accepted' && source.processing !== 'ready'),
+        };
+      }
+      const previous = new Map(state.roster.characters.map(character => [character.id, character]));
+      const replayIds = roster.characters.filter(character => {
+        const before = previous.get(character.id);
+        return before && actorHasEmotion(character) && (
+          !emotionSettingsEqual(before.emotion, character.emotion)
+          || before.persona !== character.persona
+          || JSON.stringify(before.identitySource) !== JSON.stringify(character.identitySource)
+        );
+      }).map(character => character.id);
+      const ids = new Set(roster.characters.map(character => character.id));
+      const usedCharacterRemoved = state.sources.some(source => source.status !== 'deleted' && [
+        source.envelope.targetId,
+        ...source.envelope.presentIds,
+        ...(source.speakerId ? [source.speakerId] : []),
+      ].some(id => !ids.has(id)));
+      if (usedCharacterRemoved) throw new Error('invalid_scene_character_in_use');
+
+      // The guard observes the validated pre-write state before checkpoints or cache invalidation.
+      beforeWrite?.(state, roster);
+
+      if (state.version && captureCheckpoint) this.lifecycle.checkpoint(scope, '角色配置变更', {automatic: true});
+      if (state.version) this.processing.clearScope(scope);
+      this.db.prepare('INSERT INTO scene_worlds VALUES(?,?,?,1,?) '
+        + 'ON CONFLICT(key) DO UPDATE SET roster=excluded.roster,version=scene_worlds.version+1')
         .run(scopeKey(scope), JSON.stringify(scope), JSON.stringify(roster), now);
       this.hooks.onConfigured(scope);
-      this.invalidateConfigurationChanges(scope,state,roster);
-      const worldSettings=this.worldSettings(scope);
-      if(worldSettings){
-        const updated={...worldSettings,actorLabels:Object.fromEntries(roster.characters.map(actor=>[actor.id,[actor.name,...actor.aliases]]))};
-        foldWorldState(updated,[]);
-        if(JSON.stringify(updated)!==JSON.stringify(worldSettings)){
-          this.db.prepare('UPDATE scene_world_settings SET settings=? WHERE scope=?').run(JSON.stringify(updated),scopeKey(scope));
+      this.invalidateConfigurationChanges(scope, state, roster);
+      const worldSettings = this.worldSettings(scope);
+      if (worldSettings) {
+        const updated = {
+          ...worldSettings,
+          actorLabels: Object.fromEntries(roster.characters.map(actor => [actor.id, [actor.name, ...actor.aliases]])),
+        };
+        foldWorldState(updated, []);
+        if (JSON.stringify(updated) !== JSON.stringify(worldSettings)) {
+          this.db.prepare('UPDATE scene_world_settings SET settings=? WHERE scope=?')
+            .run(JSON.stringify(updated), scopeKey(scope));
           this.markAllPending(scope);
         }
       }
+      // Naming changes keep their existing invalidation; only the still-accepted records can replay below.
+      for (const characterId of replayIds) this.rebuildEmotionStates(scope, characterId);
       this.rebuildDerived(scope);
-      const next=this.state(scope);
-      return {version:next.version,roster,needsProcessing:next.sources.some(source=>source.status==='accepted'&&source.processing!=='ready')};
+      const next = this.state(scope);
+      return {
+        version: next.version,
+        roster,
+        needsProcessing: next.sources.some(source => source.status === 'accepted' && source.processing !== 'ready'),
+      };
     });
   }
 
@@ -1217,41 +1281,69 @@ export class SceneAuthority {
    * E0: the latest persisted (replayed) OpenHer state before any read-time projection, with the character's emotion
    * settings. Cached by the same replay key as `emotion`; the caller must not mutate it.
    */
-  emotionBase(scope: SceneScope, characterId: string, state = this.state(scope), timeline?:SceneSource[]): {emotion:EmotionState;settings:unknown} {
-    return this.withLedgerRows(scope,()=>{
-    const character = state.roster.characters.find(character=>character.id===characterId);
-    if (!character) throw new Error('invalid_scene_character');
-    // The ordinary state read omits neural snapshots. Read them once and fingerprint
-    // the actual role history, so unrelated world-version changes keep this replay.
-    const rows=this.db.prepare("SELECT s.id,s.revision,j.value AS body FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j WHERE s.scope=? AND s.status='accepted' AND s.processing='ready' AND j.key=?")
-      .all(scopeKey(scope),characterId) as {id:string;revision:number;body:string}[];
-    const storedBySource=new Map(rows.map(row=>[JSON.stringify([row.id,row.revision]),row.body]));
-    // One object for this call: at most one settings derivation, one legacy world fold and one clock reading.
-    const replayTimes=this.storyClock.legacyTimeline(scope,state.sources,timeline);
-    const initialTime=replayTimes.initial(state.createdAtMs);
-    const events: {stored:EmotionState|undefined;body:string|undefined;delta:import('../emotion/openher.ts').EmotionDelta;at:number|undefined}[]=[];
-    for(const [index,source] of state.sources.entries()){
-      if(source.status!=='accepted'||source.processing!=='ready')continue;
-      const analysis=source.analysis?.characters[characterId];
-      if(!analysis||source.analysis?.emotionPendingIds?.includes(characterId))continue;
-      const stored=source.analysis?.emotionStates?.[characterId];
-      const body=stored?JSON.stringify(stored):storedBySource.get(JSON.stringify([source.id,source.revision]));
-      events.push({stored,body,delta:analysis.emotion,
-        at:body===undefined?replayTimes.at(index,source.acceptedAtMs):undefined});
-    }
-    const replayKey=createHash('sha256').update(JSON.stringify([scopeKey(scope),characterId,character.emotion,
-      initialTime,events.map(event=>[event.body,event.body===undefined?event.delta:undefined,event.at])])).digest('hex');
-    let emotion=this.emotionReplayCache.get(replayKey);
-    if(!emotion){
-      emotion=createEmotion(initialTime,character.emotion,emotionIdentitySeed(scope,characterId));
-      for(const event of events)emotion=event.body!==undefined
-        ?validateEmotionState(event.stored??JSON.parse(event.body))
-        :advanceEmotion(emotion,event.delta,event.at!,character.emotion);
-      this.emotionReplayCache.delete(replayKey);
-      this.emotionReplayCache.set(replayKey,emotion);
-      if(this.emotionReplayCache.size>64)this.emotionReplayCache.delete(this.emotionReplayCache.keys().next().value!);
-    }
-    return {emotion,settings:character.emotion};
+  emotionBase(scope: SceneScope, characterId: string, state = this.state(scope), timeline?: SceneSource[]): {
+    emotion: EmotionState;
+    settings: unknown;
+  } {
+    return this.withLedgerRows(scope, () => {
+      const character = state.roster.characters.find(character => character.id === characterId);
+      if (!character)
+        throw new Error('invalid_scene_character');
+      // The ordinary state read omits neural snapshots. Read them once and fingerprint
+      // the actual role history, so unrelated world-version changes keep this replay.
+      const rows = this.db.prepare("SELECT s.id,s.revision,j.value AS body FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j WHERE s.scope=? AND s.status='accepted' AND s.processing='ready' AND j.key=?")
+        .all(scopeKey(scope), characterId) as {
+        id: string;
+        revision: number;
+        body: string;
+      }[];
+      const storedBySource = new Map(rows.map(row => [JSON.stringify([row.id, row.revision]), row.body]));
+      // One object for this call: at most one settings derivation, one legacy world fold and one clock reading.
+      const replayTimes = this.storyClock.legacyTimeline(scope, state.sources, timeline);
+      const initialTime = replayTimes.initial(state.createdAtMs);
+      const events: {
+        stored: EmotionState | undefined;
+        body: string | undefined;
+        delta: import('../emotion/openher.ts').EmotionDelta;
+        at: number | undefined;
+        index: number;
+        acceptedAtMs: number;
+      }[] = [];
+      for (const [index, source] of state.sources.entries()) {
+        if (source.status !== 'accepted' || source.processing !== 'ready')
+          continue;
+        const analysis = source.analysis?.characters[characterId];
+        if (!analysis || source.analysis?.emotionPendingIds?.includes(characterId))
+          continue;
+        const stored = source.analysis?.emotionStates?.[characterId];
+        const body = stored ? JSON.stringify(stored) : storedBySource.get(JSON.stringify([source.id, source.revision]));
+        events.push({ stored, body, delta: analysis.emotion, index, acceptedAtMs: source.acceptedAtMs,
+          at: body === undefined ? replayTimes.at(index, source.acceptedAtMs) : undefined });
+      }
+      const replayKey = createHash('sha256').update(JSON.stringify([scopeKey(scope), characterId, character.emotion,
+        initialTime, events.map(event => [event.body, event.body === undefined ? event.delta : undefined, event.at])])).digest('hex');
+      let emotion = this.emotionReplayCache.get(replayKey);
+      if (!emotion) {
+        emotion = createEmotion(initialTime, character.emotion, emotionIdentitySeed(scope, characterId));
+        for (const event of events) {
+          const snapshot = event.body === undefined ? undefined : event.stored ?? JSON.parse(event.body);
+          const unknownSnapshot = snapshot !== null && typeof snapshot === 'object' && !Array.isArray(snapshot)
+            && !emotionStateVersionRecognized(snapshot.version);
+          if (event.body !== undefined && !unknownSnapshot) {
+            emotion = validateEmotionState(snapshot);
+          }
+          else {
+            // A skipped snapshot still belongs to its original source position on the timeline.
+            const at = event.at ?? replayTimes.at(event.index, event.acceptedAtMs);
+            emotion = advanceEmotion(emotion, event.delta, at, character.emotion);
+          }
+        }
+        this.emotionReplayCache.delete(replayKey);
+        this.emotionReplayCache.set(replayKey, emotion);
+        if (this.emotionReplayCache.size > 64)
+          this.emotionReplayCache.delete(this.emotionReplayCache.keys().next().value!);
+      }
+      return { emotion, settings: character.emotion };
     });
   }
 
@@ -1325,6 +1417,16 @@ export class SceneAuthority {
     const character=state.roster.characters.find(item=>item.id===characterId);
     if(!character) throw new Error('invalid_scene_character');
     return foldedRelationshipAnchor(state.sources,characterId,targetId,emotionSettingsOf(character.emotion).stableRelationRate);
+  }
+
+  /** Reads the stored roster, version, and accepted-event flags once; no views or writes are performed. */
+  emotionRoster(scope: SceneScope) {
+    const state = this.state(scope);
+    return {
+      version: state.version,
+      roster: state.roster,
+      emotionAcceptedEvents: acceptedEmotionEvents(this, scope, state),
+    };
   }
 
   inspect(scope: SceneScope, characterId?: string, now = Date.now()) {
@@ -1869,33 +1971,40 @@ export class SceneAuthority {
     this.processing.clearSources(scope,[source.id]);
     return true;
   }
-  private invalidateConfigurationChanges(scope:SceneScope,state:SceneState,roster:SceneRoster) {
-    const previous=new Map(state.roster.characters.map(character=>[character.id,character]));
-    const changedModel=new Set<string>();
-    const changedPerspective=new Set<string>();
-    for(const character of roster.characters){
-      const before=previous.get(character.id);
-      if(!before)continue;
-      if(before.name!==character.name||before.persona!==character.persona||JSON.stringify(before.emotion??null)!==JSON.stringify(character.emotion??null))changedModel.add(character.id);
-      if(before.name!==character.name||JSON.stringify(before.aliases)!==JSON.stringify(character.aliases))changedPerspective.add(character.id);
+  private invalidateConfigurationChanges(scope: SceneScope, state: SceneState, roster: SceneRoster) {
+    const previous = new Map(state.roster.characters.map(character => [character.id, character]));
+    const changedModel = new Set<string>();
+    const changedPerspective = new Set<string>();
+    for (const character of roster.characters) {
+      const before = previous.get(character.id);
+      if (!before) continue;
+      if (before.name !== character.name) changedModel.add(character.id);
+      if (before.name !== character.name || JSON.stringify(before.aliases) !== JSON.stringify(character.aliases)) {
+        changedPerspective.add(character.id);
+      }
     }
-    if(!changedModel.size&&!changedPerspective.size)return;
-    const changes:{index:number;characters:Set<string>}[]=[];
-    for(const [index,source] of state.sources.entries()){
-      if(source.status!=='accepted'||!source.analysis)continue;
-      const analyzed=Object.keys(source.analysis.characters);
-      const modelAffected=analyzed.some(character=>changedModel.has(character));
-      const envelopeCharacters=[source.envelope.targetId,...source.envelope.presentIds,...(source.speakerId?[source.speakerId]:[])];
-      const replan=source.envelope.mode==='scene'&&envelopeCharacters.some(character=>changedPerspective.has(character));
-      if(!modelAffected&&!replan)continue;
-      const retained=withoutEmotionStates(replan?{...source.analysis,plan:null}:source.analysis);
-      // plan:null intentionally preserves old candidates for mask migration while
-      // making SceneCore obtain a fresh perspective plan.
+    if (!changedModel.size && !changedPerspective.size) return;
+
+    const changes: {index: number; characters: Set<string>}[] = [];
+    for (const [index, source] of state.sources.entries()) {
+      if (source.status !== 'accepted' || !source.analysis) continue;
+      const analyzed = Object.keys(source.analysis.characters);
+      const modelAffected = analyzed.some(character => changedModel.has(character));
+      const envelopeCharacters = [
+        source.envelope.targetId,
+        ...source.envelope.presentIds,
+        ...(source.speakerId ? [source.speakerId] : []),
+      ];
+      const replan = source.envelope.mode === 'scene'
+        && envelopeCharacters.some(character => changedPerspective.has(character));
+      if (!modelAffected && !replan) continue;
+      const retained = withoutEmotionStates(replan ? {...source.analysis, plan: null} : source.analysis);
+      // plan:null preserves old candidates for mask migration while requesting a fresh perspective plan.
       this.db.prepare("UPDATE scene_sources SET processing='pending',analysis=? WHERE scope=? AND id=?")
-        .run(JSON.stringify(retained),scopeKey(scope),source.id);
-      changes.push({index,characters:new Set([...analyzed,...envelopeCharacters])});
+        .run(JSON.stringify(retained), scopeKey(scope), source.id);
+      changes.push({index, characters: new Set([...analyzed, ...envelopeCharacters])});
     }
-    this.invalidateCausalSuffix(scope,changes);
+    this.invalidateCausalSuffix(scope, changes);
   }
   private migrateControls(scope:SceneScope,source:SceneSource,next:SceneAnalysis) {
     const ranking:Access[]=['clear','gist','feeling','anchor','hidden'];
@@ -1948,58 +2057,80 @@ export class SceneAuthority {
     }
   }
   private migrateEmotionStates() {
-    this.transaction(()=>{
-      const worlds=this.db.prepare('SELECT scope FROM scene_worlds').all() as {scope:string}[];
-      for(const row of worlds) {
-        const scope=JSON.parse(row.scope) as SceneScope;
+    this.transaction(() => {
+      const worlds = this.db.prepare('SELECT scope FROM scene_worlds').all() as {
+        scope: string;
+      }[];
+      for (const row of worlds) {
+        const scope = JSON.parse(row.scope) as SceneScope;
         // N16 first: a restore can leave an analysed non-opening as the opening. Both calls always run (never a()||b()):
         // a re-queued opening leaves the 'ready' set, so the snapshots after it are rebuilt in the same open.
-        const requeued=this.requeueOpening(scope);
-        const rebuilt=this.rebuildEmotionStates(scope);
-        if(requeued||rebuilt)this.bump(scope);
+        const requeued = this.requeueOpening(scope);
+        const rebuilt = this.rebuildEmotionStates(scope, undefined, true);
+        if (requeued || rebuilt)
+          this.bump(scope);
         this.rebuildDerived(scope);
       }
     });
   }
   /** Rebuild local neural snapshots only from recorded accepted candidates. */
-  private rebuildEmotionStates(scope:SceneScope,onlyCharacterId?:string):boolean {
-    const state=this.state(scope),key=scopeKey(scope);
-    let changed=false;
+  private rebuildEmotionStates(scope: SceneScope, onlyCharacterId?: string, preserveUnknownSnapshots = false): boolean {
+    const state = this.state(scope), key = scopeKey(scope);
+    const eligibility = new Map(state.roster.characters.map(character => [character.id, actorHasEmotion(character)]));
+    let changed = false;
+    let unknownSnapshot = false;
     // Validate one persisted group at a time; ordinary scene state holds none.
-    for(const source of state.sources) {
-      const rows=this.db.prepare("SELECT j.key,j.value FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j WHERE s.scope=? AND s.id=?")
-        .iterate(key,source.id);
-      const obsolete:string[]=[];
-      for(const row of rows) {
-        const actorId=String(row.key);
-        if(onlyCharacterId&&actorId!==onlyCharacterId)continue;
-        validateStoredEmotionStates({[actorId]:JSON.parse(String(row.value))});
-        if(source.status!=='accepted'||source.processing!=='ready'||!source.analysis?.plan||!source.analysis.characters[actorId]||
-          source.analysis.emotionPendingIds?.includes(actorId))obsolete.push(actorId);
+    for (const source of state.sources) {
+      const rows = this.db.prepare("SELECT j.key,j.value FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j WHERE s.scope=? AND s.id=?")
+        .iterate(key, source.id);
+      const obsolete: string[] = [];
+      for (const row of rows) {
+        const actorId = String(row.key);
+        if (onlyCharacterId && actorId !== onlyCharacterId)
+          continue;
+        if (eligibility.get(actorId) === false)
+          continue;
+        const snapshot = JSON.parse(String(row.value));
+        if (snapshot !== null && typeof snapshot === 'object' && !Array.isArray(snapshot)
+          && !emotionStateVersionRecognized(snapshot.version)) {
+          unknownSnapshot = true;
+          continue;
+        }
+        validateStoredEmotionStates({ [actorId]: snapshot });
+        if (source.status !== 'accepted' || source.processing !== 'ready' || !source.analysis?.plan || !source.analysis.characters[actorId] ||
+          source.analysis.emotionPendingIds?.includes(actorId))
+          obsolete.push(actorId);
       }
-      for(const actorId of obsolete){
+      for (const actorId of obsolete) {
         this.db.prepare("UPDATE scene_sources SET analysis=json_set(analysis,'$.emotionStates',json_patch(json_extract(analysis,'$.emotionStates'),json_object(?,NULL))) WHERE scope=? AND id=?")
-          .run(actorId,key,source.id);
-        changed=true;
+          .run(actorId, key, source.id);
+        changed = true;
       }
     }
+    // Opening validates every recognized snapshot in the existing pass, but leaves future snapshots for reads.
+    if (preserveUnknownSnapshots && unknownSnapshot)
+      return changed;
     // Replaying one role across its history avoids an all-NPC neural map.
     // One object for the whole rebuild, every role: one settings derivation and one pass over the sources, on first use.
-    const snapshotTimes=this.storyClock.legacyTimeline(scope,state.sources);
-    for(const character of state.roster.characters.filter(item=>!onlyCharacterId||item.id===onlyCharacterId)) {
-      let emotion=createEmotion(snapshotTimes.initial(state.createdAtMs),character.emotion,emotionIdentitySeed(scope,character.id));
-      for(const [index,source] of state.sources.entries()) {
-        if(source.status!=='accepted'||source.processing!=='ready'||!source.analysis?.plan)continue;
-        const candidate=source.analysis.characters[character.id];
-        if(!candidate||source.analysis.emotionPendingIds?.includes(character.id))continue;
-        emotion=advanceEmotion(emotion,candidate.emotion,snapshotTimes.at(index,source.acceptedAtMs),character.emotion);
-        const body=JSON.stringify(validateEmotionState(emotion));
-        const previous=this.db.prepare("SELECT j.value AS body FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j WHERE s.scope=? AND s.id=? AND j.key=?")
-          .get(key,source.id,character.id) as {body:string}|undefined;
-        if(previous?.body!==body){
+    const snapshotTimes = this.storyClock.legacyTimeline(scope, state.sources);
+    for (const character of state.roster.characters.filter(item => eligibility.get(item.id) && (!onlyCharacterId || item.id === onlyCharacterId))) {
+      let emotion = createEmotion(snapshotTimes.initial(state.createdAtMs), character.emotion, emotionIdentitySeed(scope, character.id));
+      for (const [index, source] of state.sources.entries()) {
+        if (source.status !== 'accepted' || source.processing !== 'ready' || !source.analysis?.plan)
+          continue;
+        const candidate = source.analysis.characters[character.id];
+        if (!candidate || source.analysis.emotionPendingIds?.includes(character.id))
+          continue;
+        emotion = advanceEmotion(emotion, candidate.emotion, snapshotTimes.at(index, source.acceptedAtMs), character.emotion);
+        const body = JSON.stringify(validateEmotionState(emotion));
+        const previous = this.db.prepare("SELECT j.value AS body FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j WHERE s.scope=? AND s.id=? AND j.key=?")
+          .get(key, source.id, character.id) as {
+          body: string;
+        } | undefined;
+        if (previous?.body !== body) {
           this.db.prepare("UPDATE scene_sources SET analysis=json_set(analysis,'$.emotionStates',json_patch(COALESCE(json_extract(analysis,'$.emotionStates'),'{}'),json_object(?,json(?)))) WHERE scope=? AND id=?")
-            .run(character.id,body,key,source.id);
-          changed=true;
+            .run(character.id, body, key, source.id);
+          changed = true;
         }
       }
     }
@@ -2148,9 +2279,17 @@ function withoutUserModelCandidates<T extends {userModelCandidates?:SceneProfile
   const {userModelCandidates:_ignored,...rest}=value;
   return rest;
 }
-function validateStoredEmotionStates(value:unknown):void {
-  if(!value||typeof value!=='object'||Array.isArray(value))throw new TypeError('invalid_scene_emotion_states');
-  for(const state of Object.values(value as Record<string,unknown>))validateEmotionState(state);
+function validateStoredEmotionStates(value: unknown): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new TypeError('invalid_scene_emotion_states');
+  for (const state of Object.values(value as Record<string, unknown>)) {
+    if (state !== null && typeof state === 'object' && !Array.isArray(state)
+      && !emotionStateVersionRecognized((state as {
+        version?: unknown;
+      }).version))
+      continue;
+    validateEmotionState(state);
+  }
 }
 
 /** Plain data can be keyed without invoking getters, toJSON, proxies, or user iterators; work is O(data bytes). */
@@ -2213,4 +2352,27 @@ function detachedReadResult(value: unknown, inputs: WeakSet<object>, visited = n
       return false;
   }
   return true;
+}
+
+/**
+ * Computes accepted emotion history for every eligible roster member in one pass over the scope's records.
+ * Work is O(roster members + sources + recorded candidates); pending, failed and deferred candidates do not count.
+ * The optional state is the caller's transaction-local read, avoiding another scan. Invalid storage errors propagate.
+ */
+export function acceptedEmotionEvents(
+  authority: SceneAuthority,
+  scope: SceneScope,
+  state = authority.state(scope),
+): Record<string, boolean> {
+  const accepted = new Map(state.roster.characters
+    .filter(character => actorHasEmotion(character))
+    .map(character => [character.id, false]));
+  for (const source of state.sources) {
+    if (source.status !== 'accepted' || source.processing !== 'ready' || !source.analysis?.plan) continue;
+    const pending = new Set(source.analysis.emotionPendingIds ?? []);
+    for (const characterId of Object.keys(source.analysis.characters)) {
+      if (accepted.has(characterId) && !pending.has(characterId)) accepted.set(characterId, true);
+    }
+  }
+  return Object.fromEntries(accepted);
 }

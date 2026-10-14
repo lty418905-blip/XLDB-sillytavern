@@ -198,11 +198,23 @@
 
   function setSceneRoster(roster, invalidateSelection = true) {
     const characters = Array.isArray(roster && roster.characters) ? roster.characters.map(character => ({
-      id: String(character.id || ''), name: String(character.name || ''), aliases: Array.isArray(character.aliases) ? character.aliases.map(alias => String(alias)) : [], persona: String(character.persona || ''), emotion: normalizeSceneEmotion(character.emotion), ...(character.identitySource ? {identitySource:character.identitySource} : {}),
+      ...character,
+      id: String(character.id || ''),
+      name: String(character.name || ''),
+      aliases: Array.isArray(character.aliases) ? character.aliases.map(alias => String(alias)) : [],
+      persona: String(character.persona || ''),
     })).filter(character => character.id && character.name) : [];
     const preferences = readScenePreferences(characters);
-    const changed=invalidateSelection||JSON.stringify(state.scene.roster)!==JSON.stringify(characters);
-    state.scene = { ...state.scene, enabled: characters.length >= 1, roster: characters, targetId: preferences.targetId, presentIds: preferences.presentIds, mode: preferences.mode, selectionVersion: state.scene.selectionVersion + (changed?1:0) };
+    const changed = invalidateSelection || JSON.stringify(state.scene.roster) !== JSON.stringify(characters);
+    state.scene = {
+      ...state.scene,
+      enabled: characters.length >= 1,
+      roster: characters,
+      targetId: preferences.targetId,
+      presentIds: preferences.presentIds,
+      mode: preferences.mode,
+      selectionVersion: state.scene.selectionVersion + (changed ? 1 : 0),
+    };
     if (changed) {
       state.resources = null;
       invalidateInitializationPreview();
@@ -380,6 +392,7 @@
       invalid_scene_character:'请先选择要查看的角色，再查询该角色知道的资料。',
       unauthorized:'连接认证已失效。请重新运行启动器，并重新加载酒馆中的 XLDB 脚本。',
       context_changed_retry:'当前聊天已经变化。请刷新状态，核对当前聊天后重试。',
+      scene_emotion_change_unconfirmed:'这次的改动没有生效：XLDB 要先核对这次改动会不会改到已有经历的 NPC 的情绪参数（会的话需要你确认），但这一步没能完成。请再试一次；仍然不行时，请重新运行启动器，并重新加载酒馆中的 XLDB 脚本，然后再试。',
       config_revision_conflict:'另一页面更新了模型配置。你的草稿仍在，请核对后再保存。',
       invalid_scene_processing:'本轮资料尚未处理完成。请在高级设置中查看处理进度并重试失败项。',
       context_budget_exceeded: '这个角色每一轮都要带上的资料（偏好、人物关系、情绪和最近的记忆）加起来太长，其余记忆全部让出后仍然放不下。请在工作台缩短或停用较长的偏好，或减少 NPC 名单里的人物，然后重试。',
@@ -1493,22 +1506,113 @@
     refreshButtons();
   }
 
-  function normalizeSceneRoster(roster) {
-    return (Array.isArray(roster) ? roster : []).map(character => ({
-      id: String(character && character.id || '').trim(),
-      name: String(character && character.name || '').trim(),
-      aliases: Array.isArray(character && character.aliases) ? character.aliases.map(alias => String(alias).trim()).filter(Boolean) : [],
-      persona: String(character && character.persona || '').trim(),
-      emotion: normalizeSceneEmotion(character && character.emotion),
-    })).filter(character => character.id && character.name);
+  // Form baseline edits retain only their changed cells here; this metadata never enters a request document.
+  const sceneBaselineEdits = new WeakMap();
+
+  function normalizeSceneRoster(roster, storedRoster) {
+    const stored = new Map((storedRoster?.characters || []).map(character => [character.id, character]));
+    return (Array.isArray(roster) ? roster : []).map(character => {
+      const id = String(character && character.id || '').trim();
+      const previous = stored.get(id);
+      const result = {
+        id,
+        name: String(character && character.name || '').trim(),
+        aliases: Array.isArray(character && character.aliases)
+          ? character.aliases.map(alias => String(alias).trim()).filter(Boolean) : [],
+        persona: character?.persona !== undefined
+          ? String(character.persona || '') : String(previous?.persona || ''),
+      };
+      for (const member of ['emotion', 'identitySource']) {
+        if (character?.[member] !== undefined) result[member] = character[member];
+        else if (previous && Object.hasOwn(previous, member)) result[member] = previous[member];
+      }
+      const supplied = character?.emotion;
+      if (supplied && typeof supplied === 'object' && !Array.isArray(supplied)) {
+        result.emotion = {...previous?.emotion, ...supplied};
+        const editedBaseline = sceneBaselineEdits.get(supplied);
+        if (editedBaseline) {
+          result.emotion.driveBaseline = {...previous?.emotion?.driveBaseline, ...editedBaseline};
+        }
+      }
+      return result;
+    }).filter(character => character.id && character.name);
+  }
+
+  /** Compares all normalized settings, including the baseline values while random baselines are selected. */
+  function sceneEmotionSettingsEqual(left, right) {
+    return JSON.stringify(normalizeSceneEmotion(left)) === JSON.stringify(normalizeSceneEmotion(right));
+  }
+
+  /** Reads the current roster and accepted-event map without changing the client's expected write version. */
+  async function readSceneEmotionRoster(scope, epoch) {
+    let inspection;
+    try {
+      inspection = await request('/v1/scene/emotion-roster', 'POST', {scope});
+      const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+      if (!record(inspection) || !Number.isInteger(inspection.version)
+        || !record(inspection.roster) || !Array.isArray(inspection.roster.characters)
+        || !inspection.roster.characters.every(character => record(character) && typeof character.id === 'string')
+        || !record(inspection.emotionAcceptedEvents)
+        || !Object.values(inspection.emotionAcceptedEvents).every(value => typeof value === 'boolean')) {
+        throw new Error('scene_emotion_change_unconfirmed');
+      }
+    } catch {
+      throw new Error('XLDB：scene_emotion_change_unconfirmed');
+    }
+    assertHostScope(scope, epoch);
+    return inspection;
+  }
+
+  /** Returns the player's decision, or throws the fixed error when a required dialog cannot be displayed. */
+  async function confirmSceneEmotionChange(characters, inspection, expectedVersion) {
+    if (inspection.version !== expectedVersion) return true;
+    const stored = new Map((inspection.roster?.characters || []).map(character => [character.id, character]));
+    const names = characters.filter(character => {
+      const previous = stored.get(character.id);
+      return previous && Object.hasOwn(inspection.emotionAcceptedEvents, character.id)
+        && inspection.emotionAcceptedEvents[character.id] === true
+        && !sceneEmotionSettingsEqual(previous.emotion, character.emotion);
+    }).map(character => character.name);
+    if (!names.length) return true;
+    if (!state.panel) throw new Error('XLDB：scene_emotion_change_unconfirmed');
+
+    const dialog = element('dialog');
+    dialog.className = 'xldb-card xldb-todo-dialog';
+    dialog.append(element('h3', '改动 NPC 的情绪参数'));
+    const body = '下列 NPC 已有经历，这次保存会改动其情绪参数：{names}。只就情绪参数的改动来说，对已有经历的反应记录会保留，情绪会按新参数从头重算；重算后的情绪状态和学习结果可能与现在不同。确认后才会继续保存；取消则这次的改动都不保存。';
+    dialog.append(element('p', body.replace('{names}', () => names.join('、'))));
+    viewDocument.body.append(dialog);
+    return new Promise((resolve, reject) => {
+      let confirmed = false;
+      dialog.addEventListener('close', () => {
+        dialog.remove();
+        resolve(confirmed);
+      });
+      dialog.append(button('确认保存并重算', () => {
+        confirmed = true;
+        dialog.close();
+      }), button('取消', () => dialog.close()));
+      try {
+        dialog.showModal();
+      } catch {
+        dialog.remove();
+        reject(new Error('XLDB：scene_emotion_change_unconfirmed'));
+      }
+    });
   }
 
   async function configureScene(roster) {
     return withBusy(async () => {
       assertBound();
-      const characters = normalizeSceneRoster(roster);
+      const scope = {...state.scope};
+      const epoch = state.epoch;
+      const expectedVersion = state.scene.version;
+      const inspection = await readSceneEmotionRoster(scope, epoch);
+      const characters = normalizeSceneRoster(roster, inspection.roster);
       if (characters.length < 1) throw new Error('请补充至少一名具有姓名和稳定 ID 的 NPC');
-      const response = await request('/v1/scene/configure', 'POST', { scope: state.scope, expectedVersion:state.scene.version, roster: { characters } });
+      if (!await confirmSceneEmotionChange(characters, inspection, expectedVersion)) return null;
+      assertHostScope(scope, epoch);
+      const response = await request('/v1/scene/configure', 'POST', {scope, expectedVersion, roster: {characters}});
       assertBound();
       setSceneRoster(response && response.roster ? response.roster : { characters });
       await recordSceneReceipt(response);
@@ -3086,23 +3190,35 @@
     const row = element('fieldset');
     row._npcId = String(character.id || newId('npc'));
     row.append(element('legend', `NPC ${row._npcId}`));
-    const id = field('稳定 ID'); id.input.value = row._npcId; id.input.readOnly = true;
-    const name = field('姓名'); name.input.value = String(character.name || '');
-    const aliases = field('别名（用逗号分隔）'); aliases.input.value = Array.isArray(character.aliases) ? character.aliases.join(', ') : '';
-    const persona = element('textarea'); persona.placeholder = '该 NPC 的独立设定'; persona.value = String(character.persona || '');
+    const id = field('稳定 ID');
+    id.input.value = row._npcId;
+    id.input.readOnly = true;
+    const name = field('姓名');
+    name.input.value = String(character.name || '');
+    const aliases = field('别名（用逗号分隔）');
+    aliases.input.value = Array.isArray(character.aliases) ? character.aliases.join(', ') : '';
+    const persona = element('textarea');
+    persona.placeholder = '该 NPC 的独立设定';
+    persona.value = String(character.persona || '');
     const emotion = normalizeSceneEmotion(character.emotion);
+    row._xldbRendered = { persona: persona.value, emotion };
     const emotionDetails = element('details');
     emotionDetails.append(element('summary', '情绪参数（OpenHer）'));
     const emotionInputs = { driveBaseline: {} };
-    emotionInputs.randomizedBaseline = element('input'); emotionInputs.randomizedBaseline.type = 'checkbox'; emotionInputs.randomizedBaseline.checked = emotion.randomizedBaseline;
-    const randomizedBaseline = element('label', '按角色身份稳定生成初始驱动力'); randomizedBaseline.append(emotionInputs.randomizedBaseline);
+    emotionInputs.randomizedBaseline = element('input');
+    emotionInputs.randomizedBaseline.type = 'checkbox';
+    emotionInputs.randomizedBaseline.checked = emotion.randomizedBaseline;
+    const randomizedBaseline = element('label', '按角色身份稳定生成初始驱动力');
+    randomizedBaseline.append(emotionInputs.randomizedBaseline);
     emotionDetails.append(randomizedBaseline, element('p', '开启时由核心按角色身份生成可重现的初始差异；关闭时使用下方五项手动基线。随机种子无需填写。'));
     const emotionNumber = (label, value, min, max, step) => {
-      const item = field(label, 'number');
-      item.input.value = String(value);
-      item.input.min = String(min); item.input.max = String(max); item.input.step = String(step);
-      emotionDetails.append(item.wrap);
-      return item.input;
+        const item = field(label, 'number');
+        item.input.value = String(value);
+        item.input.min = String(min);
+        item.input.max = String(max);
+        item.input.step = String(step);
+        emotionDetails.append(item.wrap);
+        return item.input;
     };
     emotionInputs.driveBaseline.connection = emotionNumber('关系驱动力基线（0–1）', emotion.driveBaseline.connection, 0, 1, 0.01);
     emotionInputs.driveBaseline.novelty = emotionNumber('新颖驱动力基线（0–1）', emotion.driveBaseline.novelty, 0, 1, 0.01);
@@ -3118,33 +3234,47 @@
     emotionInputs.phaseThreshold = emotionNumber('累积受挫触发变化的阈值（0.1–20）', emotion.phaseThreshold, 0.1, 20, 0.1);
     emotionInputs.temperatureCoefficient = emotionNumber('情绪波动温度系数（0.001–1）', emotion.temperatureCoefficient, 0.001, 1, 0.001);
     emotionInputs.temperatureFloor = emotionNumber('情绪波动最低温度（0–0.5）', emotion.temperatureFloor, 0, 0.5, 0.001);
-    const remove = button('移除 NPC', () => { row.remove(); });
+    const remove = button('移除 NPC', () => {
+      row.remove();
+    });
     row.append(id.wrap, name.wrap, aliases.wrap, persona, emotionDetails, remove);
     row._xldbNpc = { id: id.input, name: name.input, aliases: aliases.input, persona, emotion: emotionInputs };
     return row;
   }
 
   function sceneRosterValues() {
-    if (!state.panel || !state.panel.sceneRosterEditor) return [];
-    return Array.from(state.panel.sceneRosterEditor.children).filter(row => row && row._xldbNpc).map(row => ({
-      id: row._xldbNpc.id.value,
-      name: row._xldbNpc.name.value,
-      aliases: String(row._xldbNpc.aliases.value || '').split(',').map(value => value.trim()).filter(Boolean),
-      persona: row._xldbNpc.persona.value,
-      emotion: {
-        driveBaseline: Object.fromEntries(Object.entries(row._xldbNpc.emotion.driveBaseline).map(([key, input]) => [key, Number(input.value)])),
-        randomizedBaseline: row._xldbNpc.emotion.randomizedBaseline.checked,
-        frustrationDecayPerHour: Number(row._xldbNpc.emotion.frustrationDecayPerHour.value),
-        connectionHungerPerHour: Number(row._xldbNpc.emotion.connectionHungerPerHour.value),
-        noveltyHungerPerHour: Number(row._xldbNpc.emotion.noveltyHungerPerHour.value),
-        eventRetainedFraction: Number(row._xldbNpc.emotion.eventRetainedFraction.value),
-        stableRelationRate: Number(row._xldbNpc.emotion.stableRelationRate.value),
-        hebbianLearningRate: Number(row._xldbNpc.emotion.hebbianLearningRate.value),
-        phaseThreshold: Number(row._xldbNpc.emotion.phaseThreshold.value),
-        temperatureCoefficient: Number(row._xldbNpc.emotion.temperatureCoefficient.value),
-        temperatureFloor: Number(row._xldbNpc.emotion.temperatureFloor.value),
-      },
-    }));
+    if (!state.panel || !state.panel.sceneRosterEditor)
+      return [];
+    return Array.from(state.panel.sceneRosterEditor.children).filter(row => row && row._xldbNpc).map(row => {
+      const inputs = row._xldbNpc;
+      const rendered = row._xldbRendered;
+      const result = {
+        id: inputs.id.value,
+        name: inputs.name.value,
+        aliases: String(inputs.aliases.value || '').split(',').map(value => value.trim()).filter(Boolean),
+      };
+      if (inputs.persona.value !== rendered.persona)
+        result.persona = inputs.persona.value.trim();
+      const emotion = {};
+      for (const [key, input] of Object.entries(inputs.emotion)) {
+        if (key === 'driveBaseline')
+          continue;
+        const value = key === 'randomizedBaseline' ? input.checked : Number(input.value);
+        if (value !== rendered.emotion[key])
+          emotion[key] = value;
+      }
+      const baseline = Object.fromEntries(Object.entries(inputs.emotion.driveBaseline)
+        .map(([key, input]) => [key, Number(input.value)])
+        .filter(([key, value]) => value !== rendered.emotion.driveBaseline[key]));
+      if (Object.keys(baseline).length) {
+        emotion.driveBaseline = { ...rendered.emotion.driveBaseline, ...baseline };
+        emotion.randomizedBaseline = inputs.emotion.randomizedBaseline.checked;
+        sceneBaselineEdits.set(emotion, baseline);
+      }
+      if (Object.keys(emotion).length)
+        result.emotion = emotion;
+      return result;
+    });
   }
 
   function renderSceneControls() {
@@ -4349,10 +4479,24 @@
         clearElement(transferPreview);transferPreview.append(element('pre',JSON.stringify(preview,null,2)));
         if(preview.valid) {
           const operationId=newId('transfer');transferPreview.append(button('确认以上迁入',()=>withBusy(async()=>{
-            assertHostScope(scope,epoch);const receipt=await request('/v1/scene/transfer-apply','POST',{scope,document,expectedVersion:preview.expectedVersion,previewId:preview.previewId,operationId});
-            assertHostScope(scope,epoch);await recordSceneReceipt(receipt);state.candidate=null;
-            const data=await request('/v1/scene/inspect','POST',{scope});assertHostScope(scope,epoch);setSceneRoster(data.roster);renderSceneControls();
-            clearElement(transferPreview);transferPreview.append(element('p',`迁入完成：新增 ${receipt.imported}，跳过 ${receipt.skipped}。`));
+            assertHostScope(scope, epoch);
+            if (document.format === 'xldb-scene-template-v1') {
+              const inspection = await readSceneEmotionRoster(scope, epoch);
+              if (!await confirmSceneEmotionChange(document.roster.characters, inspection, preview.expectedVersion)) return;
+              assertHostScope(scope, epoch);
+            }
+            const receipt = await request('/v1/scene/transfer-apply', 'POST', {
+              scope, document, expectedVersion: preview.expectedVersion, previewId: preview.previewId, operationId,
+            });
+            assertHostScope(scope, epoch);
+            await recordSceneReceipt(receipt);
+            state.candidate = null;
+            const data = await request('/v1/scene/inspect', 'POST', {scope});
+            assertHostScope(scope, epoch);
+            setSceneRoster(data.roster);
+            renderSceneControls();
+            clearElement(transferPreview);
+            transferPreview.append(element('p', `迁入完成：新增 ${receipt.imported}，跳过 ${receipt.skipped}。`));
           })));
         }
       })),transferPreview);root.append(transfer);

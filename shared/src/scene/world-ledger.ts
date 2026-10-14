@@ -1219,6 +1219,8 @@ interface VerifyContext {
   quoteReaderIds?:LedgerDetail['quoteReaderIds'];
   /** Only a resolved mutual pair's leader skips relation checks in a batch. */
   pairedLeader?:boolean;
+  /** Canonical targets voided under their own source; fold-local and never persisted. */
+  voidedRestatementTargets?: Set<string>;
 }
 interface Evaluated {detail:LedgerDetail;legs:LedgerLegs;returns:string[]}
 function emptyIndex():BookIndex {return {keys:new Map(),sources:new Map(),refunds:new Map()};}
@@ -1403,22 +1405,33 @@ function verifyEntry(originalStoredEntry: StoredLedgerEntry, proposalContext: Ve
             }
         }
         if (storedEntry.relation && !proposalContext.pairedLeader) {
-            const k = storedEntry.relation.kind;
-            if (!target || target.disposition === 'void') {
+            const relationKind = storedEntry.relation.kind;
+            const relationTarget = storedEntry.relation.target;
+            // The fold prepares the anchor set once. Each restatement needs at most one Set lookup.
+            // A present, live target always takes precedence over a historical void anchor.
+            const restatesVoidedTarget = proposalContext.mode === 'fold' && relationKind === 'restates'
+                && relationTarget !== null && (target?.disposition === 'void'
+                    || !target && proposalContext.voidedRestatementTargets?.has(keyText(relationTarget)) === true);
+            if (restatesVoidedTarget) {
+                pend('restates', 'restated', false);
+                pend('restates_voided_entry', 'restated', false);
+            }
+            else if (!target || target.disposition === 'void') {
                 if (proposalContext.mode === 'fold' && storedEntry.relation.target !== null) {
-                    if (k === 'refund_of' || k === 'balance_of')
+                    if (relationKind === 'refund_of' || relationKind === 'balance_of')
                         pend('relation_target_changed');
-                    else if (k === 'paired_with')
+                    else if (relationKind === 'paired_with')
                         pend('relation_invalid');
-                    else if (k === 'settles' || k === 'in_addition_to')
+                    else if (relationKind === 'settles' || relationKind === 'in_addition_to'
+                        || relationKind === 'restates')
                         flag('relation_target_changed');
                 }
                 else
                     pend('relation_invalid');
             }
-            else if (k === 'restates')
+            else if (relationKind === 'restates')
                 pend('restates', 'restated', false);
-            else if (k === 'refund_of') {
+            else if (relationKind === 'refund_of') {
                 if (!['purchase', 'payment'].includes(target.kind) || !posted(target) ||
                     typeof target.key === 'string' && target.key.startsWith('legacy:'))
                     pend('relation_invalid');
@@ -1436,9 +1449,10 @@ function verifyEntry(originalStoredEntry: StoredLedgerEntry, proposalContext: Ve
                     || (storedEntry.quantity?.count ?? 0) > (target.quantity?.count ?? 0) - used.quantity)
                     pend('refund_exceeds');
             }
-            else if (k === 'balance_of' && target.kind !== 'payment' || k === 'settles' &&
+            else if (relationKind === 'balance_of' && target.kind !== 'payment' || relationKind === 'settles' &&
                 target.status !== 'committed' && target.disposition !== 'pending'
-                || k === 'in_addition_to' && storedEntry.relation.span === null || k === 'paired_with' &&
+                || relationKind === 'in_addition_to' && storedEntry.relation.span === null
+                || relationKind === 'paired_with' &&
                 moneyOf(storedEntry) === null && !posted(target))
                 pend('relation_invalid');
         }
@@ -2927,6 +2941,18 @@ function rawLedgerOptions(raw:unknown,diagnostics:LedgerDiagnostic[]):LedgerFold
   }catch{appendDiagnostics(diagnostics, {code:'ledger_options_invalid',id:null});return {};}
 }
 function regionSame(a:LedgerRegion,b:LedgerRegion):boolean {return 'whole'in a?'whole'in b:'span'in b&&overlaps(a.span,b.span);}
+/** Test a decoded void's anchor ownership in O(1); legacy and unbooked anchors cannot identify a target here. */
+function ownsRestatementAnchor(correction: LedgerCorrection,
+    playerPostSources: ReadonlyMap<string, string>): boolean {
+    const anchor = correction.anchor;
+    if (Array.isArray(anchor)) {
+        return anchor.length === 9 && anchor[0] === correction.sourceId;
+    }
+
+    return typeof anchor === 'string' && anchor.startsWith('user:')
+        && playerPostSources.get(anchor.slice(5)) === correction.sourceId;
+}
+
 function closeLedger(ledger:LedgerFold,sources:readonly WorldSourceEffects[]):void {
   const indices=new Map(sources.map((s,i)=>[identity(s),i]));
   for(const e of ledger.entries)e.laterSources=Math.max(0,sources.length-1-(indices.get(identity(e))??sources.length-1));
@@ -2956,13 +2982,26 @@ function closeLedger(ledger:LedgerFold,sources:readonly WorldSourceEffects[]):vo
     if(e.relation.kind==='balance_of')balances.add(key);}
   for(const e of ledger.entries)if(e.status==='committed'&&moneyOf(e)){const due=BigInt(moneyOf(e)!.cents)-(settled.get(keyText(e.key))??0n);e.due=(due>0n?due:0n).toString();}
   const open=ledger.open;
-  open.pending=ledger.entries.filter(e=>e.disposition==='pending'&&['general','unconfigured','account_uncertain'].includes(e.category??'')&&!settled.has(keyText(e.key)));
-  open.unaffordable=ledger.entries.filter(e=>e.disposition==='unaffordable'&&!e.causedByCorrection&&e.laterSources<=5);
-  open.committed=ledger.entries.filter(e=>e.status==='committed'&&e.disposition!=='void'&&(e.due===null||BigInt(e.due)>0n)&&!['restated','untracked'].includes(e.category??''));
-  open.quoted=ledger.entries.filter(e=>e.status==='quoted'&&e.disposition!=='void'&&e.laterSources<20);
-  open.deposits=[];
-  for(const e of ledger.entries)if(e.kind==='payment'&&posted(e)&&e.relation?.kind==='settles'&&e.relation.target&&!balances.has(keyText(e.key))) {
-    const target=byKey.get(keyText(e.relation.target));if(target?.status==='committed'&&target.due!==null&&BigInt(target.due)>0n){e.due=target.due;open.deposits.push(e);}
+  const visibleOpenEntries = ledger.entries.filter(entry => !entry.codes.includes('restates_voided_entry'));
+  open.pending = visibleOpenEntries.filter(entry => entry.disposition === 'pending'
+    && ['general', 'unconfigured', 'account_uncertain'].includes(entry.category ?? '')
+    && !settled.has(keyText(entry.key)));
+  open.unaffordable = visibleOpenEntries.filter(entry => entry.disposition === 'unaffordable'
+    && !entry.causedByCorrection && entry.laterSources <= 5);
+  open.committed = visibleOpenEntries.filter(entry => entry.status === 'committed' && entry.disposition !== 'void'
+    && (entry.due === null || BigInt(entry.due) > 0n) && !['restated', 'untracked'].includes(entry.category ?? ''));
+  open.quoted = visibleOpenEntries.filter(entry => entry.status === 'quoted'
+    && entry.disposition !== 'void' && entry.laterSources < 20);
+  open.deposits = [];
+  for (const entry of visibleOpenEntries) {
+    if (entry.kind !== 'payment' || !posted(entry) || entry.relation?.kind !== 'settles'
+      || !entry.relation.target || balances.has(keyText(entry.key))) continue;
+
+    const targetEntry = byKey.get(keyText(entry.relation.target));
+    if (targetEntry?.status === 'committed' && targetEntry.due !== null && BigInt(targetEntry.due) > 0n) {
+      entry.due = targetEntry.due;
+      open.deposits.push(entry);
+    }
   }
   ledger.director={unpaid:open.unaffordable,unposted:open.pending,committed:open.committed,unbooked:ledger.unbooked.filter(u=>u.layer==='outer'&&!u.dismissed)};
   const unconfigured=new Map<string,{kind:string;label:string|null}>();
@@ -3016,6 +3055,17 @@ function foldLedgerWorldUnchecked(settings: WorldSettings, sources: readonly Wor
         const validIds = new Set(bridge.validSources.map(identity));
         const activeCorrections = corrections.filter(correction => correction.action === 'adjustment'
             || validIds.has(identity(correction as LedgerSourceRef)));
+        const userPostKeys = new Set<string>();
+        const playerPostSources = new Map<string, string>();
+        // O(history): visit each decoded historical correction once, including inactive posts.
+        // Source ownership deliberately ignores revision; post IDs are unique in decoded history.
+        for (const correction of correctionHistory) {
+            if (correction.action === 'post') {
+                userPostKeys.add(identity(correction as LedgerSourceRef) + '/' + `user:${correction.id}`);
+                playerPostSources.set(correction.id, correction.sourceId!);
+            }
+        }
+        const voidedRestatementTargets = new Set<string>();
         const correctionsBySource = new Map<string, LedgerCorrection[]>();
         for (const correction of activeCorrections.filter(correction => correction.action
             !== 'adjustment')) {
@@ -3023,12 +3073,11 @@ function foldLedgerWorldUnchecked(settings: WorldSettings, sources: readonly Wor
             const list = correctionsBySource.get(id) ?? [];
             list.push(correction);
             correctionsBySource.set(id, list);
-        }
-        const userPostKeys = new Set<string>();
-        for (const correction of correctionHistory)
-            if (correction.action === 'post') {
-                userPostKeys.add(identity(correction as LedgerSourceRef) + '/' + `user:${correction.id}`);
+            // Reuse the existing active-correction pass; each anchor takes constant Map/Set lookups.
+            if (correction.action === 'void' && ownsRestatementAnchor(correction, playerPostSources)) {
+                voidedRestatementTargets.add(keyText(correction.anchor!));
             }
+        }
         const positioned = new Map<number, (LedgerAccountEvent | LedgerCorrection)[]>();
         const positions = ledgerEventPositions(sources, events, correctionHistory, ledgerWork);
         if (!positions.ok)
@@ -3082,7 +3131,7 @@ function foldLedgerWorldUnchecked(settings: WorldSettings, sources: readonly Wor
             accounts, source, previous: previous.slice(-6), counterpart: getCounterpart(source), index,
             state: targetState,
             work: ledgerWork, forced, mode: 'fold', readers: safeReaders(bridge, source, entryRegion(entry)),
-            quoteReaderIds: quoteReaders(source, entry)
+            quoteReaderIds: quoteReaders(source, entry), voidedRestatementTargets
         });
         const applyUser = (correction: LedgerCorrection, source: WorldSourceEffects, targetState = state,
             original?: StoredLedgerEntry): LedgerDetail => {

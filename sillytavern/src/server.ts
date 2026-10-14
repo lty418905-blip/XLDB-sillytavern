@@ -427,6 +427,7 @@ export function createServer(core: Core, options: {token:string;configPath:strin
         }
         case '/v1/scene/identity-plan': return send(200,await core.scene.identityPlan(input.materials,config));
         case '/v1/scene/identity-extract': return send(200,await core.scene.identityExtract(scope,input.materials,config));
+        case '/v1/scene/emotion-roster': return send(200, core.authority.scene.emotionRoster(scope));
         case '/v1/scene/inspect': return send(200,core.scene.inspect(scope,input.characterId===undefined?undefined:text(input.characterId,200)));
         case '/v1/scene/sync-state': return send(200,core.scene.syncState(scope));
         case '/v1/scene/reconcile': return send(200,await core.scene.reconcile(scope,input.messages,config,{expectedVersion:integer(input.expectedVersion),operationId:text(input.operationId,200)}));
@@ -513,19 +514,44 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const token = fs.readFileSync(tokenPath, 'utf8').trim();
   if (token.length < 32) throw new Error('Local token must contain at least 32 characters');
   const dataDirectory=process.env.XLDB_DATA_DIR??path.join(root,'.local/data');
-  const authority = new Authority(path.join(dataDirectory,'authority/xldb.sqlite'));
-  const retrieval = new Retrieval(path.join(dataDirectory,'indexes'));
-  // Pair capture is a test and evaluation aid, off by default: the switch is read once here, never per model call.
-  const pairCapture = startPairCapture(process.env.XLDB_PAIR_CAPTURE, installRoot);
-  if (pairCapture.notice !== null) console.error(pairCapture.notice);
-  const core = new Core(authority, retrieval);
-  await core.scene.clearPendingIndexes();
-  const origins = (process.env.XLDB_ALLOWED_ORIGINS ?? 'http://localhost:11451,http://127.0.0.1:11451,http://localhost:8000,http://127.0.0.1:8000').split(',');
-  const stop = () => stopCore(server, authority);
-  const server = createServer(core, {token,configPath:path.join(privateDirectory,'config.json'),origins,onShutdown:stop,checkRetrievalOnStart:true});
-  const port = Number(process.env.XLDB_PORT ?? 4318);
-  server.listen(port, '127.0.0.1', () => console.log(`XLDB ready at http://127.0.0.1:${port}; token file: ${tokenPath}`));
-  server.on('error', () => { authority.close(); console.error('XLDB could not bind its local port'); process.exitCode=1; });
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
+  let authority: Authority | undefined;
+  try {
+    authority = new Authority(path.join(dataDirectory, 'authority/xldb.sqlite'));
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== 'store_format_unsupported') throw error;
+    console.error([
+      'XLDB cannot open this database: a newer version of XLDB has written to it. XLDB did not start, and the database was not changed. Update XLDB to the version that wrote to it or a newer one, then start it again.',
+      'XLDB 无法打开这份数据库：它已被较新版本的 XLDB 写入过。XLDB 没有启动，数据库也没有被改动。请把 XLDB 升级到写入它的那个版本或更高版本，然后重新启动。',
+      'XLDB 無法開啟這份資料庫：它已被較新版本的 XLDB 寫入過。XLDB 沒有啟動，資料庫也沒有被更動。請把 XLDB 升級到寫入它的那個版本或更高版本，然後重新啟動。',
+    ].join('\n'));
+    process.exitCode = 1;
+  }
+
+  if (authority) {
+    const openedAuthority = authority;
+    const retrieval = new Retrieval(path.join(dataDirectory, 'indexes'));
+    // Pair capture is a test and evaluation aid, off by default: the switch is read once here, never per model call.
+    const pairCapture = startPairCapture(process.env.XLDB_PAIR_CAPTURE, installRoot);
+    if (pairCapture.notice !== null) console.error(pairCapture.notice);
+    const core = new Core(openedAuthority, retrieval);
+    await core.scene.clearPendingIndexes();
+    const origins = (process.env.XLDB_ALLOWED_ORIGINS ?? 'http://localhost:11451,http://127.0.0.1:11451,http://localhost:8000,http://127.0.0.1:8000').split(',');
+    const stop = () => stopCore(server, openedAuthority);
+    const server = createServer(core, {
+      token,
+      configPath: path.join(privateDirectory, 'config.json'),
+      origins,
+      onShutdown: stop,
+      checkRetrievalOnStart: true,
+    });
+    const port = Number(process.env.XLDB_PORT ?? 4318);
+    server.listen(port, '127.0.0.1', () => console.log(`XLDB ready at http://127.0.0.1:${port}; token file: ${tokenPath}`));
+    server.on('error', () => {
+      openedAuthority.close();
+      console.error('XLDB could not bind its local port');
+      process.exitCode = 1;
+    });
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+  }
 }

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { backup, DatabaseSync } from 'node:sqlite';
-import { advanceEmotion, createEmotion, validateEmotionState } from '../emotion/openher.ts';
+import { advanceEmotion, createEmotion, emotionStateVersionRecognized, validateEmotionState } from '../emotion/openher.ts';
 import type { EmotionDelta } from '../emotion/openher.ts';
 import {isSourceControl,memoryAccesses,preferenceOverrides} from '../core/controls.ts';
 import type {StoredControl} from '../core/controls.ts';
@@ -12,6 +12,7 @@ import {scopeKey} from '../core/types.ts';
 import {Commitments} from '../commitments/store.ts';
 import type {CommitmentSource} from '../commitments/types.ts';
 import {SceneInteractions} from './interaction.ts';
+import {CURRENT_STORE_FORMAT, readStoreFormatFile, readStoreFormat} from '../core/store-format.ts';
 import {captureReferenceRows,restoreReferenceRows} from './transfer.ts';
 import type {PersistedReferenceRow} from './transfer.ts';
 import type {SceneScope} from './types.ts';
@@ -24,6 +25,8 @@ export interface BackupManifest {
   schemaVersion: number;
   sha256: string;
   createdAt: string;
+  /** Optional input-only format declaration; null and omission mean format 1. New manifests do not write it yet. */
+  storeFormat?: number | null;
 }
 
 export interface BackupResult {
@@ -170,6 +173,11 @@ const requiredTables = [
   'sources',
 ] as const;
 
+/** Checks the existing workspace-local path boundary without opening files, creating directories or taking a lease. */
+export function authorityPath(databasePath: string): string {
+  return localPath(databasePath);
+}
+
 /** Claim a database before opening Authority, and release it after Authority closes. */
 export function acquireAuthorityLease(databasePath: string, owner: LeaseOwner): AuthorityLease {
   const filename = localPath(databasePath);
@@ -232,9 +240,14 @@ function serverLeaseHandle(filename:string,held:HeldServerLease):AuthorityLease 
   }};
 }
 
-export async function createAuthorityBackup(databasePath: string, outputRoot = path.join(localRoot, 'backups')): Promise<BackupResult> {
+/** Copies a local authority store to a validated backup; rejects unsupported formats before creating staging files. */
+export async function createAuthorityBackup(
+  databasePath: string,
+  outputRoot = path.join(localRoot, 'backups'),
+): Promise<BackupResult> {
   const sourcePath = existingLocalFile(databasePath);
   const root = localPath(outputRoot);
+  if (readStoreFormatFile(sourcePath) > CURRENT_STORE_FORMAT) throw new Error('store_format_unsupported');
   fs.mkdirSync(root, { recursive: true });
   assertRealPath(root);
   const id = `${timestamp()}-${randomUUID()}`;
@@ -246,6 +259,7 @@ export async function createAuthorityBackup(databasePath: string, outputRoot = p
   let source: DatabaseSync | undefined;
   try {
     source = new DatabaseSync(sourcePath, { readOnly: true });
+    if (readStoreFormat(source) > CURRENT_STORE_FORMAT) throw new Error('store_format_unsupported');
     await backup(source, destination);
   } catch (error) {
     removeStaging(staging);
@@ -254,8 +268,14 @@ export async function createAuthorityBackup(databasePath: string, outputRoot = p
     source?.close();
   }
   try {
-    const copied=new DatabaseSync(destination);
-    try { clearProcessingCandidates(copied);clearDirectorCache(copied);clearRelationshipModels(copied); } finally { copied.close(); }
+    const copied = new DatabaseSync(destination);
+    try {
+      clearProcessingCandidates(copied);
+      clearDirectorCache(copied);
+      clearRelationshipModels(copied);
+    } finally {
+      copied.close();
+    }
     const schemaVersion = inspectDatabase(destination);
     const manifest: BackupManifest = {
       schemaVersion,
@@ -276,87 +296,133 @@ export async function createAuthorityBackup(databasePath: string, outputRoot = p
   }
 }
 
-export async function restoreAuthorityBackup(
-  backupDirectory: string,
-  databasePath: string,
-  options: RestoreOptions = {},
-): Promise<RestoreResult> {
-  const mode=options.mode??'rollback';
-  if(mode!=='rollback'&&mode!=='recovery')throw new Error('invalid_restore_mode');
+/** Restores a validated local backup under a lease; incompatible formats fail before target writes and errors roll back. */
+export async function restoreAuthorityBackup(backupDirectory: string, databasePath: string, options: RestoreOptions = {}): Promise<RestoreResult> {
+  const mode = options.mode ?? 'rollback';
+  if (mode !== 'rollback' && mode !== 'recovery')
+    throw new Error('invalid_restore_mode');
   const directory = existingLocalDirectory(backupDirectory);
   const source = existingLocalFile(path.join(directory, 'authority.sqlite'));
   const manifestPath = existingLocalFile(path.join(directory, 'manifest.json'));
   const manifest = readManifest(manifestPath);
-  if (await sha256(source) !== manifest.sha256) throw new Error('backup_hash_mismatch');
-  if (inspectDatabase(source) !== manifest.schemaVersion) throw new Error('backup_schema_mismatch');
-
-  const target = mode==='rollback' ? existingLocalFile(databasePath) : localPath(databasePath);
-  const targetEntry=fs.statSync(target,{throwIfNoEntry:false});
-  if(targetEntry&&!targetEntry.isFile())throw new Error('backup_recovery_target_not_file');
-  const targetExists=Boolean(targetEntry);
-
-  const lease = acquireAuthorityLease(target, mode==='rollback'?'restore':'recovery');
+  if (await sha256(source) !== manifest.sha256)
+    throw new Error('backup_hash_mismatch');
+  const format = manifest.storeFormat ?? 1;
+  if (format > CURRENT_STORE_FORMAT)
+    throw new Error('backup_store_format_unsupported');
+  if (readStoreFormatFile(source) !== format)
+    throw new Error('backup_store_format_mismatch');
+  if (inspectDatabase(source) !== manifest.schemaVersion)
+    throw new Error('backup_schema_mismatch');
+  const target = mode === 'rollback' ? existingLocalFile(databasePath) : localPath(databasePath);
+  const targetEntry = fs.statSync(target, {
+    throwIfNoEntry: false
+  });
+  if (targetEntry && !targetEntry.isFile())
+    throw new Error('backup_recovery_target_not_file');
+  const targetExists = Boolean(targetEntry);
+  const lease = acquireAuthorityLease(target, mode === 'rollback' ? 'restore' : 'recovery');
   const id = `${timestamp()}-${randomUUID()}`;
   const staging = path.join(path.dirname(target), `.${path.basename(target)}.restore-${id}`);
   const recoveryDirectory = targetExists ? path.join(path.dirname(target), `${path.basename(target)}.recovery-${id}`) : null;
   const targetFiles = [target, `${target}-wal`, `${target}-shm`];
-  const moved: { from: string; to: string }[] = [];
-  const copied: { from: string; to: string }[] = [];
+  const moved: {
+    from: string;
+    to: string;
+  }[] = [];
+  const copied: {
+    from: string;
+    to: string;
+  }[] = [];
   let preservationComplete = false;
   try {
-    if(mode==='recovery'&&recoveryDirectory) {
+    if (mode === 'recovery' && recoveryDirectory) {
       fs.mkdirSync(recoveryDirectory);
       for (const current of targetFiles) {
-        if (!fs.existsSync(current)) continue;
+        if (!fs.existsSync(current))
+          continue;
         const saved = path.join(recoveryDirectory, path.basename(current));
         fs.copyFileSync(current, saved, fs.constants.COPYFILE_EXCL);
-        copied.push({ from: current, to: saved });
+        copied.push({
+          from: current, to: saved
+        });
       }
       preservationComplete = true;
     }
-    let rules:RestoreRules|undefined;
-    if(mode==='rollback')rules=readRestoreRules(target,options.extension);
-    else if(targetExists) {
-      let targetValid=false;
-      try { inspectDatabase(target); targetValid=true; } catch {}
-      if(targetValid)throw new Error('backup_recovery_target_valid');
-      try { rules=readRestoreRules(target,options.extension); } catch {}
+    let rules: RestoreRules | undefined;
+    if (mode === 'rollback')
+      rules = readRestoreRules(target, options.extension);
+    else if (targetExists) {
+      let targetValid = false;
+      try {
+        inspectDatabase(target);
+        targetValid = true;
+      }
+      catch { }
+      if (targetValid)
+        throw new Error('backup_recovery_target_valid');
+      try {
+        rules = readRestoreRules(target, options.extension);
+      }
+      catch { }
     }
     fs.copyFileSync(source, staging, fs.constants.COPYFILE_EXCL);
     if (await sha256(staging) !== manifest.sha256 || inspectDatabase(staging) !== manifest.schemaVersion) {
       throw new Error('backup_staging_validation_failed');
     }
     const appliedDeletionCount = applyRestoreRules(staging, rules, options.extension);
-    if (inspectDatabase(staging) !== manifest.schemaVersion) throw new Error('backup_staging_validation_failed');
-    if(recoveryDirectory) {
-      if(mode==='rollback')fs.mkdirSync(recoveryDirectory);
+    if (inspectDatabase(staging) !== manifest.schemaVersion)
+      throw new Error('backup_staging_validation_failed');
+    if (recoveryDirectory) {
+      if (mode === 'rollback')
+        fs.mkdirSync(recoveryDirectory);
       for (const current of targetFiles) {
-        if (!fs.existsSync(current)) continue;
-        if(mode==='rollback') {
+        if (!fs.existsSync(current))
+          continue;
+        if (mode === 'rollback') {
           const saved = path.join(recoveryDirectory, path.basename(current));
           fs.renameSync(current, saved);
-          moved.push({ from: current, to: saved });
-        } else fs.unlinkSync(current);
+          moved.push({
+            from: current, to: saved
+          });
+        }
+        else
+          fs.unlinkSync(current);
       }
     }
-    if(fs.existsSync(target))throw new Error('backup_recovery_target_changed');
+    if (fs.existsSync(target))
+      throw new Error('backup_recovery_target_changed');
     fs.renameSync(staging, target);
-    return {databasePath:target,recoveryDirectory,appliedDeletionCount,deletionRules:rules?'target':'backup_only'};
-  } catch (error) {
+    return {
+      databasePath: target, recoveryDirectory, appliedDeletionCount, deletionRules: rules ? 'target' : 'backup_only'
+    };
+  }
+  catch (error) {
     try {
-      if (fs.existsSync(staging)) fs.unlinkSync(staging);
-      for (const entry of moved.reverse()) if (fs.existsSync(entry.to)) fs.renameSync(entry.to, entry.from);
-      if(preservationComplete) {
-        for(const current of targetFiles) if(fs.existsSync(current)) fs.unlinkSync(current);
-        for(const entry of copied) fs.copyFileSync(entry.to,entry.from,fs.constants.COPYFILE_EXCL);
+      if (fs.existsSync(staging))
+        fs.unlinkSync(staging);
+      for (const entry of moved.reverse())
+        if (fs.existsSync(entry.to))
+          fs.renameSync(entry.to, entry.from);
+      if (preservationComplete) {
+        for (const current of targetFiles)
+          if (fs.existsSync(current))
+            fs.unlinkSync(current);
+        for (const entry of copied)
+          fs.copyFileSync(entry.to, entry.from, fs.constants.COPYFILE_EXCL);
       }
-      for(const entry of copied) if(fs.existsSync(entry.to))fs.unlinkSync(entry.to);
-      if (recoveryDirectory&&fs.existsSync(recoveryDirectory) && fs.readdirSync(recoveryDirectory).length === 0) fs.rmdirSync(recoveryDirectory);
-    } catch (rollbackError) {
+      for (const entry of copied)
+        if (fs.existsSync(entry.to))
+          fs.unlinkSync(entry.to);
+      if (recoveryDirectory && fs.existsSync(recoveryDirectory) && fs.readdirSync(recoveryDirectory).length === 0)
+        fs.rmdirSync(recoveryDirectory);
+    }
+    catch (rollbackError) {
       throw new AggregateError([error, rollbackError], 'backup_restore_rollback_failed');
     }
     throw error;
-  } finally {
+  }
+  finally {
     lease.release();
   }
 }
@@ -900,31 +966,60 @@ function removeReadSidecars(filename: string): void {
   if (fs.existsSync(shm)) fs.unlinkSync(shm);
 }
 
-function validatePersistedEmotionStates(db:DatabaseSync):void {
+function validatePersistedEmotionStates(db: DatabaseSync): void {
   try {
-    for(const row of db.prepare('SELECT emotion FROM scopes').iterate() as unknown as Iterable<{emotion:string}>) {
-      const state=JSON.parse(row.emotion) as {version?:unknown};
-      if(state.version===2)validateEmotionState(state);
-      else if(state.version!==1)throw new TypeError('invalid emotion version');
+    for (const row of db.prepare('SELECT emotion FROM scopes').iterate() as unknown as Iterable<{
+      emotion: string;
+    }>) {
+      const state = JSON.parse(row.emotion) as {
+        version?: unknown;
+      };
+      if (!state || typeof state !== 'object' || Array.isArray(state))
+        validateEmotionState(state);
+      if (emotionStateVersionRecognized(state.version))
+        validateEmotionState(state);
     }
-    const validateAnalysis=(serialized:string):void=>{
-      const analysis=JSON.parse(serialized) as {emotionStates?:unknown};
-      if(analysis.emotionStates===undefined)return;
-      if(!analysis.emotionStates||typeof analysis.emotionStates!=='object'||Array.isArray(analysis.emotionStates))throw new TypeError('invalid scene emotion states');
-      for(const state of Object.values(analysis.emotionStates as Record<string,unknown>))validateEmotionState(state);
+    const validateAnalysis = (serialized: string): void => {
+      const analysis = JSON.parse(serialized) as {
+        emotionStates?: unknown;
+      };
+      if (analysis.emotionStates === undefined)
+        return;
+      if (!analysis.emotionStates || typeof analysis.emotionStates !== 'object' || Array.isArray(analysis.emotionStates))
+        throw new TypeError('invalid scene emotion states');
+      for (const state of Object.values(analysis.emotionStates as Record<string, unknown>)) {
+        if (state !== null && typeof state === 'object' && !Array.isArray(state)
+          && !emotionStateVersionRecognized((state as {
+            version?: unknown;
+          }).version))
+          continue;
+        validateEmotionState(state);
+      }
     };
-    for(const row of db.prepare('SELECT analysis FROM scene_sources WHERE analysis IS NOT NULL').iterate() as unknown as Iterable<{analysis:string}>)
+    for (const row of db.prepare('SELECT analysis FROM scene_sources WHERE analysis IS NOT NULL').iterate() as unknown as Iterable<{
+      analysis: string;
+    }>)
       validateAnalysis(row.analysis);
-    for(const row of db.prepare('SELECT snapshot FROM scene_checkpoints').iterate() as unknown as Iterable<{snapshot:string}>) {
-      const snapshot=JSON.parse(row.snapshot) as {sources?:{analysis?:string|null}[]};
-      if(!Array.isArray(snapshot.sources))throw new TypeError('invalid checkpoint sources');
-      for(const source of snapshot.sources) {
-        if(source.analysis!==null&&source.analysis!==undefined&&typeof source.analysis!=='string')throw new TypeError('invalid checkpoint analysis');
-        if(typeof source.analysis==='string')validateAnalysis(source.analysis);
+    for (const row of db.prepare('SELECT snapshot FROM scene_checkpoints').iterate() as unknown as Iterable<{
+      snapshot: string;
+    }>) {
+      const snapshot = JSON.parse(row.snapshot) as {
+        sources?: {
+          analysis?: string | null;
+        }[];
+      };
+      if (!Array.isArray(snapshot.sources))
+        throw new TypeError('invalid checkpoint sources');
+      for (const source of snapshot.sources) {
+        if (source.analysis !== null && source.analysis !== undefined && typeof source.analysis !== 'string')
+          throw new TypeError('invalid checkpoint analysis');
+        if (typeof source.analysis === 'string')
+          validateAnalysis(source.analysis);
       }
     }
-  } catch(error) {
-    throw new Error('backup_invalid_emotion_state',{cause:error});
+  }
+  catch (error) {
+    throw new Error('backup_invalid_emotion_state', { cause: error });
   }
 }
 
@@ -948,6 +1043,10 @@ function readManifest(filename: string): BackupManifest {
   if (!Number.isSafeInteger(manifest.schemaVersion) || (manifest.schemaVersion as number) < 1 ||
     typeof manifest.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(manifest.sha256) ||
     typeof manifest.createdAt !== 'string' || Number.isNaN(Date.parse(manifest.createdAt))) {
+    throw new Error('invalid_backup_manifest');
+  }
+  if (manifest.storeFormat !== undefined && manifest.storeFormat !== null
+    && (!Number.isSafeInteger(manifest.storeFormat) || manifest.storeFormat < 1)) {
     throw new Error('invalid_backup_manifest');
   }
   return manifest as BackupManifest;

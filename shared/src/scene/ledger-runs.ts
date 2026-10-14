@@ -22,8 +22,16 @@ export const LEDGER_RECORD_UTF16_LIMIT = 131072;
 /** Cache payload version for the eight caller-owned fields; older or unknown versions are misses. */
 export const LEDGER_CACHE_SCHEMA = 1;
 
+/** User-source foreground budget in milliseconds, inclusive of work after arrival at the ledger step.
+ * Product policy selects 45 seconds independently of the run's request and duration limits. */
+export const LEDGER_FOREGROUND_USER_MS = 45000;
+
+/** Assistant-source foreground budget in milliseconds, inclusive of work after arrival at the ledger step.
+ * Product policy selects 45 seconds independently of the user-source budget and the run's limits. */
+export const LEDGER_FOREGROUND_ASSISTANT_MS = 45000;
+
 /** Optional loop clock and wait in monotonic nonnegative milliseconds. Null/nonfunctions use platform defaults.
- * Timer members are reserved for a future foreground deadline and are not called by this integration. */
+ * Foreground timer members are used as a pair; an invalid pair uses the platform timers at call time. */
 export interface LedgerTiming {
   now?: (() => number) | null;
   wait?: ((milliseconds: number) => Promise<void>) | null;
@@ -55,6 +63,21 @@ export interface LedgerRunResult {
   issue: 'finish' | 'record' | 'run' | null;
 }
 
+/** Accepted-source context and a count of send invocations owned by one run, including synchronous failures.
+ * It carries no response content; the counter starts at zero and never resets on reuse or parking. */
+export interface LedgerRunContext {
+  source: LedgerText;
+  selection: LedgerInputRequest['selection'];
+  requests: number;
+}
+
+/** Linear cursor over predecessors already processed in one job; the deferred flag is sticky within that job.
+ * Index is a source count starting at zero; the cursor never reads storage or interprets record contents. */
+export interface LedgerProgress {
+  index: number;
+  deferred: boolean;
+}
+
 /** Registry entry with process-local monotone identity; done never rejects and cancellation is sticky. */
 export interface LedgerRunEntry extends LedgerRunBinding {
   id: bigint;
@@ -65,6 +88,8 @@ export interface LedgerRunEntry extends LedgerRunBinding {
   cancelled: boolean;
   done: Promise<void>;
   result: LedgerRunResult | null;
+  context?: LedgerRunContext;
+  deferred: boolean;
 }
 
 /** Per-source step data, held only until the existing job assembles its analysis.
@@ -73,6 +98,9 @@ export interface LedgerStep {
   marks?: LedgerMarks;
   ledger?: StoredLedger;
   entry?: LedgerRunEntry;
+  arrivedAt?: number | null;
+  deferred?: 'timeout' | 'waiting';
+  notice?: string;
   fallback?: {
     source: LedgerText;
     selection: LedgerInputRequest['selection'];
@@ -195,7 +223,7 @@ export function cachedLedger(
 }
 
 /** In-memory runs, at most one per (full scope key, source id).
- * Successful source commits remove their entries; job-end pruning removes deleted/revised sources.
+ * Committed deferred sources retain their runs until completion; other successful commits remove entries.
  * Thus each scope is bounded by accepted sources with an uncommitted run, including still-running failed jobs.
  * No timer, task, worker, or database activity occurs at construction. */
 export class LedgerRuns {
@@ -245,6 +273,7 @@ export class LedgerRuns {
     fingerprint: string,
     started: NonNullable<ReturnType<typeof startLedgerRun>>,
     save: (entry: LedgerRunEntry) => void,
+    context?: LedgerRunContext | null,
 
   ): LedgerRunEntry {
 
@@ -258,6 +287,8 @@ export class LedgerRuns {
       cancelled: false,
       done: Promise.resolve(),
       result: null,
+      deferred: false,
+      ...(context == null ? {} : {context}),
     };
 
     this.entries.set(this.key(scope, sourceId), entry);
@@ -274,23 +305,65 @@ export class LedgerRuns {
           issue: !finished ? 'finish' : !ledger ? 'record' : null
         };
 
-        if (ledger)
-          save(entry);
+        this.saveCompleted(entry, save);
       }
     ).catch(
       () => {
 
         // A failed cache write cannot erase the valid loop outcome, and must never become an unhandled rejection.
-        entry.result ??= {
-          ledger: null,
-          finished: null,
-          loop: null,
-          issue: 'run'
-        };
+        if (!entry.result) {
+
+          entry.result = {
+            ledger: null,
+            finished: null,
+            loop: null,
+            issue: 'run'
+          };
+
+          try {
+
+            this.saveCompleted(entry, save);
+          } catch {
+            // A failed detached cache write cannot reject the completion promise.
+          }
+        }
       }
     );
 
     return entry;
+  }
+
+  /** Save once at completion; only a successfully parked source permits a null-result substitute.
+   * Detachment happens even if the caller cannot write the cache. */
+  private saveCompleted(entry: LedgerRunEntry, save: (entry: LedgerRunEntry) => void): void {
+
+    try {
+
+      if (entry.result?.ledger || entry.deferred)
+        save(entry);
+    } finally {
+
+      if (entry.deferred)
+        this.detach(entry);
+    }
+  }
+
+  /** Detach only this exact identity without cancelling a completed run. */
+  private detach(entry: LedgerRunEntry): void {
+
+    const key = this.key(entry.scope, entry.sourceId);
+
+    if (this.entries.get(key) === entry)
+      this.entries.delete(key);
+  }
+
+  /** Cancel the source's current entry synchronously, including a completed retained entry; missing keys do nothing. */
+  cancel(scope: string, sourceId: string): void {
+
+    const entry = this.entries.get(this.key(scope, sourceId));
+
+    if (entry)
+      this.remove(entry);
   }
 
   /** Identity check for late completion: equal fingerprints do not make an obsolete run current. */
@@ -311,15 +384,42 @@ export class LedgerRuns {
       this.entries.delete(key);
   }
 
-  /** Release committed source revisions; called only after the caller's single authority commit succeeds. */
-  committed(scope: string, sources: readonly {id: string; revision: number;}[]): void {
+  /** Apply a successful source commit. Deferred identities stay alive until completion; others are cancelled.
+   * If completion preceded this commit, only a missing record needs a new cache attempt. */
+  committed(
+    scope: string,
+    sources: readonly {id: string; revision: number;}[],
+    deferred?: ReadonlySet<string> | null,
+    save?: ((entry: LedgerRunEntry) => void) | null,
+  ): void {
 
     for (const source of sources) {
 
       const entry = this.entries.get(this.key(scope, source.id));
 
-      if (entry?.revision === source.revision)
+      if (entry?.revision !== source.revision)
+        continue;
+
+      if (!deferred?.has(source.id)) {
+
         this.remove(entry);
+
+        continue;
+      }
+
+      entry.deferred = true;
+
+      if (entry.result) {
+
+        try {
+
+          if (!entry.result.ledger)
+            save?.(entry);
+        } finally {
+
+          this.detach(entry);
+        }
+      }
     }
   }
 

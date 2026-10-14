@@ -776,9 +776,15 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
   }
 }
 
+/** Returns an allowed public error code; unknown errors and non-errors become operation_failed without details. */
 export function safeError(error: unknown): string {
-  if(error instanceof Error&&/^(calendar_story_clock_unknown|calendar_todo_deleted|calendar_todo_not_found|calendar_todo_not_future)$/.test(error.message))return error.message;
+  if (error instanceof Error && ['store_format_unsupported', 'scene_emotion_settings_locked'].includes(error.message)) {
+    return error.message;
+  }
   const message = error instanceof Error ? error.message : '';
+  if (/^(calendar_story_clock_unknown|calendar_todo_deleted|calendar_todo_not_found|calendar_todo_not_future)$/.test(message)) {
+    return message;
+  }
   return /^(model_(not_configured|connection_failed|stream_failed|output_incomplete|invalid_response|invalid_json|output_truncated|output_too_large|http_\d{3})|host_(timeout|closed|worker_failed|invalid_result)|unsafe_rewrite|context_changed_retry|context_budget_exceeded|invalid_[a-z_]+|[a-z_]+_missing_source|record_not_found|duplicate_message_id|retrieval_[a-z_]+|director_model_not_configured|companion_[a-z_]+|proactive_companion_disabled|profile_[a-z_]+|relationship_evidence_(invalid_response|input_incomplete)|npc_resource_[a-z_]+|agentjev_[a-z_]+)$/.test(message)
     ? message : 'operation_failed';
 }

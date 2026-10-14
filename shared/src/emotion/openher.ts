@@ -274,6 +274,42 @@ function boundedValue(
   return clamp(requireFiniteNumber(input[key], `${path}.${key}`), minimum, maximum);
 }
 
+/** Named future judgment fields retained only when reading accepted records; their values are opaque in this version. */
+export const STORED_EMOTION_DELTA_MEMBERS = Object.freeze([
+  'appraisal',
+  'relation',
+  'appraisalRule',
+  'contract',
+] as const);
+
+/** Named future state fields retained on validation; null is a value and unlisted fields are still discarded. */
+export const STORED_EMOTION_STATE_MEMBERS = Object.freeze([
+  'engine',
+  'eventClockMs',
+  'lastEvent',
+  'relationEma',
+  'baselineOrigin',
+  'rewardMean',
+  'lastLearningReward',
+  'previousFrustration',
+  'counts',
+  'controlDigest',
+  'ownAct',
+] as const);
+
+/**
+ * Compares complete validated settings, including all five baselines even when randomization is enabled.
+ * Inputs have the same units and limits as emotionSettingsOf; invalid inputs propagate its existing error.
+ */
+export function emotionSettingsEqual(left?: unknown, right?: unknown): boolean {
+  return JSON.stringify(emotionSettingsOf(left)) === JSON.stringify(emotionSettingsOf(right));
+}
+
+/** Recognizes the persisted engine version (currently 2); unknown or missing version values return false. */
+export function emotionStateVersionRecognized(version: unknown): boolean {
+  return version === 2;
+}
+
 function boundedDrives(
   input: Record<string, unknown>,
   minimum: number,
@@ -350,6 +386,9 @@ export function validateEmotionDelta(input: unknown): EmotionDelta {
     ),
     driveSatisfaction,
     ...(stableRelationDelta === undefined ? {} : { stableRelationDelta }),
+    ...Object.fromEntries(STORED_EMOTION_DELTA_MEMBERS
+      .filter(member => Object.hasOwn(candidate, member) && candidate[member] !== undefined)
+      .map(member => [member, candidate[member]])),
   };
 }
 
@@ -365,28 +404,37 @@ export function validateModelEmotionDelta(input: unknown, clockTimeMs: number | 
   const context = requireRecord(candidate.context, 'emotionDelta.context');
   const frustration = requireRecord(candidate.frustrationDelta, 'emotionDelta.frustrationDelta');
   for (const key of Object.keys(DEFAULT_CONTEXT) as (keyof CriticContext)[]) {
-    if (key === 'timeOfDay') continue;
+    if (key === 'timeOfDay')
+      continue;
     strictValue(context, key, key === 'userEmotion' ? -1 : 0, 1, 'emotionDelta.context');
   }
   // Older model templates can still send this field, but it never sets time.
-  if (context.timeOfDay !== undefined) strictValue(context, 'timeOfDay', 0, 1, 'emotionDelta.context');
-  for (const drive of DRIVE_NAMES) strictValue(frustration, drive, -3, 3, 'emotionDelta.frustrationDelta');
+  if (context.timeOfDay !== undefined)
+    strictValue(context, 'timeOfDay', 0, 1, 'emotionDelta.context');
+  for (const drive of DRIVE_NAMES)
+    strictValue(frustration, drive, -3, 3, 'emotionDelta.frustrationDelta');
   if (candidate.driveSatisfaction !== undefined) {
     const satisfaction = requireRecord(candidate.driveSatisfaction, 'emotionDelta.driveSatisfaction');
-    for (const drive of DRIVE_NAMES) if (satisfaction[drive] !== undefined) {
-      strictValue(satisfaction, drive, 0, 0.3, 'emotionDelta.driveSatisfaction');
-    }
+    for (const drive of DRIVE_NAMES)
+      if (satisfaction[drive] !== undefined) {
+        strictValue(satisfaction, drive, 0, 0.3, 'emotionDelta.driveSatisfaction');
+      }
   }
   if (candidate.stableRelationDelta !== undefined) {
     const relations = requireRecord(candidate.stableRelationDelta, 'emotionDelta.stableRelationDelta');
-    for (const key of ['depth', 'trust', 'valence']) if (relations[key] !== undefined) {
-      strictValue(relations, key, -1, 1, 'emotionDelta.stableRelationDelta');
-    }
+    for (const key of ['depth', 'trust', 'valence'])
+      if (relations[key] !== undefined) {
+        strictValue(relations, key, -1, 1, 'emotionDelta.stableRelationDelta');
+      }
   }
-  return validateEmotionDelta({
+  const recorded: Record<string, unknown> = {
     ...candidate,
     context: { ...context, timeOfDay: timeOfDayAt(clockTimeMs, timeZone) },
-  });
+  };
+  // Accepted records can carry opaque future fields; new model output cannot introduce those fields.
+  for (const member of STORED_EMOTION_DELTA_MEMBERS)
+    delete recorded[member];
+  return validateEmotionDelta(recorded);
 }
 
 /** 0 is local midnight, 0.5 is noon, and values approach 1 before midnight. */
@@ -597,30 +645,47 @@ export function advanceEmotion(
 
 /** Restored state is trusted only after full numeric and neural shape checks. */
 export function validateEmotionState(value: unknown): EmotionState {
-  const input=requireRecord(value,'emotionState');
-  if(input.version!==2)throw new Error('invalid_emotion_state_version');
-  const checked=(source:unknown,keys:readonly string[],min:number,max:number)=>{
-    const record=requireRecord(source,'emotionState.fields');
-    return Object.fromEntries(keys.map(key=>{
-      const n=requireFiniteNumber(record[key],`emotionState.${key}`);
-      if(n<min||n>max)throw new Error('invalid_emotion_state_range');
-      return [key,n];
+  const input = requireRecord(value, 'emotionState');
+  if (input.version !== 2) throw new Error('invalid_emotion_state_version');
+  const checked = (source: unknown, keys: readonly string[], minimum: number, maximum: number) => {
+    const record = requireRecord(source, 'emotionState.fields');
+    return Object.fromEntries(keys.map(key => {
+      const number = requireFiniteNumber(record[key], `emotionState.${key}`);
+      if (number < minimum || number > maximum) throw new Error('invalid_emotion_state_range');
+      return [key, number];
     }));
   };
-  const context={...checked(input.criticContext,Object.keys(DEFAULT_CONTEXT).filter(key=>key!=='userEmotion'),0,1),
-    ...checked(input.criticContext,['userEmotion'],-1,1)} as unknown as CriticContext;
-  const relations={...checked(input.stableRelations,['depth','trust'],0,1),...checked(input.stableRelations,['valence'],-1,1)} as unknown as StableRelations;
-  const lastReward=requireFiniteNumber(input.lastReward,'emotionState.lastReward');
-  if(Math.abs(lastReward)>1)throw new Error('invalid_emotion_state_reward');
-  const updatedAtMs=requireFiniteNumber(input.updatedAtMs,'emotionState.updatedAtMs');
-  const criticContextAtMs=input.criticContextAtMs===undefined ? updatedAtMs
-    : requireFiniteNumber(input.criticContextAtMs,'emotionState.criticContextAtMs');
+
+  const context = {
+    ...checked(input.criticContext, Object.keys(DEFAULT_CONTEXT).filter(key => key !== 'userEmotion'), 0, 1),
+    ...checked(input.criticContext, ['userEmotion'], -1, 1),
+  } as unknown as CriticContext;
+  const relations = {
+    ...checked(input.stableRelations, ['depth', 'trust'], 0, 1),
+    ...checked(input.stableRelations, ['valence'], -1, 1),
+  } as unknown as StableRelations;
+  const lastReward = requireFiniteNumber(input.lastReward, 'emotionState.lastReward');
+  if (Math.abs(lastReward) > 1) throw new Error('invalid_emotion_state_reward');
+  const updatedAtMs = requireFiniteNumber(input.updatedAtMs, 'emotionState.updatedAtMs');
+  const criticContextAtMs = input.criticContextAtMs === undefined
+    ? updatedAtMs : requireFiniteNumber(input.criticContextAtMs, 'emotionState.criticContextAtMs');
   if (criticContextAtMs > updatedAtMs) throw new Error('invalid_emotion_state_context_time');
-  return {version:2,updatedAtMs,criticContextAtMs,
-    frustration:checked(input.frustration,DRIVE_NAMES,0,5) as DriveValues,
-    drives:checked(input.drives,DRIVE_NAMES,0,1) as DriveValues,criticContext:context,
-    behavioralSignals:checked(input.behavioralSignals,BEHAVIOR_SIGNAL_NAMES,0,1) as BehaviorSignals,
-    stableRelations:relations,neural:validateNeuralState(input.neural),lastReward};
+
+  return {
+    version: 2,
+    updatedAtMs,
+    criticContextAtMs,
+    frustration: checked(input.frustration, DRIVE_NAMES, 0, 5) as DriveValues,
+    drives: checked(input.drives, DRIVE_NAMES, 0, 1) as DriveValues,
+    criticContext: context,
+    behavioralSignals: checked(input.behavioralSignals, BEHAVIOR_SIGNAL_NAMES, 0, 1) as BehaviorSignals,
+    stableRelations: relations,
+    neural: validateNeuralState(input.neural),
+    lastReward,
+    ...Object.fromEntries(STORED_EMOTION_STATE_MEMBERS
+      .filter(member => Object.hasOwn(input, member) && input[member] !== undefined)
+      .map(member => [member, input[member]])),
+  };
 }
 
 /** Numeric current affect only; no episode text or hidden rationale is emitted. */

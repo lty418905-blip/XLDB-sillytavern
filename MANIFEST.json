@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "3ed0408ac57140ca972ecce0afb7cab81dbb20ca64bf6a4f61cc92367200bd91",
+  "sourceManifestSha256": "675316bd8744fea928f858d7effc16f53f9aaae0ea3ea3ed7239ae5692b919ef",
   "files": [
     {
       "file": ".gitattributes",
@@ -199,13 +199,18 @@
     },
     {
       "file": "shared/src/core/service.ts",
-      "sha256": "cbc2a8b9956a3cb0759559884b0a7c22b3492439ab8c260de8de199964b9261c",
-      "bytes": 42639
+      "sha256": "6ac3adb61a5aa8e18eaa99361d824c6729fa638cc02ea44594159c4aa3ac1217",
+      "bytes": 42882
+    },
+    {
+      "file": "shared/src/core/store-format.ts",
+      "sha256": "ef7da5f5d8e79c2ad6d3ae00dc8f619b4f9cdbd045b15b2bbfb9b0b7bcdfabb3",
+      "bytes": 3919
     },
     {
       "file": "shared/src/core/store.ts",
-      "sha256": "2945f3d9b8cab48c65829086e1e1586fc492fbefe06b84a7d106215d4348daf1",
-      "bytes": 24590
+      "sha256": "5292e8aa8c966e819bf1ea299ab55d15aff7ee91d45b2371262b09356da88775",
+      "bytes": 26477
     },
     {
       "file": "shared/src/core/tool-loop.ts",
@@ -244,8 +249,8 @@
     },
     {
       "file": "shared/src/emotion/openher.ts",
-      "sha256": "514fd33c3d1e904118c7a62f0b91cb983e46a4be520af2e18aedf912517dede4",
-      "bytes": 26422
+      "sha256": "cd6b50cd7a6a9ccfab8d2db6b66d259d5be2121b74d83641e28a05c17bd15b2a",
+      "bytes": 28513
     },
     {
       "file": "shared/src/emotion/relationships.ts",
@@ -368,14 +373,19 @@
       "bytes": 7864
     },
     {
+      "file": "shared/src/scene/actor-emotion.ts",
+      "sha256": "71ae28d4db803285778f1ad9405feeb8aa80dba1f26357e35d42f9372c56a513",
+      "bytes": 812
+    },
+    {
       "file": "shared/src/scene/address.ts",
       "sha256": "d679955e07a30b15bd1efd27e97f3ffb4bc22921d6048a034a8840f1a4124609",
       "bytes": 5239
     },
     {
       "file": "shared/src/scene/backup.ts",
-      "sha256": "c884fa1902273d3d533b52cdd49197052850b80912a1b5c2dee40e828e538a46",
-      "bytes": 50368
+      "sha256": "25e31e8f35c0065e4c07b7554f7653e81381368e80ffe1d9f32bef764e06a91b",
+      "bytes": 52710
     },
     {
       "file": "shared/src/scene/calendar-store.ts",
@@ -429,8 +439,8 @@
     },
     {
       "file": "shared/src/scene/ledger-runs.ts",
-      "sha256": "15fbe8620d02bacd008f8af16497ae690b2c9df49180f5cb8b314903d0ffb135",
-      "bytes": 10666
+      "sha256": "ce617137c273a7238fbe0159027c4e8c8b84943b570f20b949be5156cba34604",
+      "bytes": 13753
     },
     {
       "file": "shared/src/scene/ledger-stage-input.ts",
@@ -484,13 +494,13 @@
     },
     {
       "file": "shared/src/scene/service.ts",
-      "sha256": "0df73622ac0b195efd2fbc94d4eb36d3f6a904ee03dd9ed0ad9cc6cb9dd6a98f",
-      "bytes": 151066
+      "sha256": "b2690c03062e1715c78ed05b14820453171fb3053405c9f0d4efd71b7f7b783e",
+      "bytes": 158678
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "29c2616eb2cca5f69e19fec6921d13ca5a7ef1d3f19acab5e399c58f05d22a43",
-      "bytes": 124864
+      "sha256": "45f6043ceb3a7b9444660b2600a7cd17215dd119b942d592a79f95852eddd0f4",
+      "bytes": 131341
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
@@ -524,13 +534,13 @@
     },
     {
       "file": "shared/src/scene/transfer.ts",
-      "sha256": "bfc7607372b05eeb6ee391e369f24f8c22e00792dffa2d4bc10c53053edb6a2e",
-      "bytes": 28778
+      "sha256": "924e265b747f266821fdf59960ea4f90bd26362ff162bd490c898e0e890f6512",
+      "bytes": 29341
     },
     {
       "file": "shared/src/scene/types.ts",
-      "sha256": "1ff02b0e0a33c645b8adf9f5bc1d37a9fd49d71848546cc9f6f9ec722e756459",
-      "bytes": 7686
+      "sha256": "d768796bbc6ab39d2a3ae9f33505fdf01248334566f5f05b1cbef5e834b2be19",
+      "bytes": 7997
     },
     {
       "file": "shared/src/scene/views.ts",
@@ -554,8 +564,8 @@
     },
     {
       "file": "shared/src/scene/world-ledger.ts",
-      "sha256": "7e68cdbea929b9756dfcecdf245129c550d7beec7463e08cf788a342e22557e0",
-      "bytes": 219077
+      "sha256": "ea9548b5c7faab13dbf78ff6ad903d21c0acd1f972ce1e8cc44b4ed545d7704b",
+      "bytes": 221830
     },
     {
       "file": "shared/src/scene/world-state.ts",
@@ -594,8 +604,8 @@
     },
     {
       "file": "sillytavern/adapters/xldb.js",
-      "sha256": "1d7923957287bfec0298c8e9519313860766d2c9ef5f54a65d630858e85c9a62",
-      "bytes": 339412
+      "sha256": "4100a1351086ab4aadd5fcc077dfe2093374a9d1aaba3b47693a5f31f0efb35d",
+      "bytes": 344996
     },
     {
       "file": "sillytavern/src/dashboard.ts",
@@ -609,8 +619,8 @@
     },
     {
       "file": "sillytavern/src/server.ts",
-      "sha256": "8a0fe7c7b97bab51def0b29f355c2de45626b67cf0f9af220ce09155d79ff7c1",
-      "bytes": 40063
+      "sha256": "dc79090346cc2d5d5aa81d5c1299a3e53c3f529015e76d6985c5b275075da6f6",
+      "bytes": 41235
     },
     {
       "file": "START-XLDB.cmd",
@@ -629,8 +639,8 @@
     },
     {
       "file": "tools/backup.mjs",
-      "sha256": "1616320742b153bb6975ce4d9c89c44b73f42900f4b7aaca5a1a0c339844fa7c",
-      "bytes": 3273
+      "sha256": "550d67a91459b61a2592a240d35a3cf54deec16f9f96887eaec4831992e89305",
+      "bytes": 4164
     },
     {
       "file": "tools/install-agent-model.ps1",
@@ -669,13 +679,13 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "9ca33de5e233e0e1bbe028a3e776d70a458ca7fad583b58fec22eeed06aa6b4d",
-      "bytes": 351441
+      "sha256": "58baa1faa98270ef20658a464e81cced97ba35bb24db13bb793c425350eaf081",
+      "bytes": 357169
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "1f85731e6d878680f279c66a0c59387c54c4ddfa4e708300166600973437b134",
-      "bytes": 356564
+      "sha256": "2bb33b96e07e2180e2477c551a7e9900e4ac1e5d2ef75a835cde8b3446f08b6e",
+      "bytes": 362436
     }
   ]
 }

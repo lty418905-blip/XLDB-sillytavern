@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { scopeKey } from '../core/types.ts';
 import type { Memory } from '../memory/access.ts';
 import { npcScope } from './types.ts';
-import type { SceneRoster, SceneScope } from './types.ts';
+import type { SceneRoster, SceneScope, SceneState } from './types.ts';
 import {rosterOf} from './perspective.ts';
 import type { WorldSettings } from './world-state.ts';
 import { foldWorldState } from './world-state.ts';
@@ -163,35 +163,45 @@ export class SceneTransfer {
     };
   }
 
-  apply(scope: SceneScope, document: unknown, guard: ApplyGuard) {
+  /** Validates a transfer, then invokes the optional write guard in its transaction; thrown errors roll back unchanged. */
+  apply(scope: SceneScope, document: unknown, guard: ApplyGuard, beforeWrite?: (state: SceneState, roster: SceneRoster) => void) {
     return this.transaction(() => {
-    const state = this.authority.state(scope);
-    const normalized = validateDocument(document, state.roster);
-    validateGuard(guard);
-    if (typeof guard.previewId !== 'string' || !guard.previewId) throw new Error('invalid_scene_transfer_preview');
-    const documentHash = hash(normalized);
-    // This binds the reviewed input across CLI processes without writing during preview.
-    if (guard.previewId!==hash({scope:scopeKey(scope),version:guard.expectedVersion,documentHash}))throw new Error('invalid_scene_transfer_preview');
-    const requestHash = hash({action: 'apply', expectedVersion: guard.expectedVersion, documentHash});
-    const duplicate = this.operation(scope, guard.operationId, requestHash);
-    if (duplicate) return {...duplicate,version:this.authority.state(scope).version, duplicate: true};
-    if (state.version !== guard.expectedVersion) throw new Error('context_changed_retry');
-    const conflicts = normalized.format === 'xldb-scene-template-v1'
-      ? templateConflicts(state, this.authority.worldSettings(scope), normalized) : importDiff(scope,normalized,this.db).conflicts;
-    if (conflicts.length) throw new Error(conflicts[0]!.code);
-
-      const changed=normalized.format==='xldb-scene-template-v1'
-        ?canonical(state.roster)!==canonical(normalized.roster)||canonical(this.authority.worldSettings(scope))!==canonical(normalized.worldSettings)
-        :importDiff(scope,normalized,this.db).new>0;
-      const checkpoint = changed?this.authority.lifecycle.checkpoint(scope, '模板或参考资料迁入', {automatic: true}):null;
+      const state = this.authority.state(scope);
+      const normalized = validateDocument(document, state.roster);
+      validateGuard(guard);
+      if (typeof guard.previewId !== 'string' || !guard.previewId)
+        throw new Error('invalid_scene_transfer_preview');
+      const documentHash = hash(normalized);
+      // This binds the reviewed input across CLI processes without writing during preview.
+      if (guard.previewId !== hash({ scope: scopeKey(scope), version: guard.expectedVersion, documentHash }))
+        throw new Error('invalid_scene_transfer_preview');
+      const requestHash = hash({ action: 'apply', expectedVersion: guard.expectedVersion, documentHash });
+      const duplicate = this.operation(scope, guard.operationId, requestHash);
+      if (duplicate)
+        return { ...duplicate, version: this.authority.state(scope).version, duplicate: true };
+      if (state.version !== guard.expectedVersion)
+        throw new Error('context_changed_retry');
+      const conflicts = normalized.format === 'xldb-scene-template-v1'
+        ? templateConflicts(state, this.authority.worldSettings(scope), normalized) : importDiff(scope, normalized, this.db).conflicts;
+      if (conflicts.length)
+        throw new Error(conflicts[0]!.code);
+      const changed = normalized.format === 'xldb-scene-template-v1'
+        ? canonical(state.roster) !== canonical(normalized.roster) || canonical(this.authority.worldSettings(scope)) !== canonical(normalized.worldSettings)
+        : importDiff(scope, normalized, this.db).new > 0;
+      // All input checks precede this guard, including conflicts; even unchanged transfers record an operation.
+      beforeWrite?.(state, normalized.format === 'xldb-scene-template-v1' ? normalized.roster : state.roster);
+      const checkpoint = changed ? this.authority.lifecycle.checkpoint(scope, '模板或参考资料迁入', { automatic: true }) : null;
       let imported = 0;
       let skipped = 0;
       if (normalized.format === 'xldb-scene-template-v1') {
         const rosterChanged = canonical(state.roster) !== canonical(normalized.roster);
         const settingsChanged = canonical(this.authority.worldSettings(scope)) !== canonical(normalized.worldSettings);
-        if (rosterChanged) this.authority.configure(scope, normalized.roster,Date.now(),false);
-        if (settingsChanged) this.authority.configureWorld(scope, normalized.worldSettings,false);
-      } else {
+        if (rosterChanged)
+          this.authority.configure(scope, normalized.roster, Date.now(), false);
+        if (settingsChanged)
+          this.authority.configureWorld(scope, normalized.worldSettings, false);
+      }
+      else {
         const result = this.insertReferences(scope, normalized, documentHash);
         imported = result.imported;
         skipped = result.skipped;
@@ -200,7 +210,7 @@ export class SceneTransfer {
           this.queueCleanup(scope, result.readers, this.authority.state(scope).version);
         }
       }
-      const result = {version: this.authority.state(scope).version, checkpointId: checkpoint?.id??null, imported, skipped, duplicate: false};
+      const result = { version: this.authority.state(scope).version, checkpointId: checkpoint?.id ?? null, imported, skipped, duplicate: false };
       this.db.prepare('INSERT INTO scene_transfer_operations(scope,id,request_hash,result) VALUES(?,?,?,?)')
         .run(scopeKey(scope), guard.operationId, requestHash, JSON.stringify(result));
       return result;

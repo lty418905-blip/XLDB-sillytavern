@@ -23,6 +23,10 @@ import {
   LedgerRuns,
   LEDGER_INPUT_UTF16_LIMIT,
   LEDGER_CACHE_SCHEMA,
+  LEDGER_FOREGROUND_USER_MS,
+  LEDGER_FOREGROUND_ASSISTANT_MS,
+  type LedgerProgress,
+  type LedgerRunContext,
   checkedLedger,
   cachedLedger,
   type LedgerStageOptions,
@@ -1662,6 +1666,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         const results:{id:string;revision:number;analysis:SceneAnalysis}[]=[];
         const backfilled=new Map<string,{id:string;revision:number;analysis:SceneAnalysis}>();
         const processed:import('./types.ts').SceneSource[]=[];
+        const ledgerProgress=this.ledgerStageOptions&&story?{index:0,deferred:false}:undefined;
         for (const [sourceIndex,source] of accepted.entries()) {
           if(sourceIndex>targetIndex)break;
           if(source.processing==='ready'&&source.analysis&&(!target||source.id!==target.sourceId||!source.analysis.skippedStages?.length)){
@@ -1705,7 +1710,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             });
           const [plan,legacyEffects,world]=await settled([planWork(),Promise.resolve(story?undefined:worldWork()),Promise.resolve(storyWorldWork())] as const);
           this.assertVersion(scope,state.version);
-          const ledgerStep=this.ledgerStageOptions&&story?this.beginLedgerStage(scope,state,accepted,processed,source,plan,world,configs):null;
+          const ledgerStep=this.ledgerStageOptions&&story?this.beginLedgerStage(scope,state,accepted,processed,source,plan,world,configs,ledgerProgress):null;
           // Story scope. A skipped world stage (SillyTavern roleplay) is the only case in which the stage's value is
           // replaced; otherwise the stored value is world.storyClock as decodeWorldStage returned it, a 'failed' marker
           // with its issues included (no retry, no skip, no rewrite). worldEffects is written only with world settings.
@@ -2042,7 +2047,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     }
   }
 
-  /** Resolve only the loop's two timing callbacks. The reserved foreground timer callbacks remain unused. */
+  /** Resolve loop timing independently of the foreground timer pair; invalid members use platform defaults. */
   private ledgerTiming(): {now: () => number; wait: (milliseconds: number) => Promise<void>;} {
 
     let timing: LedgerTiming | null = null;
@@ -2103,6 +2108,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     plan: PerspectivePlan,
     world: WorldStageResult | undefined,
     configurations: Configurations,
+    progress: LedgerProgress = {index: 0, deferred: false},
 
   ): LedgerStep {
 
@@ -2277,6 +2283,15 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         issue: 'input_size'
       };
 
+    // Do not touch this source's cache until predecessor parking and the existing input checks have finished.
+    if (this.ledgerHasDeferred(processed, progress)) {
+
+      this.ledgerRuns?.cancel(scopeKey(scope), source.id);
+      this.deferLedgerStep(step, 'waiting');
+
+      return step;
+    }
+
     const binding = {
       revision: source.revision,
       pin,
@@ -2289,7 +2304,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     if (previous)
       return {
         ...step,
-        entry: previous
+        entry: previous,
+        arrivedAt: this.ledgerNow()
       };
 
     const address: ProcessingAddress = {
@@ -2307,6 +2323,14 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       };
 
     const timing = this.ledgerTiming();
+    const runContext: LedgerRunContext = {
+      source: bundle.source,
+      selection,
+      requests: 0
+    };
+
+    step.arrivedAt = this.ledgerNow();
+
     let started: ReturnType<typeof startLedgerRun> = null;
 
     // The address wrapper invokes synchronously. Its asynchronous signature does not require yielding the snapshot.
@@ -2330,7 +2354,12 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
               messages,
               json,
               timeoutMs
-            ) => this.models.ledgerTurn(config!, messages, json, timeoutMs),
+            ) => {
+
+              runContext.requests++;
+
+              return this.models.ledgerTurn(config!, messages, json, timeoutMs);
+            },
             parse: parseModelJson,
             now: timing.now,
             wait: timing.wait,
@@ -2366,7 +2395,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       binding,
       fingerprint,
       active,
-      entry => this.storeLedgerRun(scope, entry)
+      entry => this.storeLedgerRun(scope, entry),
+      runContext
     );
 
     return step;
@@ -2390,7 +2420,12 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
 
       const result = entry.result;
 
-      if (!result?.ledger || !result.finished)
+      if (!result)
+        return;
+
+      const ledger = result.ledger ?? (entry.deferred ? this.interruptedLedgerRun(entry) : null);
+
+      if (!ledger)
         return;
 
       this.authority.processing.complete(
@@ -2407,9 +2442,9 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
           pin: entry.pin,
           base: entry.base,
           marks: entry.marks,
-          ledger: result.ledger,
-          conversation: result.finished.payload.conversation,
-          ignoredFactRefs: result.finished.payload.ignoredFactRefs,
+          ledger,
+          conversation: result.ledger ? result.finished!.payload.conversation : [],
+          ignoredFactRefs: result.ledger ? result.finished!.payload.ignoredFactRefs : [],
         }
       );
     } catch {
@@ -2417,12 +2452,76 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     }
   }
 
-  /** Wait only for a selected run's own completion; none, not-run and cache-hit steps never call this method. */
+  /** Wait for completion or this source's remaining foreground milliseconds, then inspect the settled entry.
+   * Invalid clock reads spend zero budget; timer installation failures preserve the original completion wait. */
   private async waitLedgerStep(step: LedgerStep): Promise<void> {
 
-    await step.entry!.done;
+    const entry = step.entry!;
 
-    const result = step.entry!.result!;
+    if (entry.result) {
+
+      await entry.done;
+    } else {
+
+      const budget = entry.context?.source.role === 'assistant'
+        ? LEDGER_FOREGROUND_ASSISTANT_MS
+        : LEDGER_FOREGROUND_USER_MS;
+      const now = this.ledgerNow();
+      const arrivedAt = step.arrivedAt;
+      const elapsed = now !== null && arrivedAt != null && now >= arrivedAt ? now - arrivedAt : 0;
+      const remaining = Math.max(0, Math.min(budget, budget - elapsed));
+
+      if (remaining > 0) {
+
+        const timers = this.ledgerTimers();
+        let handle: ReturnType<typeof globalThis.setTimeout>;
+        let installed = false;
+
+        try {
+
+          let wake!: () => void;
+          const deadline = new Promise<void>(resolve => {
+
+            wake = resolve;
+          });
+
+          try {
+
+            handle = timers.setTimeout(wake, remaining);
+            installed = true;
+          } catch {
+
+            step.notice = 'timer';
+          }
+
+          if (installed)
+            await Promise.race([entry.done, deadline]);
+          else
+            await entry.done;
+        } finally {
+
+          if (installed) {
+
+            try {
+
+              timers.clearTimeout(handle!);
+            } catch {
+              // A throwing clearer cannot change the selected result or fail the foreground job.
+            }
+          }
+        }
+      }
+    }
+
+    // A timer may wake inside the completion callback. The entry, not the race winner, is authoritative.
+    const result = entry.result;
+
+    if (!result) {
+
+      this.deferLedgerStep(step, 'timeout');
+
+      return;
+    }
 
     if (result.ledger)
       step.ledger = result.ledger;
@@ -2442,8 +2541,35 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
   /** Finalize the interrupted substitute and emit one short diagnostic only when this job assembles its result. */
   private finishLedgerStep(source: SceneSource, step: LedgerStep | null): void {
 
-    if (!step || !step.issue)
+    if (!step)
       return;
+
+    if (step.deferred) {
+
+      if (step.deferred === 'timeout' || !step.ledger)
+        recordStage(
+          step.deferred,
+          {
+            sourceId: source.id,
+            revision: source.revision,
+            stage: 'ledger',
+            parts: step.details ?? []
+          }
+        );
+
+      return;
+    }
+
+    if (!step.issue) {
+
+      if (step.notice)
+        recordStage(step.notice, {sourceId: source.id, revision: source.revision, stage: 'ledger'});
+
+      return;
+    }
+
+    if (step.notice)
+      step.details = [...(step.details ?? []), step.notice];
 
     const fallback = step.fallback;
 
@@ -2493,10 +2619,137 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     );
   }
 
-  /** Remove committed run results only after the authority commit has succeeded. */
-  private commitLedgerRuns(scope: SceneScope, results: readonly {id: string; revision: number;}[]): void {
+  /** Retain only records actually committed as deferred; failed commits never mark a run as parked. */
+  private commitLedgerRuns(
+    scope: SceneScope,
+    results: readonly {id: string; revision: number; analysis?: SceneAnalysis;}[]
+  ): void {
 
-    this.ledgerRuns?.committed(scopeKey(scope), results);
+    const deferred = new Set(
+      results.filter(source => source.analysis?.ledger?.outcome === 'deferred').map(source => source.id)
+    );
+
+    this.ledgerRuns?.committed(scopeKey(scope), results, deferred, entry => this.storeLedgerRun(scope, entry));
+  }
+
+  /** Read one foreground clock value in milliseconds. Invalid now members or calls return null.
+   * An unreadable timing object keeps the loop's existing platform-clock fallback. */
+  private ledgerNow(): number | null {
+
+    let timing: LedgerTiming | null = null;
+
+    try {
+
+      timing = this.ledgerStageOptions?.timing ?? null;
+    } catch {}
+
+    try {
+
+      const supplied = timing?.now;
+      const value = typeof supplied === 'function' ? supplied() : performance.now();
+
+      return Number.isFinite(value) ? value : null;
+    } catch {
+
+      return null;
+    }
+  }
+
+  /** Select both timer members together. Platform wrappers resolve globals when called, never at module load. */
+  private ledgerTimers(): {
+    setTimeout: (callback: () => void, milliseconds: number) => ReturnType<typeof globalThis.setTimeout>;
+    clearTimeout: (handle: ReturnType<typeof globalThis.setTimeout>) => void;
+  } {
+
+    try {
+
+      const timing = this.ledgerStageOptions?.timing;
+      const set = timing?.setTimeout;
+      const clear = timing?.clearTimeout;
+
+      if (typeof set === 'function' && typeof clear === 'function')
+        return {setTimeout: set, clearTimeout: clear};
+    } catch {
+      // An unreadable member invalidates the pair, including a successfully read partner.
+    }
+
+    return {
+      setTimeout: (callback, milliseconds) => globalThis.setTimeout(callback, milliseconds),
+      clearTimeout: handle => globalThis.clearTimeout(handle)
+    };
+  }
+
+  /** Inspect each already-processed predecessor at most once per job; no fold, decode or storage read occurs. */
+  private ledgerHasDeferred(processed: readonly SceneSource[], progress: LedgerProgress): boolean {
+
+    for (; progress.index < processed.length; progress.index++) {
+
+      if (processed[progress.index].analysis?.ledger?.outcome === 'deferred')
+        progress.deferred = true;
+    }
+
+    return progress.deferred;
+  }
+
+  /** Build a foreground parking record. A missing timeout record cancels only this exact run; waiting has no run.
+   * Snapshot request counts are nonnegative invocation counts and calls intentionally remain empty. */
+  private deferLedgerStep(step: LedgerStep, cause: 'timeout' | 'waiting'): void {
+
+    const entry = cause === 'timeout' ? step.entry : null;
+    const fallback = step.fallback!;
+    const context = entry?.context;
+    const requests = entry ? context?.requests ?? 0 : 0;
+    const source = context?.source ?? fallback.source;
+    const record = ledgerDeferred(
+      {
+        cause,
+        source,
+        base: entry?.base ?? fallback.base,
+        fingerprint: entry?.fingerprint ?? fallback.fingerprint,
+        marks: (context?.selection ?? fallback.selection).marks,
+        pin: entry?.pin ?? fallback.pin!,
+        trace: {transport: 'json', requests, calls: []}
+      }
+    );
+    const ledger = checkedLedger(record, source.sourceId, source.revision);
+
+    step.deferred = cause;
+
+    if (ledger)
+      step.ledger = ledger;
+    else if (entry)
+      this.ledgerRuns?.remove(entry);
+
+    step.details = [
+      'requests_' + requests,
+      ...(ledger ? [] : ['record'])
+    ];
+  }
+
+  /** Convert a parked run's own retained context and log into a checked interrupted cache substitute.
+   * This never changes the accepted source record; missing context or invalid serialization returns null. */
+  private interruptedLedgerRun(entry: LedgerRunEntry): ReturnType<typeof checkedLedger> {
+
+    if (!entry.context)
+      return null;
+
+    const deferred = ledgerDeferred(
+      {
+        cause: 'timeout',
+        source: entry.context.source,
+        marks: entry.context.selection.marks,
+        pin: entry.pin,
+        base: entry.base,
+        fingerprint: entry.fingerprint,
+        trace: entry.result?.loop?.log ?? {transport: 'json', requests: 0, calls: []}
+      }
+    );
+    const interrupted = interruptDeferredLedgerAnalysis(JSON.stringify({ledger: deferred}));
+    const record = interrupted ? JSON.parse(interrupted).ledger : null;
+
+    return record?.outcome === 'skipped' && record.stop === 'interrupted'
+      ? checkedLedger(record, entry.sourceId, entry.revision)
+      : null;
   }
 
   /** Bound retained runs after a pending job without disrupting that job's existing close/error result. */

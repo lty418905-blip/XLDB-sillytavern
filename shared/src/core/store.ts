@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { createEmotion, advanceEmotion, emotionAt, validateEmotionState } from '../emotion/openher.ts';
+import { createEmotion, advanceEmotion, emotionAt, emotionStateVersionRecognized, validateEmotionState } from '../emotion/openher.ts';
 import type { EmotionState } from '../emotion/openher.ts';
 import { projectMemories } from '../memory/access.ts';
 import {retentionSnapshot} from '../memory/retention.ts';
@@ -14,8 +14,9 @@ import {isSourceControl,memoryAccesses,memoryControlId,preferenceControlId,prefe
 import type {StoredControl} from './controls.ts';
 import { SceneAuthority } from '../scene/store.ts';
 import type {SceneAuthorityExtensionFactory} from '../scene/extension.ts';
-import {acquireAuthorityLease} from '../scene/backup.ts';
+import {acquireAuthorityLease, authorityPath} from '../scene/backup.ts';
 import type {AuthorityLease} from '../scene/backup.ts';
+import {CURRENT_STORE_FORMAT, readStoreFormatFile} from './store-format.ts';
 
 type Source = AcceptedMessage & { status: string; payload: string | null; observedAtMs: number };
 export interface Preference {
@@ -44,12 +45,21 @@ export class Authority<M extends object = {}> {
   private lease?:AuthorityLease;
   readonly scene: SceneAuthority & M;
   constructor(filename: string, options: AuthorityOptions<M> = {}) {
-    if (filename !== ':memory:') fs.mkdirSync(path.dirname(filename), { recursive: true });
-    if(filename!==':memory:')this.lease=acquireAuthorityLease(filename,'server');
-    let opened:DatabaseSync|undefined;
+    if (filename !== ':memory:') {
+      filename = authorityPath(filename);
+      if (readStoreFormatFile(filename, true) > CURRENT_STORE_FORMAT) throw new Error('store_format_unsupported');
+    }
+    let opened: DatabaseSync | undefined;
     try {
-    this.db = opened = new DatabaseSync(filename);
-    this.db.exec(`PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
+      if (filename !== ':memory:') {
+        fs.mkdirSync(path.dirname(filename), {recursive: true});
+        this.lease = acquireAuthorityLease(filename, 'server');
+        // A cooperating writer may have upgraded the file between the first read and acquisition of the lease.
+        if (readStoreFormatFile(filename) > CURRENT_STORE_FORMAT) throw new Error('store_format_unsupported');
+      }
+      // The companion worker opens only after this succeeds; direct SceneAuthority construction is a test seam.
+      this.db = opened = new DatabaseSync(filename);
+      this.db.exec(`PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS scopes (
         key TEXT PRIMARY KEY, scope TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0,
         created INTEGER NOT NULL, emotion TEXT NOT NULL, indexed INTEGER NOT NULL DEFAULT -1);
@@ -72,13 +82,18 @@ export class Authority<M extends object = {}> {
         access TEXT NOT NULL, kind TEXT NOT NULL, origin TEXT NOT NULL, at INTEGER NOT NULL, bucket INTEGER NOT NULL,
         PRIMARY KEY(scope,memory_id,bucket));
       PRAGMA user_version=1;`);
-    const needsEmotionMigration=(this.db.prepare('PRAGMA application_id').get() as {application_id:number}).application_id!==NEURAL_PERSISTENCE_APPLICATION_ID;
-    this.scene = new SceneAuthority(this.db,needsEmotionMigration,options.sceneExtension) as SceneAuthority & M;
-    if(needsEmotionMigration) {
-      this.migrateEmotionStates();
-      this.db.exec(`PRAGMA application_id=${NEURAL_PERSISTENCE_APPLICATION_ID}`);
+      const applicationId = (this.db.prepare('PRAGMA application_id').get() as {application_id: number}).application_id;
+      const needsEmotionMigration = applicationId !== NEURAL_PERSISTENCE_APPLICATION_ID;
+      this.scene = new SceneAuthority(this.db, needsEmotionMigration, options.sceneExtension) as SceneAuthority & M;
+      if (needsEmotionMigration) {
+        this.migrateEmotionStates();
+        this.db.exec(`PRAGMA application_id=${NEURAL_PERSISTENCE_APPLICATION_ID}`);
+      }
+    } catch (error) {
+      opened?.close();
+      this.lease?.release();
+      throw error;
     }
-    }catch(error){opened?.close();this.lease?.release();throw error;}
   }
   close() { if(this.db.isOpen)this.db.close();this.lease?.release(); }
   sqliteVersion(): string { return (this.db.prepare('SELECT sqlite_version() AS version').get() as {version:string}).version; }
@@ -185,8 +200,15 @@ export class Authority<M extends object = {}> {
     return latest.id;
   }
   emotion(scope: Scope, now = Date.now()): EmotionState {
-    const row = this.db.prepare('SELECT emotion FROM scopes WHERE key=?').get(scopeKey(scope)) as {emotion:string} | undefined;
-    return row ? emotionAt(validateEmotionState(JSON.parse(row.emotion)), now) : createEmotion(now,undefined,emotionIdentitySeed(scope));
+    const row = this.db.prepare('SELECT emotion FROM scopes WHERE key=?').get(scopeKey(scope)) as {
+      emotion: string;
+    } | undefined;
+    if (!row)
+      return createEmotion(now, undefined, emotionIdentitySeed(scope));
+    const stored = JSON.parse(row.emotion);
+    const unknownSnapshot = stored !== null && typeof stored === 'object' && !Array.isArray(stored)
+      && stored.version !== 1 && !emotionStateVersionRecognized(stored.version);
+    return emotionAt(unknownSnapshot ? this.replayEmotion(scope) : validateEmotionState(stored), now);
   }
   /**
    * Record memories a reply context actually brought back (ids only, never quotes). One row per memory per 30-minute
@@ -263,6 +285,18 @@ export class Authority<M extends object = {}> {
     this.db.prepare('INSERT OR IGNORE INTO scopes(key,scope,created,emotion) VALUES(?,?,?,?)')
       .run(scopeKey(scope), JSON.stringify(scope), now, JSON.stringify(createEmotion(now,undefined,emotionIdentitySeed(scope))));
   }
+  /** Replays committed records in source order without modifying projections, versions, or stored snapshots. */
+  private replayEmotion(scope: Scope): EmotionState {
+    const row = this.db.prepare('SELECT created FROM scopes WHERE key=?').get(scopeKey(scope)) as {created: number};
+    let emotion = createEmotion(row.created, undefined, emotionIdentitySeed(scope));
+    for (const source of this.sources(scope)) {
+      if (source.status !== 'committed' || !source.payload) continue;
+      const payload = JSON.parse(source.payload) as Analysis;
+      emotion = advanceEmotion(emotion, payload.emotion, source.acceptedAtMs);
+    }
+    return emotion;
+  }
+
   private rebuild(scope: Scope) {
     const key = scopeKey(scope);
     const row = this.db.prepare('SELECT created FROM scopes WHERE key=?').get(key) as {
@@ -382,14 +416,24 @@ export class Authority<M extends object = {}> {
   }
   /** Upgrade each legacy v1 projection once by replaying recorded candidates. */
   private migrateEmotionStates() {
-    this.transaction(()=>{
-      const rows=this.db.prepare('SELECT scope,emotion FROM scopes').all() as {scope:string;emotion:string}[];
-      for(const row of rows) {
-        const scope=JSON.parse(row.scope) as Scope;
-        const stored=JSON.parse(row.emotion) as {version?:unknown};
-        if(stored.version===2) { validateEmotionState(stored); continue; }
-        if(stored.version!==1) throw new TypeError('invalid_emotion_state_version');
-        this.rebuild(scope);
+    this.transaction(() => {
+      const rows = this.db.prepare('SELECT scope,emotion FROM scopes').all() as {
+        scope: string;
+        emotion: string;
+      }[];
+      for (const row of rows) {
+        const scope = JSON.parse(row.scope) as Scope;
+        const stored = JSON.parse(row.emotion) as {
+          version?: unknown;
+        };
+        if (!stored || typeof stored !== 'object' || Array.isArray(stored))
+          validateEmotionState(stored);
+        if (emotionStateVersionRecognized(stored.version)) {
+          validateEmotionState(stored);
+          continue;
+        }
+        if (stored.version === 1)
+          this.rebuild(scope);
       }
     });
   }

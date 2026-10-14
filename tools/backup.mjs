@@ -52,6 +52,14 @@ try {
   }
 } catch(error) {
   process.stderr.write((error instanceof Error?error.message:String(error))+'\n');
+  if (error instanceof Error && error.message === 'backup_store_format_unsupported') {
+    process.stderr.write([
+      'This backup was created by a newer version of XLDB, and this version cannot restore it. Nothing was restored, and the target database was not changed. Update XLDB to the version that created it or a newer one, then run the command again.',
+      '这份备份是由较新版本的 XLDB 建立的，当前版本无法恢复它。没有恢复任何内容，目标数据库也没有被改动。请把 XLDB 升级到建立它的那个版本或更高版本，再重新执行这条命令。',
+      '這份備份是由較新版本的 XLDB 建立的，目前的版本無法還原它。沒有還原任何內容，目標資料庫也沒有被更動。請把 XLDB 升級到建立它的那個版本或更高版本，再重新執行這個指令。',
+      '',
+    ].join('\n'));
+  }
   if(error?.hint)process.stderr.write(error.hint+'\n');
   process.exitCode=1;
 }

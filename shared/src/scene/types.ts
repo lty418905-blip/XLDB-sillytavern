@@ -16,6 +16,7 @@ export interface SceneIdentityEvidence { sourceId: string; quote: string; docume
 export type SceneIdentitySource =
   | { kind: 'automatic'; evidence: SceneIdentityEvidence[] }
   | { kind: 'manual' };
+/** A roster identity and optional settings; reserved metadata is opaque and only retained from stored values. */
 export interface SceneCharacter {
   id: string;
   name: string;
@@ -24,8 +25,14 @@ export interface SceneCharacter {
   emotion?: EmotionSettings;
   /** Omitted legacy entries are treated as user-confirmed manual identities. */
   identitySource?: SceneIdentitySource;
+  calibration?: unknown;
+  emotionProvenance?: unknown;
 }
-export interface SceneRoster { characters: SceneCharacter[] }
+/** The scope's ordered roster; emotionControls is opaque stored metadata, never populated from a caller. */
+export interface SceneRoster {
+  characters: SceneCharacter[];
+  emotionControls?: unknown;
+}
 export type SceneInputMode = 'direct' | 'scene';
 export interface SceneEnvelope {
   /** Host-selected player identity, not inferred from NPC dialogue. */
