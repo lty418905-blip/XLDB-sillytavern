@@ -2,7 +2,7 @@
   "name": "xldb-sillytavern",
   "version": "0.2.0-mvp",
   "private": true,
-  "license": "SEE LICENSE IN LICENSE.md",
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=24.18.1 <25"

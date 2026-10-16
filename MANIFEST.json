@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "1505357091830a2ca1e3190cdedd6aa0313eb823ee440c30cdbe492451ed414c",
+  "sourceManifestSha256": "7f485395e57af8488a193e9afc2aef0a1d57ca8dc6eea876e65c8fada3cefa03",
   "files": [
     {
       "file": ".gitattributes",
@@ -29,23 +29,23 @@
     },
     {
       "file": "LICENSE",
-      "sha256": "c76057b4ecf744ddce64f4cb3791d6d08c054be0926dcb8066114401330944d4",
-      "bytes": 1817
+      "sha256": "85817cedca53f6806c14d43f144e2acbd6a62db6db20e3c1e2c19076c411d8bf",
+      "bytes": 1071
     },
     {
       "file": "LICENSE.md",
-      "sha256": "c76057b4ecf744ddce64f4cb3791d6d08c054be0926dcb8066114401330944d4",
-      "bytes": 1817
+      "sha256": "85817cedca53f6806c14d43f144e2acbd6a62db6db20e3c1e2c19076c411d8bf",
+      "bytes": 1071
     },
     {
       "file": "package.json",
-      "sha256": "d8d1ebfaff0b91a0b2d7757426ff74e4489815ce85faea27a1d0e9d22d81ea33",
-      "bytes": 343
+      "sha256": "b0eaa92e3f38fcb1d846d7158a7f1b3876b9dd2575f61464162dd93146de474c",
+      "bytes": 321
     },
     {
       "file": "README.md",
-      "sha256": "e906e626cd8ed69f35834ac412b01025af3e2e462b26ff283bdb3fe34c1cb3ba",
-      "bytes": 14027
+      "sha256": "9dced6a2e09c25125198b6a272ad27aff20521970e7701d76f76e46d1b81452c",
+      "bytes": 13274
     },
     {
       "file": "RECOVERY.md",
@@ -644,13 +644,13 @@
     },
     {
       "file": "THIRD_PARTY_NOTICES.md",
-      "sha256": "b5cda6967e5c521ba8ddb57dab27c168e25a5249a3220bb9e1eb354db8478fe5",
-      "bytes": 11751
+      "sha256": "5d2de616fda2fe0a7f8fa1233c9cd40c62d19359f9482d2c7ee982e87ae749c9",
+      "bytes": 11747
     },
     {
       "file": "tools/agent-assets.json",
-      "sha256": "425f8435197c570e9584f9d64cb807f607a53e4413d46443c0c66bfc03a8fc25",
-      "bytes": 2241
+      "sha256": "6725d52f884b406874b4c1326238bd07971306e4c1af920e1ae90b8b1f28d26b",
+      "bytes": 2247
     },
     {
       "file": "tools/backup.mjs",
@@ -694,12 +694,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "4bd3e56033a9df5dd6f1a62e27992f6c7a316c071de15d01ce922c7f8e7aa3f4",
+      "sha256": "fc454b9370e1523d907baffe142191be66cf0a413516027f97be1da0f132decb",
       "bytes": 357169
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "2a73a5efba73b9fc33c09174967cfcbed76d2a82e71899f6dd71f544fc9c556d",
+      "sha256": "e5a15f89269d4e3a576b8aaacca8a36e5da19ee62424e4ec7585de371fa6fb6b",
       "bytes": 362436
     }
   ]

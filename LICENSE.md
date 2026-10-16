@@ -1,29 +1,21 @@
-# XLDB 自訂許可
+MIT License
 
-Copyright (c) 2026 lty418905-blip. 保留所有未明確授予的權利.
+Copyright (c) 2026 lty418905-blip
 
-本專案不採用通用開源許可證, 不屬於公共領域;"無開源許可證"不表示無版權, 也不是 The Unlicense.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-## 允許
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-允許個人為非商業學習目的下載, 儲存, 閱讀本專案, 並按照隨附說明在本地安裝, 設定和執行. 按產品介面及檔案修改個人設定和執行資料屬於上述授權, 不構成對程式原始碼的修改授權.
-
-## 限制
-
-未經權利人另行書面授權, 不得:
-
-1. 分發, 轉載, 映象, 再發布或向第三方提供本專案的全部或實質部分, 包括原始碼, 安裝包及修改版本.
-2. 修改, 改編本專案原始碼, 或據此製作衍生作品.
-3. 將本專案用於商業用途, 包括銷售, 收費服務, 商業產品整合或其他商業經營活動.
-
-學習, 下載或署名不自動授予以上權利. 授權申請請聯絡本倉庫所有者 lty418905-blip.
-
-## 第三方與平臺權利
-
-本許可僅適用於 XLDB 權利人有權授權且未另行標明許可證的部分. 第三方程式碼, 依賴及明確標註其他許可證的檔案繼續適用各自許可證; 本許可不撤銷或限制其已經授予的權利. 特別是 `shared/src/emotion/neural.ts` 與 `shared/src/emotion/openher.ts` 按檔案宣告適用 Apache-2.0, 詳情見 `THIRD_PARTY_NOTICES.md` 和 `shared/third-party/OpenHer-LICENSE`.
-
-GitHub 服務條款已經授予的平臺內檢視及 Fork 等權利不受本許可撤銷. 本許可不授予超出該平臺條款範圍的再分發, 修改或商業使用權, 也不限制適用法律不能排除的權利.
-
-## 無擔保
-
-本專案按現狀提供, 不提供適用性, 可靠性或持續維護保證. 在適用法律允許的範圍內, 權利人不對使用本專案產生的損失承擔責任.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

@@ -1,7 +1,7 @@
 {
   "format": 1,
   "tag": "agent-v0.1.0-mvp",
-  "baseUrl": "https://github.com/lty418905-blip/XLDB/releases/download/agent-v0.1.0-mvp/",
+  "baseUrl": "https://github.com/lty418905-blip/Edencordia/releases/download/agent-v0.1.0-mvp/",
   "model": {
     "bytes": 2393718620,
     "sha256": "a3c3503b71a04da0e30cbd17362f5733ba0a5ccae6d3eb5db7a84a2398a4953b",
