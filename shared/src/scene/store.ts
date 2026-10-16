@@ -115,7 +115,13 @@ export class SceneAuthority {
   constructor(
     db: DatabaseSync,
     migrateEmotionStates = true,
-    extension?: SceneAuthorityExtensionFactory<object>
+    extension?: SceneAuthorityExtensionFactory<object>,
+    // Only literal true enables geography in Tavern roleplay; omission keeps it unavailable in that scope.
+    // Restore geography by passing true at the server Authority construction.
+    tavernGeography = false,
+    // Only literal true enables physiology in Tavern roleplay; omission keeps it unavailable in that scope.
+    // Restore physiology by passing true at the server Authority construction.
+    tavernPhysiology = false
   ) {
     Object.defineProperties(this, {
       readSteps: { value: new AsyncLocalStorage<SceneReadStep>() },
@@ -210,6 +216,7 @@ export class SceneAuthority {
       state: scope => this.state(scope),
       modeOf: scope => this.interactions.modeOf(scope),
       fullRoleplay: scope => this.interactions.isTavernRoleplay(scope),
+      tavernAvailable: tavernGeography,
       transaction: action => this.transaction(action),
       checkpoint: (scope, reason) => {
         this.lifecycle.checkpoint(scope, reason, { automatic: true });
@@ -220,6 +227,7 @@ export class SceneAuthority {
       state: scope => this.state(scope),
       modeOf: scope => this.interactions.modeOf(scope),
       fullRoleplay: scope => this.interactions.isTavernRoleplay(scope),
+      tavernAvailable: tavernPhysiology,
       clock: (scope, now) => {
         const clock = this.interactions.clock(scope, now);
         return { ...clock, timeMs: typeof clock.timeMs === 'number' ? clock.timeMs : null };

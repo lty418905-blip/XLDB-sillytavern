@@ -70,6 +70,8 @@ interface GeographyDependencies {
   state:(scope:SceneScope)=>{version:number;roster:SceneRoster;sources:Array<SceneMessage&{status:string;processing:string;analysis?:{geographyOperations?:GeographyOperation[]}|null}>};
   modeOf:(scope:SceneScope)=>'roleplay'|'companion'|undefined;
   fullRoleplay:(scope:SceneScope)=>boolean;
+  /** Literal true restores processing and writes in a Tavern roleplay scope; omission leaves it unavailable. */
+  tavernAvailable?: boolean;
   transaction:<T>(action:()=>T)=>T;
   checkpoint:(scope:SceneScope,reason:string)=>void;
   bump:(scope:SceneScope)=>void;
@@ -165,10 +167,21 @@ export class GeographyStore {
     return row?.status!=='granted';
   }
 
+  // Only the Tavern binding is gated; other hosts retain their existing data controls.
+  private tavernUnavailable(scope: SceneScope): boolean {
+    return this.dependencies.fullRoleplay(scope) && this.dependencies.tavernAvailable !== true;
+  }
+
   configuration(scope:SceneScope):{revision:number}&GeographyConfiguration{
     const row=this.db.prepare('SELECT revision,body FROM scene_geography_settings WHERE scope=?').get(scopeKey(scope)) as SettingsRow|undefined;
     const config=row?configurationOf(JSON.parse(row.body)):structuredClone(defaultConfiguration);
-    if(this.dependencies.fullRoleplay(scope))return {revision:row?.revision??0,...config,enabled:true,followAcceptedProse:true,backgroundSeed:'enabled'};
+    if(this.dependencies.fullRoleplay(scope)){
+      // Keep the historical read order and one binding lookup on the restored path.
+      if (this.dependencies.tavernAvailable !== true) {
+        return {revision: row?.revision ?? 0, ...structuredClone(defaultConfiguration)};
+      }
+      return {revision:row?.revision??0,...config,enabled:true,followAcceptedProse:true,backgroundSeed:'enabled'};
+    }
     if(this.dependencies.modeOf(scope)==='companion'){
       const location=this.companionLocation(scope);
       if(this.locationBlocked(scope))
@@ -179,6 +192,7 @@ export class GeographyStore {
   }
 
   configure(scope:SceneScope,value:unknown,guard:{expectedRevision:number;operationId:string}){
+    if (this.tavernUnavailable(scope)) throw new Error('invalid_geography_unavailable');
     return this.dependencies.transaction(()=>{
       const state=this.dependencies.state(scope);if(!state.version)throw new Error('invalid_scene_not_configured');
       operationId(guard.operationId);const config=configurationOf(value),current=this.configuration(scope);
@@ -200,6 +214,7 @@ export class GeographyStore {
   }
 
   previewImport(scope:SceneScope,value:unknown){
+    if (this.tavernUnavailable(scope)) throw new Error('invalid_geography_unavailable');
     const state=this.dependencies.state(scope);if(!state.version)throw new Error('invalid_scene_not_configured');
     const normalized=documentOf(value,scope,state.roster),documentHash=hashDocument(normalized),existing=this.map(scope,normalized.mapId);
     const conflicts=this.positionConflicts(scope,normalized);
@@ -215,6 +230,7 @@ export class GeographyStore {
   }
 
   import(scope:SceneScope,value:unknown,guard:{expectedVersion:number;operationId:string;documentHash:string;allowInitialPositionConflicts?:boolean}){
+    if (this.tavernUnavailable(scope)) throw new Error('invalid_geography_unavailable');
     return this.dependencies.transaction(()=>{
       const preview=this.previewImport(scope,value);operationId(guard.operationId);
       const hash=requestHash('import',[preview.normalized,guard.expectedVersion,guard.documentHash,guard.allowInitialPositionConflicts===true]);
@@ -240,6 +256,7 @@ export class GeographyStore {
   }
 
   correct(scope:SceneScope,value:unknown,guard:{expectedVersion:number;operationId:string}){
+    if (this.tavernUnavailable(scope)) throw new Error('invalid_geography_unavailable');
     return this.dependencies.transaction(()=>{
       const state=this.dependencies.state(scope);if(!state.version)throw new Error('invalid_scene_not_configured');
       operationId(guard.operationId);const correction=correctionOf(value,state.roster),hash=requestHash('correct',[correction,guard.expectedVersion]);
@@ -259,6 +276,7 @@ export class GeographyStore {
   }
 
   clearCorrection(scope:SceneScope,id:string,guard:{expectedVersion:number;operationId:string}){
+    if (this.tavernUnavailable(scope)) throw new Error('invalid_geography_unavailable');
     return this.dependencies.transaction(()=>{
       const state=this.dependencies.state(scope);operationId(guard.operationId);const hash=requestHash('clear-correction',[id,guard.expectedVersion]);
       const duplicate=this.duplicate(scope,guard.operationId,'clear-correction',hash);if(duplicate)return {...duplicate,duplicate:true};
@@ -292,6 +310,7 @@ export class GeographyStore {
   }
 
   saveLayout(scope:SceneScope,readerId:string,value:unknown,guard:{expectedRevision:number;operationId:string}){
+    if (this.tavernUnavailable(scope)) throw new Error('invalid_geography_unavailable');
     return this.dependencies.transaction(()=>{
       const reader=readerOf(readerId,this.dependencies.state(scope).roster),input=layoutInput(value),current=this.layoutRow(scope,reader);
       operationId(guard.operationId);const hash=requestHash('layout',[reader,input,guard.expectedRevision]);

@@ -10,7 +10,7 @@ import {
   type RateExpression,
   type AmountUnit,
 } from '../common/amount-expressions.ts';
-import {ledgerReferenceValues, foldLedgerPrefix, accountsAt} from './world-ledger.ts';
+import {ledgerReferenceValues, foldLedgerPrefix, accountsFromFold} from './world-ledger.ts';
 import type {
   LedgerAccount,
   LedgerDetail,
@@ -214,7 +214,7 @@ export function ledgerStageView(
     const settings = normalizedSettings(request);
     const options = {...request.options};
     const prefix = foldLedgerPrefix(settings, request.sources, request.position, options, foldWorldState);
-    const accounts = accountsAt(settings, request.sources, request.position, options, foldWorldState, true);
+    const accounts = accountsFromFold(settings, prefix, true);
     if (!prefix.ok || !accounts.ok) return null;
     return {settings, accounts: accounts.value, before: prefix.value.ledger ?? null};
   } catch {
@@ -780,10 +780,14 @@ function ledgerModelInput(
 }
 
 /** Assembles the sole model input and full-source read tables. O(prose + candidate rows), plus the authority's
- * prefix fold cost; invalid input or unavailable authority data returns null. */
-export function buildLedgerInput(request: LedgerInputRequest): LedgerInputBundle | null {
+ * prefix fold cost; invalid input or unavailable authority data returns null. A supplied view must come from
+ * the same request's settings, sources, position and options. Null or omission computes that view here. */
+export function buildLedgerInput(
+  request: LedgerInputRequest,
+  suppliedView?: LedgerStageView | null,
+): LedgerInputBundle | null {
   try {
-    const view = ledgerStageView(request);
+    const view = suppliedView ?? ledgerStageView(request);
     if (!view || !Array.isArray(request.history) || !Array.isArray(request.characters)) return null;
 
     const source = textOf(request.source);

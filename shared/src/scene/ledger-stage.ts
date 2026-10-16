@@ -961,8 +961,10 @@ function sortBaseRows(rows: [string, string, string | number, readonly string[] 
 }
 
 /** Hashes only authority data before the source position, including original serialized event bodies.
- * Invalid positions or body data return null. */
-export function ledgerBase(input: LedgerBaseInput): string | null {
+ * Invalid positions or body data return null. Optional memory belongs to one job and keys immutable inputs
+ * by object identity. Each held candidate array and object record is hashed at most once per job; other per-step
+ * work remains O(prefix sources) for lookups and the unchanged final hash. Null or omission keeps fresh hashes. */
+export function ledgerBase(input: LedgerBaseInput, memory?: LedgerBaseMemory | null): string | null {
   try {
     if (!Number.isSafeInteger(input.position) || input.position < 0 || input.position > input.sources.length) {
       return null;
@@ -985,26 +987,45 @@ export function ledgerBase(input: LedgerBaseInput): string | null {
         row.readerIds ?? null,
       ])),
       sources: input.sources.slice(0, input.position).map(
-        source => [
-          source.sourceId,
-          source.revision,
-          processingFingerprint(source.candidates ?? []),
-          source.ledger == null
-            ? null
-            : processingFingerprint(
-              {
+        source => {
+          const candidates = source.candidates ?? [];
+          let candidateHash = memory?.candidates.get(candidates);
+          if (candidateHash === undefined) {
+            candidateHash = processingFingerprint(candidates);
+            if (Array.isArray(candidates))
+              memory?.candidates.set(candidates, candidateHash);
+          }
+
+          let recordHash: string | null = null;
+          if (source.ledger != null) {
+            // Stored primitive records still use the original hash, but cannot be WeakMap keys.
+            const recordIsObject = typeof source.ledger === 'object';
+            recordHash = recordIsObject ? memory?.records.get(source.ledger) ?? null : null;
+            if (recordHash === null) {
+              recordHash = processingFingerprint({
                 outcome: source.ledger.outcome,
                 entries: source.ledger.entries,
                 unbooked: source.ledger.unbooked,
-              }
-            ),
-        ]),
+              });
+              if (recordIsObject)
+                memory?.records.set(source.ledger, recordHash);
+            }
+          }
+          return [source.sourceId, source.revision, candidateHash, recordHash];
+        }),
       accountEvents: authority.accountEvents,
       corrections: authority.corrections,
     });
   } catch {
     return null;
   }
+}
+
+/** Per-job hashes keyed by candidate-array and ledger-record identity. Values are SHA-256 hexadecimal strings;
+ * no source id, revision or position participates in lookup. The caller discards both maps with its job. */
+export interface LedgerBaseMemory {
+  candidates: WeakMap<object, string>;
+  records: WeakMap<object, string>;
 }
 
 /** Returns the cache-key input, without hashing or reading configuration. Caller hashes with processingFingerprint. */

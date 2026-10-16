@@ -37,6 +37,12 @@ export interface MemoryReactivation extends MemoryReactivationInput { origin: 'r
 export interface AuthorityOptions<M extends object> {
   /** Adds members and hooks to the scene authority (the Agent companion); the Tavern passes none. */
   sceneExtension?:SceneAuthorityExtensionFactory<M>;
+  /** Enables Tavern geography only for true; omission leaves it unavailable.
+   * Restore by passing true where the Tavern server constructs its Authority. */
+  tavernGeography?: boolean;
+  /** Enables Tavern physiology only for true; omission leaves it unavailable.
+   * Restore by passing true where the Tavern server constructs its Authority. */
+  tavernPhysiology?: boolean;
 }
 
 /** SQLite is the authority. Indexes and UI never write these tables directly. */
@@ -84,7 +90,9 @@ export class Authority<M extends object = {}> {
       PRAGMA user_version=1;`);
       const applicationId = (this.db.prepare('PRAGMA application_id').get() as {application_id: number}).application_id;
       const needsEmotionMigration = applicationId !== NEURAL_PERSISTENCE_APPLICATION_ID;
-      this.scene = new SceneAuthority(this.db, needsEmotionMigration, options.sceneExtension) as SceneAuthority & M;
+      this.scene = new SceneAuthority(
+        this.db, needsEmotionMigration, options.sceneExtension, options.tavernGeography, options.tavernPhysiology
+      ) as SceneAuthority & M;
       if (needsEmotionMigration) {
         this.migrateEmotionStates();
         this.db.exec(`PRAGMA application_id=${NEURAL_PERSISTENCE_APPLICATION_ID}`);

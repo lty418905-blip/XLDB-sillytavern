@@ -16,7 +16,7 @@
   // Text stages the Tavern shows. Agent-only overrides are neither listed, counted nor migrated here; saving writes
   // their stored values back unchanged.
   const TAVERN_TEXT_STAGES = TEXT_STAGES.filter(stage => !AGENT_ONLY_STAGES.includes(stage));
-  const STAGE_LABELS = {memory:'记忆整理',emotion:'角色情绪',preference:'偏好提取',rewrite:'模糊记忆表达（本地，无需模型）',roleObservation:'角色联合分析',sceneObservation:'场景联合分析',calculation:'剧情计算',front:'多角色言行候选',publicResponse:'角色公开言行（合并生成）',inputPerspective:'输入视角',perspective:'知识与视角',identity:'人物识别',outward:'对外表达',world:'世界状态',director:'剧情导演',directorGuidance:'角色行动指引',generation:'本轮生成准备',commitment:'约定与承诺',initialization:'角色资料整理',profile:'用户画像',strategy:'交流策略',proactiveDecision:'主动联系判断',proactive:'主动联系正文',physiology:'角色身体状态',geography:'剧情地理',embedding:'语义检索',reranker:'检索结果重排'};
+  const STAGE_LABELS = {memory:'记忆整理',emotion:'角色情绪',preference:'偏好提取',rewrite:'模糊记忆表达（本地，无需模型）',roleObservation:'角色联合分析',sceneObservation:'场景联合分析',calculation:'剧情计算',front:'多角色言行候选',publicResponse:'角色公开言行（合并生成）',inputPerspective:'输入视角',perspective:'知识与视角',identity:'人物识别',outward:'对外表达',world:'世界状态',director:'剧情导演',directorGuidance:'角色行动指引',generation:'本轮生成准备',commitment:'约定与承诺',initialization:'角色资料整理',profile:'用户画像',strategy:'交流策略',proactiveDecision:'主动联系判断',proactive:'主动联系正文',physiology:"角色身体状态（0.2.0 未启用）",geography:"剧情地理（0.2.0 未启用）",embedding:'语义检索',reranker:'检索结果重排'};
   const ACCESS_LEVELS = ['clear', 'gist', 'feeling', 'anchor', 'hidden'];
   const CONTEXT_TOOL = 'xldb_query_context';
   const CONTEXT_TOOL_DESCRIPTION = '只读查询本轮已授权的记忆、情绪、日程与世界状态片段。只在已有材料需要核对时调用；不是全库搜索，不能切换角色或写入事实。没有结果时保持未知。';
@@ -4014,87 +4014,38 @@
   }
 
   function buildGeographyPanel(root) {
-    const section=element('details');section.append(element('summary','跑团地图与地理位置'));const status=element('p'),controls=element('div'),preview=element('div');
-    const show=element('select');for(const [value,label]of [['map','显示地图'],['hidden','关闭地图显示']]){const option=element('option',label);option.value=value;show.append(option);}
-    controls.append(element('span','地图显示方式：'),show);
-    let configuration=null;
-    const load=async()=>{assertBound();const scope={...state.scope},epoch=state.epoch;const data=await request('/v1/scene/geography/status','POST',{scope,readerId:'player'});assertHostScope(scope,epoch);configuration=data.configuration;
-      show.value=configuration.showMode;status.textContent=`地理设置修订 ${configuration.revision} · ${data.projection.places.length} 个玩家已知地点`;return data;};
-    const documentInput=element('textarea');documentInput.setAttribute('aria-label','地图 JSON');documentInput.placeholder='粘贴 xldb-map-v1 JSON，或先从背景生成预览。';documentInput.rows=12;
-    const basis=element('select');basis.setAttribute('aria-label','地图资料性质');for(const [value,label]of [['author_setting','确认为作者设定'],['map_report','角色得到的地图／传闻']]){const option=element('option',label);option.value=value;basis.append(option);}
-    const previewDocument=async(document,evidence)=>{
-      assertBound();const scope={...state.scope},epoch=state.epoch;const selected={...document,basis:basis.value};
-      const result=await request('/v1/scene/geography/import-preview','POST',{scope,document:selected});assertHostScope(scope,epoch);documentInput.value=JSON.stringify(result.normalized,null,2);clearElement(preview);
-      preview.append(element('p','请核对地点、通路、初始位置及每项 knownBy。未知范围不自动公开；初始位置不会覆盖现有剧情位置。'),element('pre',JSON.stringify({summary:result.summary,conflicts:result.conflicts,...(evidence?{evidence}:{})},null,2)));
-      preview.append(button('确认导入以上地图',()=>withBusy(async()=>{assertHostScope(scope,epoch);const receipt=await request('/v1/scene/geography/import','POST',{scope,document:result.normalized,expectedVersion:result.expectedVersion,documentHash:result.documentHash,operationId:newId('map-import'),allowInitialPositionConflicts:true});await recordSceneReceipt(receipt,scope,epoch);clearElement(preview);await load();setStatus('地图资料已导入，已存在的剧情位置优先。');})));
-    };
-    const exportMap=()=>withBusy(async()=>{assertBound();const scope={...state.scope},epoch=state.epoch;const result=await request('/v1/scene/geography/export','POST',{scope,readerId:'player'});assertHostScope(scope,epoch);documentInput.value=JSON.stringify(result,null,2);clearElement(preview);});
-    section.append(element('p','跑团中地理状态自动开启，并跟随已接受正文更新。地图可以隐藏，隐藏只影响显示。地理整理使用 XLDB 后台模型。'),status,controls,
-      button('读取地图设置',()=>withBusy(load)),button('保存地图显示方式',()=>withBusy(async()=>{const config={enabled:true,followAcceptedProse:true,backgroundSeed:'enabled',showMode:show.value};if(!configuration)await load();const scope={...state.scope},epoch=state.epoch;await request('/v1/scene/geography/configure','POST',{scope,expectedRevision:configuration.revision,operationId:newId('map-config'),config});assertHostScope(scope,epoch);const receipt=await request('/v1/scene/sync-state','POST',{scope});await recordSceneReceipt(receipt,scope,epoch);await load();})),
-      element('h4','JSON 导入与导出'),basis,documentInput,button('预览地图 JSON',()=>withBusy(()=>previewDocument(JSON.parse(documentInput.value)))),button('导出玩家已知地图',exportMap),preview);
-    const background=element('textarea');background.rows=5;background.setAttribute('aria-label','地理背景');background.placeholder='填写世界的地理背景，例如：河湾镇北是森林，镇东步行半天到码头。';
-    const catalog=element('div');let sourceChoices=[];
-    const mapId=field('地图 ID');mapId.input.value='world-map';const revision=field('地图文档版本','number');revision.input.value='1';revision.input.min='1';
-    section.append(element('h4','根据背景生成预览'),background,mapId.wrap,revision.wrap,
-      button('选择角色卡／世界书背景',()=>withBusy(async()=>{const scope={...state.scope},epoch=state.epoch;const sources=await collectInitializationSources();assertHostScope(scope,epoch);sourceChoices=[];clearElement(catalog);for(const source of sources){const label=element('label',`${source.kind==='character_card'?'角色卡':'世界书'}：${source.name}`),check=element('input');check.type='checkbox';check.checked=false;label.append(check);catalog.append(label);sourceChoices.push({source,check});}})),catalog,
-      button('从所选背景生成地图预览',()=>withBusy(async()=>{assertBound();const scope={...state.scope},epoch=state.epoch;const sources=sourceChoices.filter(row=>row.check.checked).map(row=>row.source);if(background.value.trim())sources.push({id:'manual-background',name:'手动地理背景',text:background.value.trim()});
-        const result=await request('/v1/scene/geography/background-preview','POST',{scope,sources,mapId:mapId.input.value,revision:Number(revision.input.value),basis:basis.value,allowedReaders:['player']});assertHostScope(scope,epoch);await previewDocument(result.document,result.evidence);})),
-      element('p','只有勾选的资料和填写的正文会发送到地理模型。生成结果需预览确认；不会自动创造未提及地点或向 NPC 广播。'));
-    const correction=element('textarea');correction.setAttribute('aria-label','地理纠正 JSON');correction.placeholder='{"basis":"author_setting","knownBy":["player"],"reason":"用户修正","operation":{"kind":"position","action":"set","actorId":"player","position":{"state":"at","placeId":"town"}}}';correction.rows=5;
-    section.append(element('h4','修正地理事实或已知位置'),element('p','修正需填写原因和知情角色；只调整图标请在地图上拖动。纠正与地图资料随分支保存点恢复。'),correction,
-      button('提交地理纠正',()=>withBusy(async()=>{assertBound();const scope={...state.scope},epoch=state.epoch;const receipt=await request('/v1/scene/geography/correct','POST',{scope,correction:JSON.parse(correction.value),expectedVersion:state.scene.version,operationId:newId('map-correct')});await recordSceneReceipt(receipt,scope,epoch);await load();})),
-      button('改用无方位布局',()=>withBusy(async()=>{assertBound();const scope={...state.scope},epoch=state.epoch;const result=await load(),map=result.projection;await request('/v1/scene/geography/layout','POST',{scope,readerId:'player',expectedRevision:map.layout.revision,operationId:newId('map-layout'),layout:{axes:'free',nodes:map.layout.nodes}});assertHostScope(scope,epoch);await refreshDashboard();})));
-    root.append(section);state.panel.geographySection=section;state.panel.resetGeography=()=>{configuration=null;status.textContent='请读取当前地图设置。';show.value='hidden';documentInput.value='';background.value='';correction.value='';sourceChoices=[];clearElement(catalog);clearElement(preview);state.dashboard.mapLayer='';state.dashboard.mapDragging=false;};
+    const section = element('details');
+    section.append(element('summary', "跑团地图（0.2.0 暂不可用）"));
+    const description = element('p', "0.2.0 暂停跑团地图：不再从正文、角色卡或世界书整理地点与位置，也不把地图内容交给回复模型。本聊天已保存的地图资料、纠正和布局都保留着，没有删除，可以导出备份；之后的版本恢复地图时会继续使用。");
+    const documentOutput = element('textarea');
+    documentOutput.readOnly = true;
+    documentOutput.rows = 12;
+    documentOutput.setAttribute('aria-label', "导出已保存的地图资料");
+
+    const exportMap = () => withBusy(async () => {
+      assertBound();
+      const scope = {...state.scope};
+      const epoch = state.epoch;
+      const result = await request('/v1/scene/geography/export', 'POST', {scope, readerId: 'player'});
+      assertHostScope(scope, epoch);
+      documentOutput.value = JSON.stringify(result, null, 2);
+    });
+
+    section.append(description, button("导出已保存的地图资料", exportMap), documentOutput);
+    root.append(section);
+    state.panel.geographySection = section;
+    // The result belongs to one chat; resetWorkbench also invalidates pending requests through its epoch.
+    state.panel.resetGeography = () => { documentOutput.value = ''; };
   }
 
   function buildPhysiologyPanel(root) {
-    const section=element('details'),area=element('div');section.append(element('summary','虚拟角色生理状态'));
-    const reader=element('select');reader.setAttribute('aria-label','生理状态查看角色');
-    const load=async()=>{
-      assertBound();const scope={...state.scope},epoch=state.epoch;
-      const selected=reader.value||'player';clearElement(reader);
-      for(const actor of [{id:'player',name:'玩家可见'},...state.scene.roster]){const option=element('option',actor.name);option.value=actor.id;option.selected=actor.id===selected;reader.append(option);}
-      reader.value=selected;
-      const result=await request('/v1/scene/physiology/status','POST',{scope,readerId:selected});assertHostScope(scope,epoch);
-      render(result,scope,epoch);return result;
-    };
-    const mutate=async(path,payload,scope,epoch)=>withBusy(async()=>{
-      assertHostScope(scope,epoch);await syncInternal();assertHostScope(scope,epoch);
-      await request(path,'POST',{scope,...payload});assertHostScope(scope,epoch);
-      const data=await request('/v1/scene/inspect','POST',{scope});assertHostScope(scope,epoch);
-      await recordSceneReceipt(data,scope,epoch);invalidateSceneCandidate();
-      await load();await refreshDashboard();setStatus('虚拟角色生理设置已保存。');
-    });
-    const select=(label,choices)=>{const wrap=element('label',label),input=element('select');input.setAttribute('aria-label',label);for(const [value,name] of choices){const option=element('option',name);option.value=value;input.append(option);}wrap.append(input);return {wrap,input};};
-    const render=(status,scope,epoch)=>{
-      clearElement(area);const config=status.config;
-      area.append(element('p','跑团中的虚拟角色生理状态自动开启；仅根据正文明确证据更新，不推断现实用户身体。'));
-      const needNames=[['hydration','饮水'],['nutrition','进食'],['bladder','小便'],['bowel','排便'],['sleep','睡眠'],['energy','精力']];
-      area.append(element('p','生理提取使用 XLDB 后台模型。跑团中的适用能力会随 NPC 自动生效。'));
-      const correction=element('fieldset');correction.append(element('legend','纠正虚拟角色状态'));
-      const actor=select('被纠正角色',state.scene.roster.filter(x=>config.trackedCharacterIds.includes(x.id)).map(x=>[x.id,x.name]));
-      const visibility=select('纠正知情范围',[['private','仅角色自己'],['player','角色与玩家'],['all_tracked','全部跟踪角色与玩家']]);
-      const reason=field('纠正原因');reason.input.setAttribute('aria-label','生理纠正原因');
-      correction.append(actor.wrap,visibility.wrap,reason.wrap);
-      const commit=patch=>mutate('/v1/scene/physiology/correct',{expectedRevision:status.revision,correction:{characterId:actor.input.value,visibility:visibility.input.value,reason:reason.input.value,patch}},scope,epoch);
-      const need=select('日常需求项目',needNames.filter(([id])=>config.dailyNeeds.includes(id))),stage=select('需求状态',[['unknown','未知'],['settled','舒适'],['noticeable','开始在意'],['urgent','迫切'],['strained','明显负担']]);
-      correction.append(need.wrap,stage.wrap,button('纠正日常需求',()=>commit({kind:'need',need:need.input.value,state:stage.input.value})));
-      if(config.sustainedEffects){
-        const effect=select('身体影响',[['injury','伤势'],['illness','疾病'],['intoxication','醉酒'],['pain','疼痛'],['temperature','体温不适'],['exhaustion','疲惫'],['other','其他']]);
-        const severity=select('影响程度',[['mild','轻度'],['moderate','中度'],['severe','重度']]);const detail=field('影响说明');
-        correction.append(effect.wrap,severity.wrap,detail.wrap,button('记录持续影响',()=>commit({kind:'effect',effect:effect.input.value,action:'set',severity:severity.input.value,detail:detail.input.value})),button('清除持续影响',()=>commit({kind:'effect',effect:effect.input.value,action:'clear'})));
-      }
-      if(config.reproductive){const reproductive=select('生殖状态',[['unknown','未知'],['cycle_started','周期开始'],['pregnancy_possible','可能妊娠'],['pregnancy_confirmed','确认妊娠'],['pregnancy_ended','妊娠结束']]);correction.append(reproductive.wrap,button('纠正生殖状态',()=>commit({kind:'reproductive',status:reproductive.input.value})));}
-      if(config.sexualArousal){const arousal=select('唤起状态',[['unknown','未知'],['low','低'],['medium','中'],['high','高']]);correction.append(arousal.wrap,button('纠正唤起状态',()=>commit({kind:'sexualArousal',level:arousal.input.value})));}
-      if(config.enabled)area.append(correction);
-      for(const character of status.characters){
-        const row=element('div');row.append(element('strong',character.name));
-        for(const id of character.correctionIds||[])row.append(button(`撤销纠正 ${id}`,()=>mutate('/v1/scene/physiology/clear',{expectedRevision:status.revision,characterId:character.characterId,id},scope,epoch)));
-        area.append(row);
-      }
-    };
-    section.append(element('p','以下是管理入口，可切换查看角色自己的已知状态。常驻变量面板始终只展示玩家可见内容。'),reader,button('读取生理设置',()=>withBusy(load)),area);
-    root.append(section);state.panel.physiologyArea=area;state.panel.physiologyReader=reader;
+    const section = element('details');
+    section.append(element('summary', "角色身体状态（0.2.0 暂不可用）"));
+    const description = element('p', "0.2.0 暂停角色身体状态：不再从正文整理饮水、进食、睡眠、伤势等变化，角色卡和世界书里写明的初始身体情况也不会生效，回复模型拿不到这部分内容。本聊天已保存的身体状态记录和纠正都保留着，没有删除，会随保存点、分支和数据库备份一起保存；之后的版本恢复这项功能时会继续使用。暂停期间的剧情不会补记，恢复后可能需要重新纠正。");
+    const recovery = button("打开资料与恢复", () => navigateWorkbench('settings', 'data'));
+
+    section.append(description, recovery);
+    root.append(section);
   }
 
   function buildDashboard(root) {
@@ -4240,7 +4191,7 @@
     header.children[0].className='xldb-brand';header.children[1].className='xldb-brand-sub';
     const layout=element('div');layout.className='xldb-layout';const rail=element('aside');rail.className='xldb-rail';
     const tabs=element('nav');tabs.className='xldb-tabs';tabs.setAttribute('aria-label','工作台栏目');tabs.setAttribute('role','tablist');
-    const tabItems=[['overview','故事概览'],['calendar','待办月历'],['assets','资产'],['inventory','物品'],['ledger','最近交易'],['body','身体状态'],['emotion','情绪参数'],['map','地图']];
+    const tabItems=[['overview','故事概览'],['calendar','待办月历'],['assets','资产'],['inventory','物品'],['ledger','最近交易'],['emotion','情绪参数']];
     const dashboardTabs=new Map();for(const [index,[id,label]] of tabItems.entries()){const node=button(label,()=>navigateWorkbench(id));node.id=`xldb-tab-${id}`;node.setAttribute('role','tab');node.setAttribute('aria-label',label);node.setAttribute('aria-controls',id==='settings'?'xldb-settings-area':'xldb-dashboard-area');node.setAttribute('data-number',String(index+1).padStart(2,'0'));dashboardTabs.set(id,node);tabs.append(node);}
     const foot=element('div');foot.className='xldb-rail-foot';foot.append(element('strong','跑团 / 角色扮演'),element('span','记忆、情绪与世界状态，跟随你的故事一起前进。'));
     const settingsEntry=element('button','设置与资料');settingsEntry.type='button';settingsEntry.addEventListener('click',()=>navigateWorkbench('settings'));settingsEntry.className='xldb-settings-entry';settingsEntry.id='xldb-tab-settings';settingsEntry.setAttribute('aria-controls','xldb-settings-area');settingsEntry.setAttribute('aria-label','设置与资料');

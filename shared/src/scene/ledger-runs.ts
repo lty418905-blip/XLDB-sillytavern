@@ -79,10 +79,13 @@ export interface LedgerRunContext {
 
 /** Linear cursor over predecessors already processed in one job; the deferred flag is sticky within that job.
  * Index is a source count starting at zero; the cursor reads analysis.ledger.outcome from held source records,
- * without reading storage or decoding serialized records. */
+ * without reading storage or decoding serialized records. Optional rows and hashes are owned by the job;
+ * steps only fill supplied row storage after a successful read and never create storage themselves. */
 export interface LedgerProgress {
   index: number;
   deferred: boolean;
+  rows?: {value?: ReturnType<import('./store.ts').SceneAuthority['worldLedgerRows']> | null} | null;
+  hashes?: import('./ledger-stage.ts').LedgerBaseMemory | null;
 }
 
 /** Registry entry with process-local monotone identity; done never rejects and cancellation is sticky.

@@ -3418,20 +3418,38 @@ export function accountsAt(
 ): LedgerDecoded<LedgerAccount[]> {
   try {
     const result = foldLedgerPrefix(settings, sources, count, options, fold);
-    if (!result.ok) return result;
-
-    const ledger = result.value.ledger;
-    const diagnosticOnly = isSourceHoleLedger(ledger);
-    // A diagnostic-only fold retains the same implicit account query as an ordinary legacy fold.
-    const accounts = ledger && !diagnosticOnly
-      ? ledger.accounts
-      : implicitAccounts(settings, stateFromWorld(result.value.state));
-    return {ok: true, value: accounts.filter(account => includeClosed || account.status === 'active')};
+    return accountsFromFold(settings, result, includeClosed);
   } catch (error) {
     if (error instanceof Error && error.message === 'invalid_world_settings') throw error;
     return {ok: false, code: 'ledger_prefix_invalid'};
   }
 }
+/** Derives accounts from an existing world prefix without folding it again. O(account rows).
+ * Closed accounts are omitted unless requested; a failed prefix retains its decoded error.
+ * Invalid settings retain their exception, while malformed fold data returns ledger_prefix_invalid. */
+export function accountsFromFold(
+  settings: WorldSettings,
+  result: LedgerDecoded<WorldFoldResult>,
+  includeClosed = false,
+): LedgerDecoded<LedgerAccount[]> {
+  try {
+    if (!result.ok)
+      return result;
+
+    const ledger = result.value.ledger;
+    const diagnosticOnly = isSourceHoleLedger(ledger);
+    // Diagnostic-only and legacy folds expose the same implicit account query.
+    const accounts = ledger && !diagnosticOnly
+      ? ledger.accounts
+      : implicitAccounts(settings, stateFromWorld(result.value.state));
+    return {ok: true, value: accounts.filter(account => includeClosed || account.status === 'active')};
+  } catch (error) {
+    if (error instanceof Error && error.message === 'invalid_world_settings')
+      throw error;
+    return {ok: false, code: 'ledger_prefix_invalid'};
+  }
+}
+
 function stateFromWorld(s:WorldState):LedgerMutableState {return {timeMs:s.timeMs,
   balances:new Map(s.balances.map(r=>[assetIdentity(r.ownerId,r.unit),{ownerId:r.ownerId,unit:r.unit,cents:decimalCents(r.value),readerIds:new Set(r.readerIds)}])),
   inventory:new Map(s.inventory.map(i=>[assetIdentity(i.ownerId,i.item),{ownerId:i.ownerId,item:i.item,count:i.count,readerIds:new Set(i.readerIds)}]))};}

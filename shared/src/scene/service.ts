@@ -1676,7 +1676,14 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         const results:{id:string;revision:number;analysis:SceneAnalysis}[]=[];
         const backfilled=new Map<string,{id:string;revision:number;analysis:SceneAnalysis}>();
         const processed:import('./types.ts').SceneSource[]=[];
-        const ledgerProgress=this.ledgerStageOptions&&story?{index:0,deferred:false}:undefined;
+        const ledgerProgress: LedgerProgress | undefined = this.ledgerStageOptions && story
+          ? {
+            index: 0,
+            deferred: false,
+            rows: {},
+            hashes: {candidates: new WeakMap(), records: new WeakMap()},
+          }
+          : undefined;
         for (const [sourceIndex,source] of accepted.entries()) {
           if(sourceIndex>targetIndex)break;
           if(source.processing==='ready'&&source.analysis&&(!target||source.id!==target.sourceId||!source.analysis.skippedStages?.length)){
@@ -2143,7 +2150,13 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         }
         : earlier.get(item.id) ?? item
     );
-    const rows = this.authority.worldLedgerRows(scope);
+    // The job checks its version immediately before this synchronous step, with no intervening await.
+    // Ledger-row writes bump that version, so a changed snapshot fails the job before cached rows are used.
+    // Direct callers without supplied storage keep a fresh read; failed reads never fill the storage.
+    const rowCache = progress.rows;
+    const rows = rowCache?.value ?? this.authority.worldLedgerRows(scope);
+    if (rowCache && rowCache.value == null)
+      rowCache.value = rows;
     const input = this.authority.worldLedgerInput(scope, timeline, undefined, 'ledger', rows);
     const position = input.sources.findIndex(item => item.sourceId === source.id && item.revision === source.revision);
 
@@ -2244,7 +2257,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     const bundle = buildLedgerInput({
       ...request,
       selection
-    });
+    }, view);
     const pin = ledgerPin(request, view.accounts);
 
     step.fallback = {
@@ -2280,7 +2293,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
           body: row.body,
           correction: row.value
         })),
-      }
+      },
+      progress.hashes
     );
 
     if (!base)

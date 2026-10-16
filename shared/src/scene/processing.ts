@@ -134,10 +134,25 @@ export class Processing {
     return {status:row.status,attempts:row.attempts,...(row.error?{failure:processingFailure(row.error)}:{})};
   }
 
-  skippedForSource(scope:SceneScope,sourceId:string,revision:number):SkippedStage[] {
-    return this.rows(scope).filter(row=>row.source===sourceId&&row.revision===revision&&row.status==='skipped')
-      .map(row=>({stage:row.stage,...(row.character?{characterId:row.character}:{}),
-        failure:processingFailure(row.error??'operation_failed'),attempts:row.attempts}));
+  skippedForSource(scope: SceneScope, sourceId: string, revision: number): SkippedStage[] {
+    return this.skippedRows(scope)
+      .filter(row => row.source === sourceId && row.revision === revision && row.status === 'skipped')
+      .map(row => ({
+        stage: row.stage,
+        ...(row.character ? {characterId: row.character} : {}),
+        failure: processingFailure(row.error ?? 'operation_failed'),
+        attempts: row.attempts,
+      }));
+  }
+
+  // Read only metadata; progress keeps its separate payload-bearing query. Work is O(scope stage rows).
+  // Filtering in JavaScript preserves strict equality and metadata read errors for the complete scope.
+  private skippedRows(
+    scope: SceneScope,
+  ): Pick<Row, 'source' | 'revision' | 'stage' | 'character' | 'status' | 'error' | 'attempts'>[] {
+    return this.db.prepare(`SELECT source,revision,stage,character,status,error,attempts FROM scene_processing_stages
+      WHERE scope=? ORDER BY rowid`).all(scopeKey(scope)) as
+      Pick<Row, 'source' | 'revision' | 'stage' | 'character' | 'status' | 'error' | 'attempts'>[];
   }
 
   skip(address:ProcessingAddress,fingerprint:string,error:unknown,now=Date.now()):SkippedStage {

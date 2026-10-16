@@ -57,6 +57,8 @@ interface PhysiologyDependencies {
   state:(scope:SceneScope)=>{version:number;roster:SceneRoster;sources:Array<SceneMessage&{status:string;processing:string;analysis?:{physiologyOperations?:PhysiologyOperation[]}|null}>};
   modeOf:(scope:SceneScope)=>'roleplay'|'companion'|undefined;
   fullRoleplay:(scope:SceneScope)=>boolean;
+  /** Literal true restores processing and writes in a Tavern roleplay scope; omission leaves it unavailable. */
+  tavernAvailable?: boolean;
   clock:(scope:SceneScope,now:number)=>{kind:'story'|'realtime';known:boolean;timeMs:number|null;timeZone:string};
   /** Story scopes only (null elsewhere): the unified clock of `state`. `at` is the clock after an accepted source, null when the reading has no such source. */
   storyTime?:(scope:SceneScope,state:ReturnType<PhysiologyDependencies['state']>)=>{nowMs:number;originMs:number;at:(sourceId:string,revision?:number)=>number|null}|null;
@@ -89,16 +91,28 @@ export class PhysiologyStore {
       PRIMARY KEY(scope,id));`);
   }
 
+  // Only the Tavern binding is gated; other hosts retain their existing data controls.
+  private tavernUnavailable(scope: SceneScope): boolean {
+    return this.dependencies.fullRoleplay(scope) && this.dependencies.tavernAvailable !== true;
+  }
+
   configuration(scope:SceneScope):{revision:number;config:PhysiologyConfiguration}{
     const row=this.db.prepare('SELECT revision,body FROM scene_physiology_settings WHERE scope=?').get(scopeKey(scope)) as SettingsRow|undefined;
     const roster=this.dependencies.state(scope).roster;
     const config=row?configurationOf(JSON.parse(row.body),roster,true):structuredClone(defaultConfiguration);
-    if(this.dependencies.fullRoleplay(scope))return {revision:row?.revision??0,config:{enabled:true,dailyNeeds:[...physiologyNeeds],
+    if(this.dependencies.fullRoleplay(scope)){
+      // Keep the historical read order and one binding lookup on the restored path.
+      if (this.dependencies.tavernAvailable !== true) {
+        return {revision: row?.revision ?? 0, config: structuredClone(defaultConfiguration)};
+      }
+      return {revision:row?.revision??0,config:{enabled:true,dailyNeeds:[...physiologyNeeds],
       sustainedEffects:true,reproductive:true,sexualArousal:true,trackedCharacterIds:roster.characters.map(actor=>actor.id)}};
+    }
     return {revision:row?.revision??0,config};
   }
 
   configure(scope:SceneScope,value:unknown,expectedRevision:number){
+    if (this.tavernUnavailable(scope)) throw new Error('invalid_physiology_unavailable');
     return this.dependencies.transaction(()=>{
       const state=this.dependencies.state(scope);if(!state.version)throw new Error('invalid_scene_not_configured');
       const current=this.configuration(scope);assertRevision(expectedRevision,current.revision);
@@ -114,6 +128,7 @@ export class PhysiologyStore {
   }
 
   correct(scope:SceneScope,value:unknown,expectedRevision:number){
+    if (this.tavernUnavailable(scope)) throw new Error('invalid_physiology_unavailable');
     return this.dependencies.transaction(()=>{
       const state=this.dependencies.state(scope),current=this.configuration(scope);assertRevision(expectedRevision,current.revision);
       const correction=correctionOf(value,state.roster,current.config,this.clock(scope,Date.now()));
@@ -133,6 +148,7 @@ export class PhysiologyStore {
   }
 
   clearCorrection(scope:SceneScope,characterId:string,id:string,expectedRevision:number){
+    if (this.tavernUnavailable(scope)) throw new Error('invalid_physiology_unavailable');
     return this.dependencies.transaction(()=>{
       const current=this.configuration(scope);assertRevision(expectedRevision,current.revision);
       const row=this.db.prepare('SELECT character FROM scene_physiology_corrections WHERE scope=? AND id=?')
