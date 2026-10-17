@@ -29,7 +29,7 @@ export function addressConversation(messages:readonly {role:string;text:string}[
 }
 
 export function sceneAddressGuidance(authority:SceneAuthority,scope:SceneScope,speakerId:string,envelope:SceneEnvelope,
-  state:SceneState,emotion:Pick<EmotionState,'behavioralSignals'|'criticContext'>):string {
+  state:SceneState,emotion:Pick<EmotionState,'behavioralSignals'|'criticContext'|'neural'>):string {
   const relation=authority.relationshipAnchor(scope,speakerId,'player',state);
   const messages=state.sources.filter(s=>s.status==='accepted'&&s.processing==='ready').flatMap(source=>{
     if(source.role==='assistant')return source.speakerId===speakerId?[{role:'assistant',text:source.text}]:[];

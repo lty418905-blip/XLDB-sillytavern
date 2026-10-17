@@ -29,14 +29,17 @@ export interface AddressSuggestion {
   address?: string;
   reason: 'explicit_preference' | 'intimacy_rejected' | 'grounded_long_term_relation' | 'public_or_formal' | 'missing_relation_anchor' | 'identity_not_known';
   instruction: string;
-  tone?:'warming'|'settled'|'strained';
+  tone?:'warming'|'settled'|'strained'|'neutral';
   askNickname?:boolean;
 }
 
 export interface AddressAffect {
-  emotion:Pick<EmotionState,'behavioralSignals'|'criticContext'>;
+  emotion:Pick<EmotionState,'behavioralSignals'|'criticContext'|'neural'>;
   nicknameAsked:boolean;
 }
+
+/** Neutral address guidance when zero accepted emotion events are confirmed; exact text without a newline. */
+export const UNJUDGED_ADDRESS_INSTRUCTION = '这里暂时没有情绪方面的倾向可供参考；称呼只按人设与语境自然选择，沿用人设或前文里已有的叫法，或用全名、已知姓氏加身份；不刻意亲近，也不刻意疏远，也不另造昵称。未知姓名不编造，称呼约定优先。';
 
 const MAX_ADDRESS_LENGTH = 120;
 
@@ -67,6 +70,16 @@ export function suggestAddress(
     if(Number.isFinite(warmth)&&Number.isFinite(conflict)){
       const privateCasual=situation.visibility==='private'&&situation.presentCount===2&&situation.formality==='casual';
       const grounded=anchor&&validAnchor(anchor)&&isGroundedPositiveRelation(anchor.relations);
+      if (hasNoAcceptedEmotionEvents(affect.emotion)) {
+        return {
+          mode: grounded && situation.addresseeIdentityKnown ? 'personal-name-allowed' : 'conservative',
+          reason: grounded ? 'grounded_long_term_relation'
+            : situation.addresseeIdentityKnown ? 'missing_relation_anchor' : 'identity_not_known',
+          tone: 'neutral',
+          askNickname: false,
+          instruction: UNJUDGED_ADDRESS_INSTRUCTION,
+        };
+      }
       const warming=privateCasual&&conflict<.5&&(warmth>=.6||grounded);
       const tone=conflict>=.5?'strained':warming?'warming':'settled';
       const askNickname=warming&&!affect.nicknameAsked;
@@ -90,6 +103,16 @@ export function suggestAddress(
     instruction: '可自然使用对方已知姓名，但不必强行称呼；不得自行创造昵称、亲属称谓或亲密身份。',
   };
   return conservative('missing_relation_anchor');
+}
+
+/** Confirms zero accepted events from one count read; absent or unreadable counts keep legacy guidance. */
+function hasNoAcceptedEmotionEvents(emotion: AddressAffect['emotion']): boolean {
+  try {
+    return emotion.neural?.interactionCount === 0;
+  } catch {
+    // An unreadable count supplies no evidence that the character has never been judged.
+    return false;
+  }
 }
 
 function conservative(reason:AddressSuggestion['reason']):AddressSuggestion {
