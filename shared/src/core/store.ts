@@ -16,7 +16,7 @@ import { SceneAuthority } from '../scene/store.ts';
 import type {SceneAuthorityExtensionFactory} from '../scene/extension.ts';
 import {acquireAuthorityLease, authorityPath} from '../scene/backup.ts';
 import type {AuthorityLease} from '../scene/backup.ts';
-import {CURRENT_STORE_FORMAT, readStoreFormatFile} from './store-format.ts';
+import {CURRENT_STORE_FORMAT, STORE_WRITER_VERSION, stampStoreFormat, readStoreFormatFile} from './store-format.ts';
 
 type Source = AcceptedMessage & { status: string; payload: string | null; observedAtMs: number };
 export interface Preference {
@@ -135,6 +135,9 @@ export class Authority<M extends object = {}> {
       const source = this.source(scope, message.id);
       if (!source || source.revision !== message.revision || source.text !== message.text || source.role !== message.role || source.status === 'deleted') return 'conflict';
       if (source.status === 'committed') return 'duplicate';
+      if (Object.hasOwn(analysis.emotion, 'appraisalRule')) {
+        stampStoreFormat(this.db, CURRENT_STORE_FORMAT, STORE_WRITER_VERSION);
+      }
       this.db.prepare("UPDATE sources SET payload=?,status='committed' WHERE scope=? AND id=?")
         .run(JSON.stringify(analysis), scopeKey(scope), message.id);
       this.rebuild(scope);

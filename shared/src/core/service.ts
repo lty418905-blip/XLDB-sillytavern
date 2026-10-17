@@ -119,7 +119,8 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
     if (status !== 'pending') return {status,version:this.authority.snapshot(scope).version};
     const job = (async () => {
       try {
-        const analysis = await this.models.analyze(message, configs);
+        const analysis = await this.models.analyze(message, configs, undefined, undefined,
+          this.authority.emotion(scope, message.acceptedAtMs));
         const status = this.authority.commit(scope, message, analysis);
         return { status, version: this.authority.snapshot(scope).version };
       } catch (error) {

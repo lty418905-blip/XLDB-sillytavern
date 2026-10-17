@@ -1,3 +1,5 @@
+import { actorHasEmotion } from './actor-emotion.ts';
+import { AppraisalHistory, appraisalFingerprintInput, buildCoreAppraisalInput } from '../emotion/appraisal-input.ts';
 import {parseModelJson} from '../core/models.ts';
 import type {ModelConfig} from '../core/types.ts';
 import type {SceneSource} from './types.ts';
@@ -212,6 +214,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
 
   private async recoverLegacyEmotion(scope:SceneScope,configs:Configurations):Promise<void> {
     const key=scopeKey(scope);
+    let appraisalHistory:AppraisalHistory|undefined;
+    let historyVersion:number|undefined;
     try{
       while(this.authority.isOpen()){
         const foreground=this.jobs.get(key);
@@ -221,6 +225,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         for(const [index,source] of state.sources.entries()){
           if(source.status!=='accepted'||source.processing!=='ready'||!source.analysis?.plan)continue;
           for(const id of source.analysis.emotionPendingIds??[]){
+            const actor=state.roster.characters.find(character=>character.id===id);
+            if(!actor||!actorHasEmotion(actor))continue;
             if(blocked.has(id))continue;
             if (hasCompletedEmotionSkip(source.analysis, id)) continue;
             blocked.add(id);
@@ -240,16 +246,31 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         const experienceState=this.authority.emotion(scope,characterId,at,{...state,sources:state.sources.slice(0,index)});
         const scoped={id:source.id,revision:source.revision,role:source.role,text:visible,acceptedAtMs:source.acceptedAtMs};
         const profile={id:character.id,name:character.name,persona:character.persona,experienceState};
-        const relationshipScene=relationshipSceneInput(plan,character,state.roster,profile);
+        const relationshipScene=relationshipSceneInput(plan,character,state.roster,profile,source);
         const settings=this.authority.worldSettings(scope);
         const emotionClock={timeMs:settings?.mode!=='story'&&this.authority.interactions.frozenRoleplayTime(scope)===undefined
           ?null:at,timeZone:this.authority.interactions.clock(scope).timeZone};
         const sceneEmotion=(this.models as {sceneEmotion?:ModelTasks['sceneEmotion']}).sceneEmotion;
+        if(!appraisalHistory||historyVersion!==state.version){
+          appraisalHistory=new AppraisalHistory(state.roster.characters);
+          historyVersion=state.version;
+        }
+        const history=appraisalHistory.read(state.sources,index,characterId);
+        const elapsed=isStoryScope(this.authority,scope)
+          ?appraisalHistory.elapsed(this.authority.storyClock.readTimeline(scope,state.sources),source,history.previous):undefined;
+        const emotionInput = {
+          ...relationshipScene,
+          ...history,
+          ...(elapsed ? { elapsed } : {}),
+          contactAffect: null,
+          clockTimeMs: emotionClock.timeMs,
+          timeZone: emotionClock.timeZone,
+        };
         const result=await this.stage(scope,source,'emotion',characterId,
-          {schema:6,source:scoped,character:profile,relationshipScene,emotionClock,config:configs.emotion},
-          ()=>sceneEmotion?sceneEmotion.call(this.models,scoped,{...relationshipScene,contactAffect:null,
-            clockTimeMs:emotionClock.timeMs,timeZone:emotionClock.timeZone},configs.emotion)
-            :this.models.analyzeEmotion(scoped,configs.emotion,profile,emotionClock).then(emotion=>({emotion,relationships:[]})));
+          appraisalFingerprintInput(scoped,emotionInput,configs.emotion),
+          ()=>sceneEmotion?sceneEmotion.call(this.models,scoped,emotionInput,configs.emotion)
+            :this.models.analyzeEmotion(scoped,configs.emotion,profile,emotionClock).then(emotion=>({emotion,relationships:[]})),
+          experienceState.criticContext);
         if(!this.authority.isOpen())break;
         if(this.authority.processing.skippedForSource(scope,source.id,source.revision)
           .some(item=>item.stage==='emotion'&&item.characterId===characterId))throw new Error('model_stage_skipped');
@@ -1649,6 +1670,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
   }
 
   async processPending(scope:SceneScope,configs:Configurations,plans=new Map<string,PerspectivePlan>(),target?:{sourceId:string;revision:number}):Promise<{status:string;version:number;error?:string}> {
+    type CharacterAnalysis = import('./types.ts').SceneCharacterAnalysis;
     await this.clearPendingIndexes();
     const key=scopeKey(scope);
     const existing=this.jobs.get(key);
@@ -1666,6 +1688,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       this.queueLegacyEmotionRecovery(scope,configs);
       return {status:'ready',version:state.version};
     }
+    // An async function can finish synchronously before its returned promise is registered.
+    let jobFinished = false;
     const job=(async()=>{
       let activeSource:string|undefined;
       // Whether this is a story scope: read once for the whole job, inside the try (a settings row that cannot be read
@@ -1676,6 +1700,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         const results:{id:string;revision:number;analysis:SceneAnalysis}[]=[];
         const backfilled=new Map<string,{id:string;revision:number;analysis:SceneAnalysis}>();
         const processed:import('./types.ts').SceneSource[]=[];
+        const appraisalHistory = new AppraisalHistory(state.roster.characters);
         const ledgerProgress: LedgerProgress | undefined = this.ledgerStageOptions && story
           ? {
             index: 0,
@@ -1743,7 +1768,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             results.push({id:source.id,revision:source.revision,analysis});
             continue;
           }
-          const characters:Record<string,Analysis>={};
+          const characters:Record<string,CharacterAnalysis>={};
           const subject=this.authority.subject(scope);
           const interactionMode=this.authority.interactions.modeOf(scope);
           const agentCompanion=interactionMode==='companion'&&subject?.host==='agent';
@@ -1857,14 +1882,21 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
              ...(userModelCandidates?{userModelCandidates}:{}),...(physiologyOperations?{physiologyOperations}:{}),...(geographyOperations?{geographyOperations}:{})}});
           // OpenHer's legacy time: the prefix processed so far, its explicit cue movement read from the fold of the whole
           // list this job works on. Both arrays are fresh copies: `processed` is pushed to and assigned into.
-          const eventTime=this.authority.legacyEmotionTime(scope,processed.slice(),source.acceptedAtMs,storyTimelineOf(processed,accepted));
+          const emotionTimeline = storyTimelineOf(processed, accepted);
+          const { eventTime, appraisalClock } = this.authority.storyClock.withLedgerRows(scope, () => ({
+            eventTime: this.authority.legacyEmotionTime(scope, processed.slice(), source.acceptedAtMs, emotionTimeline),
+            // A first source has no earlier accepted judgment from which elapsed time could start.
+            appraisalClock: story && processed.length > 1
+              ? this.authority.storyClock.readTimeline(scope, emotionTimeline) : null,
+          }));
           const emotionClock={timeMs:interactionMode==='roleplay'&&settings?.mode!=='story'&&
             this.authority.interactions.frozenRoleplayTime(scope)===undefined?null:eventTime,
             timeZone:interactionMode==='roleplay'&&this.authority.interactions.modeOf(scope)
               ?this.authority.interactions.clock(scope).timeZone
               :source.acceptedTimeZone??'UTC'};
           const visibleCharacters=state.roster.characters.filter(character=>visibleText(plan,character.id));
-          const currentVisibleIds=new Set(visibleCharacters.map(character=>character.id));
+          const emotionCharacters = visibleCharacters.filter(actorHasEmotion);
+          const currentVisibleIds=new Set(emotionCharacters.map(character=>character.id));
           let selectedEmotionIds=new Set(currentVisibleIds);
           let emotionSchedule:SceneAnalysis['emotionSchedule'];
           if(this.authority.interactions.isTavernRoleplay(scope)){
@@ -1874,7 +1906,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             const used=new Set(currentSchedules.flatMap(item=>item.selectedIds));
             const backlog=processed.slice(0,-1).filter(item=>item.status==='accepted'&&item.analysis?.emotionPendingIds?.length);
             // With fixed actor and stage counts per source, the existing backlog passes are O(N).
-            const candidates = visibleCharacters.filter(character => !backlog.some(item =>
+            const candidates = emotionCharacters.filter(character => !backlog.some(item =>
               item.analysis?.emotionPendingIds?.includes(character.id)
               && !item.analysis.emotionCandidateReadyIds?.includes(character.id)
               && !hasCompletedEmotionSkip(item.analysis, character.id)));
@@ -1914,7 +1946,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             }
             selectedEmotionIds=new Set([...candidates.filter(character=>used.has(character.id)).map(character=>character.id),
               ...ranked.slice(0,free)]);
-            emotionSchedule={windowId,eligibleIds:visibleCharacters.map(character=>character.id),
+            emotionSchedule={windowId,eligibleIds:emotionCharacters.map(character=>character.id),
               selectedIds:[...selectedEmotionIds],forcedIds:[],
               deferredIds:[...currentVisibleIds].filter(id=>!selectedEmotionIds.has(id)),method,
               ...(reason?{reason}:{}),...(modelIdentity?{modelIdentity}:{})};
@@ -1932,13 +1964,17 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
                 const original=accepted.find(item=>item.id===earlier.id&&item.revision===earlier.revision);
                 if(original?.processing==='ready'&&!results.some(item=>item.id===earlier.id)){
                   const refreshed=stored.get(earlier.id);
-                  if(refreshed)processed[index]=refreshed;
+                  if(refreshed){
+                    processed[index]=refreshed;
+                    appraisalHistory.refresh(refreshed);
+                  }
                   continue;
                 }
                 const analysis={...earlier.analysis,
                   emotionPendingIds:earlier.analysis.emotionPendingIds.filter(item=>item!==id),
                   emotionCandidateReadyIds:earlier.analysis.emotionCandidateReadyIds?.filter(item=>item!==id)};
                 processed[index]={...earlier,analysis};
+                appraisalHistory.refresh(processed[index]!);
                 const pendingResult=results.find(item=>item.id===earlier.id);
                 if(pendingResult)pendingResult.analysis=analysis as SceneAnalysis;
               }
@@ -1946,46 +1982,82 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
           }
           const companionCharacterIds=companionBatch?state.roster.characters.filter(character=>visibleText(plan,character.id)).map(character=>character.id):[];
           // No character model is ever given the world source or another profile.
-          const analyzeCharacter=async(character:import('./types.ts').SceneCharacter,experienceState:import('../emotion/openher.ts').EmotionState)=>{
+          const analyzeCharacter=async(character:import('./types.ts').SceneCharacter,experienceState:import('../emotion/openher.ts').EmotionState|undefined)=>{
             const visible=visibleText(plan,character.id);
             if (!visible) return;
             const scoped={id:source.id,revision:source.revision,role:source.role,text:visible,acceptedAtMs:source.acceptedAtMs};
             const profile={id:character.id,name:character.name,persona:character.persona,experienceState};
-            const contactAffect=agentCompanion&&source.role==='user'
+            const hasEmotion = actorHasEmotion(character);
+            const contactAffect=hasEmotion&&agentCompanion&&source.role==='user'
               ?this.companion.contactEmotion(scope,character.id,source.acceptedAtMs,{...state,sources:processed.slice()},
                 {sourceId:source.id,revision:source.revision}).affect:null;
             const excerpts=plan.observations.filter(observation=>observation.readers.includes(character.id)).map(observation=>observation.quote);
           if(typeof this.models.analyzeMemory!=='function'||typeof this.models.analyzeEmotion!=='function'||typeof this.models.analyzePreference!=='function'){
-              const analysis=await this.stage(scope,source,'emotion',character.id,{schema:1,source:scoped,profile,excerpts,config:configs},
-                ()=>this.models.analyze(scoped,configs,profile,excerpts));
+              const analysis = await this.stage(scope, source, hasEmotion ? 'emotion' : 'memory', character.id, {
+                contract: 1,
+                appraisalRule: 1,
+                input: buildCoreAppraisalInput(scoped, profile),
+                clock: emotionClock,
+                ownLineSource: null,
+                config: configs,
+                excerpts,
+                experienceState: profile.experienceState,
+              }, () => this.models.analyze(scoped, configs, profile, excerpts), experienceState?.criticContext);
               if(!this.authority.processing.skippedForSource(scope,source.id,source.revision)
                 .some(item=>item.stage==='emotion'&&item.characterId===character.id))
-                characters[character.id]={...analysis,emotion:{...analysis.emotion,stableRelationDelta:{}}};
+                characters[character.id]=hasEmotion
+                  ?{...analysis,emotion:{...analysis.emotion,stableRelationDelta:{}}}
+                  :{memories:analysis.memories,preferences:analysis.preferences};
               this.assertVersion(scope,state.version);
               return;
             }
-            const relationshipScene=relationshipSceneInput(plan,character,state.roster,profile);
+            const relationshipScene=relationshipSceneInput(plan,character,state.roster,profile,source);
             const common={schema:1,source:scoped,character:profile,excerpts,plan,dependencies:source.dependencies??[]};
             const sceneEmotion=(this.models as {sceneEmotion?:ModelTasks['sceneEmotion']}).sceneEmotion;
-            const emotionInput={...relationshipScene,contactAffect,clockTimeMs:emotionClock.timeMs,timeZone:emotionClock.timeZone};
+            const history = appraisalHistory.read(processed, processed.length - 1, character.id);
+            const elapsed = appraisalHistory.elapsed(appraisalClock, processed.at(-1)!, history.previous);
+            const emotionInput = {
+              ...relationshipScene,
+              ...history,
+              ...(elapsed ? { elapsed } : {}),
+              contactAffect,
+              clockTimeMs: emotionClock.timeMs,
+              timeZone: emotionClock.timeZone,
+            };
             const batch=this.authority.interactions.isTavernRoleplay(scope)&&typeof this.models.sceneObservationBundle==='function'
               ?roleObservationBatch((parts,config)=>this.models.sceneObservationBundle(scoped,emotionInput,excerpts,parts,config)):null;
             const part=(stage:'memory'|'emotion'|'preference')=>companionBatch?.(companionCharacterIds.length>1?`${stage}:${character.id}`:stage);
             const memoryWork=()=>this.models.analyzeMemory(scoped,configs.memory,profile,excerpts,part('memory'));
-            const emotionWork=()=>sceneEmotion?sceneEmotion.call(this.models,scoped,emotionInput,configs.emotion,part('emotion'))
-              :this.models.analyzeEmotion(scoped,configs.emotion,profile,emotionClock,part('emotion')).then(emotion=>({emotion,relationships:[]}));
+            const emotionWork = () => {
+              if (sceneEmotion) {
+                return sceneEmotion.call(this.models, scoped, emotionInput, configs.emotion, part('emotion'));
+              }
+              return this.models.analyzeEmotion(scoped, configs.emotion, profile, emotionClock, part('emotion'))
+                .then(emotion => ({ emotion, relationships: [] }));
+            };
+            const scheduledEmotionWork = () => {
+              if (!batch) return emotionWork();
+              return batch('emotion', configs.emotion, emotionWork,
+                value => this.models.decodeSceneEmotion(scoped, emotionInput, value, configs.emotion));
+            };
             const preferenceWork=()=>this.models.analyzePreference(scoped,configs.preference,part('preference'));
             const [memories,emotionResult,preferences]=await settled([
               this.stage(scope,source,'memory',character.id,{...common,schema:2,config:configs.memory},()=>batch
                 ?batch('memory',configs.memory,memoryWork,value=>this.models.decodeMemory(scoped,value,profile,excerpts)):memoryWork()),
-              this.stage(scope,source,'emotion',character.id,{...common,schema:5,relationshipScene,contactAffect,emotionClock,config:configs.emotion},()=>batch
-                ?batch('emotion',configs.emotion,emotionWork,value=>this.models.decodeSceneEmotion(scoped,emotionInput,value)):emotionWork())
-                ,
+              hasEmotion ? this.stage(
+                scope,
+                source,
+                'emotion',
+                character.id,
+                appraisalFingerprintInput(scoped, emotionInput, configs.emotion),
+                scheduledEmotionWork,
+                experienceState?.criticContext,
+              ) : Promise.resolve(null),
               this.stage(scope,source,'preference',character.id,{...common,schema:2,config:configs.preference},()=>batch&&source.role==='user'
                 ?batch('preference',configs.preference,preferenceWork,value=>this.models.decodePreference(scoped,value)):preferenceWork()),
             ] as const);
-            characters[character.id]={memories,emotion:{...emotionResult.emotion,stableRelationDelta:{}},preferences,
-              ...(emotionResult.relationships.length?{relationships:emotionResult.relationships}:{})};
+            characters[character.id]={memories,...(emotionResult?{emotion:{...emotionResult.emotion,stableRelationDelta:{}}}:{}),preferences,
+              ...(emotionResult?.relationships.length?{relationships:emotionResult.relationships}:{})};
             this.assertVersion(scope,state.version);
           };
           const characterWork=this.authority.npcResources.runActivationBatches(scope,{
@@ -1993,7 +2065,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             npcIds:state.roster.characters.filter(character=>visibleText(plan,character.id)).map(character=>character.id),
             interactionIds:[source.envelope.targetId],presentIds:source.envelope.presentIds,
           },{
-            materialize:characterId=>this.authority.emotion(scope,characterId,eventTime,{...state,sources:processed.slice(0,-1)}),
+            materialize:characterId=>actorHasEmotion(state.roster.characters.find(character=>character.id===characterId)!)
+              ?this.authority.emotion(scope,characterId,eventTime,{...state,sources:processed.slice(0,-1)}):undefined,
             runBatch:batch=>settled(batch.map(({npcId,group})=>analyzeCharacter(state.roster.characters.find(character=>character.id===npcId)!,group))),
             onInvalidated:()=>this.invalidateModelConfiguration(),
           });
@@ -2033,9 +2106,20 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         this.authority.fail(scope,state.version,activeSource?[activeSource]:undefined,
           story?{reason:processingFailure(error).kind==='configuration'?'model_unset':'failed'}:undefined);
         return {status:'failed',version:this.authority.state(scope).version,error:/^(invalid_[a-z_]+|[a-z_]+_missing_source|unsafe_episode_projection|context_changed_retry|model_[a-z_0-9]+|host_(timeout|closed|worker_failed|invalid_result))$/.test(message)?message:'operation_failed'};
-      } finally { if(this.ledgerStageOptions&&story)this.pruneLedgerRuns(scope); this.jobs.delete(key); }
+      } finally {
+        jobFinished = true;
+
+        try {
+          if (this.ledgerStageOptions && story)
+            this.pruneLedgerRuns(scope);
+        } finally {
+          // Releasing the scope must also survive a failure while pruning completed runs.
+          this.jobs.delete(key);
+        }
+      }
     })();
-    this.jobs.set(key,job);
+    if (!jobFinished)
+      this.jobs.set(key, job);
     return job.then(result=>{
       if(result.status==='ready')this.queueDeferredEmotion(scope);
       if(result.status==='ready')this.queueLegacyEmotionRecovery(scope,configs);
@@ -2814,7 +2898,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     return decodeWorldStage(parseWorldStageResponse(raw),request);
   }
 
-  private async stage<T>(scope:SceneScope,source:SceneMessage,stage:ProcessingAddress['stage'],characterId:string|undefined,input:unknown,work:()=>Promise<T>|T):Promise<T> {
+  private async stage<T>(scope:SceneScope,source:SceneMessage,stage:ProcessingAddress['stage'],characterId:string|undefined,input:unknown,work:()=>Promise<T>|T,emotionContext?:unknown):Promise<T> {
     const address:ProcessingAddress={scope,sourceId:source.id,revision:source.revision,stage,...(characterId?{characterId}:{})};
     const fingerprint=processingFingerprint(input);
     const version=this.authority.state(scope).version,modelRevision=this.modelRevision;
@@ -2822,7 +2906,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     const logAddress={...address,roundId:roundKey(scope,source,this.authority.subject(scope)?.subjectId)};
     if(cached!==undefined){recordStage('cache_hit',logAddress);return cached;}
     const allowSkip=this.authority.interactions.isTavernRoleplay(scope);
-    const fallback=()=>stageFallback(stage,input) as T;
+    const fallback=()=>stageFallback(stage,input,emotionContext) as T;
     const earlier=this.authority.processing.state(address,fingerprint);
     if(allowSkip&&earlier?.status==='skipped'){recordStage('skipped',logAddress);return fallback();}
     if(allowSkip&&earlier&&earlier.attempts>=4&&earlier.failure&&
@@ -2900,7 +2984,7 @@ async function settled<T extends readonly unknown[]>(tasks:{[K in keyof T]:Promi
 }
 
 /** A skipped stage contributes no new authority. Shapes only keep dependent code running. */
-function stageFallback(stage:ProcessingAddress['stage'],input:unknown):unknown {
+function stageFallback(stage:ProcessingAddress['stage'],input:unknown,emotionContext?:unknown):unknown {
   if(stage==='perspective')return {observations:[],unresolved:[]};
   if(stage==='contactResponseExpectation')return {expected:null,quote:null};
   if(stage==='absenceExplanation')return null;
@@ -2908,7 +2992,7 @@ function stageFallback(stage:ProcessingAddress['stage'],input:unknown):unknown {
     method:'deterministic',reason:'model_stage_skipped'};
   if(stage==='emotion'){
     const context=(input as {character?:{experienceState?:{criticContext?:unknown}},profile?:{experienceState?:{criticContext?:unknown}}});
-    const emotion={context:context.character?.experienceState?.criticContext??context.profile?.experienceState?.criticContext,
+    const emotion={context:emotionContext??context.character?.experienceState?.criticContext??context.profile?.experienceState?.criticContext,
       frustrationDelta:{},stableRelationDelta:{}};
     return {emotion,relationships:[],memories:[],preferences:[]};
   }
@@ -2953,15 +3037,26 @@ function retryableStageError(stage:ProcessingStage,error:unknown):boolean {
 
 /** Only actors that actually participate in this subject's visible observations reach the emotion model. */
 function relationshipSceneInput(plan:PerspectivePlan,subject:import('./types.ts').SceneCharacter,roster:SceneRoster,
-  profile:{id:string;name:string;persona:string;experienceState:import('../emotion/openher.ts').EmotionState}) {
+  profile:{id:string;name:string;persona:string;experienceState?:import('../emotion/openher.ts').EmotionState},
+  source?:SceneMessage) {
   const visible=plan.observations.filter(observation=>observation.readers.includes(subject.id));
   const participants=new Set<string>([subject.id]);
   for(const observation of visible) {
     if(observation.actorId)participants.add(observation.actorId);
     for(const recipient of observation.recipients??[])participants.add(recipient);
   }
-  const actors=roster.characters.filter(character=>participants.has(character.id));
-  return {subjectId:subject.id,actorIds:roster.characters.map(character=>character.id),userActorId:'player',actors,plan,character:profile};
+  const actors=roster.characters.filter(character=>participants.has(character.id)&&actorHasEmotion(character));
+  return {
+    subjectId: subject.id,
+    actorIds: roster.characters.map(character => character.id),
+    userActorId: 'player',
+    actors,
+    towardActors: roster.characters.filter(actorHasEmotion),
+    rosterActors: roster.characters,
+    plan,
+    character: profile,
+    ...(source ? { source } : {}),
+  };
 }
 
 function boundedEmotionEvidence(quotes:readonly string[]):{evidenceQuotes:string[];omittedEvidenceCount:number} {
@@ -2975,13 +3070,27 @@ function boundedEmotionEvidence(quotes:readonly string[]):{evidenceQuotes:string
   return {evidenceQuotes:selected,omittedEvidenceCount};
 }
 
-function worldPurchaseReferences(sources:readonly import('./types.ts').SceneSource[]):{sourceId:string;revision:number;effectId:string}[] {
-  return sources.flatMap(source=>(source.analysis?.worldEffects??[]).flatMap(effect=>{
-    if (!effect||typeof effect!=='object'||Array.isArray(effect)) return [];
-    const candidate=effect as Record<string,unknown>;
-    return candidate.kind==='purchase'&&typeof candidate.effectId==='string'&&candidate.effectId
-      ?[{sourceId:source.id,revision:source.revision,effectId:candidate.effectId}]:[];
-  }));
+// Preserve source and effect order in O(sources + effects); malformed collections have no references.
+function worldPurchaseReferences(
+  sources: readonly import('./types.ts').SceneSource[]
+): {sourceId: string; revision: number; effectId: string}[] {
+  return sources.flatMap(source => {
+    const effects = source.analysis?.worldEffects;
+
+    if (!Array.isArray(effects))
+      return [];
+
+    return effects.flatMap(effect => {
+      if (!effect || typeof effect !== 'object' || Array.isArray(effect))
+        return [];
+
+      const candidate = effect as Record<string, unknown>;
+
+      return candidate.kind === 'purchase' && typeof candidate.effectId === 'string' && candidate.effectId
+        ? [{sourceId: source.id, revision: source.revision, effectId: candidate.effectId}]
+        : [];
+    });
+  });
 }
 
 function sourceStamp(state:import('./types.ts').SceneState) {

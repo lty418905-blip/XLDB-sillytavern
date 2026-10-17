@@ -152,7 +152,17 @@ const TOWARD_EVENT_LIMIT = 40;
 const TOWARD_LIMIT = 4;
 const RECEPTION_QUOTE_LIMIT = 120;
 const TOP_FIELDS = ['thought', 'feelings', 'needs', 'scene', 'toward', 'skipSeparation', 'reception', 'relationships'];
-const SCENE_FIELDS = ['otherMood', 'intimacy', 'depth', 'engagement', 'conflict', 'novelty', 'otherOpenness', 'tone'];
+/** Recognized scene keys in contract order; ratings use integer model units, with no runtime validation here. */
+export const SCENE_FIELDS = [
+  'otherMood',
+  'intimacy',
+  'depth',
+  'engagement',
+  'conflict',
+  'novelty',
+  'otherOpenness',
+  'tone',
+];
 const TOWARD_FIELDS = ['target', 'event', 'importance', 'trust', 'closeness', 'liking', 'bond'];
 const RECEPTION_FIELDS = ['ref', 'answered', 'level', 'quote'];
 const SEPARATIONS = new Set(['apart', 'together', 'unstated']);
@@ -385,6 +395,8 @@ function readToward(value: unknown, targets: ReadonlySet<string>, state: Validat
     }
     const id = typeof item.target === 'string' ? item.target : '';
     const path = typeof item.target === 'string' ? `toward[${JSON.stringify(id)}]` : `toward[${index + 1}]`;
+    // Reask paths retain their contract spelling; diagnostic paths must never contain an unknown model-written id.
+    const diagnosticPath = targets.has(id) ? path : `toward[${index + 1}]`;
     const checked: JsonObject = {};
     for (const key of orderedFields(item, TOWARD_FIELDS, state)) {
       const member = `${path}.${key}`;
@@ -408,6 +420,7 @@ function readToward(value: unknown, targets: ReadonlySet<string>, state: Validat
           checked.event = event;
         }
       } else if (key === 'importance') {
+        if (typeof item.target !== 'string') continue;
         if (raw == null) {
           problem(state, 'missing', member);
         } else if (typeof raw !== 'string' || !IMPORTANCES.has(raw)) {
@@ -416,10 +429,11 @@ function readToward(value: unknown, targets: ReadonlySet<string>, state: Validat
           checked.importance = raw;
         }
       } else if (key === 'bond') {
+        if (typeof item.target !== 'string') continue;
         if (typeof raw === 'string' && BONDS.has(raw)) {
           checked.bond = raw;
         } else if (state.secondAnswer) {
-          state.diagnostics.push({ code: 'appraisal_bond_dropped', path: member });
+          state.diagnostics.push({ code: 'appraisal_bond_dropped', path: `${diagnosticPath}.${key}` });
         } else {
           problem(state, 'bond', member, { id });
         }

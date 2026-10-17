@@ -3,7 +3,10 @@ import {DatabaseSync} from 'node:sqlite';
 import {pathToFileURL} from 'node:url';
 
 /** Highest authority-store format understood by this release; unmarked stores are format 1 by contract. */
-export const CURRENT_STORE_FORMAT = 1;
+export const CURRENT_STORE_FORMAT = 2;
+
+/** Opaque writer identifier stored with the first readable-appraisal record; no ordering semantics. */
+export const STORE_WRITER_VERSION = 'readable-appraisal-1';
 
 /**
  * Reads the singleton format number. Missing table means 1; a malformed marker means unsupported (Infinity).
@@ -27,7 +30,7 @@ export function readStoreFormat(database: DatabaseSync): number {
 /**
  * Stamps a positive safe-integer format inside the caller's transaction. Equal or higher markers are unchanged.
  * writerVersion is opaque nonempty release text. Invalid arguments or a missing transaction throw without writing.
- * No product operation in this release calls this function.
+ * New readable appraisals and their processing candidates stamp this marker in their writing transaction.
  */
 export function stampStoreFormat(database: DatabaseSync, format: number, writerVersion: string): void {
   if (!Number.isSafeInteger(format) || format < 1 || typeof writerVersion !== 'string' || !writerVersion) {

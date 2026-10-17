@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { backup, DatabaseSync } from 'node:sqlite';
-import { advanceEmotion, createEmotion, emotionStateVersionRecognized, validateEmotionState } from '../emotion/openher.ts';
+import { advanceEmotion, createEmotion, emotionStateVersionRecognized, validateEmotionState, validateEmotionDelta } from '../emotion/openher.ts';
 import type { EmotionDelta } from '../emotion/openher.ts';
 import {isSourceControl,memoryAccesses,preferenceOverrides} from '../core/controls.ts';
 import type {StoredControl} from '../core/controls.ts';
@@ -281,6 +281,7 @@ export async function createAuthorityBackup(
       schemaVersion,
       sha256: await sha256(destination),
       createdAt: new Date().toISOString(),
+      ...(readStoreFormatFile(destination)>1?{storeFormat:readStoreFormatFile(destination)}:{}),
     };
     fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n', { flag: 'wx' });
     fs.renameSync(staging, directory);
@@ -312,7 +313,7 @@ export async function restoreAuthorityBackup(backupDirectory: string, databasePa
     throw new Error('backup_store_format_unsupported');
   if (readStoreFormatFile(source) !== format)
     throw new Error('backup_store_format_mismatch');
-  if (inspectDatabase(source) !== manifest.schemaVersion)
+  if (inspectDatabase(source, true) !== manifest.schemaVersion)
     throw new Error('backup_schema_mismatch');
   const target = mode === 'rollback' ? existingLocalFile(databasePath) : localPath(databasePath);
   const targetEntry = fs.statSync(target, {
@@ -367,11 +368,11 @@ export async function restoreAuthorityBackup(backupDirectory: string, databasePa
       catch { }
     }
     fs.copyFileSync(source, staging, fs.constants.COPYFILE_EXCL);
-    if (await sha256(staging) !== manifest.sha256 || inspectDatabase(staging) !== manifest.schemaVersion) {
+    if (await sha256(staging) !== manifest.sha256 || inspectDatabase(staging, true) !== manifest.schemaVersion) {
       throw new Error('backup_staging_validation_failed');
     }
     const appliedDeletionCount = applyRestoreRules(staging, rules, options.extension);
-    if (inspectDatabase(staging) !== manifest.schemaVersion)
+    if (inspectDatabase(staging, true) !== manifest.schemaVersion)
       throw new Error('backup_staging_validation_failed');
     if (recoveryDirectory) {
       if (mode === 'rollback')
@@ -940,7 +941,7 @@ function pidIsAlive(pid: number): boolean {
   catch (error) { return !isCode(error, 'ESRCH'); }
 }
 
-function inspectDatabase(filename: string): number {
+function inspectDatabase(filename: string, validateJudgments = false): number {
   const db = new DatabaseSync(filename, { readOnly: true });
   let schemaVersion = 0;
   try {
@@ -949,7 +950,7 @@ function inspectDatabase(filename: string): number {
     const rows = db.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all() as unknown as { name: string }[];
     const names = new Set(rows.map(row => row.name));
     if (requiredTables.some(table => !names.has(table))) throw new Error('backup_required_table_missing');
-    validatePersistedEmotionStates(db);
+    validatePersistedEmotionStates(db, validateJudgments);
     schemaVersion = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
   } finally {
     db.close();
@@ -966,7 +967,7 @@ function removeReadSidecars(filename: string): void {
   if (fs.existsSync(shm)) fs.unlinkSync(shm);
 }
 
-function validatePersistedEmotionStates(db: DatabaseSync): void {
+function validatePersistedEmotionStates(db: DatabaseSync, validateJudgments = false): void {
   try {
     for (const row of db.prepare('SELECT emotion FROM scopes').iterate() as unknown as Iterable<{
       emotion: string;
@@ -979,10 +980,22 @@ function validatePersistedEmotionStates(db: DatabaseSync): void {
       if (emotionStateVersionRecognized(state.version))
         validateEmotionState(state);
     }
+    if (validateJudgments) {
+      for (const row of db.prepare('SELECT payload FROM sources WHERE payload IS NOT NULL').iterate()) {
+        const payload = JSON.parse(String(row.payload)) as { emotion?: unknown };
+        if (Object.hasOwn(payload, 'emotion')) validateEmotionDelta(payload.emotion);
+      }
+    }
     const validateAnalysis = (serialized: string): void => {
       const analysis = JSON.parse(serialized) as {
         emotionStates?: unknown;
+        characters?: Record<string,{emotion?:unknown}>;
       };
+      if (validateJudgments) {
+        for (const candidate of Object.values(analysis.characters ?? {})) {
+          if (Object.hasOwn(candidate, 'emotion')) validateEmotionDelta(candidate.emotion);
+        }
+      }
       if (analysis.emotionStates === undefined)
         return;
       if (!analysis.emotionStates || typeof analysis.emotionStates !== 'object' || Array.isArray(analysis.emotionStates))

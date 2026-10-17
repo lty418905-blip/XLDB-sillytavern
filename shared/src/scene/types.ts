@@ -105,9 +105,12 @@ export interface Observation {
 export interface PerspectivePlan { observations: Observation[]; unresolved: string[];
   presentation?: {sentenceCount:number|null;dialogueOnly:boolean|null};
   generationRequests?: Record<string,string> }
+/** Per-role accepted analysis; actors without emotion retain memory and preference data only. */
+export type SceneCharacterAnalysis = Omit<Analysis, 'emotion'> & { emotion?: Analysis['emotion'] };
+
 export interface SceneAnalysis {
   plan: PerspectivePlan;
-  characters: Record<string, Analysis>;
+  characters: Record<string, SceneCharacterAnalysis>;
   /** Failed model stages omitted from this accepted source's derived state. */
   skippedStages?: import('./processing.ts').SkippedStage[];
   /** Foreground decision for the user turn; assistant replies share its four-NPC budget. */
@@ -135,7 +138,7 @@ export interface SceneAnalysis {
 /** Pending causal/config retries may retain candidates while forcing a new plan. */
 export interface StoredSceneAnalysis {
   plan: PerspectivePlan | null;
-  characters: Record<string, Analysis>;
+  characters: Record<string, SceneCharacterAnalysis>;
   skippedStages?: SceneAnalysis['skippedStages'];
   emotionSchedule?: SceneAnalysis['emotionSchedule'];
   emotionPendingIds?: string[];

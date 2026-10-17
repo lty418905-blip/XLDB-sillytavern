@@ -6,6 +6,7 @@ import {withModelAddress} from './runtime-log.ts';
 export function roleObservationBatch(run:(parts:SceneObservationPart[],config:ModelConfig)=>Promise<Record<string,unknown>>) {
   type Pending={part:SceneObservationPart;config:ModelConfig;single:()=>Promise<unknown>;decode:(value:unknown)=>unknown;resolve:(value:unknown)=>void;reject:(error:unknown)=>void};
   let pending:Pending[]=[];
+  const attempted = new Set<SceneObservationPart>();
   const flush=async()=>{
     const batch=pending;pending=[];
     const groups:Pending[][]=[];
@@ -27,11 +28,21 @@ export function roleObservationBatch(run:(parts:SceneObservationPart[],config:Mo
       }
     }));
   };
-  return <T>(part:SceneObservationPart,config:ModelConfig,single:()=>Promise<T>,decode:(value:unknown)=>T):Promise<T>=>
-    new Promise<T>((resolve,reject)=>{
-      pending.push({part,config,single,decode,resolve:resolve as (value:unknown)=>void,reject});
-      if(pending.length===1)queueMicrotask(()=>{void flush();});
+  return <T>(
+    part: SceneObservationPart,
+    config: ModelConfig,
+    single: () => Promise<T>,
+    decode: (value: unknown) => T | Promise<T>,
+  ): Promise<T> => {
+    // Only emotion changes call form after an outer failure; other parts retain their batching rules.
+    if (attempted.has(part)) return withModelAddress({ stage: part }, single);
+    if (part === 'emotion') attempted.add(part);
+
+    return new Promise<T>((resolve, reject) => {
+      pending.push({ part, config, single, decode, resolve: resolve as (value: unknown) => void, reject });
+      if (pending.length === 1) queueMicrotask(() => { void flush(); });
     });
+  };
 }
 
 function sameConfig(a:ModelConfig,b:ModelConfig){

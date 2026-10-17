@@ -1,3 +1,4 @@
+import { CURRENT_STORE_FORMAT, STORE_WRITER_VERSION, stampStoreFormat } from '../core/store-format.ts';
 import {limitWorldBlock,worldBlockOmissionLines} from './world-block-limit.ts';
 import type {WorldBlockOmissions,WorldBlockCoordinate,WorldBlockLink} from './world-block-limit.ts';
 import type { DatabaseSync } from 'node:sqlite';
@@ -793,6 +794,8 @@ export class SceneAuthority {
       for(const source of state.sources){
         if(source.status!=='accepted'||source.processing!=='ready'||!source.analysis?.plan)continue;
         for(const id of source.analysis.emotionPendingIds??[]){
+          const actor=state.roster.characters.find(character=>character.id===id);
+          if(!actor||!actorHasEmotion(actor))continue;
           if(foregroundCharacterId&&id!==foregroundCharacterId)continue;
           if(blocked.has(id))continue;
           // A terminal skip keeps its stored marker but cannot block later prepared experiences.
@@ -822,6 +825,8 @@ export class SceneAuthority {
     characterId:string,result:import('../core/models.ts').SceneEmotionResult):void {
     this.transaction(()=>{
       const state=this.state(scope,true);
+      const actor=state.roster.characters.find(character=>character.id===characterId);
+      if(actor&&!actorHasEmotion(actor))return;
       if(state.version!==expectedVersion)throw new Error('context_changed_retry');
       const source=state.sources.find(item=>item.id===sourceId&&item.revision===revision&&item.status==='accepted'
         &&item.processing==='ready'&&item.analysis?.plan&&item.analysis.emotionPendingIds?.includes(characterId)
@@ -829,6 +834,9 @@ export class SceneAuthority {
       if(!source?.analysis?.plan||!source.analysis.characters[characterId])throw new Error('context_changed_retry');
       const relationships=validateRelationships(result.relationships,
         relationshipValidationContext(source,source.analysis.plan,state.roster,characterId));
+      if (Object.hasOwn(result.emotion, 'appraisalRule')) {
+        stampStoreFormat(this.db, CURRENT_STORE_FORMAT, STORE_WRITER_VERSION);
+      }
       const prior=source.analysis.characters[characterId]!;
       const analysis={...source.analysis,characters:{...source.analysis.characters,
         [characterId]:{...prior,emotion:{...result.emotion,stableRelationDelta:{}},
@@ -846,8 +854,12 @@ export class SceneAuthority {
       const prepared=results.map(result=>{
         const source=state.sources.find(item=>item.id===result.id);
         if(!source||source.status!=='accepted'||source.revision!==result.revision)throw new Error('context_changed_retry');
-        return {...result,analysis:localAnalysis(result.analysis,source,this.hooks.decodeUserModelCandidates)};
+        return {...result,analysis:localAnalysis(result.analysis,source,this.hooks.decodeUserModelCandidates,state.roster)};
       });
+      if (prepared.some(result => Object.values(result.analysis.characters)
+        .some(analysis => analysis.emotion && Object.hasOwn(analysis.emotion, 'appraisalRule')))) {
+        stampStoreFormat(this.db, CURRENT_STORE_FORMAT, STORE_WRITER_VERSION);
+      }
       const settings=this.worldSettings(scope);
       const effective=[...state.sources];
       // The whole final timeline of this commit, complete before the first clock read and never assigned to afterwards:
@@ -1334,7 +1346,7 @@ export class SceneAuthority {
         if (source.status !== 'accepted' || source.processing !== 'ready')
           continue;
         const analysis = source.analysis?.characters[characterId];
-        if (!analysis || source.analysis?.emotionPendingIds?.includes(characterId))
+        if (!analysis?.emotion || source.analysis?.emotionPendingIds?.includes(characterId))
           continue;
         const stored = source.analysis?.emotionStates?.[characterId];
         const body = stored ? JSON.stringify(stored) : storedBySource.get(JSON.stringify([source.id, source.revision]));
@@ -2244,7 +2256,7 @@ export class SceneAuthority {
         if (source.status !== 'accepted' || source.processing !== 'ready' || !source.analysis?.plan)
           continue;
         const candidate = source.analysis.characters[character.id];
-        if (!candidate || source.analysis.emotionPendingIds?.includes(character.id))
+        if (!candidate?.emotion || source.analysis.emotionPendingIds?.includes(character.id))
           continue;
         emotion = advanceEmotion(emotion, candidate.emotion, snapshotTimes.at(index, source.acceptedAtMs), character.emotion);
         const body = JSON.stringify(validateEmotionState(emotion));
@@ -2323,7 +2335,7 @@ function preferenceControlId(sourceId:string,preference:{category:string;quote:s
 }
 function preferenceSourceId(id:string) { return id.slice(0,id.lastIndexOf(':pref:@')); }
 function localAnalysis(value:SceneAnalysis,source:SceneSource,
-  decodeUserModelCandidates:SceneAuthorityHooks['decodeUserModelCandidates']):SceneAnalysis {
+  decodeUserModelCandidates:SceneAuthorityHooks['decodeUserModelCandidates'],roster:SceneRoster):SceneAnalysis {
   const input=value as SceneAnalysis&{emotionStates?:unknown;storyClock?:unknown};
   // The world stage's story-clock output (SC2) passes through unvalidated; SC0 treats a malformed stored value as degraded.
   // A value JSON cannot hold counts as absent, so a source without the key stores byte-identical rows.
@@ -2341,8 +2353,16 @@ function localAnalysis(value:SceneAnalysis,source:SceneSource,
     absence.sourceId!==source.id||absence.sourceRevision!==source.revision||
     absence.sourceAcceptedAtMs!==source.acceptedAtMs||absence.characterId!==source.envelope.targetId||
     !source.text.includes(absence.quote)))throw new Error('invalid_absence_evidence');
-  const characters=Object.fromEntries(Object.entries(input.characters).map(([id,analysis])=>[id,
-    {...analysis,emotion:{...analysis.emotion,stableRelationDelta:{}}}]));
+  const actors = new Map(roster.characters.map(actor => [actor.id, actor]));
+  const characters = Object.fromEntries(Object.entries(input.characters).map(([id, analysis]) => {
+    const actor = actors.get(id);
+    if (actor && !actorHasEmotion(actor)) {
+      const { emotion, ...rest } = analysis;
+      return [id, rest];
+    }
+
+    return [id, { ...analysis, emotion: { ...analysis.emotion!, stableRelationDelta: {} } }];
+  }));
   return {plan:input.plan,characters,
     ...(input.skippedStages===undefined?{}:{skippedStages:input.skippedStages}),
     ...(input.emotionSchedule===undefined?{}:{emotionSchedule:input.emotionSchedule}),

@@ -1,3 +1,4 @@
+import { CURRENT_STORE_FORMAT, STORE_WRITER_VERSION, stampStoreFormat } from '../core/store-format.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { scopeKey } from '../core/types.ts';
@@ -93,13 +94,35 @@ export class Processing {
     const timing=this.measurement(address,fingerprint);timing.started=this.monotonicNow();timing.durationMs=undefined;timing.attempts++;
   }
 
-  complete(address:ProcessingAddress,fingerprint:string,payload:unknown,now=Date.now()):void {
-    this.db.prepare(`INSERT INTO scene_processing_stages(scope,source,revision,stage,character,fingerprint,status,payload,error,updated,attempts)
-      VALUES(?,?,?,?,?,?,'ready',?,NULL,?,0)
-      ON CONFLICT(scope,source,revision,stage,character) DO UPDATE SET
-      fingerprint=excluded.fingerprint,status='ready',payload=excluded.payload,error=NULL,updated=excluded.updated`)
-      .run(scopeKey(address.scope),address.sourceId,address.revision,address.stage,address.characterId??'',fingerprint,JSON.stringify(payload),now);
-    this.finishTiming(address,fingerprint);
+  complete(address: ProcessingAddress, fingerprint: string, payload: unknown, now = Date.now()): void {
+    const emotion = (payload as { emotion?: object } | null)?.emotion;
+    const newAppraisal = emotion != null && Object.hasOwn(emotion, 'appraisalRule');
+    const ownsTransaction = newAppraisal && !this.db.isTransaction;
+    if (ownsTransaction) this.db.exec('BEGIN IMMEDIATE');
+
+    try {
+      this.db.prepare(`INSERT INTO scene_processing_stages(scope,source,revision,stage,character,fingerprint,status,payload,error,updated,attempts)
+        VALUES(?,?,?,?,?,?,'ready',?,NULL,?,0)
+        ON CONFLICT(scope,source,revision,stage,character) DO UPDATE SET
+        fingerprint=excluded.fingerprint,status='ready',payload=excluded.payload,error=NULL,updated=excluded.updated`)
+        .run(
+          scopeKey(address.scope),
+          address.sourceId,
+          address.revision,
+          address.stage,
+          address.characterId ?? '',
+          fingerprint,
+          JSON.stringify(payload),
+          now,
+        );
+      if (newAppraisal) stampStoreFormat(this.db, CURRENT_STORE_FORMAT, STORE_WRITER_VERSION);
+      if (ownsTransaction) this.db.exec('COMMIT');
+    } catch (error) {
+      if (ownsTransaction) this.db.exec('ROLLBACK');
+      throw error;
+    }
+
+    this.finishTiming(address, fingerprint);
   }
 
   fail(address:ProcessingAddress,fingerprint:string,error:unknown,now=Date.now()):ProcessingFailure {

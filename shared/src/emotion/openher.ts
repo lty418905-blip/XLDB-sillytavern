@@ -56,6 +56,11 @@ export interface EmotionDelta {
   frustrationDelta: Partial<DriveValues>;
   driveSatisfaction?: Partial<DriveValues>;
   stableRelationDelta?: Partial<StableRelations>;
+  /** Stored readable metadata is opaque during legacy numeric replay, including older preserved values. */
+  appraisal?: unknown;
+  relation?: unknown;
+  appraisalRule?: unknown;
+  contract?: unknown;
 }
 
 export interface EmotionState {
