@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "5191e3a753cd9ce99008af767e8389d8932164d19e7f7443d041cdf489b800af",
+  "sourceManifestSha256": "e890926952d9c1710798f2c1127c5fd61f5f06f3724098fef3c85ffbe969f2f3",
   "files": [
     {
       "file": ".gitattributes",
@@ -109,8 +109,8 @@
     },
     {
       "file": "shared/src/common/geography.ts",
-      "sha256": "19ef6e0a8f74dc160d2c46b18373e0db7e87584fafacb32c4f88018eec6dae2b",
-      "bytes": 78781
+      "sha256": "edf856c32a03fb346e8f83837f9edf9439d57c997cfd6d2e1f807cff07c9baff",
+      "bytes": 78922
     },
     {
       "file": "shared/src/common/han-script-exclusions.ts",
@@ -124,8 +124,8 @@
     },
     {
       "file": "shared/src/common/physiology.ts",
-      "sha256": "1f4f6d4d8bf41316055b0aa731a558c58161d22c3c5b70a988014440fb77816e",
-      "bytes": 40762
+      "sha256": "af403df476f185c3fee208f6c405f24efa0818305b1d721b231e679500b5c2e7",
+      "bytes": 41006
     },
     {
       "file": "shared/src/common/script-fold-data.ts",
@@ -219,8 +219,8 @@
     },
     {
       "file": "shared/src/core/store.ts",
-      "sha256": "205a866a79fac261543959c2609fc3dfdbad0d92adfb7d83c0e384c001f688b5",
-      "bytes": 27113
+      "sha256": "692c3de14d531eed7d86b7189104f8b747121d39c47deeac49669f96f205b659",
+      "bytes": 28405
     },
     {
       "file": "shared/src/core/tool-loop.ts",
@@ -273,9 +273,19 @@
       "bytes": 14599
     },
     {
+      "file": "shared/src/emotion/engine.ts",
+      "sha256": "13889b7795e68696107d6b50f5765bf2f814327ddafbae17c65b8ff2080b142d",
+      "bytes": 3344
+    },
+    {
       "file": "shared/src/emotion/expression.ts",
       "sha256": "f3e5d5c63be426809cd28e45d6f1ed40212438c0ae2b27a6562de813aae481dc",
       "bytes": 8278
+    },
+    {
+      "file": "shared/src/emotion/identity.ts",
+      "sha256": "c68940f0f772ce8704d041e82333ad05cedc66a3762e2dd510e8b954d99a9890",
+      "bytes": 870
     },
     {
       "file": "shared/src/emotion/need-scale.ts",
@@ -289,13 +299,13 @@
     },
     {
       "file": "shared/src/emotion/openher.ts",
-      "sha256": "aad3fd1a2246b784b052f41e36500f90f685f3bed2d4c30123a9482b7940d82a",
-      "bytes": 28715
+      "sha256": "a7af15dc44601b924ba272e03404cb36153b74a7215dea1b896369cb364a4f16",
+      "bytes": 29579
     },
     {
       "file": "shared/src/emotion/relationships.ts",
-      "sha256": "c852935283a7cb4c5be92fa8d53f3d2216c0a237b00355ee6e52a8c511df6ed5",
-      "bytes": 13084
+      "sha256": "ae89b6927e8fbb06d29353e836b3e0b882cf5cf32c381571ccb1b85b38349daa",
+      "bytes": 13356
     },
     {
       "file": "shared/src/judge/call-sites.ts",
@@ -424,8 +434,8 @@
     },
     {
       "file": "shared/src/scene/backup.ts",
-      "sha256": "360b207e69d1153961bea065eb147234133b031e257331c3cd5c3bbaac7bf261",
-      "bytes": 53509
+      "sha256": "25995e00b81b1446c31cdac1da5eb972dc487e00f0e1f5b1bf92518271e757e9",
+      "bytes": 53392
     },
     {
       "file": "shared/src/scene/calendar-store.ts",
@@ -539,8 +549,8 @@
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "5f5bb925c54e7ed049f02b81510e037b6ae9b33d5772d7cdb2fb6bf2d02363d5",
-      "bytes": 138230
+      "sha256": "cd06785278fe0792ba51f52481907503f9c7d5166637e2716e00cfffbf0b2204",
+      "bytes": 145442
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
@@ -579,8 +589,8 @@
     },
     {
       "file": "shared/src/scene/types.ts",
-      "sha256": "d34aa245eef85ef1c1a151e9b15166fd2441b9f47d47619790457063a6d1f3ce",
-      "bytes": 8224
+      "sha256": "e9f060b1a0322463069ce38b0c2c7a17a78b51c9529794acc86a026d4237e2df",
+      "bytes": 8298
     },
     {
       "file": "shared/src/scene/views.ts",
@@ -724,12 +734,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "63dc769f6d970a0484cf2694c00bacbc32075b3c20077f4913361e6ff60b864d",
+      "sha256": "5606630bc5f48fe900cba2b074a4cd38e0eadc7b60a68fb653f770918ffec9ac",
       "bytes": 346382
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "eb4fb79394a61965d1e8b96228b2195761fb736b9359424ad6acd74081d4ec92",
+      "sha256": "5035db6521183aaa7f819873e1395742c075a9e1ebdf863cd481d347ef7c7216",
       "bytes": 351564
     }
   ]

@@ -99,15 +99,19 @@ export class PhysiologyStore {
   configuration(scope:SceneScope):{revision:number;config:PhysiologyConfiguration}{
     const row=this.db.prepare('SELECT revision,body FROM scene_physiology_settings WHERE scope=?').get(scopeKey(scope)) as SettingsRow|undefined;
     const roster=this.dependencies.state(scope).roster;
-    const config=row?configurationOf(JSON.parse(row.body),roster,true):structuredClone(defaultConfiguration);
     if(this.dependencies.fullRoleplay(scope)){
-      // Keep the historical read order and one binding lookup on the restored path.
+      // Keep the historical read order and one binding lookup; skip parsing while Tavern physiology is suspended.
       if (this.dependencies.tavernAvailable !== true) {
         return {revision: row?.revision ?? 0, config: structuredClone(defaultConfiguration)};
+      }
+      // Validate only: the available Tavern path still rejects a corrupt stored row, but always forces every field on.
+      if (row) {
+        configurationOf(JSON.parse(row.body), roster, true);
       }
       return {revision:row?.revision??0,config:{enabled:true,dailyNeeds:[...physiologyNeeds],
       sustainedEffects:true,reproductive:true,sexualArousal:true,trackedCharacterIds:roster.characters.map(actor=>actor.id)}};
     }
+    const config = row ? configurationOf(JSON.parse(row.body), roster, true) : structuredClone(defaultConfiguration);
     return {revision:row?.revision??0,config};
   }
 

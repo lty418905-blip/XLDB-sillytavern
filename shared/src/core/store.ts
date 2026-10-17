@@ -1,8 +1,11 @@
+import {emotionIdentitySeed} from '../emotion/identity.ts';
+import {createEmotionEngineKey, emotionEngineRuleOf, recognizesEmotionSnapshot} from '../emotion/engine.ts';
+import type {EmotionEngineKey, EmotionEngineRule} from '../emotion/engine.ts';
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { createEmotion, advanceEmotion, emotionAt, emotionStateVersionRecognized, validateEmotionState } from '../emotion/openher.ts';
+import { createEmotion, advanceEmotion, emotionAt, validateEmotionState } from '../emotion/openher.ts';
 import type { EmotionState } from '../emotion/openher.ts';
 import { projectMemories } from '../memory/access.ts';
 import {retentionSnapshot} from '../memory/retention.ts';
@@ -34,7 +37,10 @@ export interface MemoryReactivationInput {
 }
 export interface MemoryReactivation extends MemoryReactivationInput { origin: 'reply'; atMs: number }
 
+/** Optional constructor capabilities; no operation or persisted setting can select a replay rule. */
 export interface AuthorityOptions<M extends object> {
+  /** Test-only engine selection; product callers omit it. Invalid values fail before any storage opens. */
+  emotionEngineRule?: EmotionEngineRule;
   /** Adds members and hooks to the scene authority (the Agent companion); the Tavern passes none. */
   sceneExtension?:SceneAuthorityExtensionFactory<M>;
   /** Enables Tavern geography only for true; omission leaves it unavailable.
@@ -48,9 +54,11 @@ export interface AuthorityOptions<M extends object> {
 /** SQLite is the authority. Indexes and UI never write these tables directly. */
 export class Authority<M extends object = {}> {
   private db: DatabaseSync;
+  readonly #emotionEngineRule: EmotionEngineRule;
   private lease?:AuthorityLease;
   readonly scene: SceneAuthority & M;
   constructor(filename: string, options: AuthorityOptions<M> = {}) {
+    this.#emotionEngineRule = emotionEngineRuleOf(options.emotionEngineRule);
     if (filename !== ':memory:') {
       filename = authorityPath(filename);
       if (readStoreFormatFile(filename, true) > CURRENT_STORE_FORMAT) throw new Error('store_format_unsupported');
@@ -91,7 +99,12 @@ export class Authority<M extends object = {}> {
       const applicationId = (this.db.prepare('PRAGMA application_id').get() as {application_id: number}).application_id;
       const needsEmotionMigration = applicationId !== NEURAL_PERSISTENCE_APPLICATION_ID;
       this.scene = new SceneAuthority(
-        this.db, needsEmotionMigration, options.sceneExtension, options.tavernGeography, options.tavernPhysiology
+        this.db,
+        needsEmotionMigration,
+        options.sceneExtension,
+        options.tavernGeography,
+        options.tavernPhysiology,
+        this.#emotionEngineRule
       ) as SceneAuthority & M;
       if (needsEmotionMigration) {
         this.migrateEmotionStates();
@@ -211,14 +224,17 @@ export class Authority<M extends object = {}> {
     return latest.id;
   }
   emotion(scope: Scope, now = Date.now()): EmotionState {
+    const engineKey = this.selectedEmotionEngineKey();
     const row = this.db.prepare('SELECT emotion FROM scopes WHERE key=?').get(scopeKey(scope)) as {
       emotion: string;
     } | undefined;
     if (!row)
-      return createEmotion(now, undefined, emotionIdentitySeed(scope));
+      return createEmotion(now, undefined, emotionIdentitySeed(scope), engineKey);
     const stored = JSON.parse(row.emotion);
     const unknownSnapshot = stored !== null && typeof stored === 'object' && !Array.isArray(stored)
-      && stored.version !== 1 && !emotionStateVersionRecognized(stored.version);
+      && stored.version !== 1 && !recognizesEmotionSnapshot(
+        stored, this.#emotionEngineRule, () => engineKey ?? createEmotionEngineKey(2, 'real'),
+      );
     return emotionAt(unknownSnapshot ? this.replayEmotion(scope) : validateEmotionState(stored), now);
   }
   /**
@@ -292,18 +308,26 @@ export class Authority<M extends object = {}> {
     const remove=this.db.prepare('DELETE FROM controls WHERE scope=? AND id=? AND revision=? AND kind=?');
     for(const control of controls)if(isSourceControl(control,sourceId))remove.run(key,control.id,control.revision,control.kind);
   }
+  /** Returns the real-domain key for the selected test rule, or undefined for historical untagged writes. */
+  private selectedEmotionEngineKey(): EmotionEngineKey | undefined {
+    return this.#emotionEngineRule === 3 ? createEmotionEngineKey(3, 'real') : undefined;
+  }
+
   private ensureScope(scope: Scope, now: number) {
+    const engineKey = this.selectedEmotionEngineKey();
+    const emotion = createEmotion(now, undefined, emotionIdentitySeed(scope), engineKey);
     this.db.prepare('INSERT OR IGNORE INTO scopes(key,scope,created,emotion) VALUES(?,?,?,?)')
-      .run(scopeKey(scope), JSON.stringify(scope), now, JSON.stringify(createEmotion(now,undefined,emotionIdentitySeed(scope))));
+      .run(scopeKey(scope), JSON.stringify(scope), now, JSON.stringify(emotion));
   }
   /** Replays committed records in source order without modifying projections, versions, or stored snapshots. */
   private replayEmotion(scope: Scope): EmotionState {
     const row = this.db.prepare('SELECT created FROM scopes WHERE key=?').get(scopeKey(scope)) as {created: number};
-    let emotion = createEmotion(row.created, undefined, emotionIdentitySeed(scope));
+    const engineKey = this.selectedEmotionEngineKey();
+    let emotion = createEmotion(row.created, undefined, emotionIdentitySeed(scope), engineKey);
     for (const source of this.sources(scope)) {
       if (source.status !== 'committed' || !source.payload) continue;
       const payload = JSON.parse(source.payload) as Analysis;
-      emotion = advanceEmotion(emotion, payload.emotion, source.acceptedAtMs);
+      emotion = advanceEmotion(emotion, payload.emotion, source.acceptedAtMs, undefined, engineKey);
     }
     return emotion;
   }
@@ -313,7 +337,8 @@ export class Authority<M extends object = {}> {
     const row = this.db.prepare('SELECT created FROM scopes WHERE key=?').get(key) as {
       created: number;
     };
-    let emotion = createEmotion(row.created, undefined, emotionIdentitySeed(scope));
+    const engineKey = this.selectedEmotionEngineKey();
+    let emotion = createEmotion(row.created, undefined, emotionIdentitySeed(scope), engineKey);
     this.migrateControls(scope);
     this.db.prepare('DELETE FROM memories WHERE scope=?').run(key);
     this.db.prepare('DELETE FROM preferences WHERE scope=?').run(key);
@@ -401,7 +426,7 @@ export class Authority<M extends object = {}> {
         );
       }
       // Only recorded accepted deltas are replayed; reads and model upgrades do not reinterpret history.
-      emotion = advanceEmotion(emotion, payload.emotion, source.acceptedAtMs);
+      emotion = advanceEmotion(emotion, payload.emotion, source.acceptedAtMs, undefined, engineKey);
     }
     for (const preference of preferences.values()) {
       this.db.prepare('INSERT INTO preferences VALUES(?,?,?,?,?)')
@@ -439,7 +464,8 @@ export class Authority<M extends object = {}> {
         };
         if (!stored || typeof stored !== 'object' || Array.isArray(stored))
           validateEmotionState(stored);
-        if (emotionStateVersionRecognized(stored.version)) {
+        if (recognizesEmotionSnapshot(stored, this.#emotionEngineRule,
+          () => createEmotionEngineKey(this.#emotionEngineRule, 'real'))) {
           validateEmotionState(stored);
           continue;
         }
@@ -455,6 +481,3 @@ export class Authority<M extends object = {}> {
   }
 }
 function digest(text: string) { return createHash('sha256').update(text).digest('hex'); }
-function emotionIdentitySeed(scope:Scope):string {
-  return JSON.stringify(['xldb-emotion-v2',scope.worldId,scope.sessionId,scope.characterId,null]);
-}

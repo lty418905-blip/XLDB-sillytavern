@@ -109,6 +109,12 @@ export function validateRelationships(value: unknown, context: SceneRelationship
 }
 
 /**
+ * Version 1 identifies the existing fold. Increment whenever foldRelationships results change: this value enters
+ * emotion engine keys, so changing it replays every story-domain actor once from accepted records.
+ */
+export const RELATIONSHIP_FOLD_RULE_VERSION = 1;
+
+/**
  * Fold only ready, accepted source analyses. The source/candidate key makes a
  * repeated replay entry harmless, without adding a cache or second authority.
  */

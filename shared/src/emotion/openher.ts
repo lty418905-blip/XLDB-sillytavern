@@ -9,6 +9,7 @@
 
 import { createNeural, neuralForward, neuralStep, neuralThermodynamic, validateNeuralState } from './neural.ts';
 import type { NeuralState } from './neural.ts';
+import type {EmotionEngineKey} from './engine.ts';
 
 export const DRIVE_NAMES = [
   "connection",
@@ -63,8 +64,10 @@ export interface EmotionDelta {
   contract?: unknown;
 }
 
+/** Persisted numeric and neural state; engine metadata is opaque until a storage trust decision. */
 export interface EmotionState {
-  version: 2;
+  version: 2 | 3;
+  engine?: unknown;
   updatedAtMs: number;
   /** Last accepted Critic observation; older saved states use updatedAtMs. */
   criticContextAtMs?: number;
@@ -310,7 +313,7 @@ export function emotionSettingsEqual(left?: unknown, right?: unknown): boolean {
   return JSON.stringify(emotionSettingsOf(left)) === JSON.stringify(emotionSettingsOf(right));
 }
 
-/** Recognizes the persisted engine version (currently 2); unknown or missing version values return false. */
+/** Legacy backup shape gate: only numeric version 2 returns true; snapshot trust is decided separately. */
 export function emotionStateVersionRecognized(version: unknown): boolean {
   return version === 2;
 }
@@ -475,7 +478,14 @@ function identitySeed(identity: string): number {
   return value >>> 0;
 }
 
-export function createEmotion(nowMs: number, settings?: unknown, identity = 'xldb-default'): EmotionState {
+/** Creates a seeded state at Unix milliseconds; optional engine metadata selects a test replay rule.
+ * Invalid times, settings and non-string identities retain their existing errors. */
+export function createEmotion(
+  nowMs: number,
+  settings?: unknown,
+  identity = 'xldb-default',
+  engineKey?: EmotionEngineKey,
+): EmotionState {
   const timestamp = requireFiniteNumber(nowMs, "nowMs");
   const selected = emotionSettingsOf(settings);
   const neural=createNeural(identitySeed(identity),{hebbianLr:selected.hebbianLearningRate,phaseThreshold:selected.phaseThreshold});
@@ -484,7 +494,7 @@ export function createEmotion(nowMs: number, settings?: unknown, identity = 'xld
     neural.driveState={...selected.driveBaseline};
   }
   return {
-    version: 2,
+    version: engineKey?.rule ?? 2,
     updatedAtMs: timestamp,
     criticContextAtMs: timestamp,
     frustration: neutralDrives(),
@@ -496,6 +506,7 @@ export function createEmotion(nowMs: number, settings?: unknown, identity = 'xld
     stableRelations: { depth: 0, trust: 0, valence: 0 },
     neural,
     lastReward:0,
+    ...(engineKey?.rule === 3 ? {engine: engineKey} : {}),
   };
 }
 
@@ -561,11 +572,14 @@ export function emotionAt(previous: EmotionState, nowMs: number, settings?: unkn
     behavioralSignals: noisy.signals as BehaviorSignals };
 }
 
+/** Advances one accepted event in milliseconds, retaining the existing numerical rules and errors.
+ * Engine metadata changes only the test replay identity, never the neural or metabolic calculation. */
 export function advanceEmotion(
   previous: EmotionState,
   candidate: EmotionDelta,
   nowMs: number,
   settings?: unknown,
+  engineKey?: EmotionEngineKey,
 ): EmotionState {
   const delta = validateEmotionDelta(candidate);
   const selected = emotionSettingsOf(settings);
@@ -633,7 +647,7 @@ export function advanceEmotion(
   const noisy=neuralThermodynamic(learned.state,learned.signals,total,selected.temperatureCoefficient,selected.temperatureFloor);
 
   return {
-    version: 2,
+    version: engineKey?.rule ?? 2,
     updatedAtMs,
     criticContextAtMs: updatedAtMs,
     frustration,
@@ -645,13 +659,14 @@ export function advanceEmotion(
     stableRelations,
     neural:noisy.state,
     lastReward:reward,
+    ...(engineKey?.rule === 3 ? {engine: engineKey} : {}),
   };
 }
 
-/** Restored state is trusted only after full numeric and neural shape checks. */
+/** Checks version 2 or 3 numeric and neural shape, preserving opaque metadata; existing shape errors propagate. */
 export function validateEmotionState(value: unknown): EmotionState {
   const input = requireRecord(value, 'emotionState');
-  if (input.version !== 2) throw new Error('invalid_emotion_state_version');
+  if (input.version !== 2 && input.version !== 3) throw new Error('invalid_emotion_state_version');
   const checked = (source: unknown, keys: readonly string[], minimum: number, maximum: number) => {
     const record = requireRecord(source, 'emotionState.fields');
     return Object.fromEntries(keys.map(key => {
@@ -677,7 +692,7 @@ export function validateEmotionState(value: unknown): EmotionState {
   if (criticContextAtMs > updatedAtMs) throw new Error('invalid_emotion_state_context_time');
 
   return {
-    version: 2,
+    version: input.version,
     updatedAtMs,
     criticContextAtMs,
     frustration: checked(input.frustration, DRIVE_NAMES, 0, 5) as DriveValues,

@@ -174,14 +174,15 @@ export class GeographyStore {
 
   configuration(scope:SceneScope):{revision:number}&GeographyConfiguration{
     const row=this.db.prepare('SELECT revision,body FROM scene_geography_settings WHERE scope=?').get(scopeKey(scope)) as SettingsRow|undefined;
-    const config=row?configurationOf(JSON.parse(row.body)):structuredClone(defaultConfiguration);
     if(this.dependencies.fullRoleplay(scope)){
-      // Keep the historical read order and one binding lookup on the restored path.
+      // Keep the historical read order and one binding lookup; skip parsing while Tavern geography is suspended.
       if (this.dependencies.tavernAvailable !== true) {
         return {revision: row?.revision ?? 0, ...structuredClone(defaultConfiguration)};
       }
+      const config = row ? configurationOf(JSON.parse(row.body)) : structuredClone(defaultConfiguration);
       return {revision:row?.revision??0,...config,enabled:true,followAcceptedProse:true,backgroundSeed:'enabled'};
     }
+    const config = row ? configurationOf(JSON.parse(row.body)) : structuredClone(defaultConfiguration);
     if(this.dependencies.modeOf(scope)==='companion'){
       const location=this.companionLocation(scope);
       if(this.locationBlocked(scope))

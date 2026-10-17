@@ -1,3 +1,4 @@
+import {emotionIdentitySeed} from '../emotion/identity.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -750,7 +751,7 @@ function sceneRosterCharacters(roster:string):string[] {
 function rebuildCoreScope(db: DatabaseSync, key: string): void {
   const scopeRow = db.prepare('SELECT scope,created FROM scopes WHERE key=?').get(key) as {scope:string;created:number};
   const scope = JSON.parse(scopeRow.scope) as Record<string,unknown>;
-  let emotion = createEmotion(scopeRow.created,undefined,coreEmotionIdentitySeed(scope));
+  let emotion = createEmotion(scopeRow.created,undefined,emotionIdentitySeed(scope));
   db.prepare('DELETE FROM memories WHERE scope=?').run(key);
   db.prepare('DELETE FROM preferences WHERE scope=?').run(key);
   const controls = db.prepare('SELECT id,revision,kind,body FROM controls WHERE scope=?').all(key) as unknown as StoredControl[];
@@ -1043,9 +1044,6 @@ function withoutStoredEmotionStates(serialized:string|null):string|null {
   return JSON.stringify(analysis);
 }
 
-function coreEmotionIdentitySeed(scope:Record<string,unknown>):string {
-  return JSON.stringify(['xldb-emotion-v2',scope.worldId,scope.sessionId,scope.characterId,null]);
-}
 
 function readManifest(filename: string): BackupManifest {
   let value: unknown;

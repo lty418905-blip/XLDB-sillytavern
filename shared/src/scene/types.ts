@@ -1,3 +1,4 @@
+import {emotionIdentitySeed as sharedEmotionIdentitySeed} from '../emotion/identity.ts';
 import type { AcceptedMessage, Analysis } from '../core/types.ts';
 import type { Scope } from '../memory/access.ts';
 import type { EmotionSettings, EmotionState } from '../emotion/openher.ts';
@@ -177,7 +178,7 @@ export function npcScope(scope: SceneScope, npcId: string): Scope {
   return { ...scope, characterId: JSON.stringify(['npc', scope.characterId, npcId]) };
 }
 
-/** Branches inherit one NPC identity and its neural starting genome. */
+/** Branches inherit one NPC identity and its neural starting genome; JSON serialization errors propagate unchanged. */
 export function emotionIdentitySeed(scope: SceneScope, npcId?: string): string {
-  return JSON.stringify(['xldb-emotion-v2', scope.worldId, scope.sessionId, scope.characterId, npcId ?? null]);
+  return sharedEmotionIdentitySeed(scope, npcId);
 }
