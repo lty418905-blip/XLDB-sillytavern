@@ -81,6 +81,14 @@ export interface EmotionState {
   stableRelations: StableRelations;
   neural: NeuralState;
   lastReward: number;
+  /** Creation baseline, present only under the third numerical rule. */
+  baselineOrigin?: DriveValues;
+  /** Dimensionless raw-reward moving mean in [-1, 1], present only under the third rule. */
+  rewardMean?: number;
+  /** Dimensionless centered learning reward in [-1, 1], present only under the third rule. */
+  lastLearningReward?: number;
+  /** Five accepted-event frustration values before the latest event, each in [0, 5]. */
+  previousFrustration?: DriveValues;
 }
 
 export interface EmotionSettings {
@@ -119,6 +127,29 @@ export const DEFAULT_EMOTION_SETTINGS: EmotionSettings = Object.freeze({
   temperatureFloor: 0.03,
   randomizedBaseline: true,
 });
+
+/** Upstream baseline shift per unit accepted frustration delta; provisional engine coefficient, no failure. */
+export const BASELINE_LEARNING_RATE = 0.01;
+
+/** Upstream dimensionless baseline spring coefficient in [0, 1]; provisional engine default, no failure. */
+export const BASELINE_ELASTICITY = 0.05;
+
+/** Design moving-mean retention per accepted event; provisional engine coefficient in [0, 1], no failure. */
+export const REWARD_MEAN_RETENTION = 0.9;
+
+/** Design raw-reward weight per accepted event; literal 0.1 preserves exact arithmetic, no failure. */
+export const REWARD_MEAN_WEIGHT = 0.1;
+
+/**
+ * Test/tool-only dimensionless coefficients in [0, 1]. Null or omitted members select the exported defaults;
+ * rewardMeanRetention + rewardMeanWeight must be at most 1 after those defaults are applied.
+ * Invalid members, unknown keys or an excessive combined weight throw TypeError at either third-rule event entry.
+ */
+export interface EmotionRuleConstants {
+  baselineLearningRate?: number | null;
+  rewardMeanRetention?: number | null;
+  rewardMeanWeight?: number | null;
+}
 
 const MIN_METABOLISM_HOURS = 0.001;
 // A single interaction's appraisal is no longer treated as the current scene
@@ -509,7 +540,13 @@ export function createEmotion(
     stableRelations: { depth: 0, trust: 0, valence: 0 },
     neural,
     lastReward:0,
-    ...(engineKey?.rule === 3 ? {engine: engineKey} : {}),
+    ...(engineKey?.rule === 3 ? {
+      engine: engineKey,
+      baselineOrigin: {...neural.driveBaseline},
+      rewardMean: 0,
+      lastLearningReward: 0,
+      previousFrustration: neutralDrives(),
+    } : {}),
   };
 }
 
@@ -575,8 +612,176 @@ export function emotionAt(previous: EmotionState, nowMs: number, settings?: unkn
     behavioralSignals: noisy.signals as BehaviorSignals };
 }
 
-/** Advances one accepted event in milliseconds, retaining the existing numerical rules and errors.
- * Engine metadata changes only the test replay identity, never the neural or metabolic calculation.
+interface RuleThreeMembers {
+  baselineOrigin: DriveValues;
+  rewardMean: number;
+  lastLearningReward: number;
+  previousFrustration: DriveValues;
+}
+
+function ruleThreeMembers(input: Record<string, unknown>): RuleThreeMembers {
+  const checkedDrives = (value: unknown, maximum: number): DriveValues => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('invalid_emotion_state_range');
+    }
+    const record = value as Record<string, unknown>;
+    if (Object.keys(record).length !== DRIVE_NAMES.length) throw new Error('invalid_emotion_state_range');
+    const result = {} as DriveValues;
+    for (const name of DRIVE_NAMES) {
+      const number = record[name];
+      if (!Object.hasOwn(record, name) || typeof number !== 'number' || !Number.isFinite(number)
+        || number < 0 || number > maximum) {
+        throw new Error('invalid_emotion_state_range');
+      }
+      result[name] = number;
+    }
+    return result;
+  };
+  const checkedReward = (value: unknown): number => {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < -1 || value > 1) {
+      throw new Error('invalid_emotion_state_reward');
+    }
+    return value;
+  };
+  return {
+    baselineOrigin: checkedDrives(input.baselineOrigin, 1),
+    rewardMean: checkedReward(input.rewardMean),
+    lastLearningReward: checkedReward(input.lastLearningReward),
+    previousFrustration: checkedDrives(input.previousFrustration, 5),
+  };
+}
+
+function unitCoefficient(value: unknown, fallback: number, name: string): number {
+  if (value == null) return fallback;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new TypeError(name + ' must be a finite number in [0, 1]');
+  }
+  return value;
+}
+
+interface RuleCoefficients {
+  baselineLearningRate: number;
+  rewardMeanRetention: number;
+  rewardMeanWeight: number;
+}
+
+function ruleConstants(value: EmotionRuleConstants | null | undefined): RuleCoefficients {
+  const defaults = {
+    baselineLearningRate: BASELINE_LEARNING_RATE,
+    rewardMeanRetention: REWARD_MEAN_RETENTION,
+    rewardMeanWeight: REWARD_MEAN_WEIGHT,
+  };
+  if (value == null) return defaults;
+  const input = requireRecord(value, 'ruleConstants');
+  for (const name of Object.keys(input)) {
+    if (!Object.hasOwn(defaults, name)) throw new TypeError('unknown ruleConstants member: ' + name);
+  }
+  const coefficients = {
+    baselineLearningRate: unitCoefficient(input.baselineLearningRate, defaults.baselineLearningRate,
+      'baselineLearningRate'),
+    rewardMeanRetention: unitCoefficient(input.rewardMeanRetention, defaults.rewardMeanRetention,
+      'rewardMeanRetention'),
+    rewardMeanWeight: unitCoefficient(input.rewardMeanWeight, defaults.rewardMeanWeight, 'rewardMeanWeight'),
+  };
+  // A weighted sum of bounded rewards must stay in the state validator's [-1, 1] interval.
+  if (coefficients.rewardMeanRetention + coefficients.rewardMeanWeight > 1) {
+    throw new TypeError('rewardMeanRetention + rewardMeanWeight must not exceed 1');
+  }
+  return coefficients;
+}
+
+function advanceRuleThree({
+  previous,
+  delta,
+  updatedAtMs,
+  frustration,
+  drives,
+  stableRelations,
+  reward,
+  selected,
+  engine,
+  baselineElasticity,
+  constants,
+  eventClockMs,
+}: {
+  previous: EmotionState;
+  delta: EmotionDelta;
+  updatedAtMs: number;
+  frustration: DriveValues;
+  drives: DriveValues;
+  stableRelations: StableRelations;
+  reward: number;
+  selected: EmotionSettings;
+  engine: unknown;
+  baselineElasticity: number | null | undefined;
+  constants: EmotionRuleConstants | null | undefined;
+  eventClockMs?: number | null;
+}): EmotionState {
+  const stored = ruleThreeMembers(previous as unknown as Record<string, unknown>);
+  const elasticity = unitCoefficient(baselineElasticity, BASELINE_ELASTICITY, 'baselineElasticity');
+  const coefficients = ruleConstants(constants);
+  // Center against the previous mean, before this event contributes to that mean.
+  const learningReward = clamp(reward - stored.rewardMean, -1, 1);
+  const rewardMean = coefficients.rewardMeanRetention * stored.rewardMean
+    + coefficients.rewardMeanWeight * reward;
+  const learned = neuralStep(
+    previous.neural,
+    neuralContext(delta.context, stableRelations),
+    learningReward,
+    delta.driveSatisfaction,
+    drives,
+  );
+  const total = Object.values(frustration).reduce((sum, value) => sum + value, 0);
+  const noisy = neuralThermodynamic(
+    learned.state,
+    learned.signals,
+    total,
+    selected.temperatureCoefficient,
+    selected.temperatureFloor,
+  );
+
+  const visibleDrives = {} as DriveValues;
+  for (const drive of DRIVE_NAMES) {
+    const baseline = previous.neural.driveBaseline[drive];
+    const origin = stored.baselineOrigin[drive];
+    const shift = (delta.frustrationDelta[drive] ?? 0) * coefficients.baselineLearningRate;
+    const pullBack = -(baseline - origin) * elasticity;
+    // Upstream addition is left associative. Include user-selected origins outside the upstream [0.1, 0.95].
+    const nextBaseline = clamp(baseline + shift + pullBack, Math.min(0.1, origin), Math.max(0.95, origin));
+    // This event's forward already consumed the old baseline; only subsequent events consume this value.
+    noisy.state.driveBaseline[drive] = nextBaseline;
+    visibleDrives[drive] = clamp(nextBaseline + frustration[drive] * FRUSTRATION_TO_DRIVE, 0, 1);
+  }
+
+  return {
+    version: 3,
+    updatedAtMs,
+    criticContextAtMs: updatedAtMs,
+    frustration,
+    drives: visibleDrives,
+    criticContext: {...delta.context},
+    behavioralSignals: noisy.signals as BehaviorSignals,
+    stableRelations,
+    neural: noisy.state,
+    lastReward: reward,
+    ...(engine === undefined ? {} : {engine}),
+    ...(eventClockMs == null ? {} : {eventClockMs}),
+    baselineOrigin: stored.baselineOrigin,
+    rewardMean,
+    lastLearningReward: learningReward,
+    previousFrustration: {...previous.frustration},
+  };
+}
+
+// A boolean selector leaves the historical metadata tail's type analysis and bytes intact.
+function requestsRuleThree(engineKey: EmotionEngineKey | undefined): boolean {
+  return engineKey?.rule === 3;
+}
+
+/** Advances one accepted event in milliseconds; historical rule 2 retains its exact numerical behavior.
+ * Rule 3 centers learning rewards and evolves baselines. Optional elasticity/constants are unit coefficients;
+ * null or omission selects defaults, invalid coefficients throw TypeError, and invalid third-rule members throw
+ * the existing state reward/range errors. No random draws are added outside the kernel.
  * Keep the event calculation equivalent to advanceEmotionWithClock when its hunger hours equal elapsed hours.
  * Only numeric values are equivalent; omitted-key identity behavior intentionally differs. */
 export function advanceEmotion(
@@ -585,6 +790,8 @@ export function advanceEmotion(
   nowMs: number,
   settings?: unknown,
   engineKey?: EmotionEngineKey,
+  baselineElasticity?: number | null,
+  constants?: EmotionRuleConstants | null,
 ): EmotionState {
   const delta = validateEmotionDelta(candidate);
   const selected = emotionSettingsOf(settings);
@@ -646,6 +853,21 @@ export function advanceEmotion(
   // Upstream reward is reduction in metabolism frustration, never a model's
   // direct weight update. One accepted event performs one full learning cycle.
   const reward=clamp(beforeEventTotal-total,-1,1);
+  if (requestsRuleThree(engineKey)) {
+    return advanceRuleThree({
+      previous,
+      delta,
+      updatedAtMs,
+      frustration,
+      drives,
+      stableRelations,
+      reward,
+      selected,
+      engine: engineKey,
+      baselineElasticity,
+      constants,
+    });
+  }
   const synced=structuredClone(previous.neural);
   synced.frustration=total;
   const learned=neuralStep(synced,neuralContext(delta.context,stableRelations),reward,delta.driveSatisfaction,drives);
@@ -790,6 +1012,8 @@ export function advanceEmotionWithClock(
   options: EmotionClockStep,
   settings?: unknown,
   engineKey?: EmotionEngineKey | null,
+  baselineElasticity?: number | null,
+  constants?: EmotionRuleConstants | null,
 ): EmotionState {
   const step = checkedClockStep(options);
   const delta = validateEmotionDelta(candidate);
@@ -830,6 +1054,22 @@ export function advanceEmotionWithClock(
 
   const total = Object.values(frustration).reduce((sum, value) => sum + value, 0);
   const reward = clamp(beforeEventTotal - total, -1, 1);
+  if ((engineKey?.rule ?? previous.version) === 3) {
+    return advanceRuleThree({
+      previous,
+      delta,
+      updatedAtMs,
+      frustration,
+      drives,
+      stableRelations,
+      reward,
+      selected,
+      engine: engineKey ?? previous.engine,
+      baselineElasticity,
+      constants,
+      eventClockMs: step.eventClockMs,
+    });
+  }
   const synced = structuredClone(previous.neural);
   synced.frustration = total;
   const learned = neuralStep(
@@ -936,6 +1176,7 @@ export function emotionAtWithClock(
 export function validateEmotionState(value: unknown): EmotionState {
   const input = requireRecord(value, 'emotionState');
   if (input.version !== 2 && input.version !== 3) throw new Error('invalid_emotion_state_version');
+  const thirdRule = input.version === 3 ? ruleThreeMembers(input) : {};
   const checked = (source: unknown, keys: readonly string[], minimum: number, maximum: number) => {
     const record = requireRecord(source, 'emotionState.fields');
     return Object.fromEntries(keys.map(key => {
@@ -974,6 +1215,7 @@ export function validateEmotionState(value: unknown): EmotionState {
     ...Object.fromEntries(STORED_EMOTION_STATE_MEMBERS
       .filter(member => Object.hasOwn(input, member) && input[member] !== undefined)
       .map(member => [member, input[member]])),
+    ...thirdRule,
   };
 }
 

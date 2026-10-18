@@ -28,7 +28,10 @@ export interface EmotionClockDuration {
 /** Closed reasons for excluding a jump from hunger; an apart jump's capped remainder is not a diagnostic. */
 export type OmittedJumpReason = 'together' | 'unstated' | 'no_member' | 'awaiting_judgement';
 
-/** Recomputed, nonpersistent exclusion for one character/source revision; advanceMs is the positive net movement. */
+/**
+ * Recomputed, nonpersistent exclusion for one character/source revision.
+ * advanceMs measures new milliseconds above the high-water clock since the previous character step.
+ */
 export interface OmittedEmotionJump {
   sourceId: string;
   revision: number;
@@ -89,7 +92,9 @@ function checkedIndex(value: number, length: number): number {
 /**
  * Computes story-domain hunger hours through one read position without changing clocks or stored data.
  * Each event, anchor and read caps ordinary elapsed time (excluding jumps) at twelve hours; decay stays uncapped.
- * Positive explicit advances or net advances above twelve hours are jumps. Only strict apart judgements add
+ * Source advances count only new time above the highest clock reached since the previous character step.
+ * Each event or anchor resets that high-water clock to the character's nondecreasing state clock.
+ * Positive explicit advances or advances above twelve hours are jumps. Only strict apart judgements add
  * min(jump, twelve hours); reads and anchors defer those additions. The added jump credit is bounded by actual
  * forward movement since the previous judgement (or origin), minus ordinary hunger credited across that whole
  * interval, including intervening anchors and the current step. Anchors end a step without resetting this budget.
@@ -125,6 +130,7 @@ export function planEmotionClock(input: EmotionClockInput): EmotionClockPlan {
   let judgementClockMs: number | undefined;
   let ordinarySinceJudgementMs = 0;
   let previousClockMs: number | undefined;
+  let highWaterClockMs: number | undefined;
   let intervalJumpMs = 0;
   let pendingCapMs = 0;
   let pending: {source: EmotionClockSource; advanceMs: number}[] = [];
@@ -152,7 +158,8 @@ export function planEmotionClock(input: EmotionClockInput): EmotionClockPlan {
       || !Number.isSafeInteger(source.revision) || source.revision < 0) {
       throw new TypeError('invalid_emotion_clock_source');
     }
-    const advanceMs = previousClockMs === undefined ? 0 : clockMs - previousClockMs;
+    const advanceMs = highWaterClockMs === undefined ? 0 : Math.max(0, clockMs - highWaterClockMs);
+    if (highWaterClockMs !== undefined) highWaterClockMs = Math.max(highWaterClockMs, clockMs);
     previousClockMs = clockMs;
 
     if (stateClockMs !== undefined && advanceMs > 0
@@ -184,6 +191,8 @@ export function planEmotionClock(input: EmotionClockInput): EmotionClockPlan {
     const hungerHours = hungerMs / 3_600_000;
     const duration = {sourceIndex, elapsedHours, hungerHours};
     stateClockMs = Math.max(stateClockMs, clockMs);
+    // A completed step starts a new interval, even when an earlier source reached a later clock.
+    highWaterClockMs = stateClockMs;
     intervalJumpMs = 0;
 
     if (isEvent) {

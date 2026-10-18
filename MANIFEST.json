@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "c83a0fa49bcd85bff6a5c65b1f97cc0d66ea48438ddb9b711eb7cb70ab8091cd",
+  "sourceManifestSha256": "825a5c92169e07ee5f443b6ef0f694e8e75ce8addf2c179b4df96b057dccd1b4",
   "files": [
     {
       "file": ".gitattributes",
@@ -179,8 +179,8 @@
     },
     {
       "file": "shared/src/core/models.ts",
-      "sha256": "67591c2b91133df3ed67e2387e4e57199030b3a6ab47938f72f18cc58f61e7b1",
-      "bytes": 57194
+      "sha256": "13c4b4f6047a5539a1c5a2515606cf3fbaec819a63894b63c7cc925080754568",
+      "bytes": 60055
     },
     {
       "file": "shared/src/core/pair-capture-switch.ts",
@@ -269,8 +269,8 @@
     },
     {
       "file": "shared/src/emotion/clock.ts",
-      "sha256": "b0b238ee36834484e0d6b5e07a93c70895e254698752ff7e7cc0ade88935320f",
-      "bytes": 9432
+      "sha256": "af750b7907485cd5a486fa61d6a19ce7128c287134ea4414d4f823169f907092",
+      "bytes": 9988
     },
     {
       "file": "shared/src/emotion/contact-affect.ts",
@@ -304,13 +304,18 @@
     },
     {
       "file": "shared/src/emotion/openher.ts",
-      "sha256": "bccad48f70e749546626e087252aabee49df0e48b159690ba4a0380ec36219d6",
-      "bytes": 40807
+      "sha256": "2eb18e4ec438321c59da6429e5cff4b44c6a27fd901a204668ecddabf0f68aef",
+      "bytes": 49775
     },
     {
       "file": "shared/src/emotion/relationships.ts",
       "sha256": "ae89b6927e8fbb06d29353e836b3e0b882cf5cf32c381571ccb1b85b38349daa",
       "bytes": 13356
+    },
+    {
+      "file": "shared/src/emotion/resting-forward.ts",
+      "sha256": "b4c9cd7f99aaf153ea7ca148874c1dd68af9219941008fb34eb46e2425502f3b",
+      "bytes": 3933
     },
     {
       "file": "shared/src/judge/call-sites.ts",
@@ -469,8 +474,8 @@
     },
     {
       "file": "shared/src/scene/extraction.ts",
-      "sha256": "1506709d0c2273a8a354e5c58c3b78192ba31e5d5e10960279c69eaff53bd4b5",
-      "bytes": 9074
+      "sha256": "416c07291f8abde7e5d40762d7531ddd9ae1bf29c69d4638e233034369c1734e",
+      "bytes": 10190
     },
     {
       "file": "shared/src/scene/generation-view.ts",
@@ -524,8 +529,8 @@
     },
     {
       "file": "shared/src/scene/perspective.ts",
-      "sha256": "30fb3079bca8c075c7f5daca447c3381a449345fc755302b7cb9007cda149c5f",
-      "bytes": 16629
+      "sha256": "d3e5bd6709d298c47545f014c75b9b15b6579bbda02a3c7dd038ee5ce174822a",
+      "bytes": 19772
     },
     {
       "file": "shared/src/scene/processing.ts",
@@ -554,8 +559,8 @@
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "851391d83963fd06680a22fe767f291a8a5df4b86795b2d2604c90dbb001b03a",
-      "bytes": 160677
+      "sha256": "8f5c776f89449c57bf63b7ffef6b3a847cfe238bbce158ea16f0d9ae20e347fc",
+      "bytes": 161124
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
@@ -664,8 +669,8 @@
     },
     {
       "file": "sillytavern/adapters/xldb.js",
-      "sha256": "6e955c17094d189fadbd8faed5717cb8721bfe28a2af9a3dd425793c0a629861",
-      "bytes": 334276
+      "sha256": "bb3dd4cce29c98a0c2a95c520c0531b5e53b37eca8c909cd84c6cadcdc862826",
+      "bytes": 334475
     },
     {
       "file": "sillytavern/src/dashboard.ts",
@@ -739,13 +744,13 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "960adbec7811043faf23eaec0cf48d8ed06edd39a6c9d6243a906b8ef3c60202",
-      "bytes": 346382
+      "sha256": "e208aaa90b4e90092c3f3cb31f1e2b3fae6a17308ae8af24a81012f40b298849",
+      "bytes": 346583
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "e681fa355648357e8db711ae530c9aa1182af84f3e5d808d411ba8deb0e77135",
-      "bytes": 351564
+      "sha256": "e27858ee2e4d969dc49fc7e222ec7cf85d1d96dceef42b8fd8005200f4068838",
+      "bytes": 351767
     }
   ]
 }

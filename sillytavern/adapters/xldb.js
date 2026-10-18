@@ -2659,6 +2659,8 @@
   function refreshCurrentNativeBinding(message) {
     const binding = message?.extra?.xldbScene;
     if (!binding || !sameScope(binding.scope, state.scope)) throw new Error('当前用户消息的 XLDB 绑定已变更');
+    // A manual message keeps its own presence list; replacing it with the auto-mode list would let public lines reach characters who are not there.
+    if (binding.automatic !== true) return false;
     const envelope = nativeEnvelope();
     if (JSON.stringify(binding.envelope) === JSON.stringify(envelope)) return false;
     binding.envelope = envelope;

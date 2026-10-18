@@ -1534,10 +1534,23 @@ export class SceneAuthority {
             body: clock !== null && positionOf(source) >= invalidFrom ? undefined : body,
           };
         });
-        const replayKey = createHash('sha256').update(JSON.stringify([
+        // Hash the same JSON in bounded chunks so a long history needs no second full snapshot string.
+        const replayHeader = JSON.stringify([
           scopeKey(scope), characterId, character.emotion, engine, initialTime,
-          steps.map(step => [step.body, step.delta, step.eventTimeMs, step.elapsedHours, step.hungerHours, step.timeOfDay]),
-        ])).digest('hex');
+        ]);
+        const replayHash = createHash('sha256').update(replayHeader.slice(0, -1) + ',[');
+        for (const [index, step] of steps.entries()) {
+          if (index > 0) replayHash.update(',');
+          replayHash.update(JSON.stringify([
+            step.body,
+            step.delta,
+            step.eventTimeMs,
+            step.elapsedHours,
+            step.hungerHours,
+            step.timeOfDay,
+          ]));
+        }
+        const replayKey = replayHash.update(']]').digest('hex');
         let emotion = this.emotionReplayCache.get(replayKey);
         if (emotion === undefined) {
           emotion = createEmotion(initialTime, character.emotion, emotionIdentitySeed(scope, characterId), engine);

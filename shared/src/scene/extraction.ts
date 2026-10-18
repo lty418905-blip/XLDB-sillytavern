@@ -1,9 +1,8 @@
-import { perspectiveOf } from './perspective.ts';
+import { MAX_IDENTITY_REFERENCES, perspectiveOf } from './perspective.ts';
 import type { KnowledgeKind, PerspectivePlan, SceneCharacter, SceneMessage, SceneRoster } from './types.ts';
 
 const MAX_OBSERVATIONS = 12;
 const MAX_RECIPIENTS = 32;
-const MAX_IDENTITY_REFS = 4;
 const MAX_UNRESOLVED = 8;
 const MAX_TEXT = 20_000;
 const kinds = new Set<KnowledgeKind>(['observed', 'heard', 'private', 'thought', 'inferred']);
@@ -27,6 +26,12 @@ export interface CompactPerspectiveInput {
   knownSpeaker: string | null;
   playerName: string | null;
   characters: { key: string; name: string; aliases: string[]; identityId?: string }[];
+  /**
+   * Compact keys of the characters the host says are present, in roster order.
+   * Only a manual scene message carries such a list; an automatic message gets
+   * null because its envelope lists every recognised character, not who is here.
+   */
+  present: string[] | null;
   current: Segment[];
   history: { ref: string; role: SceneMessage['role']; start: number; end: number; text: string }[];
 }
@@ -53,6 +58,7 @@ export function buildPerspectiveInput(messageValue: SceneMessage, rosterValue: S
   const historyByRef = new Map(historySegments.map(segment => [segment.ref, segment]));
   const knownSpeaker = message.speakerId === undefined ? null : keyByCharacter.get(message.speakerId);
   if (message.speakerId !== undefined && knownSpeaker === undefined) fail('invalid_scene_character');
+  const present = hostPresentKeys(message, characterEntries);
 
   const input: CompactPerspectiveInput = {
     role: message.role,
@@ -64,6 +70,7 @@ export function buildPerspectiveInput(messageValue: SceneMessage, rosterValue: S
       ...([character.name, ...character.aliases].some(label => labels.filter(candidate => candidate === label).length > 1)
         ? { identityId: character.id } : {}),
     })),
+    present,
     current: current.map(segment => ({ ...segment })),
     history: historySegments.map(({ ref, role, start, end, text }) => ({ ref, role, start, end, text })),
   };
@@ -95,7 +102,7 @@ export function buildPerspectiveInput(messageValue: SceneMessage, rosterValue: S
         evidence = bounded(item.audienceQuote, MAX_TEXT, 'invalid_scene_evidence');
         if (!literalCovers(message.text, evidence, start, start + quote.length)) fail('invalid_scene_evidence');
       }
-      const identityRefs = compactList(item.identityRefs, MAX_IDENTITY_REFS, 'invalid_scene_evidence');
+      const identityRefs = compactList(item.identityRefs, MAX_IDENTITY_REFERENCES, 'invalid_scene_evidence');
       const currentIdentity = identityRefs.map(ref => currentByRef.get(ref)).filter((segment): segment is Segment => segment !== undefined);
       const historyIdentity = identityRefs.map(ref => historyByRef.get(ref)).filter((segment): segment is HistorySegment => segment !== undefined);
       if (currentIdentity.length + historyIdentity.length !== identityRefs.length) fail('invalid_scene_evidence');
@@ -119,6 +126,20 @@ export function buildPerspectiveInput(messageValue: SceneMessage, rosterValue: S
     });
     return perspectiveOf({ observations, unresolved }, message, roster, history);
   } };
+}
+
+/**
+ * The host's presence list as compact keys, or null when there is none.
+ * A message that is not automatic and belongs to a scene carries the user's own
+ * choice of present characters; every other message has no presence list.
+ * Stable ids never leave this module; keys follow the roster order.
+ */
+function hostPresentKeys(message: SceneMessage, characterEntries: [string, SceneCharacter][]): string[] | null {
+  const hostListsPresence = message.automatic !== true && message.envelope.mode === 'scene';
+  if (!hostListsPresence) return null;
+  const presentIds = new Set(message.envelope.presentIds);
+  const presentEntries = characterEntries.filter(([, character]) => presentIds.has(character.id));
+  return presentEntries.map(([key]) => key);
 }
 
 function segmentsOf(text: string, prefix: string): Segment[] {

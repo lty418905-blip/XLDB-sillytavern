@@ -18,6 +18,13 @@ const MAX_OBSERVATIONS = 12;
 const MAX_UNRESOLVED = 8;
 const knowledgeKinds = new Set<KnowledgeKind>(['observed', 'heard', 'private', 'thought', 'inferred']);
 
+/**
+ * Most identity references one observation may cite: the compact identityRefs a
+ * model returns, and the history quotes they become. Eight lets a crowded scene
+ * name each listener, since one fragment can also name several people at once.
+ */
+export const MAX_IDENTITY_REFERENCES = 8;
+
 export function rosterOf(value: unknown): SceneRoster {
   const input = record(value, 'invalid_scene_roster');
   if (!Array.isArray(input.characters) || input.characters.length < 1 || input.characters.length > MAX_CHARACTERS) {
@@ -191,7 +198,7 @@ function observationOf(value: unknown, message: SceneMessage, roster: SceneRoste
     candidate.identityQuote=quote;
   }
   if (input.identityEvidence!==undefined) {
-    if (!message.automatic || !Array.isArray(input.identityEvidence) || input.identityEvidence.length>4) fail('invalid_scene_evidence');
+    if (!message.automatic || !Array.isArray(input.identityEvidence) || input.identityEvidence.length>MAX_IDENTITY_REFERENCES) fail('invalid_scene_evidence');
     candidate.identityEvidence=input.identityEvidence.map(value=>{
       const reference=record(value,'invalid_scene_evidence');
       const sourceId=idText(reference.sourceId,'invalid_scene_evidence');
@@ -232,17 +239,18 @@ function observationOf(value: unknown, message: SceneMessage, roster: SceneRoste
   }
   if (readers.some(id => !allowed.has(id))) fail('invalid_scene_readers');
 
-  if ((message.role === 'user' && envelope.mode === 'scene') || message.automatic) {
+  if (message.automatic) {
     const identityEvidence=[candidate.evidence,candidate.identityQuote??'',...(candidate.identityEvidence??[]).map(item=>item.quote)].join('\n');
     requireIdentity(identityEvidence, candidate.actorId, roster);
     if (candidate.kind === 'private' || candidate.kind === 'heard') {
       for (const recipient of candidate.recipients) requireIdentity(identityEvidence, recipient, roster);
     }
-    if(message.automatic && candidate.kind==='observed') for(const recipient of candidate.recipients) requireIdentity(identityEvidence,recipient,roster);
-  } else if (message.role === 'assistant') {
-    for (const recipient of candidate.recipients) {
-      if (recipient !== candidate.actorId) requireIdentity(candidate.evidence, recipient, roster);
+    if (candidate.kind === 'observed') {
+      for (const recipient of candidate.recipients) requireIdentity(identityEvidence, recipient, roster);
     }
+  } else {
+    // perspectiveOf rejects direct envelopes, so a message that is not automatic is a manual scene message here.
+    requireHostListedIdentity(candidate, readers, message, envelope, roster);
   }
 
   // Structural checks prevent thought/inference text from gaining other readers.
@@ -251,8 +259,63 @@ function observationOf(value: unknown, message: SceneMessage, roster: SceneRoste
   return { ...candidate, recipients: [...new Set(candidate.recipients)], readers };
 }
 
+/**
+ * Identity rule for a manual scene message, whose envelope is the user's own
+ * list of present characters. Being present needs no literal name; only an
+ * audience narrower than everyone present does:
+ * - heard or observed read by every present character: accepted as it is;
+ * - heard or observed that leaves someone present out: accepted when every
+ *   present character left out is named in the evidence or identity quote
+ *   (the text saying why they are left out), or else when the literal-name rule
+ *   holds for the readers;
+ * - private, thought and inferred always keep the literal-name rule.
+ */
+function requireHostListedIdentity(candidate: ObservationCandidate, readers: string[], message: SceneMessage, envelope: SceneEnvelope, roster: SceneRoster): void {
+  const sharedKind = candidate.kind === 'heard' || candidate.kind === 'observed';
+  if (!sharedKind) {
+    requireLiteralParticipants(candidate, readers, message, roster);
+    return;
+  }
+  const readerIds = new Set(readers);
+  const excludedIds = envelope.presentIds.filter(id => !readerIds.has(id));
+  if (excludedIds.length === 0) return;
+  const exclusionEvidence = [candidate.evidence, candidate.identityQuote ?? ''].join('\n');
+  const everyExcludedNamed = excludedIds.every(id => identityProven(exclusionEvidence, id, roster));
+  if (everyExcludedNamed) return;
+  requireLiteralParticipants(candidate, readers, message, roster);
+}
+
+/**
+ * Literal-name rule of a manual scene message. A user message names its actor
+ * and every reader in the evidence or identity quote. An assistant message
+ * names every reader except its speaker, whose identity the envelope fixes, in
+ * the evidence alone, so a name elsewhere in the reply grants nobody the quote.
+ */
+function requireLiteralParticipants(candidate: ObservationCandidate, readers: string[], message: SceneMessage, roster: SceneRoster): void {
+  if (message.role === 'user') {
+    const userEvidence = [candidate.evidence, candidate.identityQuote ?? ''].join('\n');
+    const participants = new Set([candidate.actorId, ...readers]);
+    for (const participant of participants) requireIdentity(userEvidence, participant, roster);
+    return;
+  }
+  for (const reader of readers) {
+    if (reader !== candidate.actorId) requireIdentity(candidate.evidence, reader, roster);
+  }
+}
+
 function requireIdentity(evidence: string, characterId: string, roster: SceneRoster): void {
-  if (identityMention(evidence, characterId, false)) return;
+  if (!identityProven(evidence, characterId, roster)) fail('invalid_scene_identity');
+}
+
+/**
+ * True when the evidence names the character by its stable id, or by one of its
+ * labels. A label proves the character when the spelling found in the evidence
+ * belongs to this character alone: characters owning that exact spelling decide
+ * first, and only when none owns it exactly does the folded (script-insensitive)
+ * spelling decide. Either way exactly one owner must remain.
+ */
+function identityProven(evidence: string, characterId: string, roster: SceneRoster): boolean {
+  if (identityMention(evidence, characterId, false)) return true;
   const character = roster.characters.find(item => item.id === characterId);
   if (!character) fail('invalid_scene_character');
   for (const label of [character.name, ...character.aliases]) {
@@ -260,9 +323,9 @@ function requireIdentity(evidence: string, characterId: string, roster: SceneRos
     if(quote===undefined)continue;
     const exact=roster.characters.filter(item=>[item.name,...item.aliases].includes(quote));
     const owners=exact.length?exact:roster.characters.filter(item=>[item.name,...item.aliases].some(name=>foldForMatch(name)===foldForMatch(quote)));
-    if (owners.length === 1 && owners[0]?.id === characterId) return;
+    if (owners.length === 1 && owners[0]?.id === characterId) return true;
   }
-  fail('invalid_scene_identity');
+  return false;
 }
 
 function identityMention(evidence: string, label: string, fold=true): boolean {
