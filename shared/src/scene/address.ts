@@ -59,7 +59,9 @@ export function sceneExpressionOptions(authority:SceneAuthority,scope:SceneScope
     authority.worldSettings(scope)!.publicTime===false));
   let clockTimeMs:number|null=nowMs;
   if(story){
-    try{clockTimeMs=authority.legacyEmotionTime(scope,state.sources,nowMs,state.sources,timeline);}
+    try {
+      clockTimeMs = authority.expressionClockTime(scope, state.sources, nowMs, timeline);
+    }
     catch(error){
       if(error instanceof Error&&error.message.startsWith('invalid_world_'))clockTimeMs=null;
       else throw error;

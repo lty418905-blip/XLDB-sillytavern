@@ -36,7 +36,59 @@ interface CachedPlan {
   calendarStamp:string;
   plan:DirectorPlan;
 }
-function json(raw:string){return object(JSON.parse(raw.trim().replace(/^```(?:json)?\s*/,'').replace(/\s*```$/,'')));}
+/** Decode an object without turning failures outside candidate validation into retryable errors. */
+function directorObject(value: unknown): Record<string, unknown> {
+  try {
+    return object(value);
+  } catch (error) {
+    if (error instanceof Error && error.message === 'invalid_object')
+      throw new Error('invalid_director_candidate', { cause: error });
+
+    throw error;
+  }
+}
+
+/**
+ * Preserve text and its UTF-16 limit. The inherited trim is O(maximumLength);
+ * oversized values fail before scanning.
+ */
+function directorText(value: unknown, maximumLength: number): string {
+  try {
+    return text(value, maximumLength);
+  } catch (error) {
+    if (error instanceof Error && error.message === 'invalid_text')
+      throw new Error('invalid_director_candidate', { cause: error });
+
+    throw error;
+  }
+}
+
+/** Keep the existing enum coercion; native conversion failures describe an invalid candidate. */
+function directorString(value: unknown): string {
+  try {
+    return String(value);
+  } catch (error) {
+    if (error instanceof TypeError)
+      throw new Error('invalid_director_candidate', { cause: error });
+
+    throw error;
+  }
+}
+
+function json(raw: string) {
+  const content = raw.trim()
+    .replace(/^```(?:json)?\s*/, '')
+    .replace(/\s*```$/, '');
+
+  try {
+    return directorObject(JSON.parse(content));
+  } catch (error) {
+    if (error instanceof SyntaxError)
+      throw new Error('invalid_director_candidate', { cause: error });
+
+    throw error;
+  }
+}
 /** Plans are disposable derived material. Never import them into accepted history. */
 export class SceneDirector {
   private db:DatabaseSync;
@@ -171,9 +223,9 @@ export class SceneDirector {
 
     const threads = candidate.threads.map(
       value => {
-        const item = object(value);
+        const item = directorObject(value);
 
-        const id = text(item.id, 120);
+        const id = directorText(item.id, 120);
 
         if (ids.has(id))
           throw new Error('invalid_director_plan');
@@ -186,7 +238,7 @@ export class SceneDirector {
           'realized',
           'shelved'
         ].includes(
-          String(item.status)
+          directorString(item.status)
         ))
           throw new Error('invalid_director_status');
 
@@ -195,13 +247,13 @@ export class SceneDirector {
 
         const evidence = item.evidence.map(
           value => {
-            const ref = object(value);
+            const ref = directorObject(value);
 
             const source = sources.find(source => source.id === ref.sourceId && source.revision === ref.revision);
 
             const reference = references.find(source => source.id === ref.sourceId && source.revision === ref.revision);
 
-            const modelQuote = text(ref.quote, 2000);
+            const modelQuote = directorText(ref.quote, 2000);
 
             const quote = sourceQuote(source?.text ?? '', modelQuote) ?? sourceQuote(reference?.text ?? '', modelQuote);
 
@@ -221,9 +273,9 @@ export class SceneDirector {
 
         return {
           id,
-          goal: text(item.goal, 500),
-          trigger: text(item.trigger, 500),
-          proposal: text(item.proposal, 1000),
+          goal: directorText(item.goal, 500),
+          trigger: directorText(item.trigger, 500),
+          proposal: directorText(item.proposal, 1000),
           status: item.status as DirectorPlan['threads'][number]['status'],
           evidence
         };
@@ -238,22 +290,22 @@ export class SceneDirector {
 
     const npcTodos: DirectorNpcTodo[] = (candidate.npcTodos ?? [] as unknown[]).map(
       value => {
-        const item = object(value);
+        const item = directorObject(value);
 
-        const id = text(item.id, 120);
+        const id = directorText(item.id, 120);
 
-        const characterId = text(item.characterId, 200);
+        const characterId = directorText(item.characterId, 200);
 
         if (todoIds.has(id) || !state.roster.characters.some(actor => actor.id === characterId))
           throw new Error('invalid_director_todo_actor');
 
         todoIds.add(id);
 
-        const title = text(item.title, 200);
+        const title = directorText(item.title, 200);
 
-        const date = text(item.date, 10);
+        const date = directorText(item.date, 10);
 
-        const time = text(item.time, 5);
+        const time = directorText(item.time, 5);
 
         const intent = item.intent === undefined ? undefined : item.intent;
 
@@ -264,11 +316,11 @@ export class SceneDirector {
             'decline',
             'no_show'
           ].includes(
-            String(intent)
+            directorString(intent)
           ))
           throw new Error('invalid_director_todo_intent');
 
-        const dramaticReason = item.dramaticReason === undefined ? undefined : text(item.dramaticReason, 500);
+        const dramaticReason = item.dramaticReason === undefined ? undefined : directorText(item.dramaticReason, 500);
 
         if (intent === 'no_show' && !dramaticReason)
           throw new Error('invalid_director_todo_motive');
@@ -284,13 +336,13 @@ export class SceneDirector {
 
         const evidence = item.evidence.map(
           value => {
-            const ref = object(value);
+            const ref = directorObject(value);
 
             const source = sources.find(source => source.id === ref.sourceId && source.revision === ref.revision);
 
             const reference = references.find(source => source.id === ref.sourceId && source.revision === ref.revision);
 
-            const modelQuote = text(ref.quote, 2000);
+            const modelQuote = directorText(ref.quote, 2000);
 
             const quote = sourceQuote(source?.text ?? '', modelQuote) ?? sourceQuote(reference?.text ?? '', modelQuote);
 
@@ -330,17 +382,17 @@ export class SceneDirector {
 
     const agendaClaims: DirectorAgendaClaim[] | undefined = candidate.agendaClaims?.flatMap(
       value => {
-        const item = object(value);
+        const item = directorObject(value);
 
-        const characterId = text(item.characterId, 200);
+        const characterId = directorText(item.characterId, 200);
 
-        const date = item.date === undefined || item.date === null ? undefined : text(item.date, 10);
+        const date = item.date === undefined || item.date === null ? undefined : directorText(item.date, 10);
 
         const weekday = item.weekday === undefined || item.weekday === null ? undefined : item.weekday;
 
-        const startTime = text(item.startTime, 5);
+        const startTime = directorText(item.startTime, 5);
 
-        const endTime = item.endTime === null || item.endTime === undefined ? null : text(item.endTime, 5);
+        const endTime = item.endTime === null || item.endTime === undefined ? null : directorText(item.endTime, 5);
 
         if (!state.roster.characters.some(actor => actor.id === characterId)
           ||
@@ -361,7 +413,7 @@ export class SceneDirector {
             'todo',
             'commitment'
           ].includes(
-            String(item.kind)
+            directorString(item.kind)
           ))
           throw new Error('invalid_director_agenda');
 
@@ -369,7 +421,7 @@ export class SceneDirector {
 
         const reference = references.find(source => source.id === item.sourceId && source.revision === item.revision);
 
-        const modelQuote = text(item.quote, 2000);
+        const modelQuote = directorText(item.quote, 2000);
 
         const quote = sourceQuote(source?.text ?? '', modelQuote) ?? sourceQuote(reference?.text ?? '', modelQuote);
 

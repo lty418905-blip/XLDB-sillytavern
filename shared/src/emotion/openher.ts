@@ -10,6 +10,7 @@
 import { createNeural, neuralForward, neuralStep, neuralThermodynamic, validateNeuralState } from './neural.ts';
 import type { NeuralState } from './neural.ts';
 import type {EmotionEngineKey} from './engine.ts';
+import {STORY_CLOCK_MAX_MS} from '../scene/story-clock-types.ts';
 
 export const DRIVE_NAMES = [
   "connection",
@@ -69,6 +70,8 @@ export interface EmotionState {
   version: 2 | 3;
   engine?: unknown;
   updatedAtMs: number;
+  /** Input event clock in milliseconds; unlike updatedAtMs, this value may move backward. */
+  eventClockMs?: number;
   /** Last accepted Critic observation; older saved states use updatedAtMs. */
   criticContextAtMs?: number;
   frustration: DriveValues;
@@ -573,7 +576,9 @@ export function emotionAt(previous: EmotionState, nowMs: number, settings?: unkn
 }
 
 /** Advances one accepted event in milliseconds, retaining the existing numerical rules and errors.
- * Engine metadata changes only the test replay identity, never the neural or metabolic calculation. */
+ * Engine metadata changes only the test replay identity, never the neural or metabolic calculation.
+ * Keep the event calculation equivalent to advanceEmotionWithClock when its hunger hours equal elapsed hours.
+ * Only numeric values are equivalent; omitted-key identity behavior intentionally differs. */
 export function advanceEmotion(
   previous: EmotionState,
   candidate: EmotionDelta,
@@ -660,6 +665,270 @@ export function advanceEmotion(
     neural:noisy.state,
     lastReward:reward,
     ...(engineKey?.rule === 3 ? {engine: engineKey} : {}),
+  };
+}
+
+/**
+ * Separate hunger hours and local-day context for a read. Hours are finite and nonnegative; timeOfDay is in [0, 1).
+ * Invalid numeric members throw TypeError in the clock-aware entries; getters propagate their original errors.
+ */
+export interface EmotionClockProjection {
+  hungerHours: number;
+  timeOfDay: number;
+}
+
+/**
+ * Event context plus an optional finite event clock in milliseconds, including negative or fractional values.
+ * Null means omission; invalid numeric members throw TypeError and getters propagate their original errors.
+ */
+export interface EmotionClockStep extends EmotionClockProjection {
+  eventClockMs?: number | null;
+}
+
+// Unit conversion shared by both second-resolution clock entries.
+const SECONDS_PER_DAY = 86_400;
+// The engine's specified local-day origin is 06:00, measured in seconds after midnight.
+const LOCAL_DAY_ORIGIN_SECONDS = 21_600;
+
+/** Converts a stored midnight fraction in [0, 1] to a six-o'clock fraction; invalid values throw TypeError. */
+export function convertTimeOfDay(value: number): number {
+  const fraction = requireFiniteNumber(value, 'timeOfDay');
+  if (fraction < 0 || fraction > 1) throw new TypeError('invalid_emotion_time_of_day');
+
+  // Historical clock readings are whole seconds. Recover that unit so both entries encode the same instant.
+  const wholeSeconds = Math.round(fraction * SECONDS_PER_DAY);
+  if (wholeSeconds / SECONDS_PER_DAY === fraction) {
+    return ((wholeSeconds - LOCAL_DAY_ORIGIN_SECONDS + SECONDS_PER_DAY) % SECONDS_PER_DAY) / SECONDS_PER_DAY;
+  }
+
+  // Preserve finer stored fractions; the engine contract moves the origin by one quarter of a day.
+  return ((fraction - 0.25) % 1 + 1) % 1;
+}
+
+/**
+ * Reads a floating local story clock, in safe integer milliseconds from year one, without a timezone.
+ * Unknown local time returns the contract's neutral 0.5; invalid clocks or nonboolean flags throw TypeError.
+ */
+export function storyTimeOfDay(clockMs: number, timeOfDayKnown: boolean): number {
+  if (!Number.isSafeInteger(clockMs) || clockMs < 0 || clockMs > STORY_CLOCK_MAX_MS
+    || typeof timeOfDayKnown !== 'boolean') {
+    throw new TypeError('invalid_emotion_story_clock');
+  }
+  if (!timeOfDayKnown) return 0.5;
+
+  // The engine contract defines 06:00 as zero; milliseconds retain the story clock's full precision.
+  const localHours = (clockMs % 86_400_000) / 3_600_000;
+  const shiftedHours = localHours - 6;
+  return (shiftedHours < 0 ? shiftedHours + 24 : shiftedHours) / 24;
+}
+
+/**
+ * Reads Unix milliseconds in an IANA zone using the historical second-resolution clock reader.
+ * Null zones mean unknown local time (0.5); omission selects UTC. Invalid times/zones retain the reader's errors.
+ */
+export function realTimeOfDay(clockMs: number, timeZone: string | null = 'UTC'): number {
+  requireFiniteNumber(clockMs, 'clockMs');
+  if (timeZone === null) return 0.5;
+
+  const localSeconds = Math.round(timeOfDayAt(clockMs, timeZone) * SECONDS_PER_DAY);
+  // The same contract-defined six-hour origin is used in both clock domains.
+  return ((localSeconds - LOCAL_DAY_ORIGIN_SECONDS + SECONDS_PER_DAY) % SECONDS_PER_DAY) / SECONDS_PER_DAY;
+}
+
+function checkedClockStep(options: EmotionClockStep): EmotionClockStep {
+  const hungerHours = requireFiniteNumber(options.hungerHours, 'hungerHours');
+  const timeOfDay = requireFiniteNumber(options.timeOfDay, 'timeOfDay');
+  if (hungerHours < 0 || timeOfDay < 0 || timeOfDay >= 1) {
+    throw new TypeError('invalid_emotion_clock_step');
+  }
+
+  const eventClockMs = options.eventClockMs;
+  return {
+    hungerHours,
+    timeOfDay,
+    ...(eventClockMs == null ? {} : {eventClockMs: requireFiniteNumber(eventClockMs, 'eventClockMs')}),
+  };
+}
+
+function clockFrustration(
+  previous: DriveValues,
+  elapsedHours: number,
+  hungerHours: number,
+  selected: EmotionSettings,
+): DriveValues {
+  // Each independent gate retains the historical minimum interval of 0.001 hours.
+  const applyDecay = elapsedHours >= MIN_METABOLISM_HOURS;
+  const applyHunger = hungerHours >= MIN_METABOLISM_HOURS;
+  const decay = applyDecay ? Math.exp(-selected.frustrationDecayPerHour * elapsedHours) : 1;
+  const result = {...previous};
+  if (!applyDecay && !applyHunger) return result;
+
+  for (const drive of DRIVE_NAMES) {
+    let current = previous[drive];
+    if (applyDecay) current *= decay;
+    if (applyHunger && drive === 'connection') current += selected.connectionHungerPerHour * hungerHours;
+    if (applyHunger && drive === 'novelty') current += selected.noveltyHungerPerHour * hungerHours;
+    // Clamp once, after decay then hunger, to preserve the historical event's floating-point order.
+    result[drive] = clamp(current, 0, 5);
+  }
+  return result;
+}
+
+/**
+ * Applies one complete accepted event with separate hunger hours and supplied local-day context.
+ * nowMs and optional eventClockMs are finite milliseconds, including negative or fractional values;
+ * updatedAtMs never decreases. Omitting eventClockMs writes no such member. Only a null/omitted engine key inherits
+ * the previous identity; an explicit rule-two key clears engine metadata. Invalid numeric input throws TypeError;
+ * existing candidate/settings/neural errors propagate. Neither input state nor candidate is modified.
+ * Keep the event calculation equivalent to advanceEmotion when hunger hours equal elapsed hours.
+ * Only numeric values are equivalent; omitted-key identity behavior intentionally differs.
+ */
+export function advanceEmotionWithClock(
+  previous: EmotionState,
+  candidate: EmotionDelta,
+  nowMs: number,
+  options: EmotionClockStep,
+  settings?: unknown,
+  engineKey?: EmotionEngineKey | null,
+): EmotionState {
+  const step = checkedClockStep(options);
+  const delta = validateEmotionDelta(candidate);
+  delta.context.timeOfDay = step.timeOfDay;
+  const selected = emotionSettingsOf(settings);
+  const requestedNowMs = requireFiniteNumber(nowMs, 'nowMs');
+  const updatedAtMs = Math.max(previous.updatedAtMs, requestedNowMs);
+  const elapsedHours = Math.max(0, updatedAtMs - previous.updatedAtMs) / 3_600_000;
+  const metabolized = clockFrustration(previous.frustration, elapsedHours, step.hungerHours, selected);
+
+  const frustration = {} as DriveValues;
+  let beforeEventTotal = 0;
+  for (const drive of DRIVE_NAMES) {
+    const current = metabolized[drive];
+    beforeEventTotal += current;
+    frustration[drive] = clamp(
+      (current + (delta.frustrationDelta[drive] ?? 0)) * selected.eventRetainedFraction,
+      0,
+      5,
+    );
+  }
+
+  const drives = {} as DriveValues;
+  for (const drive of DRIVE_NAMES) {
+    drives[drive] = clamp(previous.neural.driveBaseline[drive] + frustration[drive] * FRUSTRATION_TO_DRIVE, 0, 1);
+  }
+
+  const relationDelta = delta.stableRelationDelta ?? {};
+  const stableRelations: StableRelations = {
+    depth: clamp(previous.stableRelations.depth + (relationDelta.depth ?? 0) * selected.stableRelationRate, 0, 1),
+    trust: clamp(previous.stableRelations.trust + (relationDelta.trust ?? 0) * selected.stableRelationRate, 0, 1),
+    valence: clamp(
+      previous.stableRelations.valence + (relationDelta.valence ?? 0) * selected.stableRelationRate,
+      -1,
+      1,
+    ),
+  };
+
+  const total = Object.values(frustration).reduce((sum, value) => sum + value, 0);
+  const reward = clamp(beforeEventTotal - total, -1, 1);
+  const synced = structuredClone(previous.neural);
+  synced.frustration = total;
+  const learned = neuralStep(
+    synced,
+    neuralContext(delta.context, stableRelations),
+    reward,
+    delta.driveSatisfaction,
+    drives,
+  );
+  const noisy = neuralThermodynamic(
+    learned.state,
+    learned.signals,
+    total,
+    selected.temperatureCoefficient,
+    selected.temperatureFloor,
+  );
+
+  let version = previous.version;
+  let engine = previous.engine;
+  if (engineKey != null) {
+    version = engineKey.rule;
+    if (engineKey.rule === 3) {
+      engine = engineKey;
+    } else {
+      engine = undefined;
+    }
+  }
+
+  return {
+    version,
+    updatedAtMs,
+    criticContextAtMs: updatedAtMs,
+    frustration,
+    drives,
+    criticContext: {...delta.context},
+    behavioralSignals: noisy.signals as BehaviorSignals,
+    stableRelations,
+    neural: noisy.state,
+    lastReward: reward,
+    ...(engine === undefined ? {} : {engine}),
+    ...(step.eventClockMs == null ? {} : {eventClockMs: step.eventClockMs}),
+  };
+}
+
+/**
+ * Projects a state at finite milliseconds with separate hunger hours and supplied context, without another event.
+ * Version, engine, eventClockMs and persisted neural/RNG state are retained. Numeric input errors throw TypeError;
+ * existing settings/neural errors propagate. The freshness window and accepted-signal freeze remain historical.
+ * A non-null eventClockMs option is rejected with TypeError; only accepted events may replace that metadata.
+ */
+export function emotionAtWithClock(
+  previous: EmotionState,
+  nowMs: number,
+  options: EmotionClockProjection,
+  settings?: unknown,
+): EmotionState {
+  const step = checkedClockStep(options);
+  if (step.eventClockMs != null) throw new TypeError('invalid_emotion_projection_event_clock');
+  const selected = emotionSettingsOf(settings);
+  const updatedAtMs = Math.max(previous.updatedAtMs, requireFiniteNumber(nowMs, 'nowMs'));
+  const hours = (updatedAtMs - previous.updatedAtMs) / 3_600_000;
+  const criticContextAtMs = previous.criticContextAtMs ?? previous.updatedAtMs;
+  const fresh = updatedAtMs - criticContextAtMs < CRITIC_CONTEXT_FRESH_MS;
+  const criticContext = {...(fresh ? previous.criticContext : STALE_CONTEXT), timeOfDay: step.timeOfDay};
+  const frustration = clockFrustration(previous.frustration, hours, step.hungerHours, selected);
+  const drives = {} as DriveValues;
+  for (const drive of DRIVE_NAMES) {
+    drives[drive] = clamp(previous.neural.driveBaseline[drive] + frustration[drive] * FRUSTRATION_TO_DRIVE, 0, 1);
+  }
+
+  if ((previous.neural.interactionCount > 0 && fresh)
+    || (previous.neural.interactionCount === 0 && hours < MIN_METABOLISM_HOURS)) {
+    return {
+      ...structuredClone(previous),
+      updatedAtMs: hours < MIN_METABOLISM_HOURS ? previous.updatedAtMs : updatedAtMs,
+      criticContext,
+      criticContextAtMs,
+      frustration,
+      drives,
+    };
+  }
+
+  // Projection may evaluate a clone, but must never advance persisted recurrent or random state.
+  const forward = neuralForward(previous.neural, neuralContext(criticContext, previous.stableRelations), drives);
+  const noisy = neuralThermodynamic(
+    forward.state,
+    forward.signals,
+    Object.values(frustration).reduce((sum, value) => sum + value, 0),
+    selected.temperatureCoefficient,
+    selected.temperatureFloor,
+  );
+  return {
+    ...structuredClone(previous),
+    updatedAtMs,
+    criticContextAtMs,
+    criticContext,
+    frustration,
+    drives,
+    behavioralSignals: noisy.signals as BehaviorSignals,
   };
 }
 

@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "e890926952d9c1710798f2c1127c5fd61f5f06f3724098fef3c85ffbe969f2f3",
+  "sourceManifestSha256": "c83a0fa49bcd85bff6a5c65b1f97cc0d66ea48438ddb9b711eb7cb70ab8091cd",
   "files": [
     {
       "file": ".gitattributes",
@@ -268,6 +268,11 @@
       "bytes": 22612
     },
     {
+      "file": "shared/src/emotion/clock.ts",
+      "sha256": "b0b238ee36834484e0d6b5e07a93c70895e254698752ff7e7cc0ade88935320f",
+      "bytes": 9432
+    },
+    {
       "file": "shared/src/emotion/contact-affect.ts",
       "sha256": "c5061c11ebdc0225aa23c641f4a265bce506f78a10d482ca9a5248a3308e114d",
       "bytes": 14599
@@ -299,8 +304,8 @@
     },
     {
       "file": "shared/src/emotion/openher.ts",
-      "sha256": "a7af15dc44601b924ba272e03404cb36153b74a7215dea1b896369cb364a4f16",
-      "bytes": 29579
+      "sha256": "bccad48f70e749546626e087252aabee49df0e48b159690ba4a0380ec36219d6",
+      "bytes": 40807
     },
     {
       "file": "shared/src/emotion/relationships.ts",
@@ -429,8 +434,8 @@
     },
     {
       "file": "shared/src/scene/address.ts",
-      "sha256": "763b0baa2aa95514b290f78e8767b3459baf30799a4faf9690ee2e5c43d8c6af",
-      "bytes": 5248
+      "sha256": "4e9aa136696da7d0ab5f7406dffe4335b6c905601f0d5d129a39953cc710bc74",
+      "bytes": 5254
     },
     {
       "file": "shared/src/scene/backup.ts",
@@ -449,8 +454,8 @@
     },
     {
       "file": "shared/src/scene/director.ts",
-      "sha256": "96d971686c0f7431fb1692539754a83452c3ddc002b09dacd03c74b2120e1dae",
-      "bytes": 37192
+      "sha256": "12ff48c8c7a43dab491567a9d0599699fe647b3c98b031ebb18365a263cc27c9",
+      "bytes": 38760
     },
     {
       "file": "shared/src/scene/emotion-scheduler.ts",
@@ -549,8 +554,8 @@
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "cd06785278fe0792ba51f52481907503f9c7d5166637e2716e00cfffbf0b2204",
-      "bytes": 145442
+      "sha256": "851391d83963fd06680a22fe767f291a8a5df4b86795b2d2604c90dbb001b03a",
+      "bytes": 160677
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
@@ -559,8 +564,8 @@
     },
     {
       "file": "shared/src/scene/story-clock-store.ts",
-      "sha256": "d82e829ce1a9f6cf1093ff0d138556b0a996cbb5731e29a7d1be4332db56e824",
-      "bytes": 33474
+      "sha256": "f9959d2be17a4c92d5a902a32b15fd87aea7611d228d7418f29b7c6e82923bcd",
+      "bytes": 35973
     },
     {
       "file": "shared/src/scene/story-clock-types.ts",
@@ -734,12 +739,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "5606630bc5f48fe900cba2b074a4cd38e0eadc7b60a68fb653f770918ffec9ac",
+      "sha256": "960adbec7811043faf23eaec0cf48d8ed06edd39a6c9d6243a906b8ef3c60202",
       "bytes": 346382
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "5035db6521183aaa7f819873e1395742c075a9e1ebdf863cd481d347ef7c7216",
+      "sha256": "e681fa355648357e8db711ae530c9aa1182af84f3e5d808d411ba8deb0e77135",
       "bytes": 351564
     }
   ]

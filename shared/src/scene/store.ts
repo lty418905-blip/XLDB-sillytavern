@@ -1,3 +1,7 @@
+import {advanceEmotionWithClock, emotionAtWithClock, storyTimeOfDay, realTimeOfDay,
+  convertTimeOfDay, validateEmotionDelta} from '../emotion/openher.ts';
+import {planEmotionClock} from '../emotion/clock.ts';
+import type {OmittedEmotionJump} from '../emotion/clock.ts';
 import {createEmotionEngineKey, emotionEngineRuleOf, recognizesEmotionSnapshot} from '../emotion/engine.ts';
 import type {EmotionEngineKey, EmotionEngineRule} from '../emotion/engine.ts';
 import { CURRENT_STORE_FORMAT, STORE_WRITER_VERSION, stampStoreFormat } from '../core/store-format.ts';
@@ -41,7 +45,8 @@ import {readWorldLedgerRows,worldLedgerOptions,storedLedgerFields,ledgerOnlySett
 import type {WorldLedgerWrite,WorldLedgerRows} from './world-ledger-store.ts';
 import type {LedgerAfter,LedgerFoldOptions,LedgerDetail} from './world-ledger.ts';
 import {StoryClockStore,storyClockLine,storyElapsedMs} from './story-clock-store.ts';
-import type {StoryClockLegacySettings,StoryClockSummary,StoryClockReading} from './story-clock-store.ts';
+import type {StoryClockLegacySettings,StoryClockSummary,StoryClockReading,
+  StoryEmotionTimeline} from './story-clock-store.ts';
 import {STORY_CLOCK_DEGRADE_REASONS} from './story-clock-types.ts';
 import type {StoryClockDegradeReason,StoryClockIssue,StoryClockSourceRef,StoryClockView} from './story-clock-types.ts';
 import {commitmentStoryClock,storyNow} from './story-clock-consumers.ts';
@@ -59,6 +64,34 @@ function hasCompletedEmotionSkip(analysis: SceneState['sources'][number]['analys
     && !analysis.emotionCandidateReadyIds?.includes(characterId)
     && analysis.skippedStages?.some(skipped => skipped.stage === 'emotion' && skipped.characterId === characterId),
   );
+}
+
+/** Selects applied events in O(sources); rebuild additionally requires the stored observation plan. */
+function emotionEvents(sources: SceneSource[], characterId: string, requirePlan = false): SceneSource[] {
+  return sources.filter(source => {
+    if (source.status !== 'accepted' || source.processing !== 'ready') return false;
+    if (requirePlan && !source.analysis?.plan) return false;
+    const characters = source.analysis?.characters;
+    return characters !== undefined && Object.hasOwn(characters, characterId)
+      && Boolean(characters[characterId]?.emotion) && !source.analysis?.emotionPendingIds?.includes(characterId);
+  });
+}
+
+/** Story actors start at their first applied event; an empty prefix starts at its read point without elapsed time. */
+function emotionInitialTime(clock: StoryEmotionTimeline | null, events: SceneSource[], createdAtMs: number): number {
+  if (clock === null) return createdAtMs;
+  const firstEvent = events[0];
+  if (firstEvent === undefined) return clock.atMs;
+  const position = clock.positions.get(JSON.stringify([firstEvent.id, firstEvent.revision]))!;
+  return clock.sources[position]!.clockMs;
+}
+
+/** Derives the local-day fraction from immutable event time or the story clock's known-time flag. */
+function emotionEventTimeOfDay(source: SceneSource, delta: unknown,
+  clockSource: StoryEmotionTimeline['sources'][number] | undefined): number {
+  if (clockSource !== undefined) return storyTimeOfDay(clockSource.clockMs, clockSource.timeOfDayKnown);
+  if (source.acceptedTimeZone != null) return realTimeOfDay(source.acceptedAtMs, source.acceptedTimeZone);
+  return convertTimeOfDay(validateEmotionDelta(delta).context.timeOfDay);
 }
 
 /** Pure fold work owned by one outer call; code-unit and entry budgets apply to the entire call. */
@@ -181,6 +214,7 @@ export class SceneAuthority {
   /** Tests and diagnostics read this count; no failed input or error is retained. */
   declare private readSharingFailures: number;
   private emotionReplayCache=new Map<string,EmotionState>();
+  readonly #emotionValidityCache = new Map<string, {stamp: string; invalidFrom: number}>();
   private savepointSequence=0;
   declare private ledgerReadFrame?: {
     key: string;
@@ -1082,6 +1116,8 @@ export class SceneAuthority {
         const fail=this.db.prepare("UPDATE scene_sources SET processing='failed' WHERE scope=? AND id=? AND status='accepted' AND processing='pending'");
         for(const sourceId of new Set(sourceIds))fail.run(scopeKey(scope),sourceId);
       }else this.db.prepare("UPDATE scene_sources SET processing='failed' WHERE scope=? AND status='accepted' AND processing='pending'").run(scopeKey(scope));
+      // Failed pending sources can introduce legacy clock movement even without an explicit clock marker.
+      if (this.#emotionEngineRule === 3) this.rebuildEmotionStatesGuarded(scope);
     });
   }
 
@@ -1406,9 +1442,35 @@ export class SceneAuthority {
     };
   }
 
+  /**
+   * Returns expression time in story milliseconds for the current rule, or the legacy Unix domain for the older rule.
+   * A real-time scope under the current rule returns null. Clock and ledger errors propagate unchanged.
+   */
+  expressionClockTime(scope: SceneScope, sources: SceneSource[], fallbackMs: number,
+    timeline?: SceneSource[]): number | null {
+    if (this.#emotionEngineRule === 3) {
+      return this.storyClock.emotionTimeline(scope, sources, timeline)?.atMs ?? null;
+    }
+    return this.legacyEmotionTime(scope, sources, fallbackMs, sources, timeline);
+  }
+
   emotion(scope: SceneScope, characterId: string, now = Date.now(), state = this.state(scope), timeline?:SceneSource[]) {
     return this.withLedgerRows(scope,()=>{
-      const {emotion,settings}=this.emotionBase(scope,characterId,state,timeline);
+      const {emotion, settings, clockProjection} = this.emotionBase(scope, characterId, state, timeline);
+      if (this.#emotionEngineRule === 3) {
+        const character = state.roster.characters.find(item => item.id === characterId)!;
+        if (!actorHasEmotion(character)) return emotion;
+        if (clockProjection !== undefined) {
+          return emotionAtWithClock(emotion, clockProjection.timeMs, clockProjection, settings);
+        }
+        const clock = this.interactions.modeOf(scope) ? this.interactions.clock(scope, now) : null;
+        const timeZone = clock === null ? null : clock.known ? clock.timeZone : null;
+        const readTimeMs = Math.max(emotion.updatedAtMs, now);
+        return emotionAtWithClock(emotion, now, {
+          hungerHours: (readTimeMs - emotion.updatedAtMs) / 3_600_000,
+          timeOfDay: realTimeOfDay(readTimeMs, timeZone),
+        }, settings);
+      }
       const clock=this.interactions.modeOf(scope)?this.interactions.clock(scope,now):null;
       return emotionAt(emotion,this.legacyEmotionTime(scope,state.sources,now,state.sources,timeline),settings,
         clock===null?this.worldSettings(scope)?.mode==='story'?'UTC':null:clock.known?clock.timeZone:null);
@@ -1422,16 +1484,95 @@ export class SceneAuthority {
   emotionBase(scope: SceneScope, characterId: string, state = this.state(scope), timeline?: SceneSource[]): {
     emotion: EmotionState;
     settings: unknown;
+    clockProjection?: {timeMs: number; hungerHours: number; timeOfDay: number};
   } {
     return this.withLedgerRows(scope, () => {
       const character = state.roster.characters.find(character => character.id === characterId);
       if (!character)
         throw new Error('invalid_scene_character');
+      if (this.#emotionEngineRule === 3) {
+        const clock = this.storyClock.emotionTimeline(scope, state.sources, timeline);
+        const engine = createEmotionEngineKey(3, clock === null ? 'real' : 'story');
+        const eligible = actorHasEmotion(character);
+        const positionOf = (source: SceneSource): number => clock!.positions.get(
+          JSON.stringify([source.id, source.revision]),
+        )!;
+        const eligibleIds = state.roster.characters.filter(actorHasEmotion).map(actor => actor.id);
+        const invalidFrom = clock === null ? Infinity
+          : this.emotionInvalidFrom(scope, state.sources, clock, engine, eligibleIds);
+        const snapshotRows = this.db.prepare(
+          "SELECT s.id,s.revision,j.value AS body FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j " +
+          "WHERE s.scope=? AND s.status='accepted' AND s.processing='ready' AND j.key=?",
+        ).all(scopeKey(scope), characterId);
+        const storedSnapshots = new Map(snapshotRows.map(snapshotRow => [
+          JSON.stringify([snapshotRow.id, snapshotRow.revision]), String(snapshotRow.body),
+        ]));
+        const events = eligible ? emotionEvents(state.sources, characterId) : [];
+        const plan = clock === null ? null : planEmotionClock({
+          characterId,
+          sources: clock.sources,
+          events: events.map(source => ({
+            sourceIndex: positionOf(source),
+            relation: source.analysis!.characters[characterId]!.emotion!.relation,
+          })),
+        });
+        const initialTime = emotionInitialTime(clock, events, state.createdAtMs);
+        let previousTime = initialTime;
+        const steps = events.map((source, index) => {
+          const clockSource = clock?.sources[positionOf(source)];
+          const eventTimeMs = clockSource?.clockMs ?? source.acceptedAtMs;
+          const delta = source.analysis!.characters[characterId]!.emotion!;
+          const elapsedHours = Math.max(0, eventTimeMs - previousTime) / 3_600_000;
+          const hungerHours = plan?.events[index]!.hungerHours ?? elapsedHours;
+          previousTime = Math.max(previousTime, eventTimeMs);
+          const timeOfDay = emotionEventTimeOfDay(source, delta, clockSource);
+          const snapshot = source.analysis?.emotionStates;
+          const body = snapshot != null && Object.hasOwn(snapshot, characterId)
+            ? JSON.stringify(snapshot[characterId]) : storedSnapshots.get(JSON.stringify([source.id, source.revision]));
+          return {
+            delta, eventTimeMs, elapsedHours, hungerHours, timeOfDay,
+            body: clock !== null && positionOf(source) >= invalidFrom ? undefined : body,
+          };
+        });
+        const replayKey = createHash('sha256').update(JSON.stringify([
+          scopeKey(scope), characterId, character.emotion, engine, initialTime,
+          steps.map(step => [step.body, step.delta, step.eventTimeMs, step.elapsedHours, step.hungerHours, step.timeOfDay]),
+        ])).digest('hex');
+        let emotion = this.emotionReplayCache.get(replayKey);
+        if (emotion === undefined) {
+          emotion = createEmotion(initialTime, character.emotion, emotionIdentitySeed(scope, characterId), engine);
+          for (const step of steps) {
+            const snapshot = step.body === undefined ? undefined : JSON.parse(step.body);
+            if (recognizesEmotionSnapshot(snapshot, 3, () => engine) && snapshot.eventClockMs === step.eventTimeMs) {
+              emotion = validateEmotionState(snapshot);
+            } else {
+              emotion = advanceEmotionWithClock(emotion, step.delta, step.eventTimeMs, {
+                hungerHours: step.hungerHours, timeOfDay: step.timeOfDay, eventClockMs: step.eventTimeMs,
+              }, character.emotion, engine);
+            }
+          }
+          // Replays and adopted snapshots use the same validated member order and numeric representation.
+          emotion = validateEmotionState(emotion);
+          this.emotionReplayCache.set(replayKey, emotion);
+          // The existing replay cache bounds retained neural states across all scopes and rules to 64 entries.
+          if (this.emotionReplayCache.size > 64) {
+            this.emotionReplayCache.delete(this.emotionReplayCache.keys().next().value!);
+          }
+        }
+        return {
+          emotion,
+          settings: character.emotion,
+          ...(clock === null ? {} : {clockProjection: {
+            timeMs: clock.atMs,
+            hungerHours: plan?.read?.hungerHours ?? 0,
+            timeOfDay: storyTimeOfDay(clock.atMs, clock.timeOfDayKnown),
+          }}),
+        };
+      }
       let engineKey: EmotionEngineKey | undefined;
       const currentKey = () => engineKey ??= createEmotionEngineKey(
         this.#emotionEngineRule, this.isStoryScope(scope) ? 'story' : 'real',
       );
-      if (this.#emotionEngineRule === 3) currentKey();
       // The ordinary state read omits neural snapshots. Read them once and fingerprint
       // the actual role history, so unrelated world-version changes keep this replay.
       const rows = this.db.prepare("SELECT s.id,s.revision,j.value AS body,CASE WHEN j.type='object' THEN json_type(j.value,'$.engine') IS NOT NULL ELSE 0 END AS hasEngine FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j WHERE s.scope=? AND s.status='accepted' AND s.processing='ready' AND j.key=?")
@@ -1479,7 +1620,7 @@ export class SceneAuthority {
       const replayKey = createHash('sha256').update(JSON.stringify(replayIdentity)).digest('hex');
       let emotion = this.emotionReplayCache.get(replayKey);
       if (!emotion) {
-        const selectedEngine = this.#emotionEngineRule === 3 ? currentKey() : undefined;
+        const selectedEngine: EmotionEngineKey | undefined = undefined;
         emotion = createEmotion(initialTime, character.emotion, emotionIdentitySeed(scope, characterId), selectedEngine);
         for (const event of events) {
           const snapshot = event.body === undefined ? undefined : event.stored ?? JSON.parse(event.body);
@@ -1500,6 +1641,91 @@ export class SceneAuthority {
           this.emotionReplayCache.delete(this.emotionReplayCache.keys().next().value!);
       }
       return { emotion, settings: character.emotion };
+    });
+  }
+
+  /**
+   * Finds the first stale source once per scope, folded prefix, eligibility set and snapshot write version.
+   * Metadata work is O(sources + eligible snapshots) on a miss; warm calls inspect only O(sources) prefix metadata.
+   * The database stamp also rejects rolled-back writes and commits made through another connection.
+   */
+  private emotionInvalidFrom(scope: SceneScope, sources: SceneSource[], clock: StoryEmotionTimeline,
+    engine: EmotionEngineKey, eligibleIds: string[]): number {
+    const eligible = new Set(eligibleIds);
+    const prefix = sources.map(source => [source.id, source.revision, source.status, source.processing,
+      Object.entries(source.analysis?.emotionStates ?? {}).filter(([actorId]) => eligible.has(actorId))
+        .map(([actorId, snapshot]) => [actorId, snapshot?.version, snapshot?.engine, snapshot?.eventClockMs]),
+    ]);
+    const stamp = JSON.stringify([clock.stamp, prefix, this.ledgerDatabaseStamp(), eligibleIds]);
+    const key = scopeKey(scope);
+    const previous = this.#emotionValidityCache.get(key);
+    if (previous?.stamp === stamp) return previous.invalidFrom;
+
+    let invalidFrom = Infinity;
+    const inspectSnapshot = (sourceId: string, revision: number, snapshot: unknown): void => {
+      const position = clock.positions.get(JSON.stringify([sourceId, revision]));
+      if (position === undefined || !recognizesEmotionSnapshot(snapshot, 3, () => engine)) return;
+      if ((snapshot as EmotionState).eventClockMs !== clock.sources[position]!.clockMs) {
+        invalidFrom = Math.min(invalidFrom, position);
+      }
+    };
+    const snapshotRows = this.db.prepare(
+      "SELECT s.id,s.revision,j.key AS actorId,json_extract(j.value,'$.version') AS version," +
+      "json_extract(j.value,'$.engine') AS engine,json_type(j.value,'$.engine') AS engineType," +
+      "json_extract(j.value,'$.eventClockMs') AS eventClockMs " +
+      "FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j " +
+      "WHERE s.scope=? AND s.status='accepted' AND s.processing='ready' AND j.type='object'",
+    ).iterate(key);
+    const ready = new Set(sources.filter(source =>
+      source.status === 'accepted' && source.processing === 'ready',
+    ).map(source => JSON.stringify([source.id, source.revision])));
+    for (const snapshotRow of snapshotRows) {
+      if (!eligible.has(String(snapshotRow.actorId))) continue;
+      const sourceId = String(snapshotRow.id);
+      const revision = Number(snapshotRow.revision);
+      if (!ready.has(JSON.stringify([sourceId, revision]))) continue;
+      inspectSnapshot(sourceId, revision, {
+        version: snapshotRow.version,
+        engine: snapshotRow.engineType === 'object' ? JSON.parse(String(snapshotRow.engine)) : snapshotRow.engine,
+        eventClockMs: snapshotRow.eventClockMs,
+      });
+    }
+    for (const source of sources) {
+      if (source.status !== 'accepted' || source.processing !== 'ready') continue;
+      for (const [actorId, snapshot] of Object.entries(source.analysis?.emotionStates ?? {})) {
+        if (eligible.has(actorId)) inspectSnapshot(source.id, source.revision, snapshot);
+      }
+    }
+    this.#emotionValidityCache.set(key, {stamp, invalidFrom});
+    // Match the replay cache's existing bound; eviction only causes a fresh metadata scan.
+    if (this.#emotionValidityCache.size > 64) {
+      this.#emotionValidityCache.delete(this.#emotionValidityCache.keys().next().value!);
+    }
+    return invalidFrom;
+  }
+
+  /**
+   * Recomputes omitted jumps for one actor or every eligible actor; results never enter storage or prompts.
+   * Real-time scopes and the historical rule return an empty list. Work per actor is O(sources + events).
+   * Source getters, clock errors and actor predicate errors propagate unchanged.
+   */
+  emotionJumpDiagnostics(scope: SceneScope, characterId?: string | null,
+    state = this.state(scope), timeline?: SceneSource[]): OmittedEmotionJump[] {
+    if (this.#emotionEngineRule !== 3) return [];
+    return this.withLedgerRows(scope, () => {
+      const clock = this.storyClock.emotionTimeline(scope, state.sources, timeline);
+      if (clock === null) return [];
+      const diagnostics: OmittedEmotionJump[] = [];
+      for (const character of state.roster.characters) {
+        if (characterId != null && character.id !== characterId || !actorHasEmotion(character)) continue;
+        const events = emotionEvents(state.sources, character.id).map(source => ({
+          sourceIndex: clock.positions.get(JSON.stringify([source.id, source.revision]))!,
+          relation: source.analysis!.characters[character.id]!.emotion!.relation,
+        }));
+        const plan = planEmotionClock({characterId: character.id, sources: clock.sources, events});
+        for (const diagnostic of plan.diagnostics) diagnostics.push(diagnostic);
+      }
+      return diagnostics;
     });
   }
 
@@ -1876,6 +2102,8 @@ export class SceneAuthority {
       ensureWorldLedgerTables(this.db);
 
       const rows = appendWorldLedgerRows(this.db, scope, state, writes);
+      // Ledger corrections can change an earlier legacy clock receipt without changing a later endpoint.
+      if (this.#emotionEngineRule === 3) this.rebuildEmotionStatesGuarded(scope);
       this.bump(scope);
       this.rebuildDerived(scope);
       return {version: state.version + 1, rows};
@@ -2379,28 +2607,57 @@ export class SceneAuthority {
       return changed;
     // Replaying one role across its history avoids an all-NPC neural map.
     // One object for the whole rebuild, every role: one settings derivation and one pass over the sources, on first use.
-    const snapshotTimes = this.storyClock.legacyTimeline(scope, state.sources);
+    const clock = this.#emotionEngineRule === 3 ? this.storyClock.emotionTimeline(scope, state.sources) : null;
+    const snapshotTimes = this.#emotionEngineRule === 2 ? this.storyClock.legacyTimeline(scope, state.sources) : null;
     for (const character of state.roster.characters.filter(item => eligibility.get(item.id) && (!onlyCharacterId || item.id === onlyCharacterId))) {
       const selectedEngine = this.#emotionEngineRule === 3 ? currentKey() : undefined;
+      const applied = selectedEngine === undefined ? [] : emotionEvents(state.sources, character.id, true);
+      const positionOf = (source: SceneSource): number => clock!.positions.get(
+        JSON.stringify([source.id, source.revision]),
+      )!;
+      const plan = clock === null ? null : planEmotionClock({
+        characterId: character.id,
+        sources: clock.sources,
+        events: applied.map(source => ({
+          sourceIndex: positionOf(source), relation: source.analysis!.characters[character.id]!.emotion!.relation,
+        })),
+      });
+      const initialTime = snapshotTimes !== null ? snapshotTimes.initial(state.createdAtMs)
+        : emotionInitialTime(clock, applied, state.createdAtMs);
+      let eventIndex = 0;
       let emotion = createEmotion(
-        snapshotTimes.initial(state.createdAtMs),
+        initialTime,
         character.emotion,
         emotionIdentitySeed(scope, character.id),
         selectedEngine,
       );
-      for (const [index, source] of state.sources.entries()) {
+      const replaySources = selectedEngine === undefined ? state.sources : applied;
+      for (const [index, source] of replaySources.entries()) {
         if (source.status !== 'accepted' || source.processing !== 'ready' || !source.analysis?.plan)
           continue;
         const candidate = source.analysis.characters[character.id];
         if (!candidate?.emotion || source.analysis.emotionPendingIds?.includes(character.id))
           continue;
-        emotion = advanceEmotion(
-          emotion,
-          candidate.emotion,
-          snapshotTimes.at(index, source.acceptedAtMs),
-          character.emotion,
-          selectedEngine,
-        );
+        if (this.#emotionEngineRule === 3) {
+          const clockSource = clock?.sources[positionOf(source)];
+          const eventTimeMs = clockSource?.clockMs ?? source.acceptedAtMs;
+          const timeOfDay = emotionEventTimeOfDay(source, candidate.emotion, clockSource);
+          emotion = advanceEmotionWithClock(emotion, candidate.emotion, eventTimeMs, {
+            hungerHours: plan?.events[eventIndex]!.hungerHours
+              ?? Math.max(0, eventTimeMs - emotion.updatedAtMs) / 3_600_000,
+            timeOfDay,
+            eventClockMs: eventTimeMs,
+          }, character.emotion, selectedEngine);
+          eventIndex += 1;
+        } else {
+          emotion = advanceEmotion(
+            emotion,
+            candidate.emotion,
+            snapshotTimes!.at(index, source.acceptedAtMs),
+            character.emotion,
+            selectedEngine,
+          );
+        }
         const body = JSON.stringify(validateEmotionState(emotion));
         const previous = this.db.prepare("SELECT j.value AS body FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j WHERE s.scope=? AND s.id=? AND j.key=?")
           .get(key, source.id, character.id) as {

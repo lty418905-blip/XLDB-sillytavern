@@ -1,3 +1,4 @@
+import type {EmotionClockSource} from '../emotion/clock.ts';
 import type {DatabaseSync} from 'node:sqlite';
 import {createHash} from 'node:crypto';
 import {scopeKey} from '../core/types.ts';
@@ -27,6 +28,20 @@ export interface StoryClockReading {
   result: StoryClockFoldResult;
   /** storyClockView(result.state, result.dayOneStartMs). */
   view: StoryClockView | null;
+}
+
+
+/**
+ * One immutable emotion reading in local story milliseconds, or null outside a story scope.
+ * Positions align accepted source/revision pairs with the complete folded order, including pending sources.
+ */
+export interface StoryEmotionTimeline {
+  /** Content fingerprint of this prefix's folded input, independent of array identity. */
+  stamp: string;
+  sources: (EmotionClockSource & {timeOfDayKnown: boolean; pending: boolean})[];
+  positions: Map<string, number>;
+  atMs: number;
+  timeOfDayKnown: boolean;
 }
 
 export interface StoryClockSummary {
@@ -293,6 +308,8 @@ export class StoryClockStore {
   private readonly db: DatabaseSync;
   private readonly deps: StoryClockDependencies;
   private folds = 0;
+  /** Fingerprints belong to immutable folded inputs and are shared across actor reads. */
+  readonly #emotionStamps = new WeakMap<StoryClockReading, string>();
   /** Sound only for an array that is never assigned to, pushed to or spliced after the call. */
   private readonly byTimeline = new WeakMap<readonly SceneSource[], {stamp: string; reading: StoryClockReading}>();
   private readonly byInput = new Map<string, StoryClockReading>();
@@ -414,6 +431,54 @@ export class StoryClockStore {
         if (!Number.isInteger(index) || index < 0 || index >= length) throw new RangeError('invalid_story_clock_index');
         return base(index, fallbackMs) + moved(index);
       }),
+    };
+  }
+
+
+  /**
+   * Reads one prefix once for emotion replay, retaining all accepted sources in final folded order.
+   * Positive cue records identify explicit movement even when their basis is estimated. Work is O(sources + advances).
+   * Null means a real-time scope; a null row timeline means omission. Clock, ledger and input getter errors propagate.
+   */
+  emotionTimeline(
+    scope: SceneScope,
+    sources: SceneSource[],
+    rowTimeline?: SceneSource[] | null,
+  ): StoryEmotionTimeline | null {
+    const reading = this.readTimeline(scope, sources, rowTimeline ?? undefined);
+    if (reading === null) return null;
+
+    let stamp = this.#emotionStamps.get(reading);
+    if (stamp === undefined) {
+      stamp = createHash('sha256').update(JSON.stringify(reading.input)).digest('hex');
+      this.#emotionStamps.set(reading, stamp);
+    }
+
+    const explicit = new Set<string>();
+    for (const record of reading.result.advances) {
+      if (record.cueKind !== null && record.deltaMs > 0) {
+        explicit.add(refKey(record.sourceId, record.revision));
+      }
+    }
+    const positions = new Map<string, number>();
+    const timeline = reading.result.sources.map((source, index) => {
+      const key = refKey(source.sourceId, source.revision);
+      positions.set(key, index);
+      return {
+        sourceId: source.sourceId,
+        revision: source.revision,
+        clockMs: source.state.atMs,
+        explicitAdvance: explicit.has(key),
+        timeOfDayKnown: source.state.timeOfDayKnown,
+        pending: source.pending,
+      };
+    });
+    return {
+      stamp,
+      sources: timeline,
+      positions,
+      atMs: timeline.at(-1)?.clockMs ?? reading.result.originAtMs,
+      timeOfDayKnown: reading.result.state.timeOfDayKnown,
     };
   }
 
