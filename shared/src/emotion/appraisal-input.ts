@@ -58,12 +58,19 @@ function pointerKey(sourceId: string, revision: number): string {
 
 function speakerFor(
   source: Pick<SceneMessage, 'role' | 'automatic' | 'speakerId'>,
-  observation: { kind?: string; actorId?: string },
+  observation: { kind?: string; actorId?: string; attributed?: true },
   subjectId: string,
   actors: ReadonlyMap<string, { name: string }>,
   userActorId: string,
 ): string {
-  if (source.role === 'user') return 'player';
+  if (source.role === 'user') {
+    if (observation.attributed !== true) return 'player';
+    const actorId = observation.actorId;
+    if (actorId === userActorId) return 'player';
+    if (actorId === subjectId) return 'self';
+    return actorId === undefined ? 'narration' : actors.get(actorId)?.name ?? 'narration';
+  }
+
   const actorId = !source.automatic && source.speakerId
     ? source.speakerId
     : observation.kind === 'heard' ? observation.actorId : undefined;

@@ -21,7 +21,7 @@ import type { EmotionState } from '../emotion/openher.ts';
 import type { Preference } from './store.ts';
 import { SceneCore } from '../scene/service.ts';
 import type {SceneAuthority} from '../scene/store.ts';
-import type {SceneCompanionPort,SceneJudge} from '../scene/extension.ts';
+import type {SceneCompanionPort} from '../scene/extension.ts';
 import type { AcceptedMessage, Configurations } from './types.ts';
 import { scopeKey } from './types.ts';
 import {createHash} from 'node:crypto';
@@ -86,8 +86,6 @@ function reattachRecallDetails(views: readonly MemoryView[], originals: readonly
 export interface CoreOptions<M extends object,C extends SceneCompanionPort> {
   /** The scene's companion port (the Agent's CompanionFlow); without it the scene uses the inert default port. */
   sceneCompanion?:(scene:SceneAuthority&M,core:Core<M,C>,models:ModelTasks)=>C;
-  /** The host's local judge (AgentJev) for schedule conflicts and emotion ranking; without it the scene uses its own. */
-  sceneJudge?:SceneJudge;
   /** Optional recall decision step; without injection all existing context behavior is preserved. */
   recallJudge?: RecallJudgeStep;
 }
@@ -108,7 +106,7 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
     this.models = models;
     this.recallJudge = options.recallJudge;
     this.scene = new SceneCore<C>(authority.scene,this as Core,models,undefined,
-      {companion:options.sceneCompanion?.(authority.scene,this,models),judge:options.sceneJudge});
+      {companion:options.sceneCompanion?.(authority.scene,this,models)});
   }
 
   async process(scope: Scope, message: AcceptedMessage, configs: Configurations) {
@@ -745,12 +743,45 @@ export class Core<M extends object = {},C extends SceneCompanionPort = SceneComp
     const context = await this.context(scope, input, configs,Date.now(),replySourceId);
     return this.respond(context,input,persona,configs,()=>this.assertVersion(scope,context.version));
   }
-  async respond(context: {context:string;version:number;memories:MemoryView[]}, input: string, persona: string,
-    configs: Configurations, assertCurrent:()=>void, publicOutput=false) {
-    const calculations = await withModelAddress({stage:'calculation'},()=>this.models.calculations(input, context.memories, configs.calculation));
+  /**
+   * Generates role prose from a versioned context and returns the answer, context version and calculations report.
+   * With publicOutput, the front model sends structured utterances; answer is their joined visible text.
+   * If a required calculation lacks information or reliable results, appends guidance against computing new numbers,
+   * skips calculation-reference validation and returns the front prose with the calculations report.
+   * With usable results, throws invalid_calculation_reference for non-operand numbers, missing result placeholders
+   * or unknown placeholders. The same error is thrown when no calculation is needed but the answer still contains
+   * a result marker. The version guard runs after the calculation call and after the front call; on paths without
+   * the insufficient branch, reference checks precede the final version guard. Model failures and stale-context
+   * errors propagate unchanged.
+   */
+  async respond(
+    context: {context: string; version: number; memories: MemoryView[]},
+    input: string,
+    persona: string,
+    configs: Configurations,
+    assertCurrent: () => void,
+    publicOutput = false
+  ) {
+    const calculations = await withModelAddress(
+      {stage: 'calculation'},
+      () => this.models.calculations(input, context.memories, configs.calculation)
+    );
     assertCurrent();
-    if (calculations.needed && (calculations.missing.length || !calculations.results.length || calculations.results.some(result => !result.ok))) {
-      return {answer:'当前数字信息不足或超出支持的计算范围，请补充明确数值、单位及运算方式；时间差还需要时区。',version:context.version,calculations};
+
+    if (calculations.needed && (
+      calculations.missing.length || !calculations.results.length || calculations.results.some(result => !result.ok)
+    )) {
+      // An incomplete report supplies no usable placeholders, so the result-reference checks do not apply.
+      const calculationGuidance = '\n本轮需要的数字计算没有可靠的脚本结果。不要自行计算，也不要写出需要计算才能得到的数字；原文已经给出的数字可以照原样复述。需要时可以按角色自己的方式表示没算清楚，或者追问。';
+      const answer = await this.models.generate(
+        persona,
+        context.context + calculationGuidance,
+        input,
+        configs.front,
+        publicOutput
+      );
+      assertCurrent();
+      return {answer, version: context.version, calculations};
     }
     const calculationContext = calculations.results.length ? '\n以下数值由确定性脚本计算。表达计算结果只能逐字使用对应占位符，不自行计算或写出结果数字。占位符已包含数值和单位，后面不要再添加单位；例如只说“结果是 [[XLDB_CALC_1]]。”：\n' + JSON.stringify(calculations.results.map((result,index)=>({placeholder:`[[XLDB_CALC_${index+1}]]`,result}))) : '';
     let answer = await this.models.generate(persona, context.context + calculationContext, input, configs.front,publicOutput);

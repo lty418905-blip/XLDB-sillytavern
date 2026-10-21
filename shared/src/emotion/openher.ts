@@ -11,6 +11,7 @@ import { createNeural, neuralForward, neuralStep, neuralThermodynamic, validateN
 import type { NeuralState } from './neural.ts';
 import type {EmotionEngineKey} from './engine.ts';
 import {STORY_CLOCK_MAX_MS} from '../scene/story-clock-types.ts';
+import {roundFourDecimals} from './decimal-round.ts';
 
 export const DRIVE_NAMES = [
   "connection",
@@ -53,6 +54,32 @@ export interface StableRelations {
   valence: number;
 }
 
+/**
+ * One person's latest input, ordered oldest to newest by its last accepted update; ids have 1 to 200 characters.
+ * Depth/trust are unitless values in [0, 1], and valence is in [-1, 1]. Saved entries must contain exactly these fields.
+ */
+export interface RelationEmaEntry extends StableRelations {
+  counterpartId: string;
+}
+
+/**
+ * A scene event's resolved person and pre-event unitless prior: depth/trust in [0, 1], valence in [-1, 1].
+ * Event entries reject invalid ids or priors with TypeError. Null means no person; omission selects core accumulation.
+ */
+export interface EmotionRelationInput {
+  counterpartId: string;
+  prior: StableRelations;
+}
+
+/** Upstream minimum unitless relation averaging weight; provisional until engine calibration is frozen. */
+export const RELATION_EMA_MINIMUM = 0.15;
+/** Upstream multiplier for the event's normalized conversation depth; provisional until calibration is frozen. */
+export const RELATION_EMA_DEPTH_WEIGHT = 0.5;
+/** Upstream maximum unitless relation averaging weight; provisional until engine calibration is frozen. */
+export const RELATION_EMA_MAXIMUM = 0.65;
+/** Provisional per-character pair limit; an overflow evicts the pair least recently updated by an event. */
+export const RELATION_EMA_LIMIT = 64;
+
 export interface EmotionDelta {
   context: CriticContext;
   frustrationDelta: Partial<DriveValues>;
@@ -63,6 +90,12 @@ export interface EmotionDelta {
   relation?: unknown;
   appraisalRule?: unknown;
   contract?: unknown;
+}
+
+/** Identifies one applied accepted source; revisions are positive safe integers and ids contain 1 to 200 characters. */
+export interface EmotionEventSource {
+  sourceId: string;
+  revision: number;
 }
 
 /** Persisted numeric and neural state; engine metadata is opaque until a storage trust decision. */
@@ -81,13 +114,17 @@ export interface EmotionState {
   stableRelations: StableRelations;
   neural: NeuralState;
   lastReward: number;
+  /** Latest applied external event, or null before an event; present only under the third rule. */
+  lastEvent?: EmotionEventSource | null;
+  /** Per-person inputs in oldest-to-newest update order; only the third rule writes this bounded array. */
+  relationEma?: RelationEmaEntry[];
   /** Creation baseline, present only under the third numerical rule. */
   baselineOrigin?: DriveValues;
   /** Dimensionless raw-reward moving mean in [-1, 1], present only under the third rule. */
   rewardMean?: number;
   /** Dimensionless centered learning reward in [-1, 1], present only under the third rule. */
   lastLearningReward?: number;
-  /** Five accepted-event frustration values before the latest event, each in [0, 5]. */
+  /** Five stored frustration values immediately before the latest event, including prior anchor metabolism. */
   previousFrustration?: DriveValues;
 }
 
@@ -542,6 +579,8 @@ export function createEmotion(
     lastReward:0,
     ...(engineKey?.rule === 3 ? {
       engine: engineKey,
+      lastEvent: null,
+      relationEma: [],
       baselineOrigin: {...neural.driveBaseline},
       rewardMean: 0,
       lastLearningReward: 0,
@@ -703,6 +742,8 @@ function advanceRuleThree({
   baselineElasticity,
   constants,
   eventClockMs,
+  eventSource,
+  relationInput,
 }: {
   previous: EmotionState;
   delta: EmotionDelta;
@@ -716,8 +757,11 @@ function advanceRuleThree({
   baselineElasticity: number | null | undefined;
   constants: EmotionRuleConstants | null | undefined;
   eventClockMs?: number | null;
+  eventSource?: EmotionEventSource | null;
+  relationInput?: EmotionRelationInput | null;
 }): EmotionState {
   const stored = ruleThreeMembers(previous as unknown as Record<string, unknown>);
+  const relations = advanceRelationInput(previous, delta, relationInput, stableRelations);
   const elasticity = unitCoefficient(baselineElasticity, BASELINE_ELASTICITY, 'baselineElasticity');
   const coefficients = ruleConstants(constants);
   // Center against the previous mean, before this event contributes to that mean.
@@ -726,7 +770,7 @@ function advanceRuleThree({
     + coefficients.rewardMeanWeight * reward;
   const learned = neuralStep(
     previous.neural,
-    neuralContext(delta.context, stableRelations),
+    neuralContext(delta.context, relations.stableRelations),
     learningReward,
     delta.driveSatisfaction,
     drives,
@@ -761,7 +805,8 @@ function advanceRuleThree({
     drives: visibleDrives,
     criticContext: {...delta.context},
     behavioralSignals: noisy.signals as BehaviorSignals,
-    stableRelations,
+    stableRelations: relations.stableRelations,
+    relationEma: relations.relationEma,
     neural: noisy.state,
     lastReward: reward,
     ...(engine === undefined ? {} : {engine}),
@@ -770,7 +815,128 @@ function advanceRuleThree({
     rewardMean,
     lastLearningReward: learningReward,
     previousFrustration: {...previous.frustration},
+    lastEvent: eventSource == null ? null : {...eventSource},
   };
+}
+
+function validRelationTriple(value: unknown): value is StableRelations {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const input = value as Record<string, unknown>;
+  return (['depth', 'trust', 'valence'] as const).every(name => Object.hasOwn(input, name)
+    && typeof input[name] === 'number' && Number.isFinite(input[name])
+    && input[name] >= (name === 'valence' ? -1 : 0) && input[name] <= 1);
+}
+
+function validCounterpartId(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 200;
+}
+
+function checkedRelationEma(value: unknown): RelationEmaEntry[] {
+  if (!Array.isArray(value) || value.length > RELATION_EMA_LIMIT) {
+    throw new Error('invalid_emotion_state_range');
+  }
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (!validRelationTriple(entry) || Reflect.ownKeys(entry).length !== 4
+      || !Object.hasOwn(entry, 'counterpartId')) {
+      throw new Error('invalid_emotion_state_range');
+    }
+    const counterpartId = (entry as RelationEmaEntry).counterpartId;
+    if (!validCounterpartId(counterpartId) || seen.has(counterpartId)) {
+      throw new Error('invalid_emotion_state_range');
+    }
+    seen.add(counterpartId);
+  }
+  return value as RelationEmaEntry[];
+}
+
+/**
+ * Reads stored relation increments without mutating history; invalid members are omitted and flagged.
+ * Null or omission returns null for legacy numeric tapes; other non-record values return an empty relation.
+ * Values are finite unitless increments, not clamped here. Work is O(toward entries); getter errors propagate.
+ */
+export function readEmotionRelation(value: unknown): {
+  relation: {toward?: {target: string; depth?: number; trust?: number}[]; valence?: number} | null;
+  invalid: boolean;
+} {
+  if (value == null) return {relation: null, invalid: false};
+  const isRecord = (candidate: unknown): candidate is Record<string, unknown> => {
+    if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) return false;
+    const prototype = Object.getPrototypeOf(candidate);
+    return prototype === Object.prototype || prototype === null;
+  };
+  if (!isRecord(value)) return {relation: {}, invalid: true};
+
+  let invalid = false;
+  const finiteMember = (record: Record<string, unknown>, name: string): number | undefined => {
+    if (!Object.hasOwn(record, name)) return undefined;
+    const member = record[name];
+    if (typeof member === 'number' && Number.isFinite(member)) return member;
+    invalid = true;
+    return undefined;
+  };
+  const relation: NonNullable<ReturnType<typeof readEmotionRelation>['relation']> = {};
+  const valence = finiteMember(value, 'valence');
+  if (valence !== undefined) relation.valence = valence;
+  if (Object.hasOwn(value, 'toward')) {
+    if (!Array.isArray(value.toward)) {
+      invalid = true;
+    } else {
+      relation.toward = [];
+      for (const item of value.toward) {
+        if (!isRecord(item) || typeof item.target !== 'string') {
+          invalid = true;
+          continue;
+        }
+        const depth = finiteMember(item, 'depth');
+        const trust = finiteMember(item, 'trust');
+        relation.toward.push({
+          target: item.target,
+          ...(depth === undefined ? {} : {depth}),
+          ...(trust === undefined ? {} : {trust}),
+        });
+      }
+    }
+  }
+  return {relation, invalid};
+}
+
+function advanceRelationInput(
+  previous: EmotionState,
+  delta: EmotionDelta,
+  input: EmotionRelationInput | null | undefined,
+  accumulated: StableRelations,
+): {stableRelations: StableRelations; relationEma: RelationEmaEntry[]} {
+  const entries = checkedRelationEma(previous.relationEma).map(entry => ({...entry}));
+  // Only the legacy core omits this argument; an explicitly absent scene person preserves the preceding input.
+  if (input === undefined) return {stableRelations: accumulated, relationEma: entries};
+  if (input === null) return {stableRelations: {...previous.stableRelations}, relationEma: entries};
+  if (!validCounterpartId(input.counterpartId) || !validRelationTriple(input.prior)) {
+    throw new TypeError('invalid_emotion_relation_input');
+  }
+
+  const relation = readEmotionRelation(delta.relation).relation;
+  const toward = relation?.toward?.find(item => item.target === input.counterpartId);
+  // Scene records clear the legacy increment; numeric tapes retain it only when the relation is absent.
+  const increment = relation == null ? delta.stableRelationDelta ?? {} : {
+    depth: toward?.depth ?? 0,
+    trust: toward?.trust ?? 0,
+    valence: relation.valence ?? 0,
+  };
+  const weight = clamp(RELATION_EMA_MINIMUM + RELATION_EMA_DEPTH_WEIGHT * delta.context.conversationDepth,
+    RELATION_EMA_MINIMUM, RELATION_EMA_MAXIMUM);
+  const oldIndex = entries.findIndex(entry => entry.counterpartId === input.counterpartId);
+  const old = oldIndex < 0 ? input.prior : entries[oldIndex]!;
+  const stableRelations = {} as StableRelations;
+  for (const name of ['depth', 'trust', 'valence'] as const) {
+    const posterior = clamp(input.prior[name] + requireFiniteNumber(increment[name] ?? 0, 'relation increment'),
+      name === 'valence' ? -1 : 0, 1);
+    stableRelations[name] = roundFourDecimals(weight * posterior + (1 - weight) * old[name]);
+  }
+  if (oldIndex >= 0) entries.splice(oldIndex, 1);
+  entries.push({counterpartId: input.counterpartId, ...stableRelations});
+  if (entries.length > RELATION_EMA_LIMIT) entries.shift();
+  return {stableRelations, relationEma: entries};
 }
 
 // A boolean selector leaves the historical metadata tail's type analysis and bytes intact.
@@ -778,10 +944,30 @@ function requestsRuleThree(engineKey: EmotionEngineKey | undefined): boolean {
   return engineKey?.rule === 3;
 }
 
+/**
+ * Accumulates a validated relation delta at a unitless rate, returning a detached bounded relation triple.
+ * Depth and trust retain their normalized [0, 1] ranges; valence retains its signed [-1, 1] range.
+ * Callers supply validated state, delta and settings; this arithmetic helper performs no parsing or mutation.
+ */
+export function accumulateStableRelations(
+  previous: StableRelations,
+  delta: EmotionDelta['stableRelationDelta'],
+  stableRelationRate: number,
+): StableRelations {
+  const relationDelta = delta ?? {};
+  return {
+    depth: clamp(previous.depth + (relationDelta.depth ?? 0) * stableRelationRate, 0, 1),
+    trust: clamp(previous.trust + (relationDelta.trust ?? 0) * stableRelationRate, 0, 1),
+    valence: clamp(previous.valence + (relationDelta.valence ?? 0) * stableRelationRate, -1, 1),
+  };
+}
+
 /** Advances one accepted event in milliseconds; historical rule 2 retains its exact numerical behavior.
  * Rule 3 centers learning rewards and evolves baselines. Optional elasticity/constants are unit coefficients;
  * null or omission selects defaults, invalid coefficients throw TypeError, and invalid third-rule members throw
  * the existing state reward/range errors. No random draws are added outside the kernel.
+ * An omitted/null event source clears the third-rule pointer, since this event has no attributable source.
+ * An omitted relation input selects legacy core accumulation; scene callers must pass a pair or explicit null.
  * Keep the event calculation equivalent to advanceEmotionWithClock when its hunger hours equal elapsed hours.
  * Only numeric values are equivalent; omitted-key identity behavior intentionally differs. */
 export function advanceEmotion(
@@ -792,6 +978,8 @@ export function advanceEmotion(
   engineKey?: EmotionEngineKey,
   baselineElasticity?: number | null,
   constants?: EmotionRuleConstants | null,
+  eventSource?: EmotionEventSource | null,
+  relationInput?: EmotionRelationInput | null,
 ): EmotionState {
   const delta = validateEmotionDelta(candidate);
   const selected = emotionSettingsOf(settings);
@@ -830,24 +1018,11 @@ export function advanceEmotion(
     );
   }
 
-  const relationDelta = delta.stableRelationDelta ?? {};
-  const stableRelations: StableRelations = {
-    depth: clamp(
-      previous.stableRelations.depth + (relationDelta.depth ?? 0) * selected.stableRelationRate,
-      0,
-      1,
-    ),
-    trust: clamp(
-      previous.stableRelations.trust + (relationDelta.trust ?? 0) * selected.stableRelationRate,
-      0,
-      1,
-    ),
-    valence: clamp(
-      previous.stableRelations.valence + (relationDelta.valence ?? 0) * selected.stableRelationRate,
-      -1,
-      1,
-    ),
-  };
+  const stableRelations = accumulateStableRelations(
+    previous.stableRelations,
+    delta.stableRelationDelta,
+    selected.stableRelationRate,
+  );
 
   const total=Object.values(frustration).reduce((a,b)=>a+b,0);
   // Upstream reward is reduction in metabolism frustration, never a model's
@@ -866,6 +1041,8 @@ export function advanceEmotion(
       engine: engineKey,
       baselineElasticity,
       constants,
+      eventSource,
+      relationInput,
     });
   }
   const synced=structuredClone(previous.neural);
@@ -997,11 +1174,48 @@ function clockFrustration(
 }
 
 /**
+ * Advances a third-rule state by time alone, using finite milliseconds and independently supplied hunger hours.
+ * Preserves all event, neural, random and relationship members; returns a detached state without modifying input.
+ * Invalid versions or clock values throw TypeError. Null event clocks mean omission; time never moves backward.
+ */
+export function advanceEmotionAnchor(
+  previous: EmotionState,
+  nowMs: number,
+  options: EmotionClockStep,
+  settings?: unknown,
+  engineKey?: EmotionEngineKey | null,
+): EmotionState {
+  if (previous.version !== 3 || (engineKey != null && engineKey.rule !== 3)) {
+    throw new TypeError('invalid_emotion_anchor_rule');
+  }
+  const step = checkedClockStep(options);
+  const selected = emotionSettingsOf(settings);
+  const updatedAtMs = Math.max(previous.updatedAtMs, requireFiniteNumber(nowMs, 'nowMs'));
+  const elapsedHours = (updatedAtMs - previous.updatedAtMs) / 3_600_000;
+  const frustration = clockFrustration(previous.frustration, elapsedHours, step.hungerHours, selected);
+  const drives = {} as DriveValues;
+  for (const drive of DRIVE_NAMES) {
+    drives[drive] = clamp(previous.neural.driveBaseline[drive] + frustration[drive] * FRUSTRATION_TO_DRIVE, 0, 1);
+  }
+
+  // An anchor has no judgment: only time, metabolism and visible drives are replaced.
+  return {
+    ...structuredClone(previous),
+    updatedAtMs,
+    frustration,
+    drives,
+    ...(step.eventClockMs == null ? {} : {eventClockMs: step.eventClockMs}),
+  };
+}
+
+/**
  * Applies one complete accepted event with separate hunger hours and supplied local-day context.
  * nowMs and optional eventClockMs are finite milliseconds, including negative or fractional values;
  * updatedAtMs never decreases. Omitting eventClockMs writes no such member. Only a null/omitted engine key inherits
  * the previous identity; an explicit rule-two key clears engine metadata. Invalid numeric input throws TypeError;
  * existing candidate/settings/neural errors propagate. Neither input state nor candidate is modified.
+ * An omitted/null event source clears the third-rule pointer because the event has no attributable source.
+ * An omitted relation input selects legacy core accumulation; scene callers must pass a pair or explicit null.
  * Keep the event calculation equivalent to advanceEmotion when hunger hours equal elapsed hours.
  * Only numeric values are equivalent; omitted-key identity behavior intentionally differs.
  */
@@ -1014,6 +1228,8 @@ export function advanceEmotionWithClock(
   engineKey?: EmotionEngineKey | null,
   baselineElasticity?: number | null,
   constants?: EmotionRuleConstants | null,
+  eventSource?: EmotionEventSource | null,
+  relationInput?: EmotionRelationInput | null,
 ): EmotionState {
   const step = checkedClockStep(options);
   const delta = validateEmotionDelta(candidate);
@@ -1041,16 +1257,11 @@ export function advanceEmotionWithClock(
     drives[drive] = clamp(previous.neural.driveBaseline[drive] + frustration[drive] * FRUSTRATION_TO_DRIVE, 0, 1);
   }
 
-  const relationDelta = delta.stableRelationDelta ?? {};
-  const stableRelations: StableRelations = {
-    depth: clamp(previous.stableRelations.depth + (relationDelta.depth ?? 0) * selected.stableRelationRate, 0, 1),
-    trust: clamp(previous.stableRelations.trust + (relationDelta.trust ?? 0) * selected.stableRelationRate, 0, 1),
-    valence: clamp(
-      previous.stableRelations.valence + (relationDelta.valence ?? 0) * selected.stableRelationRate,
-      -1,
-      1,
-    ),
-  };
+  const stableRelations = accumulateStableRelations(
+    previous.stableRelations,
+    delta.stableRelationDelta,
+    selected.stableRelationRate,
+  );
 
   const total = Object.values(frustration).reduce((sum, value) => sum + value, 0);
   const reward = clamp(beforeEventTotal - total, -1, 1);
@@ -1068,6 +1279,8 @@ export function advanceEmotionWithClock(
       baselineElasticity,
       constants,
       eventClockMs: step.eventClockMs,
+      eventSource,
+      relationInput,
     });
   }
   const synced = structuredClone(previous.neural);
@@ -1177,6 +1390,23 @@ export function validateEmotionState(value: unknown): EmotionState {
   const input = requireRecord(value, 'emotionState');
   if (input.version !== 2 && input.version !== 3) throw new Error('invalid_emotion_state_version');
   const thirdRule = input.version === 3 ? ruleThreeMembers(input) : {};
+  if (input.version === 3) checkedRelationEma(input.relationEma);
+  if (input.version === 3 && !Object.hasOwn(input, 'lastEvent')) {
+    throw new Error('invalid_emotion_state_range');
+  }
+  if (input.version === 3 && input.lastEvent !== null) {
+    const pointer = input.lastEvent;
+    if (pointer === undefined || typeof pointer !== 'object' || Array.isArray(pointer)
+      || Reflect.ownKeys(pointer).length !== 2 || !Object.hasOwn(pointer, 'sourceId')
+      || !Object.hasOwn(pointer, 'revision')) {
+      throw new Error('invalid_emotion_state_range');
+    }
+    const event = pointer as Record<string, unknown>;
+    if (typeof event.sourceId !== 'string' || event.sourceId.length < 1 || event.sourceId.length > 200
+      || !Number.isSafeInteger(event.revision) || (event.revision as number) < 1) {
+      throw new Error('invalid_emotion_state_range');
+    }
+  }
   const checked = (source: unknown, keys: readonly string[], minimum: number, maximum: number) => {
     const record = requireRecord(source, 'emotionState.fields');
     return Object.fromEntries(keys.map(key => {

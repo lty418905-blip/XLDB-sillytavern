@@ -131,11 +131,3 @@ export function defaultCompanionPort(scene:SceneAuthority):SceneCompanionPort {
   };
 }
 
-/**
- * Local judge for the director's anonymous schedule conflicts and the Tavern emotion ranking. A host that owns an
- * AgentJev worker passes it, so the scene never starts a second worker.
- */
-export interface SceneJudge {
-  identity():string;
-  evaluate(payload:unknown):Promise<unknown>;
-}

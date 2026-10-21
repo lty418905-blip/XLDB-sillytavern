@@ -6,6 +6,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createEmotion, advanceEmotion, emotionAt, validateEmotionState } from '../emotion/openher.ts';
+import {accumulateStableRelations, advanceEmotionAnchor, convertTimeOfDay, emotionSettingsOf, validateEmotionDelta}
+  from '../emotion/openher.ts';
+import {isCoreOwnEmotionLine} from '../scene/emotion-own-line.ts';
 import type { EmotionState } from '../emotion/openher.ts';
 import { projectMemories } from '../memory/access.ts';
 import {retentionSnapshot} from '../memory/retention.ts';
@@ -319,6 +322,29 @@ export class Authority<M extends object = {}> {
     this.db.prepare('INSERT OR IGNORE INTO scopes(key,scope,created,emotion) VALUES(?,?,?,?)')
       .run(scopeKey(scope), JSON.stringify(scope), now, JSON.stringify(emotion));
   }
+
+  /** Folds one legacy record in Unix milliseconds; own speech changes only time and cumulative relations. */
+  private advanceStoredEmotion(previous: EmotionState, source: Source, payload: Analysis,
+    engineKey: EmotionEngineKey | undefined): EmotionState {
+    if (engineKey?.rule !== 3 || !isCoreOwnEmotionLine(source)) {
+      return advanceEmotion(previous, payload.emotion, source.acceptedAtMs, undefined, engineKey,
+        undefined, undefined, {sourceId: source.id, revision: source.revision});
+    }
+    const delta = validateEmotionDelta(payload.emotion);
+    const settings = emotionSettingsOf();
+    const emotion = advanceEmotionAnchor(previous, source.acceptedAtMs, {
+      hungerHours: Math.max(0, source.acceptedAtMs - previous.updatedAtMs) / 3_600_000,
+      timeOfDay: convertTimeOfDay(delta.context.timeOfDay),
+    }, settings, engineKey);
+    // The legacy scope has one cumulative relation. Own speech still contributes this stored numerical delta.
+    emotion.stableRelations = accumulateStableRelations(
+      previous.stableRelations,
+      delta.stableRelationDelta,
+      settings.stableRelationRate,
+    );
+    return emotion;
+  }
+
   /** Replays committed records in source order without modifying projections, versions, or stored snapshots. */
   private replayEmotion(scope: Scope): EmotionState {
     const row = this.db.prepare('SELECT created FROM scopes WHERE key=?').get(scopeKey(scope)) as {created: number};
@@ -327,7 +353,7 @@ export class Authority<M extends object = {}> {
     for (const source of this.sources(scope)) {
       if (source.status !== 'committed' || !source.payload) continue;
       const payload = JSON.parse(source.payload) as Analysis;
-      emotion = advanceEmotion(emotion, payload.emotion, source.acceptedAtMs, undefined, engineKey);
+      emotion = this.advanceStoredEmotion(emotion, source, payload, engineKey);
     }
     return emotion;
   }
@@ -426,7 +452,7 @@ export class Authority<M extends object = {}> {
         );
       }
       // Only recorded accepted deltas are replayed; reads and model upgrades do not reinterpret history.
-      emotion = advanceEmotion(emotion, payload.emotion, source.acceptedAtMs, undefined, engineKey);
+      emotion = this.advanceStoredEmotion(emotion, source, payload, engineKey);
     }
     for (const preference of preferences.values()) {
       this.db.prepare('INSERT INTO preferences VALUES(?,?,?,?,?)')

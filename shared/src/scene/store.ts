@@ -1,6 +1,15 @@
 import {advanceEmotionWithClock, emotionAtWithClock, storyTimeOfDay, realTimeOfDay,
-  convertTimeOfDay, validateEmotionDelta} from '../emotion/openher.ts';
+  convertTimeOfDay, validateEmotionDelta, readEmotionRelation} from '../emotion/openher.ts';
 import {planEmotionClock} from '../emotion/clock.ts';
+import {advanceEmotionAnchor} from '../emotion/openher.ts';
+import {createEmotionLineResolver, isOwnEmotionLine} from './emotion-own-line.ts';
+import type {EmotionLineResolver} from './emotion-own-line.ts';
+import {
+  selectEmotionCounterpart, storedEmotionCounterpart, withEmotionCounterpart, withoutEmotionCounterpart,
+} from './emotion-counterpart.ts';
+import {createRelationshipFold} from '../emotion/relationships.ts';
+import {recordStage, currentModelAddress} from '../core/runtime-log.ts';
+import type {EmotionRelationInput} from '../emotion/openher.ts';
 import type {OmittedEmotionJump} from '../emotion/clock.ts';
 import {createEmotionEngineKey, emotionEngineRuleOf, recognizesEmotionSnapshot} from '../emotion/engine.ts';
 import type {EmotionEngineKey, EmotionEngineRule} from '../emotion/engine.ts';
@@ -23,7 +32,7 @@ import {foldCue, foldedCues, TRACE_RECORD_LIMIT, TRACE_STRONG_CUES} from '../mem
 import { projectMemories } from '../memory/access.ts';
 import {retentionSnapshot} from '../memory/retention.ts';
 import { emotionIdentitySeed, npcScope } from './types.ts';
-import type { SceneScope, SceneRoster, SceneMessage, SceneSource, SceneState, SceneAnalysis, SceneWriteGuard, SceneProfileCandidate, SceneRecall } from './types.ts';
+import type { SceneScope, SceneRoster, SceneMessage, SceneSource, SceneState, SceneAnalysis, SceneWriteGuard, SceneProfileCandidate, SceneRecall, SceneCharacter } from './types.ts';
 import {foldWorldState,foldWorldStateRunning,projectWorldState} from './world-state.ts';
 import type {WorldFoldResult,WorldProjection,WorldRunningStep,WorldSettings,WorldSourceEffects} from './world-state.ts';
 import {SceneLifecycle,MESSAGE_CHECKPOINT_REASON} from './lifecycle.ts';
@@ -66,18 +75,114 @@ function hasCompletedEmotionSkip(analysis: SceneState['sources'][number]['analys
   );
 }
 
+/** The staged own-speech rule turns accepted speech into time anchors instead of appraisal events. */
+const OWN_SPEECH_ANCHOR_RULE: EmotionEngineRule = 3;
+
 /** Selects applied events in O(sources); rebuild additionally requires the stored observation plan. */
-function emotionEvents(sources: SceneSource[], characterId: string, requirePlan = false): SceneSource[] {
+function emotionEvents(
+  sources: SceneSource[],
+  characterId: string,
+  requirePlan: boolean,
+  rule: EmotionEngineRule,
+  resolveOwnLine?: EmotionLineResolver,
+): SceneSource[] {
   return sources.filter(source => {
     if (source.status !== 'accepted' || source.processing !== 'ready') return false;
     if (requirePlan && !source.analysis?.plan) return false;
+    if (rule === OWN_SPEECH_ANCHOR_RULE && isOwnEmotionLine(source, characterId, resolveOwnLine)) return false;
     const characters = source.analysis?.characters;
     return characters !== undefined && Object.hasOwn(characters, characterId)
       && Boolean(characters[characterId]?.emotion) && !source.analysis?.emotionPendingIds?.includes(characterId);
   });
 }
 
-/** Story actors start at their first applied event; an empty prefix starts at its read point without elapsed time. */
+/** Selects interleaved external events and own-speech anchors in O(sources), without altering stored candidates. */
+function emotionReplaySteps(sources: SceneSource[], characterId: string, requirePlan = false,
+  resolveOwnLine?: EmotionLineResolver) {
+  const events = emotionEvents(sources, characterId, requirePlan, OWN_SPEECH_ANCHOR_RULE, resolveOwnLine);
+  const anchors = sources.filter(source => source.status === 'accepted' && source.processing === 'ready'
+    && (!requirePlan || source.analysis?.plan) && isOwnEmotionLine(source, characterId, resolveOwnLine));
+  const applicable = new Set([...events, ...anchors]);
+  return {events, anchors, sources: sources.filter(source => applicable.has(source))};
+}
+
+// The process retains at most 1,024 diagnosed record versions, evicting the oldest insertion first.
+const invalidEmotionRecords = new Set<string>();
+
+/** Records a corrupt stored appraisal once per scoped source/content version, actor and error code. */
+function recordInvalidEmotion(scope: SceneScope, source: SceneSource, characterId: string,
+  delta: unknown, code: string): void {
+  // A read without a diagnostic sink must not suppress a later observable diagnostic.
+  if (currentModelAddress() === null) return;
+  const version = createHash('sha256').update(JSON.stringify(delta)).digest('hex');
+  const key = JSON.stringify([scopeKey(scope), source.id, source.revision, version, characterId, code]);
+  if (invalidEmotionRecords.has(key)) return;
+  invalidEmotionRecords.add(key);
+  if (invalidEmotionRecords.size > 1024) {
+    invalidEmotionRecords.delete(invalidEmotionRecords.values().next().value!);
+  }
+  recordStage(code, {stage: 'emotion', sourceId: source.id, revision: source.revision, characterId});
+}
+
+/** Builds pre-event relation inputs in one source/candidate pass; pending candidates still enter the same fold. */
+function emotionRelationInputs(scope: SceneScope, sources: SceneSource[], events: SceneSource[],
+  character: SceneCharacter, roster: SceneRoster): Map<SceneSource, EmotionRelationInput | null> {
+  const eventSet = new Set(events);
+  const fold = createRelationshipFold(character.id, emotionSettingsOf(character.emotion).stableRelationRate);
+  const inputs = new Map<SceneSource, EmotionRelationInput | null>();
+  for (const source of sources) {
+    if (eventSet.has(source)) {
+      const delta = source.analysis!.characters[character.id]!.emotion!;
+      if (readEmotionRelation(delta.relation).invalid) {
+        recordInvalidEmotion(scope, source, character.id, delta, 'invalid_emotion_relation');
+      }
+      const counterpartId = storedEmotionCounterpart(
+        delta, source, source.analysis?.plan, character.id, roster, actorHasEmotion,
+        () => recordInvalidEmotion(scope, source, character.id, delta, 'invalid_emotion_counterpart'),
+      );
+      inputs.set(source, counterpartId === null ? null : {
+        counterpartId,
+        prior: fold.get(counterpartId)?.relations ?? {depth: 0, trust: 0, valence: 0},
+      });
+    }
+    // A source's candidates affect the next event, never its own prior.
+    fold.append(source);
+  }
+  return inputs;
+}
+
+/** Prefix fingerprints bind snapshots to every event input without persisting derived metadata. */
+function emotionSnapshotHeader(scope: SceneScope, character: SceneCharacter, engine: EmotionEngineKey,
+  initialTime: number) {
+  return createHash('sha256').update(JSON.stringify([
+    scopeKey(scope), character.id, character.emotion, engine, initialTime,
+  ]));
+}
+
+/** Appends one event or anchor in constant work beyond the candidate payload and returns its prefix digest. */
+function appendEmotionSnapshotInput(hash: ReturnType<typeof createHash>, input: {
+  source: SceneSource;
+  anchor: boolean;
+  delta: unknown;
+  relationInput: EmotionRelationInput | null;
+  eventTimeMs: number;
+  hungerHours: number;
+  timeOfDay: number;
+}): string {
+  hash.update(JSON.stringify([
+    input.source.id,
+    input.source.revision,
+    input.anchor,
+    input.delta,
+    input.relationInput,
+    input.eventTimeMs,
+    input.hungerHours,
+    input.timeOfDay,
+  ]));
+  return hash.copy().digest('hex');
+}
+
+/** Story actors start at their first event or anchor; real-time actors retain the scope creation instant. */
 function emotionInitialTime(clock: StoryEmotionTimeline | null, events: SceneSource[], createdAtMs: number): number {
   if (clock === null) return createdAtMs;
   const firstEvent = events[0];
@@ -210,10 +315,15 @@ function replaceObjectMember(objectText: string, members: readonly string[], bod
 export class SceneAuthority {
   private db: DatabaseSync;
   readonly #emotionEngineRule: EmotionEngineRule;
+  /** Read-only authorship eligibility in constant work; actor eligibility is checked separately. */
+  readonly shouldAppraiseEmotion: (source: SceneMessage, characterId: string,
+    resolveOwnLine?: EmotionLineResolver) => boolean;
   declare private readonly readSteps: AsyncLocalStorage<SceneReadStep>;
   /** Tests and diagnostics read this count; no failed input or error is retained. */
   declare private readSharingFailures: number;
   private emotionReplayCache=new Map<string,EmotionState>();
+  // Retain one pre-anchor prefix per actor/scope; cold or evicted entries replay from source facts.
+  private emotionSnapshotInputs = new Map<string, Map<string, string>>();
   readonly #emotionValidityCache = new Map<string, {stamp: string; invalidFrom: number}>();
   private savepointSequence=0;
   declare private ledgerReadFrame?: {
@@ -263,6 +373,9 @@ export class SceneAuthority {
     emotionEngineRule?: EmotionEngineRule
   ) {
     this.#emotionEngineRule = emotionEngineRuleOf(emotionEngineRule);
+    this.shouldAppraiseEmotion = (source, characterId, resolveOwnLine) => this.#emotionEngineRule !== 3
+      || !isOwnEmotionLine(source, characterId, resolveOwnLine);
+    Object.defineProperty(this, 'shouldAppraiseEmotion', {writable: false, configurable: false, enumerable: false});
     Object.defineProperties(this, {
       readSteps: { value: new AsyncLocalStorage<SceneReadStep>() },
       readSharingFailures: { value: 0, writable: true },
@@ -929,12 +1042,14 @@ export class SceneAuthority {
   completeDeferredEmotion(scope:SceneScope,foregroundCharacterId?:string):boolean {
     return this.transaction(()=>{
       const state=this.state(scope),blocked=new Set<string>();
+      const resolveOwnLine = createEmotionLineResolver(state.sources, state.roster);
       let completed=false;
       for(const source of state.sources){
         if(source.status!=='accepted'||source.processing!=='ready'||!source.analysis?.plan)continue;
         for(const id of source.analysis.emotionPendingIds??[]){
           const actor=state.roster.characters.find(character=>character.id===id);
           if(!actor||!actorHasEmotion(actor))continue;
+          if (!this.shouldAppraiseEmotion(source, id, resolveOwnLine)) continue;
           if(foregroundCharacterId&&id!==foregroundCharacterId)continue;
           if(blocked.has(id))continue;
           // A terminal skip keeps its stored marker but cannot block later prepared experiences.
@@ -970,6 +1085,8 @@ export class SceneAuthority {
       const source=state.sources.find(item=>item.id===sourceId&&item.revision===revision&&item.status==='accepted'
         &&item.processing==='ready'&&item.analysis?.plan&&item.analysis.emotionPendingIds?.includes(characterId)
         &&!item.analysis.emotionCandidateReadyIds?.includes(characterId));
+      const resolveOwnLine = createEmotionLineResolver(state.sources, state.roster);
+      if (source && !this.shouldAppraiseEmotion(source, characterId, resolveOwnLine)) return;
       if(!source?.analysis?.plan||!source.analysis.characters[characterId])throw new Error('context_changed_retry');
       const relationships=validateRelationships(result.relationships,
         relationshipValidationContext(source,source.analysis.plan,state.roster,characterId));
@@ -977,8 +1094,12 @@ export class SceneAuthority {
         stampStoreFormat(this.db, CURRENT_STORE_FORMAT, STORE_WRITER_VERSION);
       }
       const prior=source.analysis.characters[characterId]!;
+      const counterpartId = selectEmotionCounterpart(
+        source, source.analysis.plan, characterId, state.roster, actorHasEmotion,
+      );
+      const emotion = withEmotionCounterpart({...result.emotion, stableRelationDelta: {}}, counterpartId);
       const analysis={...source.analysis,characters:{...source.analysis.characters,
-        [characterId]:{...prior,emotion:{...result.emotion,stableRelationDelta:{}},
+        [characterId]:{...prior,emotion,
           ...(relationships.length?{relationships}:{})}},
         emotionCandidateReadyIds:[...(source.analysis.emotionCandidateReadyIds??[]),characterId]};
       this.db.prepare("UPDATE scene_sources SET analysis=? WHERE scope=? AND id=? AND revision=? AND status='accepted' AND processing='ready'")
@@ -1499,7 +1620,7 @@ export class SceneAuthority {
         )!;
         const eligibleIds = state.roster.characters.filter(actorHasEmotion).map(actor => actor.id);
         const invalidFrom = clock === null ? Infinity
-          : this.emotionInvalidFrom(scope, state.sources, clock, engine, eligibleIds);
+          : this.emotionInvalidFrom(scope, state.sources, clock, engine, eligibleIds, state.roster);
         const snapshotRows = this.db.prepare(
           "SELECT s.id,s.revision,j.value AS body FROM scene_sources s,json_each(s.analysis,'$.emotionStates') j " +
           "WHERE s.scope=? AND s.status='accepted' AND s.processing='ready' AND j.key=?",
@@ -1507,33 +1628,65 @@ export class SceneAuthority {
         const storedSnapshots = new Map(snapshotRows.map(snapshotRow => [
           JSON.stringify([snapshotRow.id, snapshotRow.revision]), String(snapshotRow.body),
         ]));
-        const events = eligible ? emotionEvents(state.sources, characterId) : [];
+        const resolveOwnLine = createEmotionLineResolver(state.sources, state.roster);
+        const replay = eligible ? emotionReplaySteps(state.sources, characterId, false, resolveOwnLine)
+          : {events: [], anchors: [], sources: []};
+        const relationInputs = emotionRelationInputs(scope, state.sources, replay.events, character, state.roster);
+        const anchorSet = new Set(replay.anchors);
         const plan = clock === null ? null : planEmotionClock({
           characterId,
           sources: clock.sources,
-          events: events.map(source => ({
+          events: replay.events.map(source => ({
             sourceIndex: positionOf(source),
             relation: source.analysis!.characters[characterId]!.emotion!.relation,
           })),
+          anchorIndices: replay.anchors.map(positionOf),
         });
-        const initialTime = emotionInitialTime(clock, events, state.createdAtMs);
+        const hungerByIndex = new Map([...plan?.events ?? [], ...plan?.anchors ?? []]
+          .map(step => [step.sourceIndex, step.hungerHours]));
+        const initialTime = emotionInitialTime(clock, replay.sources, state.createdAtMs);
+        const snapshotInputs = this.emotionSnapshotInputs.get(JSON.stringify([scopeKey(scope), characterId]));
+        const snapshotHash = emotionSnapshotHeader(scope, character, engine, initialTime);
         let previousTime = initialTime;
-        const steps = events.map((source, index) => {
+        let seenAnchor = false;
+        let knownSnapshotThrough = -1;
+        const steps = replay.sources.map((source, index) => {
           const clockSource = clock?.sources[positionOf(source)];
           const eventTimeMs = clockSource?.clockMs ?? source.acceptedAtMs;
-          const delta = source.analysis!.characters[characterId]!.emotion!;
+          const anchor = anchorSet.has(source);
+          seenAnchor ||= anchor;
+          const delta = anchor ? undefined : source.analysis!.characters[characterId]!.emotion!;
           const elapsedHours = Math.max(0, eventTimeMs - previousTime) / 3_600_000;
-          const hungerHours = plan?.events[index]!.hungerHours ?? elapsedHours;
+          const hungerHours = clock === null ? elapsedHours : hungerByIndex.get(positionOf(source))!;
           previousTime = Math.max(previousTime, eventTimeMs);
-          const timeOfDay = emotionEventTimeOfDay(source, delta, clockSource);
+          const timeOfDay = anchor && clockSource === undefined
+            ? realTimeOfDay(source.acceptedAtMs, source.acceptedTimeZone ?? null)
+            : emotionEventTimeOfDay(source, delta, clockSource);
           const snapshot = source.analysis?.emotionStates;
-          const body = snapshot != null && Object.hasOwn(snapshot, characterId)
+          const snapshotBody = snapshot != null && Object.hasOwn(snapshot, characterId)
             ? JSON.stringify(snapshot[characterId]) : storedSnapshots.get(JSON.stringify([source.id, source.revision]));
+          const relationInput = relationInputs.get(source) ?? null;
+          const fingerprint = seenAnchor ? undefined : appendEmotionSnapshotInput(snapshotHash, {
+            source, anchor, delta, relationInput, eventTimeMs, hungerHours, timeOfDay,
+          });
+          const knownInputs = fingerprint !== undefined
+            && snapshotInputs?.get(JSON.stringify([source.id, source.revision])) === fingerprint;
+          if (knownInputs) knownSnapshotThrough = index;
           return {
-            delta, eventTimeMs, elapsedHours, hungerHours, timeOfDay,
-            body: clock !== null && positionOf(source) >= invalidFrom ? undefined : body,
+            source, anchor, delta, eventTimeMs, elapsedHours, hungerHours, timeOfDay, relationInput,
+            // Only matching prefixes before the first anchor can supply a replay result.
+            adoptableBody: !knownInputs || seenAnchor || (clock !== null && positionOf(source) >= invalidFrom)
+              ? undefined : snapshotBody,
+            // Even without local provenance, validate current pre-anchor snapshots to reject incompatible data.
+            validatedBody: seenAnchor || (clock !== null && positionOf(source) >= invalidFrom)
+              ? undefined : snapshotBody,
           };
         });
+        // A matching final prefix authenticates its earlier inputs too. This preserves valid earlier
+        // snapshots when a later stored clock is stale, without retaining one fingerprint per source.
+        for (const [index, step] of steps.entries()) {
+          if (index <= knownSnapshotThrough) step.adoptableBody = step.validatedBody;
+        }
         // Hash the same JSON in bounded chunks so a long history needs no second full snapshot string.
         const replayHeader = JSON.stringify([
           scopeKey(scope), characterId, character.emotion, engine, initialTime,
@@ -1542,12 +1695,16 @@ export class SceneAuthority {
         for (const [index, step] of steps.entries()) {
           if (index > 0) replayHash.update(',');
           replayHash.update(JSON.stringify([
-            step.body,
+            step.adoptableBody,
             step.delta,
             step.eventTimeMs,
             step.elapsedHours,
             step.hungerHours,
             step.timeOfDay,
+            step.anchor,
+            step.source.id,
+            step.source.revision,
+            step.relationInput,
           ]));
         }
         const replayKey = replayHash.update(']]').digest('hex');
@@ -1555,16 +1712,29 @@ export class SceneAuthority {
         if (emotion === undefined) {
           emotion = createEmotion(initialTime, character.emotion, emotionIdentitySeed(scope, characterId), engine);
           for (const step of steps) {
-            const snapshot = step.body === undefined ? undefined : JSON.parse(step.body);
-            if (recognizesEmotionSnapshot(snapshot, 3, () => engine) && snapshot.eventClockMs === step.eventTimeMs) {
-              emotion = validateEmotionState(snapshot);
-            } else {
-              emotion = advanceEmotionWithClock(emotion, step.delta, step.eventTimeMs, {
-                hungerHours: step.hungerHours, timeOfDay: step.timeOfDay, eventClockMs: step.eventTimeMs,
+            if (step.anchor) {
+              emotion = advanceEmotionAnchor(emotion, step.eventTimeMs, {
+                hungerHours: step.hungerHours,
+                timeOfDay: step.timeOfDay,
+                eventClockMs: step.eventTimeMs,
               }, character.emotion, engine);
+            } else {
+              const storedState = step.validatedBody === undefined ? undefined : JSON.parse(step.validatedBody);
+              const validated = recognizesEmotionSnapshot(storedState, 3, () => engine)
+                ? validateEmotionState(storedState) : undefined;
+              if (step.adoptableBody !== undefined && validated !== undefined) {
+                emotion = validated;
+                continue;
+              }
+              emotion = advanceEmotionWithClock(emotion, step.delta!, step.eventTimeMs, {
+                hungerHours: step.hungerHours, timeOfDay: step.timeOfDay, eventClockMs: step.eventTimeMs,
+              }, character.emotion, engine, undefined, undefined, {
+                sourceId: step.source.id,
+                revision: step.source.revision,
+              }, step.relationInput);
             }
           }
-          // Replays and adopted snapshots use the same validated member order and numeric representation.
+          // Replayed and adopted states use the same validated member order and numeric representation.
           emotion = validateEmotionState(emotion);
           this.emotionReplayCache.set(replayKey, emotion);
           // The existing replay cache bounds retained neural states across all scopes and rules to 64 entries.
@@ -1619,7 +1789,8 @@ export class SceneAuthority {
         // SQLite reports presence without retaining a parsed neural state for every history entry.
         const tagged = Boolean(stored && Object.hasOwn(stored, 'engine')) || Boolean(storedRow?.hasEngine);
         if (this.#emotionEngineRule === 2 && tagged) currentKey();
-        events.push({ stored, body, delta: analysis.emotion, index, acceptedAtMs: source.acceptedAtMs,
+        events.push({ stored, body, delta: withoutEmotionCounterpart(analysis.emotion), index,
+          acceptedAtMs: source.acceptedAtMs,
           at: body === undefined ? replayTimes.at(index, source.acceptedAtMs) : undefined });
       }
       const replayIdentity: unknown[] = [
@@ -1627,7 +1798,11 @@ export class SceneAuthority {
         characterId,
         character.emotion,
         initialTime,
-        events.map(event => [event.body, event.body === undefined ? event.delta : undefined, event.at]),
+        events.map(event => [
+          event.body,
+          event.body === undefined ? event.delta : undefined,
+          event.at,
+        ]),
       ];
       if (engineKey !== undefined) replayIdentity.push(engineKey);
       const replayKey = createHash('sha256').update(JSON.stringify(replayIdentity)).digest('hex');
@@ -1663,9 +1838,15 @@ export class SceneAuthority {
    * The database stamp also rejects rolled-back writes and commits made through another connection.
    */
   private emotionInvalidFrom(scope: SceneScope, sources: SceneSource[], clock: StoryEmotionTimeline,
-    engine: EmotionEngineKey, eligibleIds: string[]): number {
+    engine: EmotionEngineKey, eligibleIds: string[], roster: SceneRoster): number {
+    const resolveOwnLine = createEmotionLineResolver(sources, roster);
     const eligible = new Set(eligibleIds);
     const prefix = sources.map(source => [source.id, source.revision, source.status, source.processing,
+      source.role, source.automatic, source.speakerId, source.replyTo, source.analysis?.plan,
+      source.analysis?.skippedStages,
+      // Relation data conservatively invalidates this cache; its only cost is additional cache misses.
+      eligibleIds.map(id => Object.hasOwn(source.analysis?.characters ?? {}, id)
+        ? [id, source.analysis!.characters[id]!.relationships, source.analysis!.characters[id]!.emotion?.relation] : null),
       Object.entries(source.analysis?.emotionStates ?? {}).filter(([actorId]) => eligible.has(actorId))
         .map(([actorId, snapshot]) => [actorId, snapshot?.version, snapshot?.engine, snapshot?.eventClockMs]),
     ]);
@@ -1675,6 +1856,13 @@ export class SceneAuthority {
     if (previous?.stamp === stamp) return previous.invalidFrom;
 
     let invalidFrom = Infinity;
+    for (const source of sources) {
+      if (source.status !== 'accepted' || source.processing !== 'ready') continue;
+      if (eligibleIds.some(characterId => isOwnEmotionLine(source, characterId, resolveOwnLine))) {
+        const position = clock.positions.get(JSON.stringify([source.id, source.revision]));
+        if (position !== undefined) invalidFrom = Math.min(invalidFrom, position);
+      }
+    }
     const inspectSnapshot = (sourceId: string, revision: number, snapshot: unknown): void => {
       const position = clock.positions.get(JSON.stringify([sourceId, revision]));
       if (position === undefined || !recognizesEmotionSnapshot(snapshot, 3, () => engine)) return;
@@ -1731,11 +1919,20 @@ export class SceneAuthority {
       const diagnostics: OmittedEmotionJump[] = [];
       for (const character of state.roster.characters) {
         if (characterId != null && character.id !== characterId || !actorHasEmotion(character)) continue;
-        const events = emotionEvents(state.sources, character.id).map(source => ({
+        const replay = emotionReplaySteps(state.sources, character.id, false,
+          createEmotionLineResolver(state.sources, state.roster));
+        const events = replay.events.map(source => ({
           sourceIndex: clock.positions.get(JSON.stringify([source.id, source.revision]))!,
           relation: source.analysis!.characters[character.id]!.emotion!.relation,
         }));
-        const plan = planEmotionClock({characterId: character.id, sources: clock.sources, events});
+        const plan = planEmotionClock({
+          characterId: character.id,
+          sources: clock.sources,
+          events,
+          anchorIndices: replay.anchors.map(source => clock.positions.get(
+            JSON.stringify([source.id, source.revision]),
+          )!),
+        });
         for (const diagnostic of plan.diagnostics) diagnostics.push(diagnostic);
       }
       return diagnostics;
@@ -2577,6 +2774,7 @@ export class SceneAuthority {
   /** Rebuild local neural snapshots only from recorded accepted candidates. */
   private rebuildEmotionStates(scope: SceneScope, onlyCharacterId?: string, preserveUnknownSnapshots = false): boolean {
     const state = this.state(scope), key = scopeKey(scope);
+    const resolveOwnLine = createEmotionLineResolver(state.sources, state.roster);
     const eligibility = new Map(state.roster.characters.map(character => [character.id, actorHasEmotion(character)]));
     let engineKey: EmotionEngineKey | undefined;
     const currentKey = () => engineKey ??= createEmotionEngineKey(
@@ -2606,7 +2804,9 @@ export class SceneAuthority {
         }
         validateStoredEmotionStates({ [actorId]: snapshot }, this.#emotionEngineRule, currentKey);
         if (source.status !== 'accepted' || source.processing !== 'ready' || !source.analysis?.plan || !source.analysis.characters[actorId] ||
-          source.analysis.emotionPendingIds?.includes(actorId))
+          source.analysis.emotionPendingIds?.includes(actorId)
+          || (this.#emotionEngineRule === 3 && (isOwnEmotionLine(source, actorId, resolveOwnLine)
+            || !source.analysis?.characters[actorId]?.emotion)))
           obsolete.push(actorId);
       }
       for (const actorId of obsolete) {
@@ -2624,48 +2824,83 @@ export class SceneAuthority {
     const snapshotTimes = this.#emotionEngineRule === 2 ? this.storyClock.legacyTimeline(scope, state.sources) : null;
     for (const character of state.roster.characters.filter(item => eligibility.get(item.id) && (!onlyCharacterId || item.id === onlyCharacterId))) {
       const selectedEngine = this.#emotionEngineRule === 3 ? currentKey() : undefined;
-      const applied = selectedEngine === undefined ? [] : emotionEvents(state.sources, character.id, true);
+      const replay = selectedEngine === undefined ? {events: [], anchors: [], sources: []}
+        : emotionReplaySteps(state.sources, character.id, true, resolveOwnLine);
+      const relationInputs = selectedEngine === undefined ? null
+        : emotionRelationInputs(scope, state.sources, replay.events, character, state.roster);
+      const anchorSet = new Set(replay.anchors);
       const positionOf = (source: SceneSource): number => clock!.positions.get(
         JSON.stringify([source.id, source.revision]),
       )!;
       const plan = clock === null ? null : planEmotionClock({
         characterId: character.id,
         sources: clock.sources,
-        events: applied.map(source => ({
+        events: replay.events.map(source => ({
           sourceIndex: positionOf(source), relation: source.analysis!.characters[character.id]!.emotion!.relation,
         })),
+        anchorIndices: replay.anchors.map(positionOf),
       });
+      const hungerByIndex = new Map([...plan?.events ?? [], ...plan?.anchors ?? []]
+        .map(step => [step.sourceIndex, step.hungerHours]));
       const initialTime = snapshotTimes !== null ? snapshotTimes.initial(state.createdAtMs)
-        : emotionInitialTime(clock, applied, state.createdAtMs);
-      let eventIndex = 0;
+        : emotionInitialTime(clock, replay.sources, state.createdAtMs);
       let emotion = createEmotion(
         initialTime,
         character.emotion,
         emotionIdentitySeed(scope, character.id),
         selectedEngine,
       );
-      const replaySources = selectedEngine === undefined ? state.sources : applied;
+      const snapshotHash = selectedEngine === undefined ? null
+        : emotionSnapshotHeader(scope, character, selectedEngine, initialTime);
+      const snapshotInputs = new Map<string, string>();
+      let seenAnchor = false;
+      const replaySources = selectedEngine === undefined ? state.sources : replay.sources;
       for (const [index, source] of replaySources.entries()) {
         if (source.status !== 'accepted' || source.processing !== 'ready' || !source.analysis?.plan)
           continue;
         const candidate = source.analysis.characters[character.id];
-        if (!candidate?.emotion || source.analysis.emotionPendingIds?.includes(character.id))
+        const anchor = selectedEngine !== undefined && anchorSet.has(source);
+        if (!anchor && (!candidate?.emotion || source.analysis.emotionPendingIds?.includes(character.id)))
           continue;
         if (this.#emotionEngineRule === 3) {
           const clockSource = clock?.sources[positionOf(source)];
           const eventTimeMs = clockSource?.clockMs ?? source.acceptedAtMs;
-          const timeOfDay = emotionEventTimeOfDay(source, candidate.emotion, clockSource);
-          emotion = advanceEmotionWithClock(emotion, candidate.emotion, eventTimeMs, {
-            hungerHours: plan?.events[eventIndex]!.hungerHours
-              ?? Math.max(0, eventTimeMs - emotion.updatedAtMs) / 3_600_000,
+          const timeOfDay = anchor && clockSource === undefined
+            ? realTimeOfDay(source.acceptedAtMs, source.acceptedTimeZone ?? null)
+            : emotionEventTimeOfDay(source, candidate?.emotion, clockSource);
+          const options = {
+            hungerHours: clock === null ? Math.max(0, eventTimeMs - emotion.updatedAtMs) / 3_600_000
+              : hungerByIndex.get(positionOf(source))!,
             timeOfDay,
             eventClockMs: eventTimeMs,
-          }, character.emotion, selectedEngine);
-          eventIndex += 1;
+          };
+          seenAnchor ||= anchor;
+          if (!seenAnchor) {
+            const fingerprint = appendEmotionSnapshotInput(snapshotHash!, {
+              source,
+              anchor,
+              delta: candidate!.emotion!,
+              relationInput: relationInputs!.get(source) ?? null,
+              eventTimeMs,
+              hungerHours: options.hungerHours,
+              timeOfDay,
+            });
+            // Earlier prefixes can never be the latest adopted snapshot; keep memory independent of history.
+            snapshotInputs.clear();
+            snapshotInputs.set(JSON.stringify([source.id, source.revision]), fingerprint);
+          }
+          if (anchor) {
+            emotion = advanceEmotionAnchor(emotion, eventTimeMs, options, character.emotion, selectedEngine);
+            // Time-only steps have no per-source snapshot; subsequent reads replay them from their source facts.
+            continue;
+          }
+          emotion = advanceEmotionWithClock(emotion, candidate!.emotion!, eventTimeMs, options,
+            character.emotion, selectedEngine, undefined, undefined,
+            {sourceId: source.id, revision: source.revision}, relationInputs!.get(source) ?? null);
         } else {
           emotion = advanceEmotion(
             emotion,
-            candidate.emotion,
+            candidate!.emotion!,
             snapshotTimes!.at(index, source.acceptedAtMs),
             character.emotion,
             selectedEngine,
@@ -2699,6 +2934,15 @@ export class SceneAuthority {
               .run(character.id, body, key, source.id);
           }
           changed = true;
+        }
+      }
+      if (selectedEngine !== undefined) {
+        const snapshotKey = JSON.stringify([key, character.id]);
+        this.emotionSnapshotInputs.delete(snapshotKey);
+        this.emotionSnapshotInputs.set(snapshotKey, snapshotInputs);
+        // Match the replay cache limit of 64 actor/scope entries; eviction only causes a cold replay.
+        if (this.emotionSnapshotInputs.size > 64) {
+          this.emotionSnapshotInputs.delete(this.emotionSnapshotInputs.keys().next().value!);
         }
       }
     }
@@ -2787,7 +3031,7 @@ function localAnalysis(value:SceneAnalysis,source:SceneSource,
   const actors = new Map(roster.characters.map(actor => [actor.id, actor]));
   const characters = Object.fromEntries(Object.entries(input.characters).map(([id, analysis]) => {
     const actor = actors.get(id);
-    if (actor && !actorHasEmotion(actor)) {
+    if ((actor && !actorHasEmotion(actor)) || analysis.emotion == null) {
       const { emotion, ...rest } = analysis;
       return [id, rest];
     }

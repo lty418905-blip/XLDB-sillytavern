@@ -9,7 +9,14 @@ import type {CalendarSource} from './calendar.ts';
 import {projectMemories} from '../memory/access.ts';
 import type {MemorySnapshot} from '../memory/access.ts';
 import {chooseScheduleConflict,overlaps,neutralScheduleMotive,neutralScheduleNature} from './schedule-conflicts.ts';
-import type {ScheduleSlot,ConflictContext,ConflictDecision} from './schedule-conflicts.ts';
+import type {
+  ScheduleSlot,
+  ConflictContext,
+  ConflictDecision,
+  BlindConflictReview,
+  BlindConflictChoice,
+  ReviewScheduleConflict,
+} from './schedule-conflicts.ts';
 
 export interface DirectorPlan {
   threads:{id:string;goal:string;trigger:string;proposal:string;status:'proposed'|'waiting'|'realized'|'shelved';
@@ -28,7 +35,8 @@ export interface DirectorClock {kind:'story';known:boolean;date:string|null;time
 export interface DirectorAgenda {items:ScheduleSlot[];needsRefresh:boolean;context:ConflictContext}
 export interface DirectorCue {stage:'explore'|'wait';evidence:string[]}
 interface CachedPlan {
-  schema:4;
+  schema: 4 | 5;
+  conflictReviews?: Array<[string, BlindConflictChoice]>;
   candidate:Record<string,unknown>;
   stateVersion:number;
   sourceStamp:string;
@@ -36,6 +44,92 @@ interface CachedPlan {
   calendarStamp:string;
   plan:DirectorPlan;
 }
+
+/** Provisional limit on actual review requests in one plan attempt; retries start a new four-request budget. */
+export const DIRECTOR_CONFLICT_REVIEW_LIMIT = 4;
+
+/** Provisional maximum of 64 anonymous answers per scope, independent of chat length; oldest insertions are evicted. */
+export const DIRECTOR_CONFLICT_CACHE_LIMIT = 64;
+
+/** Final anonymous review wording without judge advice, used verbatim as the system message. */
+export const DIRECTOR_CONFLICT_REVIEW_PROMPT = `你是剧情导演，只判断两件匿名未来安排的撞期取舍。A/B没有请求方标签，不猜哪边来自玩家。根据日程性质、动机、情绪和近期主题独立判断应放弃 A、放弃 B，或证据不足选 neither。只返回JSON {"decline":"A|B|neither"}。这只是临时规划建议，不取消、改期或改写已接受的历史和承诺。`;
+
+/** Existing review wording when an injected judge supplied advice; used verbatim as the system message. */
+export const DIRECTOR_CONFLICT_JUDGE_REVIEW_PROMPT = `你是剧情导演，只判断两件匿名未来安排的撞期取舍。A/B没有请求方标签，不猜哪边来自玩家。AgentJev 的分布只用于提示不确定性，未经校准；根据日程性质、动机、情绪和近期主题独立判断应放弃 A、放弃 B，或证据不足选 neither。只返回JSON {"decline":"A|B|neither"}。这只是临时规划建议，不取消、改期或改写已接受的历史和承诺。`;
+
+/** Recognize either exact system prompt; unknown or null values are not conflict review requests. */
+export function isDirectorConflictReviewPrompt(prompt: unknown): boolean {
+  return prompt === DIRECTOR_CONFLICT_REVIEW_PROMPT || prompt === DIRECTOR_CONFLICT_JUDGE_REVIEW_PROMPT;
+}
+
+/** Assemble anonymous review messages; missing or null judge advice emits no agentJev member. Invalid JSON throws. */
+export function directorConflictReviewMessages(review: BlindConflictReview): Parameters<ModelRunner>[1] {
+  const hasJudge = review.agentJevChoice != null;
+  return [{
+    role: 'system',
+    content: hasJudge ? DIRECTOR_CONFLICT_JUDGE_REVIEW_PROMPT : DIRECTOR_CONFLICT_REVIEW_PROMPT,
+  }, {
+    role: 'user',
+    content: JSON.stringify({
+      schedule: JSON.parse(review.state),
+      ...(hasJudge ? {agentJev: {
+        decline: review.agentJevChoice,
+        distribution: review.distribution ?? null,
+      }} : {}),
+    }),
+  }];
+}
+
+/** Decode A, B or neither from a review response; invalid JSON, properties or choices throw. Work is O(n). */
+export function parseDirectorConflictReview(raw: string): BlindConflictChoice {
+  const response = json(raw);
+  if (response.decline !== 'A' && response.decline !== 'B' && response.decline !== 'neither')
+    throw new Error('invalid_director_conflict_review');
+
+  return response.decline;
+}
+
+/** Hash anonymous messages and model identity; credentials never participate in the cache key. */
+export function directorConflictReviewKey(messages: Parameters<ModelRunner>[1], config: ModelConfig): string {
+  const promptHash = createHash('sha256').update(messages[0].content).digest('hex');
+  return createHash('sha256').update(JSON.stringify({
+    state: messages[1].content,
+    promptHash,
+    config: {baseUrl: config.baseUrl, model: config.model, thinking: config.thinking ?? null},
+  })).digest('hex');
+}
+
+function readCachedPlan(body: string | undefined): CachedPlan | undefined {
+  if (!body) return undefined;
+
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+
+    const stored = parsed as CachedPlan;
+    return stored.schema === 4 || stored.schema === 5 ? stored : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function conflictReviewCache(stored: CachedPlan | undefined): Map<string, BlindConflictChoice> {
+  const cache = new Map<string, BlindConflictChoice>();
+  if (stored?.schema !== 5 || !Array.isArray(stored.conflictReviews)) return cache;
+
+  // Read only the bounded tail of discarded derived data, even when a persisted array is oversized.
+  for (const row of stored.conflictReviews.slice(-DIRECTOR_CONFLICT_CACHE_LIMIT)) {
+    if (!Array.isArray(row) || row.length !== 2) continue;
+    const [key, choice] = row;
+    if (typeof key !== 'string' || !/^[a-f0-9]{64}$/.test(key)) continue;
+    if (choice !== 'A' && choice !== 'B' && choice !== 'neither') continue;
+
+    cache.set(key, choice);
+  }
+
+  return cache;
+}
+
 /** Decode an object without turning failures outside candidate validation into retryable errors. */
 function directorObject(value: unknown): Record<string, unknown> {
   try {
@@ -208,9 +302,31 @@ export class SceneDirector {
       body: string;
     } | undefined;
 
-    const stored = cached?.fingerprint === fingerprint ? JSON.parse(cached.body) as CachedPlan : undefined;
+    const stored = readCachedPlan(cached?.body);
+    const conflictReviews = conflictReviewCache(stored);
+    let reviewRequests = 0;
+    const reviewMessages = (review: BlindConflictReview) => directorConflictReviewMessages(review);
+    const reviewKey = (review: BlindConflictReview) => directorConflictReviewKey(reviewMessages(review), config);
+    const reviewConflict: ReviewScheduleConflict = async review => {
+      const messages = reviewMessages(review);
+      const key = directorConflictReviewKey(messages, config);
+      const cachedChoice = conflictReviews.get(key);
+      if (cachedChoice !== undefined) return cachedChoice;
 
-    const candidate = stored?.schema === 4 && stored.candidate
+      reviewRequests++;
+      const choice = parseDirectorConflictReview(await run(config, messages, true));
+      assertCurrent();
+      conflictReviews.set(key, choice);
+      while (conflictReviews.size > DIRECTOR_CONFLICT_CACHE_LIMIT)
+        conflictReviews.delete(conflictReviews.keys().next().value!);
+
+      return choice;
+    };
+    reviewConflict.canReview = review => conflictReviews.has(reviewKey(review))
+      || reviewRequests < DIRECTOR_CONFLICT_REVIEW_LIMIT;
+
+    const candidate = cached?.fingerprint === fingerprint
+      && (stored?.schema === 4 || stored?.schema === 5) && stored.candidate
       ? structuredClone(stored.candidate)
       : json(await run(config, messages, true));
 
@@ -553,35 +669,7 @@ export class SceneDirector {
             proposed,
             agenda.context,
             undefined,
-            async (review) => {
-              const response = json(
-                await run(
-                  config,
-                  [{
-                    role: 'system',
-                    content: `你是剧情导演，只判断两件匿名未来安排的撞期取舍。A/B没有请求方标签，不猜哪边来自玩家。AgentJev 的分布只用于提示不确定性，未经校准；根据日程性质、动机、情绪和近期主题独立判断应放弃 A、放弃 B，或证据不足选 neither。只返回JSON {"decline":"A|B|neither"}。这只是临时规划建议，不取消、改期或改写已接受的历史和承诺。`
-                  },
-                  {
-                    role: 'user',
-                    content: JSON.stringify(
-                      {
-                        schedule: JSON.parse(review.state),
-                        agentJev: {
-                          decline: review.agentJevChoice,
-                          distribution: review.distribution
-                        }
-                      }
-                    )
-                  }],
-                  true
-                )
-              );
-
-              if (response.decline !== 'A' && response.decline !== 'B' && response.decline !== 'neither')
-                throw new Error('invalid_director_conflict_review');
-
-              return response.decline;
-            }
+            reviewConflict
           );
 
           assertCurrent();
@@ -643,7 +731,8 @@ export class SceneDirector {
         fingerprint,
         JSON.stringify(
           {
-            schema: 4,
+            schema: 5,
+            conflictReviews: [...conflictReviews],
             candidate: storedCandidate,
             stateVersion: state.version,
             sourceStamp: sourceStamp(state),
@@ -698,7 +787,7 @@ export class SceneDirector {
 
     const cached = JSON.parse(row.body) as CachedPlan;
 
-    if (cached.schema !== 4 || cached.stateVersion !== state.version
+    if (cached.schema !== 5 || cached.stateVersion !== state.version
       || cached.sourceStamp !== sourceStamp(state)
       ||
       cached.referenceStamp !== referenceSourceStamp(referenceSources.filter(source => source.kind === 'reference'))

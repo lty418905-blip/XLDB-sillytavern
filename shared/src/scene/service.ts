@@ -1,3 +1,6 @@
+import {activeEmotionCharacters, createEmotionLineResolver} from './emotion-own-line.ts';
+import type {EmotionLineResolver} from './emotion-own-line.ts';
+import {selectEmotionCounterpart, withEmotionCounterpart} from './emotion-counterpart.ts';
 import { actorHasEmotion } from './actor-emotion.ts';
 import { AppraisalHistory, appraisalFingerprintInput, buildCoreAppraisalInput } from '../emotion/appraisal-input.ts';
 import {parseModelJson} from '../core/models.ts';
@@ -53,7 +56,7 @@ import {commitmentDisplayText,commitmentTransitionTargets,extractCommitmentPromp
 import {buildInitializationPrompt,decodeInitializationCandidate} from './initialization.ts';
 import type {InitializationSource} from './initialization.ts';
 import {defaultCompanionPort} from './extension.ts';
-import type {ReplyDiagnostic,SceneCompanionPort,SceneJudge} from './extension.ts';
+import type {ReplyDiagnostic,SceneCompanionPort} from './extension.ts';
 import {processingFingerprint,processingFailure} from './processing.ts';
 import type {ProcessingAddress,ProcessingProgress,SkippedStage,ProcessingStage} from './processing.ts';
 import {sceneExpressionOptions} from './address.ts';
@@ -63,9 +66,8 @@ import {generationView} from './generation-view.ts';
 import type {GenerationView} from './generation-view.ts';
 import type {DirectorAgenda,DirectorNpcTodo} from './director.ts';
 import {chooseScheduleConflict,neutralScheduleMotive,neutralScheduleNature} from './schedule-conflicts.ts';
-import type {ConflictDecision} from './schedule-conflicts.ts';
 import {calendarSourcesFromScene} from './calendar.ts';
-import {EMOTION_NPC_BUDGET,emotionRankModelIdentity,emotionScheduleStatus,rankEmotionCandidates} from './emotion-scheduler.ts';
+import {EMOTION_NPC_BUDGET,EMOTION_RANK_RULE_VERSION,deterministicEmotionRanking,emotionScheduleStatus,rankEmotionCandidates} from './emotion-scheduler.ts';
 import type {EmotionRankCandidate,EmotionRanking} from './emotion-scheduler.ts';
 import {emotionSummary} from '../emotion/openher.ts';
 import {buildWorldStagePrompts,parseWorldStageResponse,decodeWorldStage,degradedStoryClock,WORLD_STAGE_CONTRACT_VERSION} from './world-extraction.ts';
@@ -80,6 +82,17 @@ function hasCompletedEmotionSkip(analysis: SceneState['sources'][number]['analys
     && !analysis.emotionCandidateReadyIds?.includes(characterId)
     && analysis.skippedStages?.some(skipped => skipped.stage === 'emotion' && skipped.characterId === characterId),
   );
+}
+
+/** Fingerprinted perspective-stage inputs; host bindings distinguish overlapping candidate errors. */
+interface PerspectiveStageInput {
+  schema: number;
+  viewContract?: number;
+  source: ReturnType<SceneCore['modelSource']>;
+  roster: SceneRoster;
+  history: ReturnType<SceneCore['modelSource']>[];
+  config: ModelConfig;
+  suppliedPlan?: PerspectivePlan | null;
 }
 
 interface Draft {
@@ -97,21 +110,24 @@ interface PrepareWrite extends SceneWriteGuard {
 export interface SceneCoreOptions<C extends SceneCompanionPort> {
   /** The companion port (the Agent's CompanionFlow); each SceneCore otherwise gets its own inert default port. */
   companion?:C;
-  /** The host's local judge for schedule conflicts and emotion ranking, so the scene never starts a second worker. */
-  judge?:SceneJudge;
   /** Internal ledger integration; only numeric gate 4 enables it, captured once at construction. */
   ledgerStage?: LedgerStageOptions | null;
 }
 
+/**
+ * How many reported perspective skips one service remembers at the same time.
+ * The value is provisional. Evicting an old marker only costs the user one extra click.
+ */
+const REPORTED_PERSPECTIVE_SKIP_LIMIT = 100;
+
 export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
   readonly companion:C;
-  private readonly judge?:SceneJudge;
-  private readonly emotionRankIdentity:()=>string;
   private authority: SceneAuthority;
   private core: Core;
   private models: ModelTasks;
-  private readonly emotionRanker:(candidates:readonly EmotionRankCandidate[])=>Promise<EmotionRanking>;
+  emotionRanker:(candidates:readonly EmotionRankCandidate[])=>EmotionRanking|Promise<EmotionRanking>;
   private drafts = new Map<string,Draft>();
+  private readonly reportedPerspectiveSkips = new Set<string>();
   private jobs = new Map<string,Promise<{status:string;version:number;error?:string}>>();
   private backgroundEmotionQueued=new Set<string>();
   private backgroundEmotionErrors=new Map<string,string>();
@@ -123,19 +139,11 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
   private nativeTickets=new Map<string,{scope:SceneScope;version:number;modelRevision:number;expires:number;envelope:SceneEnvelope;dependencies:{id:string;revision:number}[];replyTo:{id:string;revision:number};automatic:boolean;speakerId?:string;replaces?:{id:string;revision:number};accepted?:SceneMessage;recalled?:SceneRecall[]}>();
   private packetRecalls = new WeakMap<object, SceneRecall[]>();
   constructor(authority:SceneAuthority, core:Core, models:ModelTasks,
-    emotionRanker:(candidates:readonly EmotionRankCandidate[])=>Promise<EmotionRanking>=rankEmotionCandidates,
+    emotionRanker:(candidates:readonly EmotionRankCandidate[])=>EmotionRanking|Promise<EmotionRanking>=rankEmotionCandidates,
     options:SceneCoreOptions<C>={}) {
     this.authority=authority;this.core=core;this.models=models;
     this.ledgerStageOptions = this.readLedgerStageOptions(options);
-    const judge=options.judge;this.judge=judge;
-    if(emotionRanker===rankEmotionCandidates&&judge){
-      this.emotionRanker=candidates=>rankEmotionCandidates(candidates,
-        payload=>judge.evaluate(payload) as ReturnType<NonNullable<Parameters<typeof rankEmotionCandidates>[1]>>);
-      this.emotionRankIdentity=()=>judge.identity();
-    }else{
-      this.emotionRanker=emotionRanker;
-      this.emotionRankIdentity=emotionRanker===rankEmotionCandidates?emotionRankModelIdentity:()=>'injected';
-    }
+    this.emotionRanker = emotionRanker;
     this.companion=options.companion??defaultCompanionPort(authority) as C;
     for(const scope of authority.deferredEmotionScopes())this.queueDeferredEmotion(scope);
   }
@@ -166,13 +174,20 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     return {candidate,sources,preview:this.authority.initialization.preview(scope,candidate,sources)};
   }
   resources(scope:SceneScope){return this.authority.npcResources.status(scope,this.authority.state(scope).roster.characters.map(character=>character.id));}
-  emotionScheduling(scope:SceneScope){
+  emotionScheduling(scope: SceneScope) {
     // Only roleplay defers NPC emotion; a companion scope has no queue to report or start.
-    if(this.authority.interactions.modeOf(scope)==='companion')
-      return {...emotionScheduleStatus({...this.authority.state(scope),sources:[]}),backgroundError:null};
+    if (this.authority.interactions.modeOf(scope) === 'companion') {
+      return {
+        ...emotionScheduleStatus({...this.authority.state(scope), sources: []}, this.authority.shouldAppraiseEmotion),
+        backgroundError: null,
+      };
+    }
+
     this.queueDeferredEmotion(scope);
-    return {...emotionScheduleStatus(this.authority.state(scope)),
-      backgroundError:this.backgroundEmotionErrors.get(scopeKey(scope))??null};
+    return {
+      ...emotionScheduleStatus(this.authority.state(scope), this.authority.shouldAppraiseEmotion),
+      backgroundError: this.backgroundEmotionErrors.get(scopeKey(scope)) ?? null,
+    };
   }
 
   private queueDeferredEmotion(scope:SceneScope):void {
@@ -198,11 +213,20 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     });
   }
 
+  /** Own speech has no emotion stage only under the construction-selected third rule. */
+  private isOwnLineWithoutEmotion(source: import('./types.ts').SceneMessage, characterId: string,
+    resolveOwnLine?: EmotionLineResolver): boolean {
+    return !this.authority.shouldAppraiseEmotion(source, characterId, resolveOwnLine);
+  }
+
   /** Older pending rows contain placeholders. Analyze them only after an explicit process call. */
   private queueLegacyEmotionRecovery(scope:SceneScope,configs:Configurations):void {
     const key=scopeKey(scope);
-    if(!this.authority.state(scope).sources.some(source=>source.status==='accepted'&&source.processing==='ready'&&
-      source.analysis?.emotionPendingIds?.some(id=>!source.analysis?.emotionCandidateReadyIds?.includes(id)&&
+    const state = this.authority.state(scope);
+    const resolveOwnLine = createEmotionLineResolver(state.sources, state.roster);
+    if(!state.sources.some(source=>source.status==='accepted'&&source.processing==='ready'&&
+      source.analysis?.emotionPendingIds?.some(id=>!this.isOwnLineWithoutEmotion(source, id, resolveOwnLine)
+        &&!source.analysis?.emotionCandidateReadyIds?.includes(id)&&
         !source.analysis?.skippedStages?.some(item=>item.stage==='emotion'&&item.characterId===id)))){
       this.legacyEmotionConfigs.delete(key);return;
     }
@@ -221,12 +245,14 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         const foreground=this.jobs.get(key);
         if(foreground){await foreground;continue;}
         const state=this.authority.state(scope),blocked=new Set<string>();
+        const resolveOwnLine = createEmotionLineResolver(state.sources, state.roster);
         let next:{source:import('./types.ts').SceneSource;index:number;characterId:string}|undefined;
         for(const [index,source] of state.sources.entries()){
           if(source.status!=='accepted'||source.processing!=='ready'||!source.analysis?.plan)continue;
           for(const id of source.analysis.emotionPendingIds??[]){
             const actor=state.roster.characters.find(character=>character.id===id);
             if(!actor||!actorHasEmotion(actor))continue;
+            if (this.isOwnLineWithoutEmotion(source, id, resolveOwnLine)) continue;
             if(blocked.has(id))continue;
             if (hasCompletedEmotionSkip(source.analysis, id)) continue;
             blocked.add(id);
@@ -817,13 +843,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     const actorInput = (actorId: string) => visibleText(plan, actorId) + (plan.generationRequests?.[actorId] ?
       '\n本轮玩家指定的回答任务（不是新经历或新知识；问题中的前提不能替代授权事实）：\n' + plan.generationRequests[actorId] : '');
     const retrievalModes = new Set<string>();
-    const activeIds = new Set(
-      [
-        ...plan.observations.filter(item => item.playerVisible).flatMap(item => item.readers),
-        ...Object.keys(plan.generationRequests ?? {})
-      ]
-    );
-    const actors = state.roster.characters.filter(item => activeIds.has(item.id));
+    const actors = activeEmotionCharacters(plan, state.roster);
     if (!actors.length)
       throw new Error('invalid_scene_native_visibility');
     const assertCurrent = () => this.assertVersion(scope, state.version);
@@ -1057,6 +1077,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
    * and if it still fails the result is `phase:'pending-sync'` without storing the new user text. Any other
    * unfinished source (for example a user text left by `user-sync`), or no `finishPending`, rejects a new user text
    * with `invalid_scene_processing`; resending that same user submission, or `processPending`, recovers it.
+   * In Tavern roleplay a skipped user perspective is ready and degraded, so it does not block new text.
+   * Preparing that same submission again retries only after a previous prepare reported its perspective skip.
    */
   async prepare(
     scope: SceneScope,
@@ -1136,7 +1158,17 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
       this.authority.reconcile(scope, [userMessage], false, Date.now(), submission);
     }
     const userStamp = sourceStamp(this.authority.state(scope));
-    const synchronized = await this.processPending(scope, configs);
+    const perspectiveRetryKey = JSON.stringify([scopeKey(scope), userMessage.id, userMessage.revision]);
+    // Reconcile may have already spent the budget before the first prepare reports the skip.
+    const perspectiveSkipReported = this.authority.interactions.isTavernRoleplay(scope)
+      && this.reportedPerspectiveSkips.delete(perspectiveRetryKey);
+    const retryPerspective = this.authority.interactions.isTavernRoleplay(scope)
+      && existing?.processing === 'ready'
+      && existing.analysis?.skippedStages?.some(
+        item => item.stage === 'perspective' && perspectiveSkipReported
+      );
+    const retryTarget = retryPerspective ? {sourceId: userMessage.id, revision: userMessage.revision} : undefined;
+    const synchronized = await this.processPending(scope, configs, new Map(), retryTarget);
     if (sourceStamp(this.authority.state(scope)) !== userStamp)
       throw new Error('context_changed_retry');
     const state = this.authority.state(scope);
@@ -1161,6 +1193,23 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     const latest = state.sources.filter(source => source.status === 'accepted').at(-1);
     if (latest?.id !== userMessage.id || !storedUser.analysis?.plan)
       throw new Error('context_changed_retry');
+    const skippedPerspective = this.authority.interactions.isTavernRoleplay(scope)
+      ? storedUser.analysis.skippedStages?.find(item => item.stage === 'perspective') : undefined;
+    if (skippedPerspective) {
+      this.reportedPerspectiveSkips.add(perspectiveRetryKey);
+      // Bounded by REPORTED_PERSPECTIVE_SKIP_LIMIT, with O(1) eviction of the oldest marker.
+      // Eviction only adds one report before retry; it never prevents processing a long chat.
+      if (this.reportedPerspectiveSkips.size > REPORTED_PERSPECTIVE_SKIP_LIMIT)
+        this.reportedPerspectiveSkips.delete(this.reportedPerspectiveSkips.values().next().value!);
+      return {
+        status: 'failed',
+        phase: 'user-sync',
+        version: state.version,
+        error: skippedPerspective.failure.code,
+        userMessage,
+        progress: this.progress(scope)
+      };
+    }
     const userPlan = storedUser.analysis.plan;
     const character = state.roster.characters.find(item => item.id === envelope.targetId)!;
     const current = visibleText(userPlan, character.id);
@@ -1637,15 +1686,9 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     );
   }
 
-  /** With a host judge, conflicts go to its worker and never to the module-level AgentJev client. */
-  private scheduleConflictChooser():typeof chooseScheduleConflict {
-    const judge=this.judge;
-    if(!judge)return chooseScheduleConflict;
-    return async(existing,proposed,context,evaluate,review)=>{
-      const decision:ConflictDecision=await chooseScheduleConflict(existing,proposed,context,evaluate??(payload=>judge.evaluate(payload)),review);
-      if(evaluate||decision.method==='deterministic'||decision.modelIdentity)return decision;
-      try{return {...decision,modelIdentity:judge.identity()};}catch{return decision;}
-    };
+  /** Return the shared rules and anonymous director chain; the companion provider is never attached here. */
+  private scheduleConflictChooser(): typeof chooseScheduleConflict {
+    return chooseScheduleConflict;
   }
 
   private async withGenerationRetry<T>(scope:SceneScope,stage:ProcessingStage,characterId:string|undefined,
@@ -1700,6 +1743,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
         const results:{id:string;revision:number;analysis:SceneAnalysis}[]=[];
         const backfilled=new Map<string,{id:string;revision:number;analysis:SceneAnalysis}>();
         const processed:import('./types.ts').SceneSource[]=[];
+        const processedOwnLineSources = new Map<string, SceneSource>();
+        const resolveOwnLine = createEmotionLineResolver(state.sources, state.roster, processedOwnLineSources);
         const appraisalHistory = new AppraisalHistory(state.roster.characters);
         const ledgerProgress: LedgerProgress | undefined = this.ledgerStageOptions && story
           ? {
@@ -1713,6 +1758,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
           if(sourceIndex>targetIndex)break;
           if(source.processing==='ready'&&source.analysis&&(!target||source.id!==target.sourceId||!source.analysis.skippedStages?.length)){
             processed.push(source);
+            processedOwnLineSources.set(source.id, source);
             continue;
           }
           if(source.processing==='ready'&&source.analysis?.skippedStages?.length){
@@ -1721,7 +1767,11 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
           }
           activeSource=source.id;
           const history=accepted.slice(0,accepted.indexOf(source)).slice(-6);
-          const suppliedPlan=plans.get(source.id)??source.analysis?.plan??undefined;
+          // A skipped perspective stores an empty fallback, not a host-supplied plan for the next retry.
+          const retryPerspective = this.authority.interactions.isTavernRoleplay(scope)
+            && source.analysis?.skippedStages?.some(item => item.stage === 'perspective');
+          const suppliedPlan = plans.get(source.id)
+            ?? (retryPerspective ? undefined : source.analysis?.plan);
           const perspectiveConfig=source.automatic&&source.role==='user'&&configs.inputPerspective.model?configs.inputPerspective:configs.perspective;
           const shared=this.authority.interactions.isTavernRoleplay(scope)?sceneObservationBatch(
             (config,prompts)=>this.models.structuredTask(config,prompts)):null;
@@ -1743,8 +1793,17 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
           const worldWork=()=>settings?this.stage(scope,source,'world',undefined,
             {schema:2,source:this.modelSource(source),settings,history:worldHistory.slice(-6).map(item=>this.modelSource(item)),purchaseRefs,config:configs.world},
             ()=>this.models.worldEffects(source,settings,configs.world,worldHistory,shared?.('world'))):undefined;
-          const planWork=()=>this.stage(scope,source,'perspective',undefined,
-            {schema:1,source:this.modelSource(source),roster:state.roster,history:history.map(item=>this.modelSource(item)),config:perspectiveConfig,suppliedPlan:suppliedPlan??null},
+          const perspectiveInput: PerspectiveStageInput = {
+            schema: 1,
+            // Version only the automatic user view contract; supplied legacy plans remain authoritative inputs.
+            ...(source.automatic && source.role === 'user' ? { viewContract: 2 } : {}),
+            source: this.modelSource(source),
+            roster: state.roster,
+            history: history.map(item => this.modelSource(item)),
+            config: perspectiveConfig,
+            suppliedPlan: suppliedPlan ?? null,
+          };
+          const planWork=()=>this.stage(scope,source,'perspective',undefined,perspectiveInput,
             async()=>{
               const candidate=suppliedPlan??await this.plan(source,state.roster,configs,history,shared?.('perspective'));
               if(candidate.unresolved.length)throw new Error('invalid_scene_unresolved');
@@ -1765,6 +1824,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             if(ledgerStep)this.finishLedgerStep(source,ledgerStep);
             const analysis:SceneAnalysis={plan,characters:{},...clockPart,skippedStages:this.authority.processing.skippedForSource(scope,source.id,source.revision),...(ledgerStep?.marks?{ledgerMarks:ledgerStep.marks}:{}),...(ledgerStep?.ledger?{ledger:ledgerStep.ledger}:{})};
             processed.push({...source,processing:'ready',analysis});
+            processedOwnLineSources.set(source.id, processed.at(-1)!);
             results.push({id:source.id,revision:source.revision,analysis});
             continue;
           }
@@ -1895,7 +1955,8 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
               ?this.authority.interactions.clock(scope).timeZone
               :source.acceptedTimeZone??'UTC'};
           const visibleCharacters=state.roster.characters.filter(character=>visibleText(plan,character.id));
-          const emotionCharacters = visibleCharacters.filter(actorHasEmotion);
+          const emotionCharacters = visibleCharacters.filter(character => actorHasEmotion(character)
+            && !this.isOwnLineWithoutEmotion(source, character.id, resolveOwnLine));
           const currentVisibleIds=new Set(emotionCharacters.map(character=>character.id));
           let selectedEmotionIds=new Set(currentVisibleIds);
           let emotionSchedule:SceneAnalysis['emotionSchedule'];
@@ -1908,6 +1969,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             // With fixed actor and stage counts per source, the existing backlog passes are O(N).
             const candidates = emotionCharacters.filter(character => !backlog.some(item =>
               item.analysis?.emotionPendingIds?.includes(character.id)
+              && !this.isOwnLineWithoutEmotion(item, character.id, resolveOwnLine)
               && !item.analysis.emotionCandidateReadyIds?.includes(character.id)
               && !hasCompletedEmotionSkip(item.analysis, character.id)));
 
@@ -1915,7 +1977,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             const newCandidates=candidates.filter(character=>!used.has(character.id));
             let ranked=newCandidates.map(character=>character.id);
             let method:NonNullable<SceneAnalysis['emotionSchedule']>['method']='all';
-            let reason:string|undefined,modelIdentity:string|undefined;
+            let reason: string | undefined;
             if(newCandidates.length>free&&new Set([...used,...candidates.map(item=>item.id)]).size>EMOTION_NPC_BUDGET&&free>0){
               const rankCandidates=newCandidates.map(character=>{
                 const evidence=boundedEmotionEvidence([
@@ -1926,19 +1988,26 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
                     {...state,sources:processed.slice(0,-1)}))),
                   currentTarget:character.id===source.envelope.targetId,present:source.envelope.presentIds.includes(character.id),
                   // Earlier accepted sources whose update for this NPC still waits in the background queue. This also
-                  // enters the AgentJev input and so the rank-stage fingerprint.
+                  // enters the rules input and therefore the rank-stage fingerprint.
                   deferredEvents: backlog.filter(item =>
                     item.analysis?.emotionPendingIds?.includes(character.id)
+                    && !this.isOwnLineWithoutEmotion(item, character.id, resolveOwnLine)
                     && !hasCompletedEmotionSkip(item.analysis, character.id)).length};
               });
-              const ranking=await this.stage(scope,source,'emotionRank',undefined,{
-                schema:4,windowId,modelIdentity:this.emotionRankIdentity(),
-                used:[...used].sort(),free,candidates:rankCandidates},()=>this.emotionRanker(rankCandidates));
+              const ranking = await this.stage(scope, source, 'emotionRank', undefined, {
+                schema: 5,
+                windowId,
+                ruleVersion: EMOTION_RANK_RULE_VERSION,
+                used: [...used].sort(),
+                free,
+                candidates: rankCandidates,
+              }, async () => this.emotionRanker(rankCandidates));
               if(ranking.orderedIds.length!==newCandidates.length||
                 new Set(ranking.orderedIds).size!==newCandidates.length||
                 ranking.orderedIds.some(id=>!newCandidates.some(character=>character.id===id)))
                 throw new Error('invalid_scene_emotion_rank');
-              ranked=ranking.orderedIds;method=ranking.method;modelIdentity=ranking.modelIdentity;
+              ranked = ranking.orderedIds;
+              method = ranking.method;
               const omitted=rankCandidates.reduce((sum,item)=>sum+item.omittedEvidenceCount,0);
               reason=[ranking.reason,omitted?`bounded_evidence_omitted:${omitted}`:undefined].filter(Boolean).join(';')||undefined;
             }else if(free===0&&newCandidates.length){
@@ -1949,16 +2018,18 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             emotionSchedule={windowId,eligibleIds:emotionCharacters.map(character=>character.id),
               selectedIds:[...selectedEmotionIds],forcedIds:[],
               deferredIds:[...currentVisibleIds].filter(id=>!selectedEmotionIds.has(id)),method,
-              ...(reason?{reason}:{}),...(modelIdentity?{modelIdentity}:{})};
+              ...(reason?{reason}:{})};
             // One foreground slot covers this NPC's prepared history in source order.
             for(const id of selectedEmotionIds){
               if (!backlog.some(item => item.analysis?.emotionPendingIds?.includes(id)
+                && !this.isOwnLineWithoutEmotion(item, id, resolveOwnLine)
                 && !hasCompletedEmotionSkip(item.analysis, id))) continue;
               this.authority.completeDeferredEmotion(scope,id);
               const stored=new Map(this.authority.state(scope).sources.map(item=>[item.id,item]));
               for(let index=0;index<processed.length-1;index++){
                 const earlier=processed[index]!;
                 if(!earlier.analysis?.emotionPendingIds?.includes(id))continue;
+                if (this.isOwnLineWithoutEmotion(earlier, id, resolveOwnLine)) continue;
                 // Preserve this job's skipped marker so its fallback never becomes an accepted experience.
                 if (hasCompletedEmotionSkip(earlier.analysis, id)) continue;
                 const original=accepted.find(item=>item.id===earlier.id&&item.revision===earlier.revision);
@@ -1966,6 +2037,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
                   const refreshed=stored.get(earlier.id);
                   if(refreshed){
                     processed[index]=refreshed;
+                    processedOwnLineSources.set(refreshed.id, refreshed);
                     appraisalHistory.refresh(refreshed);
                   }
                   continue;
@@ -1974,6 +2046,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
                   emotionPendingIds:earlier.analysis.emotionPendingIds.filter(item=>item!==id),
                   emotionCandidateReadyIds:earlier.analysis.emotionCandidateReadyIds?.filter(item=>item!==id)};
                 processed[index]={...earlier,analysis};
+                processedOwnLineSources.set(earlier.id, processed[index]!);
                 appraisalHistory.refresh(processed[index]!);
                 const pendingResult=results.find(item=>item.id===earlier.id);
                 if(pendingResult)pendingResult.analysis=analysis as SceneAnalysis;
@@ -1987,7 +2060,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
             if (!visible) return;
             const scoped={id:source.id,revision:source.revision,role:source.role,text:visible,acceptedAtMs:source.acceptedAtMs};
             const profile={id:character.id,name:character.name,persona:character.persona,experienceState};
-            const hasEmotion = actorHasEmotion(character);
+            const hasEmotion = actorHasEmotion(character) && !this.isOwnLineWithoutEmotion(source, character.id, resolveOwnLine);
             const contactAffect=hasEmotion&&agentCompanion&&source.role==='user'
               ?this.companion.contactEmotion(scope,character.id,source.acceptedAtMs,{...state,sources:processed.slice()},
                 {sourceId:source.id,revision:source.revision}).affect:null;
@@ -2080,6 +2153,12 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
            if(emotionSchedule&&skippedEmotionIds.size){
              emotionSchedule={...emotionSchedule,deferredIds:[...new Set([...emotionSchedule.deferredIds,...skippedEmotionIds])]};
            }
+           for (const [characterId, analysis] of Object.entries(characters)) {
+             // A skipped stage's placeholder remains historical numeric data, not a resolved appraisal.
+             if (!analysis.emotion || skippedEmotionIds.has(characterId)) continue;
+             const counterpartId = selectEmotionCounterpart(source, plan, characterId, state.roster, actorHasEmotion);
+             analysis.emotion = withEmotionCounterpart(analysis.emotion, counterpartId);
+           }
            if(ledgerStep?.entry)await this.waitLedgerStep(ledgerStep);
            if(ledgerStep)this.finishLedgerStep(source,ledgerStep);
            const completedAnalysis:SceneAnalysis={plan,characters,...(skippedStages.length?{skippedStages}:{}),...(ledgerStep?.marks?{ledgerMarks:ledgerStep.marks}:{}),...(ledgerStep?.ledger?{ledger:ledgerStep.ledger}:{}),
@@ -2090,6 +2169,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
              ...clockPart,...(worldEffects?{worldEffects}:{}),...(commitmentOperations?{commitmentOperations}:{}),
              ...(userModelCandidates?{userModelCandidates}:{}),...(physiologyOperations?{physiologyOperations}:{}),...(geographyOperations?{geographyOperations}:{})};
            processed[processed.length-1]={...processed.at(-1)!,analysis:completedAnalysis};
+           processedOwnLineSources.set(source.id, processed.at(-1)!);
            results.push({id:source.id,revision:source.revision,analysis:completedAnalysis});
         }
         const version=this.authority.commit(scope,state.version,[...backfilled.values(),...results]);
@@ -2906,11 +2986,12 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
     const logAddress={...address,roundId:roundKey(scope,source,this.authority.subject(scope)?.subjectId)};
     if(cached!==undefined){recordStage('cache_hit',logAddress);return cached;}
     const allowSkip=this.authority.interactions.isTavernRoleplay(scope);
+    const perspectiveInput = stage === 'perspective' ? input as PerspectiveStageInput : undefined;
     const fallback=()=>stageFallback(stage,input,emotionContext) as T;
     const earlier=this.authority.processing.state(address,fingerprint);
     if(allowSkip&&earlier?.status==='skipped'){recordStage('skipped',logAddress);return fallback();}
     if(allowSkip&&earlier&&earlier.attempts>=4&&earlier.failure&&
-      !retryableStageError(stage,earlier.failure.code))
+      !retryableStageError(stage,earlier.failure.code,perspectiveInput))
       throw new Error(earlier.failure.code);
     let lastError:unknown=earlier?.failure?.code??'operation_failed';
     for(let attempt=allowSkip?(earlier?.attempts??0):0;attempt<(allowSkip?4:1);attempt++){
@@ -2927,7 +3008,7 @@ export class SceneCore<C extends SceneCompanionPort = SceneCompanionPort> {
           processingFailure(error).kind==='conflict')throw new Error('context_changed_retry');
         lastError=error;
         const failure=this.authority.processing.fail(address,fingerprint,error);
-        if(!allowSkip||!retryableStageError(stage,error))throw error;
+        if(!allowSkip||!retryableStageError(stage,error,perspectiveInput))throw error;
         if(!failure.retryable||failure.kind==='configuration')break;
         if((failure.kind==='rate_limited'||failure.kind==='transport')&&attempt<3)
           await new Promise(resolve=>setTimeout(resolve,50*(attempt+1)));
@@ -2988,8 +3069,12 @@ function stageFallback(stage:ProcessingAddress['stage'],input:unknown,emotionCon
   if(stage==='perspective')return {observations:[],unresolved:[]};
   if(stage==='contactResponseExpectation')return {expected:null,quote:null};
   if(stage==='absenceExplanation')return null;
-  if(stage==='emotionRank')return {orderedIds:((input as {candidates?:{id:string}[]}).candidates??[]).map(item=>item.id),
-    method:'deterministic',reason:'model_stage_skipped'};
+  if (stage === 'emotionRank') {
+    return deterministicEmotionRanking(
+      (input as {candidates?: EmotionRankCandidate[]}).candidates ?? [],
+      'structural_priority_stage_skipped',
+    );
+  }
   if(stage==='emotion'){
     const context=(input as {character?:{experienceState?:{criticContext?:unknown}},profile?:{experienceState?:{criticContext?:unknown}}});
     const emotion={context:emotionContext??context.character?.experienceState?.criticContext??context.profile?.experienceState?.criticContext,
@@ -3006,32 +3091,86 @@ function degradedGuidance(source:import('./types.ts').SceneSource):string {
   return '\n本轮后台有未完成阶段，沿用此前已确认信息；不要让角色声称得知本轮未确认事实，不要补写未确认的记忆、情绪、世界变化或承诺。';
 }
 
-function retryableStageError(stage:ProcessingStage,error:unknown):boolean {
-  const code=processingFailure(error).code;
-  if(code.startsWith('model_')||code.startsWith('host_'))return true;
-  if((stage==='director'||stage==='directorGuidance')&&code.startsWith('invalid_director_'))return true;
-  if(stage==='generation'&&(code==='unsafe_rewrite'||code==='invalid_calculations'))return true;
-  // These codes arise while decoding one model candidate, before any authority write.
-  if(stage==='perspective'&&code==='invalid_scene_views')return true;
-  if(stage==='world'&&code==='invalid_world_effects')return true;
+// processPending supplies the fingerprinted perspective-stage input built from the accepted source.
+// It is used only to distinguish host bindings from candidate failures when their error codes overlap.
+// Without input, only invalid_scene_views and model_* / host_* errors remain retryable.
+// All other perspective errors require the accepted host context before retrying.
+function retryableStageError(stage: ProcessingStage, error: unknown, perspectiveInput?: PerspectiveStageInput): boolean {
+  const code = processingFailure(error).code;
+  if (code.startsWith('model_') || code.startsWith('host_')) return true;
+  if ((stage === 'director' || stage === 'directorGuidance') && code.startsWith('invalid_director_')) return true;
+  if (stage === 'generation' && (code === 'unsafe_rewrite' || code === 'invalid_calculations')) return true;
+
+  // Candidate failures: view shape, unresolved identities, readers, speaker attribution,
+  // player evidence, identity evidence, character references, presentation, requests,
+  // perspective shape, quotes, offsets, ambiguous quotes and expanded observation objects.
+  // Host failures: invalid_scene_view_input, invalid_scene_envelope, invalid_scene_roster,
+  // invalid_scene_message, invalid_scene_direct, invalid_outward_projection and version conflicts.
+  // Character/speaker codes overlap: reject bad host bindings before retrying the candidate.
+  // Direct and supplied plans are host inputs, so asking the model again cannot repair them.
+  if (stage === 'perspective' && [
+    'invalid_scene_views',
+    'invalid_scene_unresolved',
+    'invalid_scene_readers',
+    'invalid_scene_speaker',
+    'invalid_scene_player_evidence',
+    'invalid_scene_identity',
+    'invalid_scene_evidence',
+    'invalid_scene_character',
+    'invalid_scene_presentation',
+    'invalid_scene_request',
+    'invalid_scene_perspective',
+    'invalid_scene_quote',
+    'invalid_scene_offset',
+    'invalid_scene_ambiguous_quote',
+    'invalid_object',
+  ].includes(code)) {
+    if (!perspectiveInput) {
+      // Preserve the context-free retry policy when accepted host bindings are unavailable.
+      return code === 'invalid_scene_views';
+    }
+    if (perspectiveInput.suppliedPlan != null || perspectiveInput.source.envelope.mode === 'direct') return false;
+
+    const {source, roster} = perspectiveInput;
+    // O(R + P), bounded by the roster and presence limits; no source text is scanned.
+    const characters = new Set(roster.characters.map(character => character.id));
+    if (!characters.has(source.envelope.targetId)
+      || source.envelope.presentIds.some(identifier => !characters.has(identifier))
+      || (source.speakerId != null && !characters.has(source.speakerId))) return false;
+    if (source.role === 'assistant' && !source.automatic && source.speakerId !== source.envelope.targetId) return false;
+
+    return true;
+  }
+
+  if (stage === 'world' && code === 'invalid_world_effects') return true;
   // Historical commitments are folded before this stage. A new candidate can
   // still fail the read-only transition preview after its basic decode passed.
-  if(stage==='commitment'&&code.startsWith('invalid_commitment_'))return true;
-  if(stage==='memory'&&['invalid_memories','invalid_fact_memory','invalid_episode_memory','invalid_episode_evidence',
-    'invalid_episode_metadata','invalid_memory_kind','invalid_memory_metadata','invalid_protected_facts',
-    'invalid_scene_memory_source','memory_missing_source','episode_missing_source','protected_fact_missing_source',
-    'invalid_memory_reference_payload','invalid_memory_reference','invalid_feeling_basis',
-    'invalid_episode_participants','invalid_episode_sensory_cues','invalid_memory_retention','unsafe_episode_projection'].includes(code))return true;
-  if(stage==='preference'&&['invalid_preferences','invalid_preference_duration','preference_missing_source'].includes(code))return true;
-  if(stage==='emotion'&&['invalid_emotion_delta','invalid_relationships','invalid_relationship',
-    'invalid_relationship_target','invalid_relationship_evidence','invalid_relationship_delta'].includes(code))return true;
-  if(stage==='physiology'&&['invalid_physiology_operations','invalid_physiology_operation','invalid_physiology_source',
-    'invalid_physiology_temporality','invalid_physiology_need','invalid_scene_character'].includes(code))return true;
-  if(stage==='geography'&&['invalid_geography_operations','invalid_geography_operation','invalid_geography_source',
-    'invalid_geography_temporality','invalid_geography_position_source','invalid_geography_place',
-    'invalid_geography_relation','invalid_geography_route','invalid_geography_travel','invalid_geography_position',
-    'invalid_geography_readers','invalid_geography_reader_scope','invalid_geography_fact_source',
-    'invalid_geography_actor','invalid_geography_parent'].includes(code))return true;
+  if (stage === 'commitment' && code.startsWith('invalid_commitment_')) return true;
+  if (stage === 'memory' && [
+    'invalid_memories', 'invalid_fact_memory', 'invalid_episode_memory', 'invalid_episode_evidence',
+    'invalid_episode_metadata', 'invalid_memory_kind', 'invalid_memory_metadata', 'invalid_protected_facts',
+    'invalid_scene_memory_source', 'memory_missing_source', 'episode_missing_source', 'protected_fact_missing_source',
+    'invalid_memory_reference_payload', 'invalid_memory_reference', 'invalid_feeling_basis',
+    'invalid_episode_participants', 'invalid_episode_sensory_cues', 'invalid_memory_retention', 'unsafe_episode_projection',
+  ].includes(code)) return true;
+  if (stage === 'preference' && [
+    'invalid_preferences', 'invalid_preference_duration', 'preference_missing_source',
+  ].includes(code)) return true;
+  if (stage === 'emotion' && [
+    'invalid_emotion_delta', 'invalid_relationships', 'invalid_relationship',
+    'invalid_relationship_target', 'invalid_relationship_evidence', 'invalid_relationship_delta',
+  ].includes(code)) return true;
+  if (stage === 'physiology' && [
+    'invalid_physiology_operations', 'invalid_physiology_operation', 'invalid_physiology_source',
+    'invalid_physiology_temporality', 'invalid_physiology_need', 'invalid_scene_character',
+  ].includes(code)) return true;
+  if (stage === 'geography' && [
+    'invalid_geography_operations', 'invalid_geography_operation', 'invalid_geography_source',
+    'invalid_geography_temporality', 'invalid_geography_position_source', 'invalid_geography_place',
+    'invalid_geography_relation', 'invalid_geography_route', 'invalid_geography_travel', 'invalid_geography_position',
+    'invalid_geography_readers', 'invalid_geography_reader_scope', 'invalid_geography_fact_source',
+    'invalid_geography_actor', 'invalid_geography_parent',
+  ].includes(code)) return true;
   return false;
 }
 

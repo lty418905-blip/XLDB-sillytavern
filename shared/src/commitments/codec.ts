@@ -44,7 +44,11 @@ export function extractCommitmentPrompt(input: CommitmentValidationInput): Commi
       role: input.source.role,
       ...(input.source.speakerId===undefined?{}:{speakerId:input.source.speakerId}),
       text: input.source.text,
-      observations: input.plan.observations.map(observation=>({...observation,readers:[...commitmentReaders(input,observation)]})),
+      // The commitment prompt does not define this speaker marker; actorId stays as the observation's actor.
+      observations: input.plan.observations.map(({ attributed: _speakerMarker, ...observation }) => ({
+        ...observation,
+        readers: [...commitmentReaders(input, observation)],
+      })),
       actorIds: input.actorIds,
       ...(input.userActorId === undefined ? {} : {userActorId: input.userActorId}),
       mode: input.mode,
@@ -422,24 +426,31 @@ function negativeContactFeedback(quote:string):boolean {
 }
 
 function groundedEvidenceActor(
-  input:CommitmentValidationInput,relevant:CommitmentValidationInput['plan']['observations'],
-  evidence:{actorId:string;quote:string},strict:boolean,
-):boolean{
-  const quoted=(observation:CommitmentValidationInput['plan']['observations'][number])=>
-    observation.readers.includes(evidence.actorId)&&(includesForMatch(observation.quote,evidence.quote)||includesForMatch(evidence.quote,observation.quote));
-  if(!strict){
-    return (input.source.role==='user'&&input.userActorId===evidence.actorId)||
-      relevant.some(observation=>observation.actorId===evidence.actorId&&quoted(observation));
+  input: CommitmentValidationInput,
+  relevant: CommitmentValidationInput['plan']['observations'],
+  evidence: { actorId: string; quote: string },
+  strict: boolean,
+): boolean {
+  // User-authored NPC speech is attribution, never that NPC's own consent. Legacy evidence stays unchanged.
+  const quoted = (observation: CommitmentValidationInput['plan']['observations'][number]) =>
+    !(input.source.role === 'user' && observation.attributed === true)
+    && observation.readers.includes(evidence.actorId)
+    && (includesForMatch(observation.quote, evidence.quote) || includesForMatch(evidence.quote, observation.quote));
+
+  if (!strict) {
+    return (input.source.role === 'user' && input.userActorId === evidence.actorId)
+      || relevant.some(observation => observation.actorId === evidence.actorId && quoted(observation));
   }
-  if(input.source.role==='user'&&input.userActorId===evidence.actorId)return true;
-  if(input.source.role==='assistant'&&input.source.speakerId)return input.source.speakerId===evidence.actorId;
-  if(input.source.envelope.mode==='direct')return false;
-  // perspectiveOf has already bound identityQuote to this source and actor;
-  // only assistant scene narration may use that current-source identity path.
-  return relevant.some(observation=>observation.actorId===evidence.actorId&&quoted(observation)&&(
-    Boolean(observation.identityEvidence?.length)||
-    (input.source.role==='assistant'&&typeof observation.identityQuote==='string'&&
-      includesForMatch(input.source.text,observation.identityQuote)&&includesForMatch(observation.identityQuote,evidence.quote))));
+  if (input.source.role === 'user' && input.userActorId === evidence.actorId) return true;
+  if (input.source.role === 'assistant' && input.source.speakerId) return input.source.speakerId === evidence.actorId;
+  if (input.source.envelope.mode === 'direct') return false;
+
+  // The older codec bound identityQuote to this source and actor; only assistant narration may use that path.
+  return relevant.some(observation => observation.actorId === evidence.actorId && quoted(observation) && (
+    Boolean(observation.identityEvidence?.length)
+    || (input.source.role === 'assistant' && typeof observation.identityQuote === 'string'
+      && includesForMatch(input.source.text, observation.identityQuote)
+      && includesForMatch(observation.identityQuote, evidence.quote))));
 }
 
 function bindTarget(input:CommitmentValidationInput,candidate:GroundedCandidate):CommitmentTargetCandidate|undefined{

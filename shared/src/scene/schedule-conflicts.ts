@@ -1,7 +1,5 @@
 import {foldForMatch} from '../common/script-fold.ts';
 import {createHash} from 'node:crypto';
-import {available as agentJevAvailable} from '../agentjev/client.ts';
-import {emotionRankModelIdentity,evaluateSceneAgentJev} from './emotion-scheduler.ts';
 
 export interface ScheduleSlot {
   /** Internal stable key. It is never sent to AgentJev. */
@@ -27,9 +25,20 @@ export interface ConflictContext {
 export interface ConflictDecision {decline:'existing'|'proposed'|'undecided';method:'agentjev'|'director'|'deterministic';reason?:string;
   modelIdentity?:string}
 export type BlindConflictChoice='A'|'B'|'neither';
-export interface BlindConflictReview {state:string;agentJevChoice:BlindConflictChoice;
-  distribution:Record<BlindConflictChoice,number>|null}
-export type ReviewScheduleConflict=(input:BlindConflictReview)=>Promise<BlindConflictChoice>;
+/** Anonymous JSON and optional injected-judge advice; absent or null advice means no judge participated. */
+export interface BlindConflictReview {
+  state: string;
+  agentJevChoice?: BlindConflictChoice | null;
+  distribution?: Record<BlindConflictChoice, number> | null;
+}
+
+/**
+ * Review one anonymous pair. The optional capacity predicate runs before review and may allow cached results
+ * even after the per-plan request budget is spent. Callback or getter errors become an undecided decision.
+ */
+export type ReviewScheduleConflict = ((input: BlindConflictReview) => Promise<BlindConflictChoice>) & {
+  canReview?: ((input: BlindConflictReview) => boolean) | null;
+};
 // AgentJev choice scores are uncalibrated. These are routing thresholds, not accuracy claims.
 const decisiveTop=0.7,decisiveMargin=0.2;
 const driveNames=['connection','novelty','expression','safety','play'] as const;
@@ -46,56 +55,135 @@ export function overlaps(proposed:ScheduleSlot,existing:ScheduleSlot):boolean {
   return proposed.startTime<existingEnd&&existing.startTime<proposedEnd;
 }
 
-/** Blind symmetric A/B recommendation. The caller keeps accepted history authoritative. */
-export async function chooseScheduleConflict(existing:ScheduleSlot,proposed:ScheduleSlot,context:ConflictContext,
-  evaluate?:((payload:unknown)=>Promise<unknown>),reviewLowConfidence?:ReviewScheduleConflict):Promise<ConflictDecision> {
-  if(!overlaps(proposed,existing))return {decline:'undecided',method:'deterministic',reason:'no_exact_overlap'};
-  if(JSON.stringify(blindSlot(existing))===JSON.stringify(blindSlot(proposed)))
-    return {decline:'undecided',method:'deterministic',reason:'indistinguishable_schedule_evidence'};
-  const evidenced=evidencePriority(existing,proposed,context);
-  if(evidenced)return {decline:evidenced,method:'deterministic',reason:'visible_schedule_evidence'};
-  const fallback=(reason:string):ConflictDecision=>({decline:'undecided',method:'deterministic',reason});
-  if(!evaluate&&!agentJevAvailable())return fallback('agentjev_unavailable');
-  try{
-    const ordered=stableOrder(existing,proposed,context.scopeKey,context.npcId);
-    const [a,b]=ordered;
-    const state=JSON.stringify({
-      A:blindSlot(a),B:blindSlot(b),
-      affect:blindAffect(context.affect),recent:blindRecent(context.recent),
+/**
+ * Resolve exact overlap by existing evidence, then anonymous director review. With an injected judge, retain
+ * the original five confidence gates before review. Invalid responses and review errors stay undecided.
+ */
+export async function chooseScheduleConflict(
+  existing: ScheduleSlot,
+  proposed: ScheduleSlot,
+  context: ConflictContext,
+  evaluate?: ((payload: unknown) => Promise<unknown>) | null,
+  reviewLowConfidence?: ReviewScheduleConflict | null,
+): Promise<ConflictDecision> {
+  if (!overlaps(proposed, existing))
+    return {decline: 'undecided', method: 'deterministic', reason: 'no_exact_overlap'};
+
+  if (JSON.stringify(blindSlot(existing)) === JSON.stringify(blindSlot(proposed)))
+    return {decline: 'undecided', method: 'deterministic', reason: 'indistinguishable_schedule_evidence'};
+
+  const evidenced = evidencePriority(existing, proposed, context);
+  if (evidenced)
+    return {decline: evidenced, method: 'deterministic', reason: 'visible_schedule_evidence'};
+
+  const fallback = (reason: string): ConflictDecision => ({decline: 'undecided', method: 'deterministic', reason});
+
+  try {
+    const ordered = stableOrder(existing, proposed, context.scopeKey, context.npcId);
+    const state = JSON.stringify({
+      A: blindSlot(ordered[0]),
+      B: blindSlot(ordered[1]),
+      affect: blindAffect(context.affect),
+      recent: blindRecent(context.recent),
     });
-    const response=await (evaluate??evaluateSceneAgentJev)({requests:[{
-      id:'conflict',state,questions:[{id:'decline',type:'choice',
-        question:'同一 NPC 的两件未来安排撞期。匿名比较 kind（commitment 是履约事项）、nature、motive、当前情绪与近期主题：若一边有具体且更强的行为动机，建议放弃另一边；两边相近、理由冲突或证据不足时选 neither。不要推断哪边是用户请求。建议只供导演规划；反悔须在后续剧情产生反应，不能改写承诺或已接受历史。',
-        options:{A:'放弃 A，保留 B',B:'放弃 B，保留 A',neither:'无法据此区分，暂不取舍'}}],
-    }]}) as {results?:Array<{id:string;answers?:Array<{value?:unknown;distribution?:unknown}>}>};
-    if(response.results?.length!==1||response.results[0]?.id!=='conflict')throw new Error('agentjev_invalid_schedule_choice');
-    const answer=response.results[0].answers?.[0],choice=answer?.value;
-    if(choice!=='A'&&choice!=='B'&&choice!=='neither')throw new Error('agentjev_invalid_schedule_choice');
-    const distribution=choiceDistribution(answer?.distribution);
-    const scores=distribution?[...Object.values(distribution)].sort((left,right)=>right-left):null;
-    const decisive=choice!=='neither'&&scores!==null&&distribution!==null&&distribution[choice]>=decisiveTop&&
-      Math.abs(distribution[choice]-scores[0])<=1e-4&&scores[0]-scores[1]>=decisiveMargin;
-    const decline=(selected:BlindConflictChoice)=>selected==='neither'?'undecided':
-      ordered[selected==='A'?0:1]===existing?'existing':'proposed';
-    const modelIdentity=!evaluate?{modelIdentity:emotionRankModelIdentity()}:{};
-    if(decisive)return {decline:decline(choice),method:'agentjev',...modelIdentity};
-    if(!reviewLowConfidence)return {decline:'undecided',method:'agentjev',
-      reason:distribution?'agentjev_uncertain_choice':'agentjev_missing_confidence',...modelIdentity};
-    try{
-      const reviewed=await reviewLowConfidence({state,agentJevChoice:choice,distribution});
-      if(reviewed!=='A'&&reviewed!=='B'&&reviewed!=='neither')throw new Error('invalid_director_conflict_review');
-      return {decline:decline(reviewed),method:'director',reason:'agentjev_uncertain_choice',...modelIdentity};
-    }catch{return {decline:'undecided',method:'director',reason:'director_conflict_review_failed',...modelIdentity};}
-  }catch(error){return fallback(error instanceof Error?error.message:'agentjev_schedule_failed');}
+    const decline = (selected: BlindConflictChoice): ConflictDecision['decline'] => selected === 'neither'
+      ? 'undecided'
+      : ordered[selected === 'A' ? 0 : 1] === existing ? 'existing' : 'proposed';
+
+    const review = async (input: BlindConflictReview, reason: string): Promise<ConflictDecision> => {
+      if (!reviewLowConfidence) return fallback('director_conflict_review_unavailable');
+
+      try {
+        // Check before invoking the callback: throwing here would lose the distinct budget reason.
+        if (reviewLowConfidence.canReview?.(input) === false)
+          return {decline: 'undecided', method: 'director', reason: 'director_conflict_review_budget'};
+
+        const reviewed = await reviewLowConfidence(input);
+        if (reviewed !== 'A' && reviewed !== 'B' && reviewed !== 'neither')
+          throw new Error('invalid_director_conflict_review');
+
+        return {decline: decline(reviewed), method: 'director', reason};
+      } catch {
+        return {decline: 'undecided', method: 'director', reason: 'director_conflict_review_failed'};
+      }
+    };
+
+    if (!evaluate) return review({state}, 'director_conflict_review');
+
+    const response = await evaluate({
+      requests: [{
+        id: 'conflict',
+        state,
+        questions: [{
+          id: 'decline',
+          type: 'choice',
+          question: '同一 NPC 的两件未来安排撞期。匿名比较 kind（commitment 是履约事项）、nature、motive、当前情绪与近期主题：若一边有具体且更强的行为动机，建议放弃另一边；两边相近、理由冲突或证据不足时选 neither。不要推断哪边是用户请求。建议只供导演规划；反悔须在后续剧情产生反应，不能改写承诺或已接受历史。',
+          options: {A: '放弃 A，保留 B', B: '放弃 B，保留 A', neither: '无法据此区分，暂不取舍'},
+        }],
+      }],
+    }) as {results?: Array<{id: string; answers?: Array<{value?: unknown; distribution?: unknown}>}>};
+
+    if (response.results?.length !== 1 || response.results[0]?.id !== 'conflict')
+      throw new Error('agentjev_invalid_schedule_choice');
+
+    const answer = response.results[0].answers?.[0];
+    const choice = answer?.value;
+    if (choice !== 'A' && choice !== 'B' && choice !== 'neither')
+      throw new Error('agentjev_invalid_schedule_choice');
+
+    const distribution = choiceDistribution(answer?.distribution);
+    const scores = distribution ? [...Object.values(distribution)].sort((left, right) => right - left) : null;
+    const decisive = choice !== 'neither' && scores !== null && distribution !== null
+      && distribution[choice] >= decisiveTop
+      && Math.abs(distribution[choice] - scores[0]) <= 1e-4
+      && scores[0] - scores[1] >= decisiveMargin;
+
+    if (decisive) return {decline: decline(choice), method: 'agentjev'};
+
+    if (!reviewLowConfidence) {
+      return {
+        decline: 'undecided',
+        method: 'agentjev',
+        reason: distribution ? 'agentjev_uncertain_choice' : 'agentjev_missing_confidence',
+      };
+    }
+
+    return review({state, agentJevChoice: choice, distribution}, 'agentjev_uncertain_choice');
+  } catch (error) {
+    // Injected judges preserve their error codes; the review-only path always records review failure.
+    if (evaluate) {
+      if (error instanceof Error) return fallback(error.message);
+
+      return fallback('agentjev_schedule_failed');
+    }
+
+    return fallback('director_conflict_review_failed');
+  }
 }
 
-function choiceDistribution(value:unknown):Record<BlindConflictChoice,number>|null {
-  if(!value||typeof value!=='object'||Array.isArray(value))return null;
-  const scores=value as Record<string,unknown>;
-  if(Object.keys(scores).length!==3||!['A','B','neither'].every(key=>typeof scores[key]==='number'&&
-    Number.isFinite(scores[key])&&scores[key]>=0&&scores[key]<=1))return null;
-  const distribution={A:scores.A as number,B:scores.B as number,neither:scores.neither as number};
-  return Math.abs(distribution.A+distribution.B+distribution.neither-1)<=1e-4?distribution:null;
+// Own-key enumeration is O(k) in supplied keys; each of the three score getters is read once.
+function choiceDistribution(value: unknown): Record<BlindConflictChoice, number> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+
+  const scores = value as Record<BlindConflictChoice, unknown>;
+  const choices = ['A', 'B', 'neither'] as const;
+  if (Object.keys(scores).length !== 3) return null;
+
+  // A getter can delete a later field; check ownership immediately before reading each value.
+  const distribution = {} as Record<BlindConflictChoice, unknown>;
+  for (const choice of choices) {
+    if (!Object.hasOwn(scores, choice)) return null;
+    distribution[choice] = scores[choice];
+  }
+
+  // Every confidence gate uses this snapshot, never the external object.
+  for (const score of Object.values(distribution)) {
+    if (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 1) return null;
+  }
+
+  const snapshot = distribution as Record<BlindConflictChoice, number>;
+  // The normalized probability contract permits an absolute sum error of one millionth.
+  return Math.abs(snapshot.A + snapshot.B + snapshot.neither - 1) <= 1e-6 ? snapshot : null;
 }
 
 function stableOrder(a:ScheduleSlot,b:ScheduleSlot,scopeKey:string,npcId:string):[ScheduleSlot,ScheduleSlot] {

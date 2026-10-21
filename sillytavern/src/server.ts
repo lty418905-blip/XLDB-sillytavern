@@ -14,7 +14,6 @@ import {sceneWorkbench,correctSceneSource} from '../../shared/src/scene/workbenc
 import {sceneDashboard} from './dashboard.ts';
 import {listModels, ModelCatalogError} from './model-catalog.ts';
 import {RuntimeLog} from '../../shared/src/core/runtime-log.ts';
-import {closeEmotionRanker,emotionRankerStatus} from '../../shared/src/scene/emotion-scheduler.ts';
 import {startPairCapture} from '../../shared/src/core/pair-capture-switch.ts';
 
 export function loadConfigProfile(filename: string): ConfigProfile {
@@ -278,8 +277,6 @@ export function createServer(core: Core, options: {token:string;configPath:strin
     try {
       if (request.url === '/v1/config' && request.method === 'GET') return send(200, config);
       if (request.url === '/v1/config-profile' && request.method === 'GET') return send(200, profile);
-      // Read-only NPC emotion ranker state for the Tavern badge; reading it never starts AgentJev.
-      if (request.url === '/v1/emotion-ranker' && request.method === 'GET') return send(200, emotionRankerStatus());
       // Read-only retrieval health for the Tavern status line; never contains a key or an address.
       if (request.url === '/v1/retrieval-status' && request.method === 'GET') return send(200, retrievalHealth.snapshot());
       if (!['POST','PUT'].includes(request.method ?? '')) return send(405, {error:'method_not_allowed'});
@@ -298,7 +295,7 @@ export function createServer(core: Core, options: {token:string;configPath:strin
         }
       }
       if(request.url==='/v1/diagnostics')return send(200,{protocol:'xldb-scene-v2',authenticated:true,
-        node:process.version,sqlite:core.authority.sqliteVersion(),emotionRanker:emotionRankerStatus(),retrieval:retrievalHealth.snapshot(),stages:Object.fromEntries(Object.entries(config).map(([name,value])=>[name,{configured:Boolean(value.model)}]))});
+        node:process.version,sqlite:core.authority.sqliteVersion(),retrieval:retrievalHealth.snapshot(),stages:Object.fromEntries(Object.entries(config).map(([name,value])=>[name,{configured:Boolean(value.model)}]))});
       if (request.url === '/v1/config') {
         if (profileV2) return send(409,{error:'config_profile_required'});
         const next = configsOf(input);
@@ -375,7 +372,7 @@ export function createServer(core: Core, options: {token:string;configPath:strin
           const scheduling=dashboard.selectedCharacterId==='player'?null:core.scene.emotionScheduling(scope);
           const directorTodos=dashboard.selectedCharacterId==='player'?[]:core.scene.directorCalendarTodos(scope).filter(item=>item.characterId===dashboard.selectedCharacterId);
           const skipped=core.scene.progress(scope).sources.flatMap(source=>source.stages.filter(stage=>String(stage.status)==='skipped').map(stage=>({sourceId:source.sourceId,...stage})));
-          return send(200,{...dashboard,directorTodos,skippedStages:skipped,emotionRanker:emotionRankerStatus(),emotionScheduling:scheduling?{budget:scheduling.budget,pendingTotal:scheduling.pendingTotal,backgroundError:scheduling.backgroundError,
+          return send(200,{...dashboard,directorTodos,skippedStages:skipped,emotionScheduling:scheduling?{budget:scheduling.budget,pendingTotal:scheduling.pendingTotal,backgroundError:scheduling.backgroundError,
             latestRanking:scheduling.latestRanking,npc:scheduling.npcs.find(item=>item.id===dashboard.selectedCharacterId)}:null});
         }
         case '/v1/scene/calendar-preview': return send(200,await core.scene.previewCalendar(scope,config));
@@ -482,12 +479,8 @@ export function createServer(core: Core, options: {token:string;configPath:strin
   });
 }
 
-/**
- * Stops a Tavern core. The NPC emotion ranker's AgentJev worker is a module singleton; it is closed first so no python
- * child outlives the core.
- */
+/** Stop accepting Tavern requests, then close authority after the server closes. */
 export function stopCore(server: http.Server, authority: {close():void}) {
-  closeEmotionRanker();
   server.close(() => { authority.close(); });
 }
 

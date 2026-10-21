@@ -13,7 +13,10 @@ export interface DirectionalRelationship {
   delta: RelationshipDelta;
 }
 
+/** Literal evidence visible to readers; attributed actorId identifies its speaker or actor, not a reader. */
 export interface RelationshipObservation {
+  /** Missing means legacy data; an attributed observation without actorId has no single known speaker. */
+  attributed?: true;
   id: string;
   quote: string;
   evidence: string;
@@ -60,51 +63,98 @@ export function relationshipContext(relationships:readonly FoldedRelationship[])
 }
 
 const MAX_RELATIONSHIPS = 6;
+// Product contract: each relationship candidate may cite at most three observations and three quotes.
 const MAX_EVIDENCE = 3;
 const MAX_ID_LENGTH = 200;
 const MAX_QUOTE_LENGTH = 4_000;
 
 /**
- * Validate model candidates against already-filtered perspective observations.
+ * Validate at most six candidates against already-filtered perspective observations.
+ * Returns detached evidence arrays and source-spelled quotes, or throws an invalid_relationship* error.
+ * Each candidate checks at most three pairs; quote matching is linear in the paired text lengths.
+ * Context observations and actor aliases have no count cap and are visited once during context validation.
  * A roster entry or bare name mention cannot establish a relationship.
  */
-export function validateRelationships(value: unknown, context: SceneRelationshipContext,
-  options:{ignoreValidatedZeroDelta?:boolean}={}): DirectionalRelationship[] {
+export function validateRelationships(
+  value: unknown,
+  context: SceneRelationshipContext,
+  options: {ignoreValidatedZeroDelta?: boolean} = {},
+): DirectionalRelationship[] {
   const checked = checkedContext(context);
-  if (!Array.isArray(value) || value.length > MAX_RELATIONSHIPS) throw new Error('invalid_relationships');
+
+  if (!Array.isArray(value) || value.length > MAX_RELATIONSHIPS) {
+    throw new Error('invalid_relationships');
+  }
+
   const observations = new Map(checked.observations.map(observation => [observation.id, observation]));
   const result: DirectionalRelationship[] = [];
   const ids = new Set<string>();
   const targets = new Set<string>();
+
   for (const item of value) {
     const input = record(item, 'invalid_relationship');
-    if (Object.keys(input).some(key => !['id', 'subjectId', 'targetId', 'evidenceObservationIds', 'evidenceQuotes', 'delta'].includes(key))) {
+    const allowedKeys = ['id', 'subjectId', 'targetId', 'evidenceObservationIds', 'evidenceQuotes', 'delta'];
+
+    if (Object.keys(input).some(key => !allowedKeys.includes(key))) {
       throw new Error('invalid_relationship');
     }
+
     const id = requiredText(input.id, MAX_ID_LENGTH, 'invalid_relationship');
     const subjectId = requiredText(input.subjectId, MAX_ID_LENGTH, 'invalid_relationship');
     const targetId = requiredText(input.targetId, MAX_ID_LENGTH, 'invalid_relationship');
+
     if (subjectId !== checked.subjectId || targetId === subjectId ||
       (targetId !== checked.userActorId && !checked.actors.has(targetId)) || ids.has(id) || targets.has(targetId)) {
       throw new Error('invalid_relationship_target');
     }
+
     const evidenceIds = textList(input.evidenceObservationIds, MAX_EVIDENCE, MAX_ID_LENGTH, 'invalid_relationship_evidence');
-    const evidenceQuotes = textList(input.evidenceQuotes, MAX_EVIDENCE, MAX_QUOTE_LENGTH, 'invalid_relationship_evidence');
-    if (!evidenceIds.length || evidenceIds.length !== evidenceQuotes.length || new Set(evidenceIds).size !== evidenceIds.length) {
+    const evidenceQuotes = textList(
+      input.evidenceQuotes,
+      MAX_EVIDENCE,
+      MAX_QUOTE_LENGTH,
+      'invalid_relationship_evidence',
+    );
+    const sharedObservation = evidenceIds.length === 1 && evidenceQuotes.length > 1;
+
+    if (!evidenceIds.length || (!sharedObservation && evidenceIds.length !== evidenceQuotes.length) ||
+      new Set(evidenceIds).size !== evidenceIds.length) {
       throw new Error('invalid_relationship_evidence');
     }
-    const pairs = evidenceIds.map((observationId, index) => ({observation:observations.get(observationId),quote:evidenceQuotes[index]!}));
+
+    // Direct replies can be one observation containing several relevant passages. Check every passage against
+    // that observation, but keep the supplied ID array so storing and revalidating do not rewrite its shape.
+    // The existing three-quote cap bounds this mapping; no cross product of IDs and quotes is constructed.
+    const pairs = evidenceQuotes.map((quote, index) => ({
+      observation: observations.get(evidenceIds[sharedObservation ? 0 : index]!),
+      quote,
+    }));
+
     if (pairs.some(pair => !pair.observation || !pair.observation.readers.includes(checked.subjectId) ||
-      !includesForMatch(pair.observation.quote,pair.quote))) throw new Error('invalid_relationship_evidence');
+      !includesForMatch(pair.observation.quote, pair.quote))) {
+      throw new Error('invalid_relationship_evidence');
+    }
+
     if (!pairs.every(pair => targetHasGroundedParticipation(pair.observation!, pair.quote, targetId, checked))) {
       throw new Error('invalid_relationship_target');
     }
-    const delta = relationshipDelta(input.delta,options.ignoreValidatedZeroDelta===true);
-    ids.add(id); targets.add(targetId);
-    if(options.ignoreValidatedZeroDelta===true&&Object.values(delta).every(value=>value===0))continue;
-    result.push({id,subjectId,targetId,evidenceObservationIds:evidenceIds,
-      evidenceQuotes:pairs.map(pair=>sourceQuote(pair.observation!.quote,pair.quote)!),delta});
+
+    const delta = relationshipDelta(input.delta, options.ignoreValidatedZeroDelta === true);
+    ids.add(id);
+    targets.add(targetId);
+
+    if (options.ignoreValidatedZeroDelta === true && Object.values(delta).every(value => value === 0)) continue;
+
+    result.push({
+      id,
+      subjectId,
+      targetId,
+      evidenceObservationIds: evidenceIds,
+      evidenceQuotes: pairs.map(pair => sourceQuote(pair.observation!.quote, pair.quote)!),
+      delta,
+    });
   }
+
   return result;
 }
 
@@ -113,6 +163,58 @@ export function validateRelationships(value: unknown, context: SceneRelationship
  * emotion engine keys, so changing it replays every story-domain actor once from accepted records.
  */
 export const RELATIONSHIP_FOLD_RULE_VERSION = 1;
+
+/** A caller-owned prefix fold; append visits one source and reads return detached provenance-bearing values. */
+export interface RelationshipFold {
+  append(source: RelationshipSource): void;
+  get(targetId: string): FoldedRelationship | undefined;
+  values(): FoldedRelationship[];
+}
+
+/**
+ * Creates the existing directional fold as an incremental prefix reader, with rate in [0, 0.1].
+ * Invalid subject/rate throws invalid_relationship_fold; source getter errors propagate as in the whole-history fold.
+ * Appending N sources visits O(N + candidates), including pending emotion candidates on ready accepted sources.
+ * Duplicate candidate identities remain suppressed for this fold's entire lifetime, without limiting history length.
+ */
+export function createRelationshipFold(subjectId: string, rate: number): RelationshipFold {
+  if (!validId(subjectId) || !Number.isFinite(rate) || rate < 0 || rate > 0.1) {
+    throw new Error('invalid_relationship_fold');
+  }
+  const states = new Map<string, FoldedRelationship>();
+  const applied = new Set<string>();
+  const detached = (value: FoldedRelationship): FoldedRelationship => ({...value, relations: {...value.relations}});
+  return {
+    append(source) {
+      if (!usableSource(source)) return;
+      const characters = source.analysis?.characters;
+      const candidates = characters && Object.hasOwn(characters, subjectId)
+        ? characters[subjectId]?.relationships ?? [] : [];
+      for (const relationship of candidates) {
+        if (!validStoredRelationship(relationship, subjectId)) continue;
+        const key = `${source.id}:${source.revision}:${relationship.id}`;
+        if (applied.has(key)) continue;
+        applied.add(key);
+        const previous = states.get(relationship.targetId)?.relations ?? {depth: 0, trust: 0, valence: 0};
+        const relations: StableRelations = {
+          depth: clamp(previous.depth + (relationship.delta.depth ?? 0) * rate, 0, 1),
+          trust: clamp(previous.trust + (relationship.delta.trust ?? 0) * rate, 0, 1),
+          valence: clamp(previous.valence + (relationship.delta.valence ?? 0) * rate, -1, 1),
+        };
+        states.set(relationship.targetId, {
+          subjectId, targetId: relationship.targetId, relations, sourceId: source.id, revision: source.revision,
+        });
+      }
+    },
+    get(targetId) {
+      const value = states.get(targetId);
+      return value === undefined ? undefined : detached(value);
+    },
+    values() {
+      return [...states.values()].map(detached);
+    },
+  };
+}
 
 /**
  * Fold only ready, accepted source analyses. The source/candidate key makes a
@@ -175,17 +277,37 @@ function checkedContext(context: SceneRelationshipContext) {
   return {subjectId:context.subjectId,actorIds,userActorId:context.userActorId,actors,observations:[...context.observations],messageRole:context.messageRole};
 }
 
-function targetHasGroundedParticipation(observation: RelationshipObservation, quote: string, targetId: string, context:ReturnType<typeof checkedContext>): boolean {
-  // A user can narrate NPC-only events. Authorship or visibility alone is not
-  // participation; require a literal player reference outside quoted speech.
+function targetHasGroundedParticipation(
+  observation: RelationshipObservation,
+  quote: string,
+  targetId: string,
+  context: ReturnType<typeof checkedContext>,
+): boolean {
   if (targetId === context.userActorId) {
-    if(context.messageRole==='assistant')return observation.playerVisible===true&&Boolean(observation.playerEvidence);
-    const narrative=foldForMatch(quote).replace(/“[^”]*”|「[^」]*」|『[^』]*』|"[^"]*"/g,'');
+    if (context.messageRole === 'assistant') {
+      return observation.playerVisible === true && Boolean(observation.playerEvidence);
+    }
+
+    // An explicit player actor grounds the player's speech without needing a separate narrative reference.
+    if (observation.actorId === context.userActorId) return true;
+
+    // Legacy views carry no speaker attribution. Their public visibility retains the historical tradeoff
+    // that also accepts NPC dialogue. Newly attributed narration must instead ground an unquoted player reference.
+    if (observation.attributed !== true && observation.actorId === undefined
+      && observation.playerVisible === true && Boolean(observation.playerEvidence)) {
+      return true;
+    }
+
+    // Outside the explicit actor and visibility paths, require an unquoted player reference so an NPC's
+    // quotation alone cannot establish player participation.
+    const narrative = foldForMatch(quote).replace(/“[^”]*”|「[^」]*」|『[^』]*』|"[^"]*"/g, '');
     return /你|您|我|玩家|用户|使用者/.test(narrative);
   }
+
   if (observation.actorId !== targetId && !observation.recipients?.includes(targetId)) return false;
+
   const target = context.actors.get(targetId)!;
-  return [target.name,...target.aliases].some(label => includesForMatch(quote,label));
+  return [target.name, ...target.aliases].some(label => includesForMatch(quote, label));
 }
 
 function relationshipDelta(value: unknown,allowZero=false): RelationshipDelta {

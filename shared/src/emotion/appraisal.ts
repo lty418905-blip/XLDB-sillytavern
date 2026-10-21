@@ -77,7 +77,7 @@ export interface AppraisalRelation {
   valence: number;
   toward: { target: string; depth: number; trust: number }[];
   skipSeparation?: AppraisalSeparation;
-  counterpartId?: string;
+  counterpartId?: string | null;
 }
 
 /** Newly mapped record, without driveSatisfaction or the caller-specific stableRelationDelta. */

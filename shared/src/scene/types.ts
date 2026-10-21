@@ -87,7 +87,13 @@ export interface ObservationCandidate {
   evidence: string;
   identityEvidence?: {sourceId:string;quote:string;revision?:number}[];
 }
+/** A source-bound experience for its readers; optional attribution does not change visibility. */
 export interface Observation {
+  /**
+   * When present, actorId names the speaker or actor. Its absence means narration, multiple actors, or uncertainty.
+   * Observations without this marker are legacy data and retain the older codec's identity semantics.
+   */
+  attributed?: true;
   playerVisible?: boolean;
   playerEvidence?: string;
   identityQuote?: string;
@@ -96,7 +102,11 @@ export interface Observation {
   start: number;
   end: number;
   quote: string;
-  /** Legacy actor/recipient attribution is present on the older perspective codec only. */
+  /**
+   * Older codec: the speaking NPC for NPC speech, the direct listener for the player's own speech,
+   * the observer for observed items, and the holder for thought/inferred items.
+   * Attributed views: only the speaker or actor who said or did the content.
+   */
   actorId?: string;
   recipients?: string[];
   evidence: string;

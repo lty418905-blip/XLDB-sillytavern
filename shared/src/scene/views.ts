@@ -89,7 +89,26 @@ export function viewsOf(
   const fragments = new Map(segmentOutward(message.text).map((fragment, index) =>
     [fragment.ref, { ...fragment, index }] as const));
   const candidateRoot=record(raw,'invalid_scene_views');
-  const root = exactRecord(raw, ['views', 'unresolved',...['presentation','requests'].filter(key=>Object.hasOwn(candidateRoot,key))], 'invalid_scene_views');
+  const root = exactRecord(raw, [
+    'views',
+    'unresolved',
+    ...(message.role === 'user' && Object.hasOwn(candidateRoot, 'by') ? ['by'] : []),
+    ...['presentation', 'requests'].filter(key => Object.hasOwn(candidateRoot, key)),
+  ], 'invalid_scene_views');
+  // An omitted table is empty: only refs used by views require attribution, not presentation or request refs.
+  // Missing used refs or invalid tables share the view retry code: Tavern roleplay tries four times, then skips
+  // all observations; other hosts try once and fail. Valid extra keys are checked but never create observations.
+  // Each table entry and selected fragment is checked once: O(table entries + selected refs).
+  const attribution = new Map<string, string | null>();
+  if (message.role === 'user' && Object.hasOwn(root, 'by')) {
+    for (const [ref, actor] of Object.entries(record(root.by, 'invalid_scene_views'))) {
+      if (!fragments.has(ref)
+        || (actor !== null && actor !== 'player' && (typeof actor !== 'string' || !characters.has(actor)))) {
+        fail('invalid_scene_views');
+      }
+      attribution.set(ref, actor as string | null);
+    }
+  }
   const generationRequests:Record<string,string>={};
   if(root.requests!==undefined){
     const requests=record(root.requests,'invalid_scene_request');
@@ -134,7 +153,7 @@ export function viewsOf(
       const selected = item.refs.map(ref => {
         if (typeof ref !== 'string' || used.has(ref)) fail('invalid_scene_views');
         const fragment = fragments.get(ref);
-        if (!fragment) fail('invalid_scene_views');
+        if (!fragment || (message.role === 'user' && !attribution.has(ref))) fail('invalid_scene_views');
         used.add(ref);
         return fragment;
       });
@@ -175,6 +194,7 @@ export function viewsOf(
       const quote = message.text.slice(first.start, last.end);
       const readers = [...new Set(item.readers)].sort((left, right) => readerRank.get(left)! - readerRank.get(right)!);
       const identity = identityFor(readers, message, roster, history.slice(-MAX_HISTORY), fragments);
+      const actorId = attributedActor(item, attribution, characters);
       return {
         id: `${message.id}:view:${index}`,
         kind: item.kind,
@@ -183,12 +203,34 @@ export function viewsOf(
         quote,
         evidence: quote,
         readers,
+        ...(message.role === 'user' ? { attributed: true as const } : {}),
+        ...(actorId === undefined ? {} : { actorId }),
         ...(item.isPublic ? { playerVisible: true, playerEvidence: quote } : {}),
         ...(identity.identityQuote ? { identityQuote: identity.identityQuote } : {}),
         ...(identity.identityEvidence.length ? { identityEvidence: identity.identityEvidence } : {}),
       };
     });
   return { observations, unresolved,...(presentation?{presentation}:{}),...(Object.keys(generationRequests).length?{generationRequests}:{}) };
+}
+
+// Attribution is read after grouping, so it cannot change observation ids, readers, or the 32-observation limit.
+// Work is O(refs in this observation); a null or conflicting fragment prevents a single-actor claim.
+function attributedActor(
+  observation: Pick<DecodedView, 'fragments' | 'kind'>,
+  attribution: ReadonlyMap<string, string | null>,
+  characters: ReadonlyMap<string, SceneCharacter>,
+): string | undefined {
+  const actor = attribution.get(observation.fragments[0]!.ref);
+  if (actor === undefined || actor === null
+    || !observation.fragments.every(fragment => attribution.get(fragment.ref) === actor)) return undefined;
+
+  if (actor === 'player') {
+    // The player's private thoughts and NPC-only private exchanges cannot make the player their speaker.
+    return observation.kind === 'thought' || observation.kind === 'inferred' || observation.kind === 'private'
+      ? undefined
+      : 'player';
+  }
+  return characters.get(actor)!.id;
 }
 
 function identityFor(
