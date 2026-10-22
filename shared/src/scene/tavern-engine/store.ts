@@ -4,7 +4,17 @@ import { scopeKey } from '../../core/types.ts';
 import { readStoreFormat, stampStoreFormat } from '../../core/store-format.ts';
 import type { Scope } from '../../memory/access.ts';
 import { projectBeatItems } from './codec.ts';
-import type { DecodedBeat, EngineEvent } from './types.ts';
+import type {
+  TavernAcceptedPlayerInterpretation,
+  TavernEngineCommitInput,
+  TavernEngineLedgerPort,
+  TavernEnginePlayerInput,
+  TavernInterpretationMetadata,
+  TavernTurnIdentity,
+  TavernUnknownActionDiagnostic,
+  TavernUnknownEffectDiagnostic,
+} from './engine.ts';
+import type { DecodedBeat, EngineEvent, EngineEventEnvelope, EventOrigin } from './types.ts';
 
 /** Caller-selected positive store format and nonempty writer identity; no production format is allocated here. */
 export interface TavernStoreFormat {
@@ -26,6 +36,7 @@ export interface PlayerInterpretationInput {
   source: TavernSourceReference;
   expectedVersion: number;
   events: readonly EngineEvent[];
+  interpretation?: TavernInterpretationMetadata | null;
 }
 
 /** A validated beat and its actually emitted original item indices; omitted items and effects are discarded. */
@@ -65,9 +76,25 @@ export type AcceptedTavernTurn = {
   source: TavernSourceReference;
   version: number;
 } & (
-  | { kind: 'interpret'; events: readonly EngineEvent[] }
-  | { kind: 'npc'; beats: readonly DecodedBeat[] }
+  | { kind: 'interpret'; events: readonly EngineEvent[]; interpretation?: TavernInterpretationMetadata }
+  | ({ kind: 'npc'; beats: readonly DecodedBeat[] } & Partial<TavernNpcAcceptance>)
 );
+
+/**
+ * Accepted, non-executable Unknown record. The envelope is ledger-owned; source retains the tentative origin.
+ * Original zero-based item/effect indices and rejected links are audit data, never projected world effects.
+ */
+export type AcceptedTavernUnknownDiagnostic = (TavernUnknownActionDiagnostic | TavernUnknownEffectDiagnostic) & {
+  envelope: EngineEventEnvelope;
+  origin: EventOrigin;
+};
+
+interface TavernNpcAcceptance {
+  playerSource: TavernSourceReference;
+  inputHash: string;
+  display: TavernEngineCommitInput['display'];
+  unknownDiagnostics: readonly AcceptedTavernUnknownDiagnostic[];
+}
 
 /** Durable result; acceptedAtMs is Unix ms, bodyHash is SHA-256 of the JSON-quoted display string in UTF-8. */
 export interface TavernCommitReceipt {
@@ -132,7 +159,7 @@ function inTransaction<Value>(database: DatabaseSync, action: () => Value): Valu
 }
 
 function checkEvent(
-  event: EngineEvent | DecodedBeat,
+  event: Pick<EngineEvent, 'envelope' | 'origin'>,
   scope: Scope,
   turnId: string,
   turnRevision: number,
@@ -155,22 +182,71 @@ function checkEvent(
   }
 }
 
+function sameSource(left: TavernSourceReference, right: TavernSourceReference): boolean {
+  return left.id === right.id && left.revision === right.revision;
+}
+
+function checkInterpretation(input: PlayerInterpretationInput): void {
+  const metadata = input.interpretation;
+
+  if (metadata == null) throw new Error('tavern_interpretation_metadata_missing');
+  sourceReference(metadata.source);
+  integer(metadata.turnRevision, 1);
+
+  if (!sameSource(metadata.source, input.source) || metadata.turnRevision !== input.turnRevision
+    || (metadata.outcome !== 'success' && metadata.outcome !== 'fallback')
+    || (metadata.outcome === 'fallback' && input.events.length !== 0)) {
+    throw new Error('tavern_interpretation_metadata_mismatch');
+  }
+}
+
+function checkedIdentity(identity: TavernTurnIdentity): string {
+  const key = turnAddress(identity.scope, identity.turnId, identity.turnRevision);
+  identifier(identity.ticketId);
+  sourceReference(identity.playerSource);
+  sourceReference(identity.assistantSource);
+  return key;
+}
+
+function npcInputHash(input: TavernEngineCommitInput): string {
+  // Scope is the SQL primary-key namespace. Normalize only the already-checked scope fields so a fork
+  // can retry the same accepted request in its destination scope without retaining a second executable copy.
+  // Native serialization/hash and these array passes are O(input bytes + items + effects + diagnostics).
+  const { scope: _scope, ...address } = input;
+  const relativeOrigin = ({ scope: _originScope, ...origin }: EventOrigin) => origin;
+  const relative = {
+    ...address,
+    beats: input.beats.map(selection => ({
+      ...selection,
+      beat: { ...selection.beat, origin: relativeOrigin(selection.beat.origin) },
+    })),
+    unknownDiagnostics: input.unknownDiagnostics.map(diagnostic => ({
+      ...diagnostic,
+      source: { ...diagnostic.source, origin: relativeOrigin(diagnostic.source.origin) },
+    })),
+  };
+  return createHash('sha256').update(JSON.stringify(relative), 'utf8').digest('hex');
+}
+
 /**
  * Inert data operations on the caller's scene database; construction and module import perform no SQL.
  * Inputs are trusted decoder/validator outputs, never raw model candidates. SQLite and getter errors propagate.
  * Writes use one transaction or a savepoint inside the caller's transaction; outer rollback remains authoritative.
  */
-export class TavernLedgerStore {
+export class TavernLedgerStore implements TavernEngineLedgerPort {
   private readonly database: DatabaseSync;
   private readonly format: TavernStoreFormat;
+  private readonly now: () => number;
   private readonly tickets = new Map<string, TavernTurnTicket>();
 
-  constructor(database: DatabaseSync, format: TavernStoreFormat) {
+  constructor(database: DatabaseSync, format: TavernStoreFormat, now?: (() => number) | null) {
     const copied = structuredClone(format);
     integer(copied.format, 1);
     identifier(copied.writerVersion);
     this.database = database;
     this.format = copied;
+    if (now != null && typeof now !== 'function') throw new TypeError('invalid_tavern_clock');
+    this.now = now ?? Date.now;
   }
 
   /** Explicit schema setup on an existing scene database; no format stamp, source or scene is created. */
@@ -193,6 +269,112 @@ export class TavernLedgerStore {
   }
 
   /**
+   * Checks the exact authority version and accepted user revision without creating ledger tables.
+   * Missing/stale authority returns false; invalid identity, malformed stored JSON and SQL errors throw.
+   */
+  isCurrent(identity: TavernTurnIdentity, expectedVersion: number): boolean {
+    const copied = structuredClone(identity);
+    const key = checkedIdentity(copied);
+    integer(expectedVersion, 0);
+    const row = this.database.prepare('SELECT version FROM scene_worlds WHERE key=?').get(key) as
+      { version: number } | undefined;
+    return row?.version === expectedVersion && this.sourceIsCurrent(key, copied.playerSource, 'user');
+  }
+
+  /**
+   * Reads the exact player source/turn revision, or null when absent or no longer current. No SQL writes occur.
+   * Legacy rows stay readable via readTurn, but absent metadata throws here: never infer an outcome or rerun M1.
+   */
+  readPlayer(identity: TavernTurnIdentity): TavernAcceptedPlayerInterpretation | null {
+    const copied = structuredClone(identity);
+    const key = checkedIdentity(copied);
+
+    if (!this.sourceIsCurrent(key, copied.playerSource, 'user')) return null;
+    const entry = this.readTurn(copied.scope, copied.turnId, copied.turnRevision, 'interpret');
+
+    if (!entry || entry.kind !== 'interpret' || !sameSource(entry.source, copied.playerSource)) return null;
+    checkInterpretation({ ...entry, expectedVersion: entry.version });
+    return entry as TavernAcceptedPlayerInterpretation;
+  }
+
+  /**
+   * Accepts M1 events and required metadata in one transaction. Fallback is an explicit exhausted-M1 outcome,
+   * not inferred from event count; success may be empty. Exact retries do not write; conflicting metadata throws.
+   */
+  acceptPlayer(input: TavernEnginePlayerInput): TavernAcceptedPlayerInterpretation {
+    const copied = structuredClone(input);
+    checkInterpretation(copied);
+    return this.acceptPlayerInterpretation(copied) as TavernAcceptedPlayerInterpretation;
+  }
+
+  /**
+   * Accepts emitted beats, non-executable diagnostics, display and receipt in the caller's SQLite transaction.
+   * The ticket binds the complete request, including expectedVersion. Exact retries survive reopen and fork.
+   * The injected clock supplies Unix milliseconds only for a new acceptance; clock/SQL failures roll back.
+   */
+  commitNpc(input: TavernEngineCommitInput): TavernCommitReceipt {
+    const copied = structuredClone(input);
+    const key = checkedIdentity(copied);
+    integer(copied.expectedVersion, 0);
+
+    if (typeof copied.display.body !== 'string'
+      || (copied.display.renderer !== 'A' && copied.display.renderer !== 'B')
+      || typeof copied.display.fallback !== 'boolean') {
+      throw new TypeError('invalid_tavern_display');
+    }
+
+    return inTransaction(this.database, () => {
+      const player = this.readPlayer(copied);
+      if (!player) throw new Error('tavern_interpretation_missing');
+      const details = this.npcAcceptance(copied, player);
+      const previous = this.readReceipt(copied.scope, copied.ticketId);
+
+      if (previous) {
+        const receipt = this.findReceipt(copied);
+        const turn = this.readTurn(copied.scope, copied.turnId, copied.turnRevision, 'npc');
+
+        if (!receipt || turn?.kind !== 'npc' || turn.inputHash !== details.inputHash) {
+          throw new Error('tavern_ticket_conflict');
+        }
+        return receipt;
+      }
+
+      this.requireVersion(key, copied.expectedVersion);
+      const ticket = this.prepareNpcTurn(copied);
+      const acceptedAtMs = this.now();
+      integer(acceptedAtMs, 0);
+      // An injected clock can execute caller code. Recheck authority after it and before writing any NPC data.
+      this.requireVersion(key, copied.expectedVersion);
+      this.requirePlayerSource(key, copied.playerSource);
+      return this.acceptNpcTicket(ticket, copied.display.body, acceptedAtMs, details);
+    });
+  }
+
+  /**
+   * Returns a durable receipt only for the full requested turn/ticket and both current source revisions.
+   * Missing, obsolete or legacy unbound records return null. SQL/JSON and malformed-identity errors throw.
+   */
+  findReceipt(identity: TavernTurnIdentity): TavernCommitReceipt | null {
+    const copied = structuredClone(identity);
+    const key = checkedIdentity(copied);
+    const receipt = this.readReceipt(copied.scope, copied.ticketId);
+
+    if (!receipt || receipt.turnId !== copied.turnId || receipt.turnRevision !== copied.turnRevision
+      || !sameSource(receipt.source, copied.assistantSource)
+      || !this.sourceIsCurrent(key, copied.playerSource, 'user')
+      || !this.sourceIsCurrent(key, copied.assistantSource, 'assistant')) {
+      return null;
+    }
+
+    const turn = this.readTurn(copied.scope, copied.turnId, copied.turnRevision, 'npc');
+    if (turn?.kind !== 'npc' || !turn.playerSource || !sameSource(turn.playerSource, copied.playerSource)
+      || !sameSource(turn.source, copied.assistantSource)) {
+      return null;
+    }
+    return receipt;
+  }
+
+  /**
    * Accepts a player's interpretation independently of NPC generation. Empty interpretations are permitted.
    * Exact replay returns the original entry without writes; changed content, stale sources or versions throw.
    * Work is O(input bytes + events), plus indexed lookups, independent of the number of prior chat sources.
@@ -202,6 +384,7 @@ export class TavernLedgerStore {
     const key = turnAddress(copied.scope, copied.turnId, copied.turnRevision);
     sourceReference(copied.source);
     integer(copied.expectedVersion, 0);
+    if (copied.interpretation != null) checkInterpretation(copied);
     const eventIds = new Set<string>();
 
     for (const event of copied.events) {
@@ -217,13 +400,15 @@ export class TavernLedgerStore {
       if (previous) {
         if (previous.kind !== 'interpret'
           || JSON.stringify(previous.source) !== JSON.stringify(copied.source)
-          || JSON.stringify(previous.events) !== JSON.stringify(copied.events)) {
+          || JSON.stringify(previous.events) !== JSON.stringify(copied.events)
+          || JSON.stringify(previous.interpretation ?? null) !== JSON.stringify(copied.interpretation ?? null)) {
           throw new Error('tavern_interpretation_conflict');
         }
         return previous;
       }
 
       this.requireVersion(key, copied.expectedVersion);
+      if (!this.hasTable('scene_tavern_turns')) this.initialize();
       this.stampFormat();
       const entry: AcceptedTavernTurn = {
         scope: copied.scope,
@@ -233,6 +418,7 @@ export class TavernLedgerStore {
         version: copied.expectedVersion + 1,
         kind: 'interpret',
         events: copied.events,
+        ...(copied.interpretation == null ? {} : { interpretation: copied.interpretation }),
       };
       this.insertTurn(key, entry);
       this.bumpVersion(key, copied.expectedVersion);
@@ -336,53 +522,7 @@ export class TavernLedgerStore {
         throw new Error('tavern_interpretation_missing');
       }
 
-      this.stampFormat();
-      const message = {
-        id: ticket.assistantSource.id,
-        revision: ticket.assistantSource.revision,
-        role: 'assistant',
-        text: body,
-        acceptedAtMs,
-      };
-      // INSERT deliberately rejects an existing source; editing/replacing accepted turns belongs to lifecycle wiring.
-      this.database.prepare(`INSERT INTO scene_sources
-        (scope,id,revision,message,observed,status,processing,analysis)
-        VALUES(?,?,?,?,?,'accepted','pending',NULL)`).run(
-        key,
-        message.id,
-        message.revision,
-        JSON.stringify(message),
-        acceptedAtMs,
-      );
-      const beats = ticket.beats.map(beat => ({
-        ...beat,
-        envelope: { ...beat.envelope, status: 'accepted' as const },
-      }));
-      this.insertTurn(key, {
-        scope: copiedScope,
-        turnId: ticket.turnId,
-        turnRevision: ticket.turnRevision,
-        source: ticket.assistantSource,
-        version: ticket.expectedVersion + 1,
-        kind: 'npc',
-        beats,
-      });
-      const receipt: TavernCommitReceipt = {
-        scope: copiedScope,
-        ticketId,
-        turnId: ticket.turnId,
-        turnRevision: ticket.turnRevision,
-        source: ticket.assistantSource,
-        version: ticket.expectedVersion + 1,
-        acceptedAtMs,
-        bodyHash: digest,
-        status: 'accepted',
-      };
-      this.database.prepare(`INSERT INTO scene_tavern_receipts(scope,ticket_id,body_hash,receipt)
-        VALUES(?,?,?,?)`).run(key, ticketId, digest, JSON.stringify(receipt));
-      this.bumpVersion(key, ticket.expectedVersion);
-      // Keep the single scope ticket until replaced: a caller may still roll back its outer transaction.
-      return receipt;
+      return this.acceptNpcTicket(ticket, body, acceptedAtMs);
     });
   }
 
@@ -395,6 +535,7 @@ export class TavernLedgerStore {
   ): AcceptedTavernTurn | undefined {
     const key = turnAddress(structuredClone(scope), turnId, turnRevision);
     if (kind !== 'interpret' && kind !== 'npc') throw new TypeError('invalid_tavern_turn_kind');
+    if (!this.hasTable('scene_tavern_turns')) return undefined;
     const row = this.database.prepare(`SELECT body FROM scene_tavern_turns
       WHERE scope=? AND turn_id=? AND turn_revision=? AND kind=?`).get(key, turnId, turnRevision, kind) as
       { body: string } | undefined;
@@ -405,22 +546,162 @@ export class TavernLedgerStore {
   readReceipt(scope: Scope, ticketId: string): TavernCommitReceipt | undefined {
     const key = checkedScope(structuredClone(scope));
     identifier(ticketId);
+    if (!this.hasTable('scene_tavern_receipts')) return undefined;
     const row = this.database.prepare(`SELECT receipt FROM scene_tavern_receipts
       WHERE scope=? AND ticket_id=?`).get(key, ticketId) as { receipt: string } | undefined;
     return row ? JSON.parse(row.receipt) as TavernCommitReceipt : undefined;
   }
 
+  private hasTable(name: string): boolean {
+    return Boolean(this.database.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(name));
+  }
+
+  private npcAcceptance(
+    input: TavernEngineCommitInput,
+    player: TavernAcceptedPlayerInterpretation,
+  ): TavernNpcAcceptance {
+    const beats = new Map(input.beats.map(selection => {
+      const beat = selection.beat;
+      checkEvent(beat, input.scope, input.turnId, input.turnRevision, input.playerSource, 'beat');
+      return [beat.envelope.id, {
+        beat,
+        items: new Map(beat.items.map(item => [item.itemIndex, item])),
+        emitted: new Set(selection.emittedItemRefs),
+        effects: new Set(beat.effects.map(link => link.effectIndex)),
+      }];
+    }));
+    const eventIds = new Set([
+      ...player.events.map(event => event.envelope.id),
+      ...beats.keys(),
+    ]);
+    const unknownDiagnostics: AcceptedTavernUnknownDiagnostic[] = [];
+
+    for (const [index, diagnostic] of input.unknownDiagnostics.entries()) {
+      checkEvent(diagnostic.source, input.scope, input.turnId, input.turnRevision, input.playerSource, 'beat');
+      identifier(diagnostic.actorId);
+      identifier(diagnostic.reason);
+      integer(diagnostic.itemRef, 0);
+      const selected = beats.get(diagnostic.source.envelope.id);
+      const item = selected?.items.get(diagnostic.itemRef);
+
+      if (diagnostic.kind !== 'Unknown' || !selected || !item
+        || diagnostic.text !== item.text || diagnostic.actorId !== selected.beat.actorId
+        || diagnostic.source.envelope.beatIndex !== selected.beat.envelope.beatIndex
+        || diagnostic.source.origin.ruleVersion !== selected.beat.origin.ruleVersion) {
+        throw new Error('tavern_diagnostic_mismatch');
+      }
+
+      if ('effectIndex' in diagnostic) {
+        integer(diagnostic.effectIndex, 0);
+        const link = diagnostic.effect;
+        if (link.effectIndex !== diagnostic.effectIndex || link.itemRef !== diagnostic.itemRef
+          || selected.effects.has(diagnostic.effectIndex)) {
+          throw new Error('tavern_diagnostic_effect_retained');
+        }
+      } else if (selected.emitted.has(diagnostic.itemRef)) {
+        throw new Error('tavern_diagnostic_action_retained');
+      }
+
+      // Array position distinguishes multiple rejections of the same beat/item. The content-addressed base
+      // is stable across retries/reopen/fork; suffixing also avoids caller-chosen beat/player event IDs.
+      const address = [input.turnId, input.turnRevision, input.ticketId, diagnostic.source.envelope.id, index];
+      const base = `unknown:${createHash('sha256').update(JSON.stringify(address), 'utf8').digest('hex')}`;
+      let id = base;
+      let suffix = 0;
+      while (eventIds.has(id)) id = `${base}:${++suffix}`;
+      eventIds.add(id);
+      unknownDiagnostics.push({
+        ...diagnostic,
+        envelope: {
+          id,
+          turnId: input.turnId,
+          beatIndex: diagnostic.source.envelope.beatIndex,
+          source: 'engine',
+          status: 'accepted',
+        },
+        origin: structuredClone(diagnostic.source.origin),
+      });
+    }
+
+    return {
+      playerSource: input.playerSource,
+      inputHash: npcInputHash(input),
+      display: input.display,
+      unknownDiagnostics,
+    };
+  }
+
+  private acceptNpcTicket(
+    ticket: TavernTurnTicket,
+    body: string,
+    acceptedAtMs: number,
+    details?: TavernNpcAcceptance,
+  ): TavernCommitReceipt {
+    const key = checkedScope(ticket.scope);
+    const digest = bodyHash(body);
+    this.stampFormat();
+    const message = {
+      id: ticket.assistantSource.id,
+      revision: ticket.assistantSource.revision,
+      role: 'assistant',
+      text: body,
+      acceptedAtMs,
+    };
+    // INSERT deliberately rejects an existing source; editing/replacing accepted turns belongs to lifecycle wiring.
+    this.database.prepare(`INSERT INTO scene_sources
+      (scope,id,revision,message,observed,status,processing,analysis)
+      VALUES(?,?,?,?,?,'accepted','pending',NULL)`).run(
+      key,
+      message.id,
+      message.revision,
+      JSON.stringify(message),
+      acceptedAtMs,
+    );
+    const beats = ticket.beats.map(beat => ({
+      ...beat,
+      envelope: { ...beat.envelope, status: 'accepted' as const },
+    }));
+    this.insertTurn(key, {
+      scope: ticket.scope,
+      turnId: ticket.turnId,
+      turnRevision: ticket.turnRevision,
+      source: ticket.assistantSource,
+      version: ticket.expectedVersion + 1,
+      kind: 'npc',
+      beats,
+      ...details,
+    });
+    const receipt: TavernCommitReceipt = {
+      scope: ticket.scope,
+      ticketId: ticket.ticketId,
+      turnId: ticket.turnId,
+      turnRevision: ticket.turnRevision,
+      source: ticket.assistantSource,
+      version: ticket.expectedVersion + 1,
+      acceptedAtMs,
+      bodyHash: digest,
+      status: 'accepted',
+    };
+    this.database.prepare(`INSERT INTO scene_tavern_receipts(scope,ticket_id,body_hash,receipt)
+      VALUES(?,?,?,?)`).run(key, ticket.ticketId, digest, JSON.stringify(receipt));
+    this.bumpVersion(key, ticket.expectedVersion);
+    // Keep the single scope ticket until replaced: a caller may still roll back its outer transaction.
+    return receipt;
+  }
+
   private requirePlayerSource(key: string, source: TavernSourceReference): void {
+    if (!this.sourceIsCurrent(key, source, 'user')) throw new Error('tavern_player_source_changed');
+  }
+
+  private sourceIsCurrent(key: string, source: TavernSourceReference, role: 'user' | 'assistant'): boolean {
     const row = this.database.prepare(`SELECT revision,status,message FROM scene_sources
       WHERE scope=? AND id=?`).get(key, source.id) as
       { revision: number; status: string; message: string } | undefined;
     if (!row || row.revision !== source.revision || row.status !== 'accepted') {
-      throw new Error('tavern_player_source_changed');
+      return false;
     }
     const message = JSON.parse(row.message);
-    if (message.id !== source.id || message.revision !== source.revision || message.role !== 'user') {
-      throw new Error('tavern_player_source_changed');
-    }
+    return message.id === source.id && message.revision === source.revision && message.role === role;
   }
 
   private requireVersion(key: string, expectedVersion: number): void {
@@ -548,6 +829,13 @@ export function restoreTavernEngineRows(
 
           for (const event of events)
             event.origin.scope = structuredClone(scope);
+
+          if (turn.kind === 'npc') {
+            for (const diagnostic of turn.unknownDiagnostics ?? []) {
+              diagnostic.origin.scope = structuredClone(scope);
+              diagnostic.source.origin.scope = structuredClone(scope);
+            }
+          }
           body = JSON.stringify(turn);
         }
         insertTurn.run(key, row.turn_id, row.turn_revision, row.kind, body);
@@ -688,6 +976,14 @@ export function filterTavernEngineSnapshot(
     for (const event of events) {
       eventOwners.set(eventIdentity(event.envelope.turnId, event.origin.turnRevision, event.envelope.id), index);
     }
+
+    if (turn.kind === 'npc') {
+      for (const diagnostic of turn.unknownDiagnostics ?? []) {
+        eventOwners.set(eventIdentity(
+          diagnostic.envelope.turnId, diagnostic.origin.turnRevision, diagnostic.envelope.id,
+        ), index);
+      }
+    }
   }
 
   const depend = (index: number, owner: number | undefined): void => {
@@ -716,6 +1012,25 @@ export function filterTavernEngineSnapshot(
 
     if (turn.kind === 'npc') {
       depend(index, positions.get(identity(turn.turnId, turn.turnRevision, 'interpret')));
+
+      if (turn.playerSource) dependOnSource(index, turn.playerSource);
+      for (const diagnostic of turn.unknownDiagnostics ?? []) {
+        dependOnSource(index, { id: diagnostic.origin.sourceId, revision: diagnostic.origin.sourceRevision });
+        dependOnSource(index, {
+          id: diagnostic.source.origin.sourceId,
+          revision: diagnostic.source.origin.sourceRevision,
+        });
+        // Rejected links are only inspected for erasure dependencies. They never enter the executable beat list.
+        if ('effect' in diagnostic && 'evidence' in diagnostic.effect.effect) {
+          checkEvidence(index, diagnostic.effect.effect.evidence);
+        }
+      }
+    } else if (turn.interpretation != null) {
+      dependOnSource(index, turn.interpretation.source);
+      if (!sameSource(turn.interpretation.source, turn.source)
+        || turn.interpretation.turnRevision !== turn.turnRevision) {
+        invalidate(index);
+      }
     }
 
     const events = turn.kind === 'interpret' ? turn.events : turn.beats;
@@ -938,6 +1253,14 @@ export function tavernEngineSnapshotReferencesSources(
   for (const turn of turns) {
     for (const event of turn.kind === 'interpret' ? turn.events : turn.beats)
       eventIdentities.add(JSON.stringify([event.envelope.turnId, event.origin.turnRevision, event.envelope.id]));
+
+    if (turn.kind === 'npc') {
+      for (const diagnostic of turn.unknownDiagnostics ?? []) {
+        eventIdentities.add(JSON.stringify([
+          diagnostic.envelope.turnId, diagnostic.origin.turnRevision, diagnostic.envelope.id,
+        ]));
+      }
+    }
   }
 
   const references = (evidence: import('./types.ts').EventEvidence['evidence']): boolean =>
@@ -948,6 +1271,23 @@ export function tavernEngineSnapshotReferencesSources(
   for (const turn of turns) {
     if (sourceInvalid(turn.source.id, turn.source.revision))
       return true;
+
+    if (turn.kind === 'interpret' && turn.interpretation != null
+      && sourceInvalid(turn.interpretation.source.id, turn.interpretation.source.revision)) {
+      return true;
+    }
+
+    if (turn.kind === 'npc') {
+      if (turn.playerSource && sourceInvalid(turn.playerSource.id, turn.playerSource.revision)) return true;
+      for (const diagnostic of turn.unknownDiagnostics ?? []) {
+        if (sourceInvalid(diagnostic.origin.sourceId, diagnostic.origin.sourceRevision)
+          || sourceInvalid(diagnostic.source.origin.sourceId, diagnostic.source.origin.sourceRevision)
+          || ('effect' in diagnostic && 'evidence' in diagnostic.effect.effect
+            && references(diagnostic.effect.effect.evidence))) {
+          return true;
+        }
+      }
+    }
 
     const events = turn.kind === 'interpret' ? turn.events : turn.beats;
 
