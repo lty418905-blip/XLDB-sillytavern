@@ -1,10 +1,11 @@
 /**
- * Ownership handoff: EN-09 creates this file; EN-10 takes ownership after this candidate is accepted.
- * SLOT-M1 wording belongs to Claude. This module only assembles data and adapts injected runners.
+ * Ownership handoff: EN-09 created this file; EN-10 now adds the M2 contract adapter only.
+ * SLOT-M1, SLOT-M2 and SLOT-RETRY wording belongs to Claude. Only data and injected runners are assembled here.
  */
 import type { AcceptedMessage } from '../../core/types.ts';
 import type { PerspectivePlan } from '../types.ts';
-import { decodeInterpretationCandidate, TAVERN_INTERPRETATION_FORMAT } from './codec.ts';
+import { decodeInterpretationCandidate, resolveTavernBeatScript, TAVERN_INTERPRETATION_FORMAT } from './codec.ts';
+import type { TavernBeatQuotation, TavernBeatScript } from './codec.ts';
 import type {
   TavernAcceptedPlayerInterpretation,
   TavernEnginePorts,
@@ -13,15 +14,140 @@ import type {
 import { TavernPerception } from './perception.ts';
 import { projectTavernWorld } from './projection.ts';
 import type { TavernSourceReference } from './store.ts';
+import { CODEC_LIMITS } from './types.ts';
 import type {
   EventDecodeContext,
+  DecodedBeat,
   EventOrigin,
   TavernActorEventView,
   TavernPerceptionInput,
+  TavernPerceptionDispatch,
 } from './types.ts';
 
 /** SLOT-M1, 待 Claude. Empty until approved wording is supplied; not a usable production prompt. */
 export const SLOT_M1_INSTRUCTIONS = '';
+
+/** SLOT-M2, 待 Claude. Empty wording slot; it is not a production prompt. */
+export const SLOT_M2_INSTRUCTIONS = '';
+
+/** SLOT-RETRY, 待 Claude. Empty wording slot; mechanical reason codes are separate data. */
+export const SLOT_RETRY_INSTRUCTIONS = '';
+
+/**
+ * Per-actor M2 contract supplied by preparation. Configuration IDs identify resolved settings, never secrets.
+ * A different front configuration requires its already-completed intent. No front call occurs in this adapter.
+ * history is newest-first current, authorized player text; null optional fields mean omission.
+ */
+export interface TavernBeatActorContract {
+  actorId: string;
+  beatConfigurationId: string;
+  frontConfigurationId: string;
+  frontIntent?: NonNullable<DecodedBeat['intent']> | null;
+  persona?: string | null;
+  history?: readonly string[] | null;
+  quotations?: readonly TavernBeatQuotation[] | null;
+}
+
+/** Stable per-actor starting data; only the supplied, already filtered materials and history enter this prefix. */
+export interface TavernBeatPrefix {
+  persona: string;
+  materials: TavernPerceptionDispatch['input']['materials'];
+  turnWindow: TavernPerceptionDispatch['input']['turnWindow'];
+}
+
+/**
+ * Structured runner input. prefix is fixed at turn start; tail is the current actor-only delivery snapshot.
+ * Script/limits are data, not instruction wording. Intent is optional until the first same-setting response.
+ */
+export interface TavernBeatInput {
+  instructions: typeof SLOT_M2_INSTRUCTIONS;
+  retryInstructions: typeof SLOT_RETRY_INSTRUCTIONS;
+  actorId: string;
+  identity: TavernInterpretationRequest['identity'];
+  beatIndex: number;
+  maxItems: number;
+  firstForActor: boolean;
+  intentRequired: boolean;
+  script: TavernBeatScript;
+  prefix: TavernBeatPrefix;
+  tail: TavernPerceptionDispatch['input'];
+  intent?: NonNullable<DecodedBeat['intent']>;
+  retryReasons: readonly string[];
+}
+
+/** Injected M2 call; supports synchronous values/thenables. Retries and cancellation belong to the engine. */
+export type TavernBeatRunner = (input: TavernBeatInput, signal: AbortSignal) => unknown | PromiseLike<unknown>;
+
+function intentTriggered(input: TavernPerceptionDispatch['input']): boolean {
+  // Only newly delivered, already authorized structural events count. No free-text topic inference occurs.
+  return input.inbox.some(({ content }) => {
+    if (content.kind === 'Enter' || content.kind === 'Exit' || content.kind === 'Transfer'
+      || content.kind === 'CommitmentEvent') return true;
+    return 'addressees' in content && content.addressees.includes(input.actorId);
+  });
+}
+
+/**
+ * Assembles one detached M2 snapshot from a prepared prefix and current filtered tail; never reads the world.
+ * Throws invalid_m2_context on bad caller data/getters. Text work is linear in input bytes and visited history.
+ * Retry takes the same snapshot; only the engine's mechanical retryReasons change between attempts.
+ */
+export function buildTavernBeatInput(
+  request: Omit<Parameters<TavernEnginePorts['beat']>[0], 'signal' | 'modelInput'>,
+  contract: TavernBeatActorContract,
+  prefix: TavernBeatPrefix,
+  playerText: string,
+): TavernBeatInput {
+  try {
+    const data = structuredClone({ request, contract, prefix });
+    const current = data.request;
+    if (current.actorId !== data.contract.actorId || current.input.actorId !== current.actorId
+      || typeof current.firstForActor !== 'boolean'
+      || !Number.isSafeInteger(current.beatIndex) || current.beatIndex < 1
+      || (current.maxItems !== CODEC_LIMITS.items && current.maxItems !== CODEC_LIMITS.soloFirstItems)
+      || ![0, 1].includes(current.attempt)) {
+      throw new Error();
+    }
+    for (const value of [current.actorId, data.contract.beatConfigurationId, data.contract.frontConfigurationId]) {
+      requireId(value);
+    }
+    const script = resolveTavernBeatScript(playerText, data.contract.history ?? []).script;
+    return {
+      instructions: SLOT_M2_INSTRUCTIONS,
+      retryInstructions: SLOT_RETRY_INSTRUCTIONS,
+      identity: current.identity,
+      actorId: current.actorId,
+      beatIndex: current.beatIndex,
+      maxItems: current.maxItems,
+      firstForActor: current.firstForActor,
+      intentRequired: current.firstForActor
+        ? data.contract.beatConfigurationId === data.contract.frontConfigurationId
+        : intentTriggered(current.input),
+      script,
+      prefix: data.prefix,
+      tail: current.input,
+      ...(current.intent == null ? {} : { intent: current.intent }),
+      retryReasons: current.retryReasons,
+    };
+  } catch {
+    throw new Error('invalid_m2_context');
+  }
+}
+
+/**
+ * Runs exactly one injected attempt, without rewriting/parsing speech or adding a retry loop.
+ * Missing input and pre-cancellation throw machine codes. Runner/thenable errors propagate to engine Abort.
+ */
+export async function runTavernBeat(
+  request: Parameters<TavernEnginePorts['beat']>[0],
+  runner: TavernBeatRunner,
+): Promise<unknown> {
+  if (request.signal.aborted) throw new Error('m2_cancelled');
+  if (request.modelInput == null) throw new Error('invalid_m2_context');
+  const result = await runner(structuredClone(request.modelInput), request.signal);
+  if (request.signal.aborted) throw new Error('m2_cancelled');
+  return result;
+}
 
 /** No inferred addressee passes the action threshold; zero represents the exhausted-retry fallback. */
 export const M1_FALLBACK_CONFIDENCE = 0;

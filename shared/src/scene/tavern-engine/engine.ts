@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { AcceptedMessage } from '../../core/types.ts';
 import type { Scope } from '../../memory/access.ts';
-import { decodeBeatCandidate } from './codec.ts';
+import { checkTavernBeatScript, decodeBeatCandidate, MAX_TAVERN_TURN_UNITS } from './codec.ts';
+import { buildTavernBeatInput } from './model-input.ts';
+import type { TavernBeatActorContract, TavernBeatInput, TavernBeatPrefix } from './model-input.ts';
 import { TavernPerception } from './perception.ts';
 import { projectTavernWorld } from './projection.ts';
 import type { TavernWorldSnapshot } from './projection.ts';
@@ -169,6 +171,8 @@ export interface TavernPreparedTurn {
   actors: readonly TavernActorSignals[];
   ruleVersion: string;
   eventReferences?: readonly EventReference[] | null;
+  /** M2 adapter preparation; omit only for a port implementing its own complete contract validation. */
+  beatContracts?: readonly TavernBeatActorContract[] | null;
 }
 
 /** Nonempty reason codes address original action items; speech cannot be silently removed or rewritten. */
@@ -228,6 +232,9 @@ export interface TavernEnginePorts {
     beatIndex: number;
     attempt: number;
     maxItems: number;
+    firstForActor: boolean;
+    intent?: NonNullable<DecodedBeat['intent']>;
+    modelInput?: TavernBeatInput;
     input: TavernPerceptionDispatch['input'];
     retryReasons: readonly string[];
     signal: AbortSignal;
@@ -695,6 +702,46 @@ export class TavernEngine {
     });
     const selections: EmittedTavernBeat[] = [];
     const diagnostics: (TavernUnknownActionDiagnostic | TavernUnknownEffectDiagnostic)[] = [];
+    const contracts = new Map<string, TavernBeatActorContract>();
+    const prefixes = new Map<string, TavernBeatPrefix>();
+    const intents = new Map<string, NonNullable<DecodedBeat['intent']>>();
+    const completedActors = new Set<string>();
+    let serializedTurnUnits = 0;
+    for (const contract of prepared.beatContracts ?? []) {
+      if (contracts.has(contract.actorId) || !world.entityIds.includes(contract.actorId)) {
+        throw new StopTurn('invalid_preparation');
+      }
+      requireId(contract.beatConfigurationId);
+      requireId(contract.frontConfigurationId);
+      const initial = perception.prepareDispatch(contract.actorId, turn.identity.turnId).input;
+      if (contract.persona != null && typeof contract.persona !== 'string') throw new StopTurn('invalid_preparation');
+      contracts.set(contract.actorId, contract);
+      prefixes.set(contract.actorId, {
+        persona: contract.persona ?? '',
+        materials: initial.materials.filter(material =>
+          material.channel === 'memory' || material.channel === 'recall' || material.channel === 'emotion'),
+        turnWindow: initial.turnWindow,
+      });
+      if (contract.beatConfigurationId !== contract.frontConfigurationId) {
+        if (contract.frontIntent == null) throw new StopTurn('invalid_preparation');
+        // Reuse the codec's exact goal/next units for front output; no independent front retry is introduced.
+        const checked = decodeBeatCandidate({ items: [], intent: contract.frontIntent }, {
+          envelope: { id: 'intent', turnId: turn.identity.turnId, beatIndex: 1, source: 'beat', status: 'tentative' },
+          scope: turn.identity.scope,
+          turnRevision: turn.identity.turnRevision,
+          ruleVersion: prepared.ruleVersion,
+          message: turn.request.message,
+          actorId: contract.actorId,
+          entityIds: world.entityIds,
+          itemIds: world.possessions.map(item => item.itemId),
+          placeIds: world.placeIds,
+          eventReferences: [],
+          scheduledActorCount: 1,
+        });
+        if (!checked.ok || checked.value.intent == null) throw new StopTurn('invalid_preparation');
+        intents.set(contract.actorId, checked.value.intent);
+      }
+    }
 
     move(turn, 'Schedule');
     while (true) {
@@ -721,19 +768,40 @@ export class TavernEngine {
       turn.summary.dispatches = [...turn.summary.dispatches, dispatch];
       this.#unserved(turn, roster);
       const delivery = perception.prepareDispatch(decision.actorId, turn.identity.turnId);
+      const firstForActor = !completedActors.has(decision.actorId);
+      const intent = intents.get(decision.actorId);
+      const contract = contracts.get(decision.actorId);
+      if (prepared.beatContracts != null && contract == null) throw new StopTurn('invalid_preparation');
+      const dispatchInput = {
+        identity: structuredClone(turn.identity),
+        actorId: decision.actorId,
+        beatIndex: decision.beatIndex,
+        maxItems: decision.maxItems,
+        firstForActor,
+        ...(intent == null ? {} : { intent: structuredClone(intent) }),
+        input: structuredClone(delivery.input),
+        attempt: 0,
+        retryReasons: [] as string[],
+      };
+      // Assemble once before either attempt: rejected output cannot alter the prefix, tail, actor or intent.
+      const modelInput = contract == null ? undefined : buildTavernBeatInput(
+        dispatchInput,
+        contract,
+        prefixes.get(decision.actorId)!,
+        turn.request.message.text,
+      );
       let retryReasons: string[] = [];
       let completed = false;
       try {
         while (!completed) {
           move(turn, 'Beat');
           const raw = await this.#wait(turn, lease.deadlineMs, 'beat_deadline', true, signal => this.#ports.beat({
-            identity: structuredClone(turn.identity),
-            actorId: decision.actorId,
-            beatIndex: decision.beatIndex,
+            ...structuredClone(dispatchInput),
             attempt: lease!.attempt,
-            maxItems: decision.maxItems,
-            input: structuredClone(delivery.input),
             retryReasons: [...retryReasons],
+            ...(modelInput == null ? {} : {
+              modelInput: { ...structuredClone(modelInput), retryReasons: [...retryReasons] },
+            }),
             signal,
           }));
           move(turn, 'CheckBeat');
@@ -757,14 +825,29 @@ export class TavernEngine {
             eventReferences: prepared.eventReferences ?? [],
             scheduledActorCount: decision.scheduledActorCount,
           });
-          const check = decoded.ok ? structuredClone(this.#ports.checkBeat({
+          let contractReason: string | null = null;
+          if (decoded.ok && contract != null && modelInput != null) {
+            if (modelInput.intentRequired && decoded.value.intent == null) contractReason = 'missing_intent';
+            // Pending-item ownership is a later scheduler contract; a reference cannot activate it by itself.
+            if (decoded.value.interrupt != null) contractReason = 'interrupt_unavailable';
+            const scriptCheck = checkTavernBeatScript(decoded.value, modelInput.script, contract.quotations ?? []);
+            if (!scriptCheck.ok) contractReason = scriptCheck.reason;
+          }
+          let check: TavernBeatCheck | null = contractReason != null
+            ? { kind: 'retry', reason: contractReason, permissions: [] }
+            : decoded.ok ? structuredClone(this.#ports.checkBeat({
             identity: structuredClone(turn.identity),
             world: structuredClone(world),
             beat: structuredClone(decoded.value),
           })) : null;
           this.#check(turn);
           const invalid = decoded.ok && check != null ? this.#invalidActions(decoded.value, check) : [];
-          const invalidEffects = decoded.ok && check != null ? this.#invalidEffects(decoded.value, check) : [];
+          const invalidEffects = decoded.ok && check != null
+            ? this.#invalidEffects(decoded.value, check, contract != null) : [];
+          if (decoded.ok && check != null && check.kind !== 'retry' && contract != null) {
+            const presenceReason = this.#beatPresence(world, decoded.value, invalid, invalidEffects);
+            if (presenceReason != null) check = { kind: 'retry', reason: presenceReason, permissions: [] };
+          }
           retryReasons = !decoded.ok ? [decoded.reason]
             : check?.kind === 'retry' ? [check.reason]
               : [...invalid.map(action => action.reason), ...invalidEffects.map(effect => effect.reason)];
@@ -782,6 +865,7 @@ export class TavernEngine {
           // The checker supplied the full closure. Drop only those links; original item/effect indices survive.
           const beat = {
             ...decoded.value,
+            ...(decoded.value.intent == null && intent != null ? { intent: structuredClone(intent) } : {}),
             effects: decoded.value.effects.filter(effect => !rejectedEffects.has(effect.effectIndex)),
           };
           const selection = {
@@ -814,12 +898,17 @@ export class TavernEngine {
             });
           }
           const nextWorld = projectTavernWorld(world, [{ kind: 'emitted', selection }]).world;
+          // The bound is per turn, not per chat. Invalid candidates never consume persistent turn capacity.
+          serializedTurnUnits += JSON.stringify(selection).length;
+          if (serializedTurnUnits > MAX_TAVERN_TURN_UNITS) throw new StopTurn('invalid_beat');
           if (!perception.acknowledgeDispatch(delivery.receipt)) throw new StopTurn('invalid_packet');
           prepared.perception.steps = [...prepared.perception.steps, { kind: 'emitted', selection }];
           prepared.perception.permissions = [...prepared.perception.permissions, ...check.permissions];
           perception.replaceSources(prepared.perception);
           world = nextWorld;
           selections.push(selection);
+          if (beat.intent != null) intents.set(decision.actorId, structuredClone(beat.intent));
+          completedActors.add(decision.actorId);
           const emitted = beat.items.filter(item => !rejected.has(item.itemIndex));
           dispatch.hasSpoken = emitted.some(item => item.kind === 'speech');
           dispatch.hasActed = emitted.some(item => item.kind === 'action');
@@ -839,8 +928,17 @@ export class TavernEngine {
     this.#check(turn);
     const packet = perception.playerView();
     move(turn, 'Render');
-    let body = await this.#wait(turn, turn.budget.snapshot().turnHardDeadlineMs, 'turn_deadline', true,
-      signal => this.#ports.render({ identity: structuredClone(turn.identity), packet: structuredClone(packet), signal }));
+    let body = await this.#wait(
+      turn,
+      turn.budget.snapshot().turnHardDeadlineMs,
+      'turn_deadline',
+      true,
+      signal => this.#ports.render({
+        identity: structuredClone(turn.identity),
+        packet: structuredClone(packet),
+        signal,
+      }),
+    );
     move(turn, 'VerifyRender');
     this.#check(turn);
     let renderer: 'A' | 'B' = 'B';
@@ -871,6 +969,7 @@ export class TavernEngine {
       unknownDiagnostics: diagnostics,
       display: { body, renderer, fallback: renderer === 'A' },
     };
+    if (JSON.stringify(input).length > MAX_TAVERN_TURN_UNITS) throw new StopTurn('invalid_beat');
     // Resolve getters and detach arguments before the final guards; neither may run external work afterwards.
     const ledger = this.#ports.ledger;
     const commitNpc = ledger.commitNpc.bind(ledger);
@@ -918,16 +1017,55 @@ export class TavernEngine {
     return [...invalid.values()];
   }
 
-  #invalidEffects(beat: DecodedBeat, check: TavernBeatCheck): TavernInvalidEffect[] {
-    if (check.kind !== 'invalid_effects') return [];
+  #invalidEffects(beat: DecodedBeat, check: TavernBeatCheck, m2Contract: boolean): TavernInvalidEffect[] {
     const invalid = new Map<number, TavernInvalidEffect>();
-    for (const effect of check.effects) {
+    for (const effect of check.kind === 'invalid_effects' ? check.effects : []) {
       requireId(effect.reason);
       const link = beat.effects.find(entry => entry.effectIndex === effect.effectIndex);
       if (!link || invalid.has(effect.effectIndex)) throw new StopTurn('invalid_beat');
       invalid.set(effect.effectIndex, effect);
     }
-    if (invalid.size === 0) throw new StopTurn('invalid_beat');
+    if (check.kind === 'invalid_effects' && invalid.size === 0) throw new StopTurn('invalid_beat');
+    // A custom port without M2 preparation retains responsibility for its own complete validation policy.
+    if (!m2Contract) return [...invalid.values()];
+    // Unknown on speech rejects only the effect. The words remain a statement, never proof of fulfillment.
+    for (const link of beat.effects) {
+      if (link.effect.kind !== 'Unknown') continue;
+      const item = beat.items.find(entry => entry.itemIndex === link.itemRef);
+      if (item?.kind === 'speech' && !invalid.has(link.effectIndex)) {
+        invalid.set(link.effectIndex, { effectIndex: link.effectIndex, reason: link.effect.reason });
+      }
+    }
     return [...invalid.values()];
+  }
+
+  #beatPresence(
+    world: TavernWorldSnapshot,
+    beat: DecodedBeat,
+    actions: readonly TavernInvalidAction[],
+    effects: readonly TavernInvalidEffect[],
+  ): string | null {
+    const rejectedItems = new Set(actions.map(action => action.itemRef));
+    const rejectedEffects = new Set(effects.map(effect => effect.effectIndex));
+    const selection = {
+      beat: { ...beat, effects: beat.effects.filter(effect => !rejectedEffects.has(effect.effectIndex)) },
+      emittedItemRefs: beat.items.filter(item => !rejectedItems.has(item.itemIndex)).map(item => item.itemIndex),
+    };
+    try {
+      // All folds stay local until the existing publication step. The port still owns effect dependency closure.
+      const projected = projectTavernWorld(world, [{ kind: 'emitted', selection }]);
+      for (const phase of projected.phases) {
+        if (phase.phase !== 'item') continue;
+        const item = beat.items.find(entry => entry.itemIndex === phase.itemRef)!;
+        const present = new Set(phase.presentIds);
+        if (!phase.presenceKnown || !present.has(item.actorId)
+          || !item.addressees.every(actorId => present.has(actorId))) return 'invalid_presence';
+      }
+
+      return null;
+    } catch {
+      // A checker that omitted a failed prerequisite cannot publish even a partly valid overlay.
+      return 'effect_precondition';
+    }
   }
 }

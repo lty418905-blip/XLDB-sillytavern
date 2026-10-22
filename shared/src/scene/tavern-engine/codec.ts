@@ -1,4 +1,5 @@
 import { CODEC_LIMITS, MAX_EVENT_REFERENCES, MIN_ACTION_CONFIDENCE } from './types.ts';
+import { countHanScriptEvidence } from '../../common/han-script.ts';
 import type {
   BeatDecodeContext,
   BeatEffect,
@@ -393,17 +394,24 @@ export function decodeBeatCandidate(raw: unknown, suppliedContext: BeatDecodeCon
     const current = context(suppliedContext);
     if (current.envelope.source !== 'beat') reject('invalid_context');
     const scheduledActorCount = integer(current.scheduledActorCount, 1);
+    if (typeof raw === 'string') {
+      if (raw.length > MAX_TAVERN_TURN_UNITS) reject('invalid_length');
+      raw = JSON.parse(raw);
+    }
     const input = record(raw);
+    beatKeys(input, ['items', 'effects', 'intent', 'interrupt', 'actorId']);
     const maximum = scheduledActorCount === 1 && current.envelope.beatIndex === 1
       ? CODEC_LIMITS.soloFirstItems : CODEC_LIMITS.items;
     const items = array(input.items, maximum).map<BeatItem>((value, itemIndex) => {
       const item = record(value);
+      beatKeys(item, ['kind', 'text', 'addressees', 'whisperTo', 'actorId']);
       if (item.kind !== 'speech' && item.kind !== 'action') reject('unknown_kind');
       return { itemIndex, actorId: current.actorId, kind: item.kind, text: text(item.text),
         ...audience(item, current, new References()) };
     });
     const effects = array(input.effects ?? [], CODEC_LIMITS.effects).map<LinkedBeatEffect>((value, effectIndex) => {
       const entry = record(value);
+      beatKeys(entry, ['itemRef', 'phase', 'effect']);
       const itemRef = integer(entry.itemRef);
       if (itemRef >= items.length) reject('invalid_item_ref');
       const phase = entry.phase;
@@ -417,6 +425,7 @@ export function decodeBeatCandidate(raw: unknown, suppliedContext: BeatDecodeCon
 
     if (input.intent != null) {
       const intent = record(input.intent);
+      beatKeys(intent, ['goal', 'next']);
       const goal = text(intent.goal, CODEC_LIMITS.goal);
       const next = text(intent.next, CODEC_LIMITS.nextCodePoints * 2);
       // Unicode iteration counts scalar/code-point slots, not UTF-16 surrogate halves. At most 120 units enter.
@@ -426,6 +435,7 @@ export function decodeBeatCandidate(raw: unknown, suppliedContext: BeatDecodeCon
 
     if (input.interrupt != null) {
       const interrupt = record(input.interrupt);
+      beatKeys(interrupt, ['turnId', 'turnRevision', 'beatIndex', 'itemIndex']);
       result.interrupt = {
         turnId: identifier(interrupt.turnId), turnRevision: integer(interrupt.turnRevision, 1),
         beatIndex: integer(interrupt.beatIndex, 1), itemIndex: integer(interrupt.itemIndex),
@@ -435,6 +445,147 @@ export function decodeBeatCandidate(raw: unknown, suppliedContext: BeatDecodeCon
     return { ok: true, value: result };
   } catch (error) {
     return { ok: false, reason: issue(error) };
+  }
+}
+
+// The closed M2 envelope cannot quietly discard misspelled fields or model-claimed quotation exemptions.
+function beatKeys(input: Record<string, unknown>, allowed: readonly string[]): void {
+  const fields = new Set(allowed);
+  if (Object.keys(input).some(key => !fields.has(key))) reject('invalid_shape');
+}
+
+/** Provisional contract ceiling in serialized UTF-16 units per turn; also bounds one JSON beat response. */
+export const MAX_TAVERN_TURN_UNITS = 65_536;
+
+/** A definite output script, selected from player evidence rather than a majority over mixed writing. */
+export type TavernBeatScript = 'traditional' | 'simplified';
+
+/** Script selection plus deterministic work counts; sources are visited newest first until one is definite. */
+export interface TavernBeatScriptSelection {
+  script: TavernBeatScript;
+  visited: number;
+  sources: number;
+}
+
+/**
+ * Selects current player text, then newest-first valid chat history, then Simplified as the ruled fallback.
+ * Mixed means both kinds of exclusive evidence exist, regardless of majority. O(total visited code points).
+ * There is no chat-wide cap. Invalid input/getters throw invalid_beat_script_context without exposing text.
+ */
+export function resolveTavernBeatScript(
+  playerText: string,
+  history: readonly string[] | null = [],
+): TavernBeatScriptSelection {
+  try {
+    history ??= [];
+    if (typeof playerText !== 'string' || !Array.isArray(history)) throw new Error();
+    let visited = 0;
+    let sources = 0;
+    for (let index = -1; index < history.length; index++) {
+      const source = index === -1 ? playerText : history[index];
+      if (typeof source !== 'string') throw new Error();
+      const count = countHanScriptEvidence(source);
+      visited += count.visited;
+      sources++;
+      if (count.traditional > 0 && count.simplified === 0) return { script: 'traditional', visited, sources };
+      if (count.simplified > 0 && count.traditional === 0) return { script: 'simplified', visited, sources };
+    }
+
+    return { script: 'simplified', visited, sources };
+  } catch {
+    throw new Error('invalid_beat_script_context');
+  }
+}
+
+/**
+ * Host-provided quotation evidence for one original item. Offsets are half-open UTF-16 units.
+ * sourceText must come from an authorized, current source; the model cannot grant access or provide this list.
+ */
+export interface TavernBeatQuotation {
+  itemRef: number;
+  start: number;
+  end: number;
+  sourceId: string;
+  sourceRevision: number;
+  sourceText: string;
+  sourceStart: number;
+  sourceEnd: number;
+}
+
+/** Mechanical script result; the counts measure scanned speech code points and checked quotation UTF-16 units. */
+export type TavernBeatScriptCheck = {
+  visited: number;
+  quoteUnits: number;
+} & ({ ok: true } | { ok: false; reason: 'script_mismatch' | 'invalid_quotation' | 'invalid_script_context' });
+
+/**
+ * Checks speech without modifying any text. Only exact host-sourced spans are exempt; actions are not speech.
+ * At most six 800-unit items and 4,800 quotation spans enter. Work is O(speech units + checked quote units).
+ * Bad host data/getters return invalid_script_context; mismatched source spans return invalid_quotation.
+ */
+export function checkTavernBeatScript(
+  beat: DecodedBeat,
+  script: TavernBeatScript,
+  quotations: readonly TavernBeatQuotation[] | null = [],
+): TavernBeatScriptCheck {
+  let visited = 0;
+  let quoteUnits = 0;
+  try {
+    if (script !== 'traditional' && script !== 'simplified') throw new Error();
+    const items = array(beat.items, CODEC_LIMITS.soloFirstItems).map(value => record(value));
+    const masks = new Map<number, Uint8Array>();
+    const byIndex = new Map<number, Record<string, unknown>>();
+    for (const item of items) {
+      const index = integer(item.itemIndex);
+      const literal = text(item.text);
+      if (byIndex.has(index)) throw new Error();
+      byIndex.set(index, item);
+      masks.set(index, new Uint8Array(literal.length));
+    }
+    const quotes = array(quotations ?? [], CODEC_LIMITS.soloFirstItems * CODEC_LIMITS.text);
+    for (const value of quotes) {
+      const quote = record(value);
+      const itemRef = integer(quote.itemRef);
+      const item = byIndex.get(itemRef);
+      const start = integer(quote.start);
+      const end = integer(quote.end);
+      const sourceStart = integer(quote.sourceStart);
+      const sourceEnd = integer(quote.sourceEnd);
+      identifier(quote.sourceId);
+      integer(quote.sourceRevision, 1);
+      if (item?.kind !== 'speech' || typeof quote.sourceText !== 'string'
+        || end <= start || end > (item.text as string).length
+        || sourceEnd <= sourceStart || sourceEnd > quote.sourceText.length
+        || end - start !== sourceEnd - sourceStart) {
+        return { ok: false, reason: 'invalid_quotation', visited, quoteUnits };
+      }
+      quoteUnits += end - start;
+      if ((item.text as string).slice(start, end) !== quote.sourceText.slice(sourceStart, sourceEnd)) {
+        return { ok: false, reason: 'invalid_quotation', visited, quoteUnits };
+      }
+      masks.get(itemRef)!.fill(1, start, end);
+    }
+
+    let mismatch = false;
+    for (const item of items) {
+      if (item.kind !== 'speech') continue;
+      const literal = item.text as string;
+      const mask = masks.get(item.itemIndex as number)!;
+      let offset = 0;
+      for (const character of literal) {
+        visited++;
+        // Both surrogate units must be covered before a supplementary code point can be exempted.
+        const quoted = mask[offset] === 1 && (character.length === 1 || mask[offset + 1] === 1);
+        offset += character.length;
+        if (quoted) continue;
+        const count = countHanScriptEvidence(character);
+        if (script === 'traditional' ? count.simplified > 0 : count.traditional > 0) mismatch = true;
+      }
+    }
+
+    return mismatch ? { ok: false, reason: 'script_mismatch', visited, quoteUnits } : { ok: true, visited, quoteUnits };
+  } catch {
+    return { ok: false, reason: 'invalid_script_context', visited, quoteUnits };
   }
 }
 
