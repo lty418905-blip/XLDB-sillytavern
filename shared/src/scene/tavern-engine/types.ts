@@ -183,3 +183,94 @@ export interface ProjectedBeatItem {
   beforeItem: readonly LinkedBeatEffect[];
   afterItem: readonly LinkedBeatEffect[];
 }
+
+/** Structural sub-event address; item/effect indices retain their decoded zero-based positions. */
+export interface TavernEventAddress extends EventReference {
+  phase: 'event' | 'beforeItem' | 'item' | 'afterItem';
+  itemRef?: number | null;
+  effectIndex?: number | null;
+}
+
+/**
+ * Caller-validated content permission in the input world's scope. Missing entries grant nothing.
+ * basis lists all earlier event dependencies; readers must know every basis, including through authorship.
+ * observableBy separately grants visibility of the whisper act, never its content or private reasons.
+ */
+export interface TavernEventPermission {
+  address: TavernEventAddress;
+  readers: readonly string[];
+  observableBy: readonly string[];
+  basis: readonly TavernEventAddress[];
+}
+
+/**
+ * A routed structural event, independent of rendered prose. sequence is a positive ordered event count.
+ * quote is the exact original text, or empty for non-text effects; no message offsets are fabricated.
+ * eventId identifies the full structural address, while source.eventId retains the original ledger ID.
+ */
+export interface EventObservation {
+  eventId: string;
+  sequence: number;
+  source: TavernEventAddress & { channel: 'event' };
+  actorId: string;
+  perceptionKind: 'heard' | 'observed' | 'diagnostic';
+  quote: string;
+  content: EventPayload | BeatItem;
+  readers: readonly string[];
+}
+
+/** Closed supplementary input channels; opaque structured values are never parsed, summarized or interpreted. */
+export interface TavernPerceptionMaterial {
+  id: string;
+  channel: 'memory' | 'recall' | 'emotion' | 'candidate' | 'diagnostic' | 'possession' | 'commitment' | 'physiology';
+  readers: readonly string[];
+  basis: readonly TavernEventAddress[];
+  value: unknown;
+}
+
+/** Validated source set; all presence and position values come exclusively from the supplied world projection. */
+export interface TavernPerceptionInput {
+  baseline: import('./projection.ts').TavernWorldSnapshot;
+  steps: readonly import('./projection.ts').TavernProjectionStep[];
+  playerId: string;
+  permissions: readonly TavernEventPermission[];
+  materials?: readonly TavernPerceptionMaterial[] | null;
+  geography?: {
+    freshPositions: readonly {
+      entityId: string;
+      basis: import('./projection.ts').TavernProjectionBasis;
+    }[];
+    adjacent: readonly { fromId: string; toId: string }[];
+  } | null;
+}
+
+/** Detached per-actor input; authorship does not add the author to a whisper's routed readers. */
+export interface TavernActorEventView {
+  actorId: string;
+  inbox: readonly EventObservation[];
+  authoredEvents: readonly EventObservation[];
+  materials: readonly TavernPerceptionMaterial[];
+}
+
+/** Content-free observable whisper act; includes only its structural source and visible participants. */
+export interface TavernWhisperMarker {
+  source: TavernEventAddress & { channel: 'event' };
+  actorId: string;
+  recipientIds: readonly string[];
+  kind: 'whisper';
+}
+
+/** Player input for both renderers; it contains neither hidden beat fields nor inaccessible original content. */
+export interface TavernPlayerEventView {
+  playerRenderableEvents: readonly EventObservation[];
+  whisperMarkers: readonly TavernWhisperMarker[];
+}
+
+/** Prepared input and opaque delivery receipt; cursor movement is a separate explicit consumption operation. */
+export interface TavernPerceptionDispatch {
+  input: TavernActorEventView & {
+    deliveryCursor: number;
+    turnWindow: readonly EventObservation[];
+  };
+  receipt: object;
+}

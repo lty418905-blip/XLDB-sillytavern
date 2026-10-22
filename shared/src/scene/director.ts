@@ -400,7 +400,7 @@ export class SceneDirector {
 
     const todoIds = new Set<string>();
 
-    if (candidate.npcTodos !== undefined
+    if (candidate.npcTodos !== undefined && candidate.npcTodos !== null
       && (!Array.isArray(candidate.npcTodos) || candidate.npcTodos.length > 16))
       throw new Error('invalid_director_todos');
 
@@ -423,7 +423,7 @@ export class SceneDirector {
 
         const time = directorText(item.time, 5);
 
-        const intent = item.intent === undefined ? undefined : item.intent;
+        const intent = item.intent === undefined || item.intent === null ? undefined : item.intent;
 
         if (intent !== undefined
           && ![
@@ -436,7 +436,9 @@ export class SceneDirector {
           ))
           throw new Error('invalid_director_todo_intent');
 
-        const dramaticReason = item.dramaticReason === undefined ? undefined : directorText(item.dramaticReason, 500);
+        const dramaticReason = item.dramaticReason === undefined || item.dramaticReason === null
+          ? undefined
+          : directorText(item.dramaticReason, 500);
 
         if (intent === 'no_show' && !dramaticReason)
           throw new Error('invalid_director_todo_motive');
@@ -490,7 +492,7 @@ export class SceneDirector {
       }
     );
 
-    if (candidate.agendaClaims !== undefined
+    if (candidate.agendaClaims !== undefined && candidate.agendaClaims !== null
       && (!Array.isArray(candidate.agendaClaims) || candidate.agendaClaims.length > 32))
       throw new Error('invalid_director_agenda');
 
@@ -713,7 +715,7 @@ export class SceneDirector {
 
     const result: DirectorPlan = {
       threads,
-      ...(candidate.npcTodos === undefined ? {} : {
+      ...(candidate.npcTodos === undefined || candidate.npcTodos === null ? {} : {
         npcTodos
       }),
       ...(agendaClaims === undefined ? {} : {
