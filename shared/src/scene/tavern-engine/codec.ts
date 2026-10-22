@@ -471,3 +471,121 @@ export function projectBeatItems(
     return { ok: false, reason: issue(error) };
   }
 }
+
+/** Machine format for M1 envelopes; it is a protocol identifier, not model instruction wording. */
+export const TAVERN_INTERPRETATION_FORMAT = 'tavern-interpretation-v1';
+
+/** Provisional per-response event limit, matching the existing perspective stage's 12-observation budget. */
+export const MAX_INTERPRETATION_EVENTS = 12;
+
+function interpretationKeys(input: Record<string, unknown>, allowed: readonly string[]): void {
+  const keys = new Set(allowed);
+  if (Object.keys(input).some(key => !keys.has(key))) reject('invalid_shape');
+}
+
+function interpretationEvidence(value: unknown, current: Context): ObservationSource {
+  const input = record(value);
+  interpretationKeys(input, ['sourceId', 'revision', 'start', 'end', 'quote']);
+  const result = observationSource({ ...input, channel: 'message' }, current);
+  if (result.channel !== 'message' || typeof input.quote !== 'string'
+    || current.messageText.slice(result.start, result.end) !== input.quote) {
+    reject('invalid_reference');
+  }
+
+  return result;
+}
+
+function interpretationPayload(value: unknown, current: Context): EventPayload {
+  let candidate: Record<string, unknown> = Object.create(null);
+  try {
+    const entry = record(value);
+    candidate = record(entry.payload);
+    interpretationKeys(entry, ['payload', 'confidence', 'evidence', 'temporality']);
+    const confidence = finite(entry.confidence, 0, 1);
+    const source = interpretationEvidence(entry.evidence, current);
+    const temporality = entry.temporality;
+    if (temporality !== 'current' && temporality !== 'recollection' && temporality !== 'plan') {
+      reject('invalid_shape');
+    }
+    // Historical/planned acts are not present effects. The existing clock remains the sole time authority.
+    if (temporality !== 'current') reject('invalid_source');
+
+    const common = ['kind', 'actorId', 'confidence', 'evidence', 'text'];
+    switch (candidate.kind) {
+      case 'PlayerUtterance':
+        interpretationKeys(candidate, [...common, 'addressees', 'whisperTo']);
+        break;
+      case 'PlayerAction':
+        interpretationKeys(candidate, [...common, 'action', 'targets', 'objects']);
+        interpretationKeys(record(candidate.action), ['kind']);
+        break;
+      case 'Enter':
+      case 'Exit':
+        interpretationKeys(candidate, [...common, 'entityId', 'placeId']);
+        break;
+      case 'Transfer':
+        interpretationKeys(candidate, [...common, 'itemId', 'fromId', 'toId']);
+        break;
+      case 'CommitmentEvent':
+        interpretationKeys(candidate, [...common, 'operation']);
+        const operation = record(candidate.operation);
+        interpretationKeys(operation, [
+          'operationId', 'action', 'quote', 'evidence', 'commitmentId', 'targetId', 'targetRevision',
+          'content', 'participants', 'obligors', 'agreement', 'term',
+        ]);
+        for (const entry of array(operation.evidence, MAX_EVENT_REFERENCES)) {
+          interpretationKeys(record(entry), ['actorId', 'quote']);
+        }
+        if (operation.term != null) {
+          const term = record(operation.term);
+          interpretationKeys(term, term.kind === 'deadline'
+            ? ['kind', 'clock', 'deadlineQuote', 'reminderQuote', 'dueAtMs', 'remindAtMs']
+            : ['kind']);
+        }
+        break;
+      case 'Unknown':
+        interpretationKeys(candidate, [...common, 'reason']);
+        break;
+      default:
+        reject('unknown_kind');
+    }
+
+    if (candidate.text != null) text(candidate.text);
+    // Confidence and evidence on the wrapper override nested model values; actor identity is host-owned.
+    return decodePayload({ ...candidate, confidence, evidence: [source] }, current);
+  } catch (error) {
+    return unknown(candidate, current, issue(error));
+  }
+}
+
+/**
+ * Decodes one M1 response using the existing event vocabulary and host identity; never applies effects.
+ * The response is {format, events:[{payload, confidence, evidence, temporality}]}. Evidence is one exact
+ * UTF-16 half-open message span with quote; temporality is current/recollection/plan. Only current acts pass.
+ * Invalid envelopes fail for retry. Invalid individual candidates retain their position as Unknown.
+ * Work is O(catalog entries + response fields + source text): at most 12 events, each text at most 800 units.
+ * Source text/catalogs have no chat-wide cap. Own-property readers reject accessors without invoking them.
+ */
+export function decodeInterpretationCandidate(
+  raw: unknown,
+  suppliedContext: EventDecodeContext,
+): DecodeResult<readonly EngineEvent[]> {
+  try {
+    const current = context(suppliedContext);
+    if (current.envelope.source !== 'interpret' || current.envelope.status !== 'tentative') {
+      reject('invalid_context');
+    }
+    const input = record(raw);
+    interpretationKeys(input, ['format', 'events']);
+    if (input.format !== TAVERN_INTERPRETATION_FORMAT) reject('invalid_shape');
+    const events = array(input.events, MAX_INTERPRETATION_EVENTS).map((value, index) => ({
+      envelope: { ...current.envelope, id: JSON.stringify([current.envelope.id, index]) },
+      origin: current.origin,
+      payload: interpretationPayload(value, current),
+    }));
+
+    return { ok: true, value: events };
+  } catch (error) {
+    return { ok: false, reason: issue(error) };
+  }
+}
