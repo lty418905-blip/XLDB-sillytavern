@@ -1,4 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import {
+  captureTavernEngineRows,
+  restoreTavernEngineRows,
+  filterTavernEngineSnapshot,
+  eraseTavernEngineSources,
+  tavernEngineSnapshotReferencesSources,
+} from './tavern-engine/store.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import { scopeKey } from '../core/types.ts';
 import type { SceneScope } from './types.ts';
@@ -54,6 +61,8 @@ interface WorldSettingsRow {
 }
 
 interface SceneCheckpointSnapshot {
+  /** Absent for scopes without accepted Tavern ledger data; null also means no ledger rows. */
+  tavernEngine?: ReturnType<typeof captureTavernEngineRows> | null;
   schema: 1;
   world: WorldRow;
   sources: SourceRow[];
@@ -244,41 +253,92 @@ export class SceneLifecycle {
   /** A deletion is an erasure boundary, so retained checkpoints cannot replay it. */
   redactUnsafeCheckpoints(scope: SceneScope, sourceIds: Iterable<string>): void {
     const deleted = new Set(sourceIds);
-    if (!deleted.size) return;
+
+    if (!deleted.size)
+      return;
+
+    const invalidated = eraseTavernEngineSources(this.db, scope, deleted);
+
     const checkpoints = this.db.prepare('SELECT id,snapshot FROM scene_checkpoints WHERE scope=?')
       .all(scopeKey(scope)) as { id: string; snapshot: string }[];
+
     for (const checkpoint of checkpoints) {
-      if (!this.snapshotReferencesDeletedSource(checkpoint.snapshot, deleted)) continue;
+      if (!this.snapshotReferencesDeletedSource(checkpoint.snapshot, invalidated))
+        continue;
       this.db.prepare('DELETE FROM scene_checkpoints WHERE id=?').run(checkpoint.id);
     }
   }
 
   private capture(scope: SceneScope): SceneCheckpointSnapshot {
     const key = scopeKey(scope);
-    const world = this.db.prepare('SELECT scope,roster,created FROM scene_worlds WHERE key=?').get(key) as WorldRow | undefined;
-    if (!world) throw new Error('invalid_scene_not_configured');
-    const sources = this.db.prepare(`SELECT id,revision,message,observed,status,processing,json_remove(analysis,'$.emotionStates') AS analysis
-      FROM scene_sources WHERE scope=? ORDER BY rowid`).all(key) as unknown as SourceRow[];
+    const world = this.db.prepare(
+      'SELECT scope,roster,created FROM scene_worlds WHERE key=?'
+    ).get(key) as WorldRow | undefined;
+
+    if (!world)
+      throw new Error('invalid_scene_not_configured');
+
+    const sources = this.db.prepare(
+      `SELECT id,revision,message,observed,status,processing,json_remove(analysis,'$.emotionStates') AS analysis
+      FROM scene_sources WHERE scope=? ORDER BY rowid`
+    ).all(key) as unknown as SourceRow[];
     const controls = this.db.prepare(`SELECT character,id,revision,access
       FROM scene_controls WHERE scope=? ORDER BY rowid`).all(key) as unknown as ControlRow[];
     const settings = this.db.prepare(`SELECT settings,clock_floor AS clockFloor
       FROM scene_world_settings WHERE scope=?`).get(key) as WorldSettingsRow | undefined;
-    const preferenceControls=this.db.prepare('SELECT character,id,body FROM scene_preference_controls WHERE scope=? ORDER BY rowid').all(key) as {character:string;id:string;body:string}[];
-    const physiologySettings=this.db.prepare('SELECT revision,body FROM scene_physiology_settings WHERE scope=?').get(key) as {revision:number;body:string}|undefined;
-    const physiologyCorrections=this.db.prepare('SELECT id,character,body FROM scene_physiology_corrections WHERE scope=? ORDER BY rowid').all(key) as {id:string;character:string;body:string}[];
-    const geographySettings=this.db.prepare('SELECT revision,body FROM scene_geography_settings WHERE scope=?').get(key) as {revision:number;body:string}|undefined;
-    const geographyMaps=this.db.prepare(`SELECT map_id AS mapId,document_revision AS documentRevision,document_hash AS documentHash,basis,body,imported
-      FROM scene_geography_maps WHERE scope=? ORDER BY rowid`).all(key) as unknown as {mapId:string;documentRevision:number;documentHash:string;basis:string;body:string;imported:number}[];
-    const geographyCorrections=this.db.prepare('SELECT id,body FROM scene_geography_corrections WHERE scope=? ORDER BY rowid').all(key) as {id:string;body:string}[];
-    const geographyLayouts=this.db.prepare('SELECT reader,revision,body FROM scene_geography_layouts WHERE scope=? ORDER BY rowid').all(key) as {reader:string;revision:number;body:string}[];
-    const companionPreset=this.extension.capture(key);
-    return { schema: 1, world, sources, controls, preferenceControls,physiologySettings:physiologySettings??null,physiologyCorrections,
-      geographySettings:geographySettings??null,geographyMaps,geographyCorrections,geographyLayouts,
-      references:captureReferenceRows(this.db,scope),calendarTodos:captureCalendarTodoRows(this.db,scope),
-      calendarReminderAcks:captureCalendarAckRows(this.db,scope),
-      storyClockCorrections:captureStoryClockCorrectionRows(this.db,scope),
-      ...captureWorldLedgerRows(this.db,scope),
-      worldSettings: settings ?? null,...(companionPreset===undefined?{}:{companionPreset}) };
+    const preferenceControls = this.db.prepare(
+      'SELECT character,id,body FROM scene_preference_controls WHERE scope=? ORDER BY rowid'
+    ).all(key) as { character: string; id: string; body: string }[];
+    const physiologySettings = this.db.prepare(
+      'SELECT revision,body FROM scene_physiology_settings WHERE scope=?'
+    ).get(key) as { revision: number; body: string } | undefined;
+    const physiologyCorrections = this.db.prepare(
+      'SELECT id,character,body FROM scene_physiology_corrections WHERE scope=? ORDER BY rowid'
+    ).all(key) as { id: string; character: string; body: string }[];
+    const geographySettings = this.db.prepare(
+      'SELECT revision,body FROM scene_geography_settings WHERE scope=?'
+    ).get(key) as { revision: number; body: string } | undefined;
+    const geographyMaps = this.db.prepare(
+      `SELECT map_id AS mapId,document_revision AS documentRevision,document_hash AS documentHash,basis,body,imported
+      FROM scene_geography_maps WHERE scope=? ORDER BY rowid`
+    ).all(key) as unknown as {
+      mapId: string;
+      documentRevision: number;
+      documentHash: string;
+      basis: string;
+      body: string;
+      imported: number
+    }[];
+    const geographyCorrections = this.db.prepare(
+      'SELECT id,body FROM scene_geography_corrections WHERE scope=? ORDER BY rowid'
+    ).all(key) as { id: string; body: string }[];
+    const geographyLayouts = this.db.prepare(
+      'SELECT reader,revision,body FROM scene_geography_layouts WHERE scope=? ORDER BY rowid'
+    ).all(key) as { reader: string; revision: number; body: string }[];
+    const tavernEngine = captureTavernEngineRows(this.db, scope);
+    const companionPreset = this.extension.capture(key);
+
+    return {
+      schema: 1,
+      world,
+      sources,
+      controls,
+      preferenceControls,
+      physiologySettings: physiologySettings ?? null,
+      physiologyCorrections,
+      geographySettings: geographySettings ?? null,
+      geographyMaps,
+      geographyCorrections,
+      geographyLayouts,
+      references: captureReferenceRows(this.db, scope),
+      calendarTodos: captureCalendarTodoRows(this.db, scope),
+      calendarReminderAcks: captureCalendarAckRows(this.db, scope),
+      storyClockCorrections: captureStoryClockCorrectionRows(this.db, scope),
+      ...captureWorldLedgerRows(this.db, scope),
+      ...(tavernEngine === undefined ? {} : { tavernEngine }),
+      worldSettings: settings ?? null,
+      ...(companionPreset === undefined ? {} : { companionPreset })
+    };
   }
 
   private checkVersion(scope:SceneScope,expectedVersion?:number):void {
@@ -295,22 +355,51 @@ export class SceneLifecycle {
     return checkpoint;
   }
 
-  private restoreSnapshot(scope: SceneScope, snapshot: SceneCheckpointSnapshot, hasParked?: (sourceId:string,revision:number)=>boolean): void {
+  private restoreSnapshot(
+    scope: SceneScope,
+    snapshot: SceneCheckpointSnapshot,
+    hasParked?: (sourceId: string, revision: number) => boolean
+
+  ): void {
     const key = scopeKey(scope);
-    const live = this.db.prepare('SELECT version,roster FROM scene_worlds WHERE key=?').get(key) as { version: number; roster: string } | undefined;
-    if (!live) throw new Error('invalid_scene_not_configured');
-    if (snapshot.schema !== 1) throw new Error('invalid_scene_checkpoint');
+    const live = this.db.prepare(
+      'SELECT version,roster FROM scene_worlds WHERE key=?'
+    ).get(key) as { version: number; roster: string } | undefined;
+
+    if (!live)
+      throw new Error('invalid_scene_not_configured');
+
+    if (snapshot.schema !== 1)
+      throw new Error('invalid_scene_checkpoint');
     snapshot = this.withCurrentTombstones(scope, snapshot);
-    snapshot.sources=snapshot.sources.map(row=>{
-      const analysis=interruptDeferredLedgerAnalysis(row.analysis);
-      if(analysis===row.analysis)return row;
-      // A failed parked-result lookup is an interruption, never permission to restart inference.
-      try{if(hasParked?.(row.id,row.revision)===true)return row;}catch{ /* No usable parked result. */ }
-      return {...row,analysis};
-    });
+    snapshot.sources = snapshot.sources.map(
+      row => {
+        const analysis = interruptDeferredLedgerAnalysis(row.analysis);
+
+        if (analysis === row.analysis)
+          return row;
+
+        // A failed parked-result lookup is an interruption, never permission to restart inference.
+        try {
+          if (hasParked?.(row.id, row.revision) === true)
+            return row;
+        } catch { /* No usable parked result. */
+        }
+
+        return { ...row, analysis };
+      }
+    );
     this.db.prepare('DELETE FROM scene_processing_stages WHERE scope=?').run(key);
-    if(snapshot.references!==undefined)restoreReferenceRows(this.db,scope,snapshot.references,{replaceAccepted:true});
-    const cleanupCharacters = new Set([...rosterCharacterIds(live.roster), ...rosterCharacterIds(snapshot.world.roster)]);
+
+    if (snapshot.references !== undefined)
+      restoreReferenceRows(this.db, scope, snapshot.references, { replaceAccepted: true });
+
+    const cleanupCharacters = new Set([...rosterCharacterIds(
+      live.roster
+    ), ...rosterCharacterIds(
+      snapshot.world.roster
+    )]);
+    restoreTavernEngineRows(this.db, scope);
     this.db.prepare('DELETE FROM scene_sources WHERE scope=?').run(key);
     this.db.prepare('DELETE FROM scene_controls WHERE scope=?').run(key);
     this.db.prepare('DELETE FROM scene_preference_controls WHERE scope=?').run(key);
@@ -323,7 +412,13 @@ export class SceneLifecycle {
     this.db.prepare('DELETE FROM scene_geography_write_operations WHERE scope=?').run(key);
     this.db.prepare('DELETE FROM scene_world_settings WHERE scope=?').run(key);
     this.db.prepare('UPDATE scene_worlds SET scope=?,roster=?,version=?,created=? WHERE key=?')
-      .run(snapshot.world.scope, snapshot.world.roster, live.version + 1, snapshot.world.created, key);
+      .run(
+        snapshot.world.scope,
+        snapshot.world.roster,
+        live.version + 1,
+        snapshot.world.created,
+        key
+      );
     this.insertChildren(key, snapshot, true);
     this.recordIndexCleanup(scope, cleanupCharacters, live.version + 1);
   }
@@ -344,44 +439,138 @@ export class SceneLifecycle {
   }
 
   private insertChildren(key: string, snapshot: SceneCheckpointSnapshot, replace = false): void {
-    const [worldId,sessionId,branchId,characterId]=JSON.parse(key) as string[];
-    restoreWorldLedgerRows(this.db,{worldId:worldId!,sessionId:sessionId!,branchId:branchId!,characterId:characterId!},
-      snapshot.worldLedgerAccounts??[],snapshot.worldLedgerCorrections??[]);
-    restoreReferenceRows(this.db,{worldId:worldId!,sessionId:sessionId!,branchId:branchId!,characterId:characterId!},snapshot.references??[]);
-    if(snapshot.calendarTodos!==undefined||snapshot.calendarReminderAcks!==undefined)
-      restoreCalendarRows(this.db,{worldId:worldId!,sessionId:sessionId!,branchId:branchId!,characterId:characterId!},
-        snapshot.calendarTodos??[],snapshot.calendarReminderAcks??[]);
-    restoreStoryClockCorrectionRows(this.db,{worldId:worldId!,sessionId:sessionId!,branchId:branchId!,characterId:characterId!},snapshot.storyClockCorrections??[]);
-    const insertSource = this.db.prepare(`INSERT INTO scene_sources
-      (scope,id,revision,message,observed,status,processing,analysis) VALUES(?,?,?,?,?,?,?,?)`);
+    const [worldId, sessionId, branchId, characterId] = JSON.parse(key) as string[];
+    restoreWorldLedgerRows(
+      this.db,
+      { worldId: worldId!, sessionId: sessionId!, branchId: branchId!, characterId: characterId! },
+      snapshot.worldLedgerAccounts ?? [],
+      snapshot.worldLedgerCorrections ?? []
+    );
+    restoreReferenceRows(
+      this.db,
+      { worldId: worldId!, sessionId: sessionId!, branchId: branchId!, characterId: characterId! },
+      snapshot.references ?? []
+    );
+
+    if (snapshot.calendarTodos !== undefined || snapshot.calendarReminderAcks !== undefined)
+      restoreCalendarRows(
+        this.db,
+        { worldId: worldId!, sessionId: sessionId!, branchId: branchId!, characterId: characterId! },
+        snapshot.calendarTodos ?? [],
+        snapshot.calendarReminderAcks ?? []
+      );
+    restoreStoryClockCorrectionRows(
+      this.db,
+      { worldId: worldId!, sessionId: sessionId!, branchId: branchId!, characterId: characterId! },
+      snapshot.storyClockCorrections ?? []
+    );
+
+    const insertSource = this.db.prepare(
+      `INSERT INTO scene_sources
+      (scope,id,revision,message,observed,status,processing,analysis) VALUES(?,?,?,?,?,?,?,?)`
+    );
+
     for (const row of snapshot.sources) {
-      insertSource.run(key, row.id, row.revision, row.message, row.observed, row.status, row.processing, row.analysis);
+      insertSource.run(
+        key,
+        row.id,
+        row.revision,
+        row.message,
+        row.observed,
+        row.status,
+        row.processing,
+        row.analysis
+      );
     }
+    restoreTavernEngineRows(
+      this.db,
+      {
+        worldId: worldId!,
+        sessionId: sessionId!,
+        branchId: branchId!,
+        characterId: characterId!,
+      },
+      snapshot.tavernEngine
+    );
+
     const insertControl = this.db.prepare(`INSERT INTO scene_controls
       (scope,character,id,revision,access) VALUES(?,?,?,?,?)`);
+
     for (const row of snapshot.controls) {
       insertControl.run(key, row.character, row.id, row.revision, row.access);
     }
-    for(const row of snapshot.preferenceControls??[])this.db.prepare('INSERT INTO scene_preference_controls VALUES(?,?,?,?)').run(key,row.character,row.id,row.body);
-    if(snapshot.physiologySettings)this.db.prepare('INSERT INTO scene_physiology_settings VALUES(?,?,?)')
-      .run(key,snapshot.physiologySettings.revision,snapshot.physiologySettings.body);
-    for(const row of snapshot.physiologyCorrections??[])this.db.prepare('INSERT INTO scene_physiology_corrections VALUES(?,?,?,?)')
-      .run(key,row.id,row.character,row.body);
-    if(snapshot.geographySettings)this.db.prepare('INSERT INTO scene_geography_settings VALUES(?,?,?)')
-      .run(key,snapshot.geographySettings.revision,snapshot.geographySettings.body);
-    for(const row of snapshot.geographyMaps??[])this.db.prepare('INSERT INTO scene_geography_maps VALUES(?,?,?,?,?,?,?)')
-      .run(key,row.mapId,row.documentRevision,row.documentHash,row.basis,row.body,row.imported);
-    for(const row of snapshot.geographyCorrections??[])this.db.prepare('INSERT INTO scene_geography_corrections VALUES(?,?,?)')
-      .run(key,row.id,row.body);
-    for(const row of snapshot.geographyLayouts??[])this.db.prepare('INSERT INTO scene_geography_layouts VALUES(?,?,?,?)')
-      .run(key,row.reader,row.revision,row.body);
+
+    for (const row of snapshot.preferenceControls ?? [])
+      this.db.prepare('INSERT INTO scene_preference_controls VALUES(?,?,?,?)').run(
+        key,
+        row.character,
+        row.id,
+        row.body
+      );
+
+    if (snapshot.physiologySettings)
+      this.db.prepare('INSERT INTO scene_physiology_settings VALUES(?,?,?)')
+        .run(
+          key,
+          snapshot.physiologySettings.revision,
+          snapshot.physiologySettings.body
+        );
+
+    for (const row of snapshot.physiologyCorrections ?? [])
+      this.db.prepare('INSERT INTO scene_physiology_corrections VALUES(?,?,?,?)')
+        .run(
+          key,
+          row.id,
+          row.character,
+          row.body
+        );
+
+    if (snapshot.geographySettings)
+      this.db.prepare('INSERT INTO scene_geography_settings VALUES(?,?,?)')
+        .run(
+          key,
+          snapshot.geographySettings.revision,
+          snapshot.geographySettings.body
+        );
+
+    for (const row of snapshot.geographyMaps ?? [])
+      this.db.prepare('INSERT INTO scene_geography_maps VALUES(?,?,?,?,?,?,?)')
+        .run(
+          key,
+          row.mapId,
+          row.documentRevision,
+          row.documentHash,
+          row.basis,
+          row.body,
+          row.imported
+        );
+
+    for (const row of snapshot.geographyCorrections ?? [])
+      this.db.prepare('INSERT INTO scene_geography_corrections VALUES(?,?,?)')
+        .run(key, row.id, row.body);
+
+    for (const row of snapshot.geographyLayouts ?? [])
+      this.db.prepare('INSERT INTO scene_geography_layouts VALUES(?,?,?,?)')
+        .run(
+          key,
+          row.reader,
+          row.revision,
+          row.body
+        );
+
     if (snapshot.worldSettings) {
       this.db.prepare(`INSERT INTO scene_world_settings(scope,settings,clock_floor) VALUES(?,?,?)`)
-        .run(key, snapshot.worldSettings.settings, snapshot.worldSettings.clockFloor);
+        .run(
+          key,
+          snapshot.worldSettings.settings,
+          snapshot.worldSettings.clockFloor
+        );
     }
+
     // Legacy snapshots did not carry the extension field; only a snapshot that explicitly owns it may replace or remove
     // the live value. Without the extension the field is ignored, so no possibly missing table is ever touched.
-    if(snapshot.companionPreset!==undefined)this.extension.restore(key,snapshot.companionPreset,replace);
+    if (snapshot.companionPreset !== undefined)
+      this.extension.restore(key, snapshot.companionPreset, replace);
   }
 
   private deletedSourceIds(scope: SceneScope): string[] {
@@ -391,26 +580,81 @@ export class SceneLifecycle {
 
   private withCurrentTombstones(scope: SceneScope, value: SceneCheckpointSnapshot): SceneCheckpointSnapshot {
     const snapshot = structuredClone(value);
-    if(snapshot.references!==undefined) {
-      const references=new Map(snapshot.references.map(row=>[row.id,row]));
-      for(const row of captureReferenceRows(this.db,scope))if(row.status==='deleted')references.set(row.id,row);
-      snapshot.references=[...references.values()];
+
+    if (snapshot.references !== undefined) {
+      const references = new Map(snapshot.references.map(row => [row.id, row]));
+
+      for (const row of captureReferenceRows(this.db, scope))
+        if (row.status === 'deleted')
+          references.set(row.id, row);
+      snapshot.references = [...references.values()];
     }
+
     const key = scopeKey(scope);
-    const tombstones = this.db.prepare(`SELECT id,revision,message,observed,status,processing,analysis
-      FROM scene_sources WHERE scope=? AND status='deleted' ORDER BY rowid`).all(key) as unknown as SourceRow[];
-    if (!tombstones.length) return snapshot;
+    const tombstones = this.db.prepare(
+      `SELECT id,revision,message,observed,status,processing,analysis
+      FROM scene_sources WHERE scope=? AND status='deleted' ORDER BY rowid`
+    ).all(key) as unknown as SourceRow[];
     const changes: { index: number; characters: Set<string> }[] = [];
+    const filterTavernSources = (): void => {
+      if (snapshot.tavernEngine == null)
+        return;
+
+      const invalidated = { deletedSourceIds: new Set<string>(), sourceRevisions: new Set<string>() };
+      snapshot.tavernEngine = filterTavernEngineSnapshot(snapshot.tavernEngine, snapshot.sources, [], invalidated);
+
+      for (const [index, source] of snapshot.sources.entries()) {
+        if (source.status !== 'accepted'
+          || !invalidated.sourceRevisions.has(JSON.stringify([source.id, source.revision])))
+          continue;
+        changes.push({ index, characters: this.analysisCharacters(source.analysis) });
+        source.status = 'needs_review';
+        source.processing = 'failed';
+        source.analysis = null;
+      }
+
+      if (invalidated.sourceRevisions.size) {
+        this.invalidateSnapshotDependents(snapshot, changes);
+        this.invalidateSnapshotCausalSuffix(snapshot, changes);
+      }
+    };
+
+    if (!tombstones.length) {
+      if (snapshot.tavernEngine != null) {
+        filterTavernSources();
+      }
+
+      return snapshot;
+    }
+
     for (const tombstone of tombstones) {
-      snapshot.preferenceControls=snapshot.preferenceControls?.filter(control=>control.id.slice(0,control.id.lastIndexOf(':pref:@'))!==tombstone.id);
-      if(snapshot.worldLedgerCorrections!==undefined)snapshot.worldLedgerCorrections=snapshot.worldLedgerCorrections
-        .filter(row=>row.kind==='adjustment'||row.source_id!==tombstone.id);
+      snapshot.preferenceControls = snapshot.preferenceControls?.filter(
+        control => control.id.slice(
+          0,
+          control.id.lastIndexOf(
+            ':pref:@'
+          )
+        ) !== tombstone.id
+      );
+
+      if (snapshot.worldLedgerCorrections !== undefined)
+        snapshot.worldLedgerCorrections = snapshot.worldLedgerCorrections
+          .filter(
+            row => row.kind === 'adjustment' || row.source_id !== tombstone.id
+          );
+
       const index = snapshot.sources.findIndex(source => source.id === tombstone.id);
       const prior = index < 0 ? undefined : snapshot.sources[index];
+
       if (index >= 0 && prior?.status === 'accepted') {
         changes.push({ index, characters: this.analysisCharacters(prior.analysis) });
       }
-      const revision = Math.max(tombstone.revision, prior && prior.status !== 'deleted' ? prior.revision + 1 : prior?.revision ?? 0);
+
+      const revision = Math.max(
+        tombstone.revision,
+        prior
+          && prior.status !== 'deleted' ? prior.revision + 1 : prior?.revision ?? 0
+      );
       const redacted: SourceRow = {
         ...tombstone,
         revision,
@@ -419,11 +663,19 @@ export class SceneLifecycle {
         processing: 'ready',
         analysis: null,
       };
-      if (index < 0) snapshot.sources.push(redacted);
-      else snapshot.sources[index] = redacted;
+
+      if (index < 0)
+        snapshot.sources.push(redacted);
+      else
+        snapshot.sources[index] = redacted;
     }
     this.invalidateSnapshotDependents(snapshot, changes);
     this.invalidateSnapshotCausalSuffix(snapshot, changes);
+
+    if (snapshot.tavernEngine != null) {
+      filterTavernSources();
+    }
+
     return snapshot;
   }
 
@@ -502,27 +754,52 @@ export class SceneLifecycle {
     return JSON.stringify(value);
   }
 
-  private snapshotReferencesDeletedSource(serialized: string, deleted: Set<string>): boolean {
+  private snapshotReferencesDeletedSource(
+    serialized: string,
+    invalidated: ReturnType<typeof eraseTavernEngineSources>,
+  ): boolean {
+    const deleted = invalidated.deletedSourceIds;
+    const revisions = invalidated.sourceRevisions;
     try {
       const snapshot = JSON.parse(serialized) as SceneCheckpointSnapshot;
-      if (snapshot.schema !== 1 || !Array.isArray(snapshot.sources)) return true;
+
+      if (snapshot.schema !== 1 || !Array.isArray(snapshot.sources))
+        return true;
+
       const unsafe = new Set(snapshot.sources
-        .filter(source => typeof source.id === 'string' && deleted.has(source.id) && source.status !== 'deleted')
-        .map(source => source.id));
+        .filter(
+          source => typeof source.id === 'string' && source.status !== 'deleted'
+            && (deleted.has(source.id) || revisions.has(JSON.stringify([source.id, source.revision])))
+        )
+        .map(
+          source => source.id
+        ));
       let changed = true;
+
       while (changed) {
         changed = false;
+
         for (const source of snapshot.sources) {
-          if (source.status !== 'accepted' || typeof source.id !== 'string' || unsafe.has(source.id)) continue;
-          const message = JSON.parse(source.message) as { dependencies?: { id?: string }[] };
-          if (!(message.dependencies ?? []).some(dependency => typeof dependency.id === 'string' &&
-            (deleted.has(dependency.id) || unsafe.has(dependency.id)))) continue;
+          if (source.status !== 'accepted' || typeof source.id !== 'string' || unsafe.has(source.id))
+            continue;
+
+          const message = JSON.parse(source.message) as { dependencies?: { id?: string; revision?: number }[] };
+
+          if (!(message.dependencies ?? []).some(
+            dependency => typeof dependency.id === 'string' &&
+              (deleted.has(dependency.id) || unsafe.has(dependency.id)
+                || revisions.has(JSON.stringify([dependency.id, dependency.revision])))
+          ))
+            continue;
           unsafe.add(source.id);
           changed = true;
         }
       }
-      return unsafe.size > 0;
-    } catch { return true; }
+
+      return unsafe.size > 0 || tavernEngineSnapshotReferencesSources(snapshot.tavernEngine, deleted, revisions);
+    } catch {
+      return true;
+    }
   }
 
   private transaction<T>(action: () => T): T {

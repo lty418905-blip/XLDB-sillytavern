@@ -1,3 +1,8 @@
+import {
+  captureTavernEngineRows,
+  eraseTavernEngineSources,
+  tavernEngineSnapshotReferencesSources,
+} from './tavern-engine/store.ts';
 import {emotionIdentitySeed} from '../emotion/identity.ts';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -462,72 +467,190 @@ function applyRestoreRules(filename: string, rules?: RestoreRules, extension?: B
   const db = new DatabaseSync(filename);
   let transaction = false;
   let appliedDeletionCount = 0;
+
   try {
     db.exec('PRAGMA foreign_keys=ON; BEGIN IMMEDIATE');
     transaction = true;
     clearProcessingCandidates(db);
     clearDirectorCache(db);
     ensureExtendedRestoreSchema(db, extension, rules?.targetControls.extensionSchema ?? []);
-    if (rules) restoreTargetControls(db, rules.targetControls);
+
+    if (rules)
+      restoreTargetControls(db, rules.targetControls);
+
     for (const deletion of rules?.referenceDeletions ?? []) {
       restoreReferenceRows(db, deletion.scope, deletion.rows);
       appliedDeletionCount += deletion.rows.length;
     }
+
     const rebuiltCoreScopes = new Set<string>();
+
     for (const deletion of rules?.coreDeletions ?? []) {
-      if (!db.prepare('SELECT 1 FROM scopes WHERE key=?').get(deletion.scope)) continue;
+      if (!db.prepare('SELECT 1 FROM scopes WHERE key=?').get(deletion.scope))
+        continue;
+
       const existing = db.prepare('SELECT revision,status FROM sources WHERE scope=? AND id=?')
-        .get(deletion.scope, deletion.id) as {revision: number; status: string} | undefined;
+        .get(
+          deletion.scope,
+          deletion.id
+        ) as { revision: number; status: string } | undefined;
       const revision = Math.max(
         deletion.revision,
         existing && existing.status !== 'deleted' ? existing.revision + 1 : existing?.revision ?? 0,
       );
-      db.prepare(`INSERT INTO sources(scope,id,revision,role,text,hash,accepted,observed,status,payload)
+      db.prepare(
+        `INSERT INTO sources(scope,id,revision,role,text,hash,accepted,observed,status,payload)
         VALUES(?,?,?,?,?,?,?,?, 'deleted',NULL)
         ON CONFLICT(scope,id) DO UPDATE SET revision=excluded.revision,role=excluded.role,text='',hash='',
-        accepted=excluded.accepted,observed=excluded.observed,status='deleted',payload=NULL`)
-        .run(deletion.scope, deletion.id, revision, deletion.role, '', '', deletion.accepted, deletion.observed);
+        accepted=excluded.accepted,observed=excluded.observed,status='deleted',payload=NULL`
+      )
+        .run(
+          deletion.scope,
+          deletion.id,
+          revision,
+          deletion.role,
+          '',
+          '',
+          deletion.accepted,
+          deletion.observed
+        );
       removeCoreControls(db, deletion.scope, deletion.id);
       rebuiltCoreScopes.add(deletion.scope);
       appliedDeletionCount++;
     }
-    for (const scope of rebuiltCoreScopes) rebuildCoreScope(db, scope);
+
+    for (const scope of rebuiltCoreScopes)
+      rebuildCoreScope(db, scope);
 
     const sceneScopes = new Map<string, SceneDeletion[]>();
+
     for (const deletion of rules?.sceneDeletions ?? []) {
-      if (!db.prepare('SELECT 1 FROM scene_worlds WHERE key=?').get(deletion.scope)) continue;
+      if (!db.prepare('SELECT 1 FROM scene_worlds WHERE key=?').get(deletion.scope))
+        continue;
+
       const group = sceneScopes.get(deletion.scope) ?? [];
       group.push(deletion);
       sceneScopes.set(deletion.scope, group);
       appliedDeletionCount++;
     }
-    for (const [scope, deletions] of sceneScopes) applySceneDeletions(db, scope, deletions);
+
+    for (const [scope, deletions] of sceneScopes)
+      applySceneDeletions(db, scope, deletions);
 
     // A legacy backup can already contain tombstones; cleanup must also run without target deletion rules.
     for (const row of db.prepare('SELECT scope FROM scene_worlds').iterate()) {
       sweepWorldLedgerTombstones(db, JSON.parse(row.scope as string) as SceneScope);
+
+      const tavernScope = JSON.parse(row.scope as string) as SceneScope;
+
+      if (captureTavernEngineRows(db, tavernScope) !== undefined) {
+        const tombstones = db.prepare(
+          `SELECT scope,id,revision,message,observed,status,processing,analysis
+          FROM scene_sources WHERE scope=? AND status='deleted' ORDER BY rowid`
+        )
+          .all(
+            scopeKey(tavernScope)
+          ) as unknown as SceneDeletion[];
+
+        // Recovery has no target rules to replay. Reuse source invalidation before erasing the ledger so
+        // dependent accepted analyses cannot relearn a deleted event. Scopes without ledger data stay unchanged.
+        if (tombstones.length)
+          applySceneDeletions(db, scopeKey(tavernScope), tombstones);
+      }
+
+      const invalidated = eraseTavernEngineSources(db, tavernScope, []);
+      const invalidSources = db.prepare(
+        "SELECT id,revision,status FROM scene_sources WHERE scope=? AND status!='accepted'",
+      )
+        .all(
+          scopeKey(tavernScope)
+        ) as { id: string; revision: number; status: string }[];
+
+      for (const source of invalidSources) {
+        if (source.status === 'deleted')
+          invalidated.deletedSourceIds.add(source.id);
+        else
+          invalidated.sourceRevisions.add(JSON.stringify([source.id, source.revision]));
+      }
+
+      if (!invalidated.deletedSourceIds.size && !invalidated.sourceRevisions.size)
+        continue;
+
+      const checkpoints = db.prepare('SELECT id,snapshot FROM scene_checkpoints WHERE scope=?')
+        .all(scopeKey(tavernScope)) as { id: string; snapshot: string }[];
+
+      for (const checkpoint of checkpoints) {
+        let snapshot: {
+          sources?: { id: string; revision: number; status: string; message: string }[];
+          tavernEngine?: Parameters<typeof tavernEngineSnapshotReferencesSources>[0];
+        };
+
+        try {
+          snapshot = JSON.parse(checkpoint.snapshot) as typeof snapshot;
+        } catch {
+          // This added sweep owns only identifiable Tavern snapshots, not legacy checkpoint validation.
+          continue;
+        }
+
+        if (snapshot?.tavernEngine == null)
+          continue;
+
+        let unsafe = false;
+
+        try {
+          // A snapshot can retain a source's analysis without retaining that source's ledger rows.
+          unsafe = (snapshot.sources ?? []).some(source => {
+            if (source.status !== 'deleted'
+              && (invalidated.deletedSourceIds.has(source.id)
+                || invalidated.sourceRevisions.has(JSON.stringify([source.id, source.revision]))))
+              return true;
+
+            const message = JSON.parse(source.message) as { dependencies?: { id: string; revision: number }[] };
+
+            return source.status === 'accepted' && (message.dependencies ?? []).some(dependency =>
+              invalidated.deletedSourceIds.has(dependency.id)
+              || invalidated.sourceRevisions.has(JSON.stringify([dependency.id, dependency.revision])));
+          });
+          unsafe ||= tavernEngineSnapshotReferencesSources(
+            snapshot.tavernEngine,
+            invalidated.deletedSourceIds,
+            invalidated.sourceRevisions,
+          );
+        } catch {
+          unsafe = true;
+        }
+
+        if (unsafe)
+          db.prepare('DELETE FROM scene_checkpoints WHERE id=?').run(checkpoint.id);
+      }
     }
 
     // Backups carry no parked results. Scan every processing state after deletions can requeue the suffix.
     // O(source rows) visits, one row held at a time; the shared converter owns JSON/ledger normalization work.
     const updateAnalysis = db.prepare('UPDATE scene_sources SET analysis=? WHERE rowid=?');
+
     for (const row of db.prepare('SELECT rowid,analysis FROM scene_sources WHERE analysis IS NOT NULL').iterate()) {
       const original = row.analysis as string;
       const interrupted = interruptDeferredLedgerAnalysis(original);
-      if (interrupted !== original) updateAnalysis.run(interrupted, row.rowid);
-    }
 
+      if (interrupted !== original)
+        updateAnalysis.run(interrupted, row.rowid);
+    }
     rebuildCommitmentProjections(db);
     clearProfileProjections(db);
     clearRelationshipModels(db);
-    if (rules) bumpRestoredVersions(db, rules);
+
+    if (rules)
+      bumpRestoredVersions(db, rules);
     scheduleRestoredSceneIndexCleanup(db, rules);
     db.exec('COMMIT');
     transaction = false;
     db.exec('PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE');
+
     return appliedDeletionCount;
   } catch (error) {
-    if (transaction) db.exec('ROLLBACK');
+    if (transaction)
+      db.exec('ROLLBACK');
     throw error;
   } finally {
     db.close();
@@ -798,13 +921,15 @@ function removeCoreControls(db:DatabaseSync,scope:string,sourceId:string):void {
  */
 function applySceneDeletions(db: DatabaseSync, scope: string, deletions: SceneDeletion[]): void {
   const before = sceneRows(db, scope);
-  const changes: {index: number; characters: Set<string>}[] = [];
+  const changes: { index: number; characters: Set<string> }[] = [];
 
   for (const deletion of deletions) {
     const existing = before.find(row => row.id === deletion.id);
+
     if (existing?.status === 'accepted') {
-      changes.push({index: before.indexOf(existing), characters: analysisCharacters(existing.analysis)});
+      changes.push({ index: before.indexOf(existing), characters: analysisCharacters(existing.analysis) });
     }
+
     const revision = Math.max(
       deletion.revision,
       existing && existing.status !== 'deleted' ? existing.revision + 1 : existing?.revision ?? 0,
@@ -813,44 +938,93 @@ function applySceneDeletions(db: DatabaseSync, scope: string, deletions: SceneDe
     message.revision = revision;
     message.text = '';
     message.dependencies = [];
-    db.prepare(`INSERT INTO scene_sources(scope,id,revision,message,observed,status,processing,analysis)
+    db.prepare(
+      `INSERT INTO scene_sources(scope,id,revision,message,observed,status,processing,analysis)
       VALUES(?,?,?,?,?,'deleted','ready',NULL)
       ON CONFLICT(scope,id) DO UPDATE SET revision=excluded.revision,message=excluded.message,
-      observed=excluded.observed,status='deleted',processing='ready',analysis=NULL`)
-      .run(scope, deletion.id, revision, JSON.stringify(message), deletion.observed);
+      observed=excluded.observed,status='deleted',processing='ready',analysis=NULL`
+    )
+      .run(
+        scope,
+        deletion.id,
+        revision,
+        JSON.stringify(message),
+        deletion.observed
+      );
     removeScenePreferenceControls(db, scope, deletion.id);
   }
 
   let changed = true;
+
   while (changed) {
     changed = false;
+
     const rows = sceneRows(db, scope);
+
     for (const row of rows) {
-      if (row.status !== 'accepted') continue;
-      const message = JSON.parse(row.message) as {dependencies?: {id: string; revision: number}[]};
-      const valid = (message.dependencies ?? []).every(dependency => rows.some(origin =>
-        origin.id === dependency.id && origin.revision === dependency.revision && origin.status === 'accepted'));
-      if (valid) continue;
-      changes.push({index: rows.indexOf(row), characters: analysisCharacters(row.analysis)});
-      db.prepare("UPDATE scene_sources SET status='needs_review',processing='failed',analysis=NULL WHERE scope=? AND id=?")
-        .run(scope, row.id);
+      if (row.status !== 'accepted')
+        continue;
+
+      const message = JSON.parse(row.message) as { dependencies?: { id: string; revision: number }[] };
+      const valid = (message.dependencies ?? []).every(
+        dependency => rows.some(
+          origin =>
+            origin.id === dependency.id && origin.revision === dependency.revision && origin.status === 'accepted'
+        )
+      );
+
+      if (valid)
+        continue;
+      changes.push({ index: rows.indexOf(row), characters: analysisCharacters(row.analysis) });
+      db.prepare(
+        "UPDATE scene_sources SET status='needs_review',processing='failed',analysis=NULL WHERE scope=? AND id=?"
+      )
+        .run(
+          scope,
+          row.id
+        );
       changed = true;
     }
   }
 
   const hasWorld = Boolean(db.prepare('SELECT 1 FROM scene_world_settings WHERE scope=?').get(scope));
   const rows = sceneRows(db, scope);
+
   for (const [index, row] of rows.entries()) {
-    if (row.status !== 'accepted' || !row.analysis) continue;
+    if (row.status !== 'accepted' || !row.analysis)
+      continue;
+
     const characters = analysisCharacters(row.analysis);
-    const affected = changes.some(change => change.index < index &&
-      (hasWorld || [...characters].some(id => change.characters.has(id))));
-    if (!affected) continue;
+    const affected = changes.some(
+      change => change.index < index &&
+        (hasWorld || [...characters].some(id => change.characters.has(id)))
+    );
+
+    if (!affected)
+      continue;
     db.prepare("UPDATE scene_sources SET processing='pending',analysis=? WHERE scope=? AND id=?")
-      .run(withoutStoredEmotionStates(row.analysis), scope, row.id);
-    changes.push({index, characters});
+      .run(
+        withoutStoredEmotionStates(row.analysis),
+        scope,
+        row.id
+      );
+    changes.push({ index, characters });
   }
-  removeUnsafeCheckpoints(db, scope, new Set(deletions.map(row => row.id)));
+
+  const deletedIds = new Set(deletions.map(row => row.id));
+  const [worldId, sessionId, branchId, characterId] = JSON.parse(scope) as string[];
+
+  const invalidated = eraseTavernEngineSources(
+    db,
+    {
+      worldId: worldId!,
+      sessionId: sessionId!,
+      branchId: branchId!,
+      characterId: characterId!,
+    },
+    deletedIds
+  );
+  removeUnsafeCheckpoints(db, scope, invalidated);
 }
 
 function removeScenePreferenceControls(db:DatabaseSync,scope:string,sourceId:string):void {
@@ -877,30 +1051,68 @@ function analysisCharacters(analysis:string|null):Set<string> {
   return new Set(Object.keys(value.characters??{}));
 }
 
-function removeUnsafeCheckpoints(db:DatabaseSync,scope:string,deletedIds:Set<string>):void {
-  const checkpoints=db.prepare('SELECT id,snapshot FROM scene_checkpoints WHERE scope=?').all(scope) as unknown as {id:string;snapshot:string}[];
-  for(const checkpoint of checkpoints) {
-    let remove=false;
+function removeUnsafeCheckpoints(
+  db: DatabaseSync,
+  scope: string,
+  invalidated: ReturnType<typeof eraseTavernEngineSources>,
+): void {
+  const deletedIds = invalidated.deletedSourceIds;
+  const revisions = invalidated.sourceRevisions;
+  const checkpoints = db.prepare(
+    'SELECT id,snapshot FROM scene_checkpoints WHERE scope=?'
+  ).all(scope) as unknown as { id: string; snapshot: string }[];
+
+  for (const checkpoint of checkpoints) {
+    let remove = false;
+
     try {
-      const snapshot=JSON.parse(checkpoint.snapshot) as {sources?:{id?:string;status?:string;message?:string}[]};
-      if(!Array.isArray(snapshot.sources))remove=true;
+      const snapshot = JSON.parse(checkpoint.snapshot) as {
+        sources?: { id?: string; revision?: number; status?: string; message?: string }[];
+        tavernEngine?: Parameters<typeof tavernEngineSnapshotReferencesSources>[0];
+      };
+
+      if (!Array.isArray(snapshot.sources))
+        remove = true;
       else {
-        const unsafe=new Set(snapshot.sources.filter(source=>typeof source.id==='string'&&deletedIds.has(source.id)&&source.status!=='deleted')
-          .map(source=>source.id as string));
-        let changed=true;
-        while(changed) {
-          changed=false;
-          for(const source of snapshot.sources) {
-            if(source.status!=='accepted'||typeof source.id!=='string'||unsafe.has(source.id)||typeof source.message!=='string')continue;
-            const message=JSON.parse(source.message) as {dependencies?:{id?:string}[]};
-            if(!(message.dependencies??[]).some(dependency=>typeof dependency.id==='string'&&(deletedIds.has(dependency.id)||unsafe.has(dependency.id))))continue;
-            unsafe.add(source.id);changed=true;
+        const unsafe = new Set(snapshot.sources.filter(
+          source => typeof source.id === 'string'
+            && (deletedIds.has(source.id) || revisions.has(JSON.stringify([source.id, source.revision])))
+            && source.status !== 'deleted'
+        )
+          .map(
+            source => source.id as string
+          ));
+        let changed = true;
+
+        while (changed) {
+          changed = false;
+
+          for (const source of snapshot.sources) {
+            if (source.status !== 'accepted' || typeof source.id !== 'string' || unsafe.has(source.id)
+              || typeof source.message !== 'string')
+              continue;
+
+            const message = JSON.parse(source.message) as { dependencies?: { id?: string; revision?: number }[] };
+
+            if (!(message.dependencies ?? []).some(
+              dependency => typeof dependency.id === 'string'
+                && (deletedIds.has(dependency.id) || unsafe.has(dependency.id)
+                  || revisions.has(JSON.stringify([dependency.id, dependency.revision])))
+            ))
+              continue;
+            unsafe.add(source.id);
+            changed = true;
           }
         }
-        remove=unsafe.size>0;
+        remove = unsafe.size > 0;
+        remove ||= tavernEngineSnapshotReferencesSources(snapshot.tavernEngine, deletedIds, revisions);
       }
-    } catch { remove=true; }
-    if(remove)db.prepare('DELETE FROM scene_checkpoints WHERE id=?').run(checkpoint.id);
+    } catch {
+      remove = true;
+    }
+
+    if (remove)
+      db.prepare('DELETE FROM scene_checkpoints WHERE id=?').run(checkpoint.id);
   }
 }
 

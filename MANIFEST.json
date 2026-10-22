@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "244080d3edc9255b730663cfd836e9ded702e2cd3fbbf52ec320dacd7ad0accc",
+  "sourceManifestSha256": "422531dcab6a00d3f29b712a62dcd6570ff7248fb950e9e783ce4a48d18999a1",
   "files": [
     {
       "file": ".gitattributes",
@@ -449,8 +449,8 @@
     },
     {
       "file": "shared/src/scene/backup.ts",
-      "sha256": "25995e00b81b1446c31cdac1da5eb972dc487e00f0e1f5b1bf92518271e757e9",
-      "bytes": 53392
+      "sha256": "d4d1c1990590882d95a6a2be35a116a333d2a9acdcffd6510d2959a4e8ebff14",
+      "bytes": 58524
     },
     {
       "file": "shared/src/scene/calendar-store.ts",
@@ -534,8 +534,8 @@
     },
     {
       "file": "shared/src/scene/lifecycle.ts",
-      "sha256": "47139f2bf6be85c301fcd6a4f33befcec26438ff3c91a9a4913f2c83f9e274d2",
-      "bytes": 29952
+      "sha256": "6b8ec77b564c1dda3fa9ac670da5fb0ac4dcdfefaba0a4001d166c6baf61289d",
+      "bytes": 33968
     },
     {
       "file": "shared/src/scene/outward.ts",
@@ -629,8 +629,8 @@
     },
     {
       "file": "shared/src/scene/tavern-engine/store.ts",
-      "sha256": "b0f0e644dc1bdb9b898a55f844c1ce69de193cdcf4f0387ebe3f45a4c86e420e",
-      "bytes": 18496
+      "sha256": "f955ec67c5fd35afbc09625f1a4ec3d445889f9dc9131afa13ffb829ef3ab471",
+      "bytes": 39468
     },
     {
       "file": "shared/src/scene/tavern-engine/types.ts",
@@ -794,12 +794,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "dbbed19be582877b39ee56e42b3c40dfc16ed85cb601d635a93de8221a9fb729",
+      "sha256": "85c23bf11f829a53c3293ed2aa4eae1d64a434bc3dc38004e60b0afbd274a544",
       "bytes": 346583
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "d298f30f7813a61cf3ca8be8e6e6ec6c4b884e00536cf19930c648203e49c14b",
+      "sha256": "249856aa29e4378977bc4df3d4e5672dcf97aa8bf1b5a562a950d1db250a4379",
       "bytes": 351767
     }
   ]
