@@ -340,7 +340,7 @@ export class TavernLedgerStore implements TavernEngineLedgerPort {
       }
 
       this.requireVersion(key, copied.expectedVersion);
-      const ticket = this.prepareNpcTurn(copied);
+      const ticket = this.projectNpcTurn(copied);
       const acceptedAtMs = this.now();
       integer(acceptedAtMs, 0);
       // An injected clock can execute caller code. Recheck authority after it and before writing any NPC data.
@@ -432,6 +432,19 @@ export class TavernLedgerStore implements TavernEngineLedgerPort {
    * Projection is O(input bytes + items + effects); original item/effect indices and phase order are preserved.
    */
   prepareNpcTurn(input: NpcTurnInput): TavernTurnTicket {
+    const ticket = this.projectNpcTurn(input);
+    const key = checkedScope(ticket.scope);
+    const previous = this.tickets.get(key);
+
+    if (previous?.ticketId === ticket.ticketId && JSON.stringify(previous) !== JSON.stringify(ticket)) {
+      throw new Error('tavern_ticket_conflict');
+    }
+    this.tickets.set(key, ticket);
+    return structuredClone(ticket);
+  }
+
+  /** Projects a detached ticket without retaining it; failed port transactions leave no in-memory candidates. */
+  private projectNpcTurn(input: NpcTurnInput): TavernTurnTicket {
     const copied = structuredClone(input);
     const key = turnAddress(copied.scope, copied.turnId, copied.turnRevision);
     identifier(copied.ticketId);
@@ -473,12 +486,7 @@ export class TavernLedgerStore implements TavernEngineLedgerPort {
       assistantSource: copied.assistantSource,
       beats,
     };
-    const previous = this.tickets.get(key);
-    if (previous?.ticketId === ticket.ticketId && JSON.stringify(previous) !== JSON.stringify(ticket)) {
-      throw new Error('tavern_ticket_conflict');
-    }
-    this.tickets.set(key, ticket);
-    return structuredClone(ticket);
+    return ticket;
   }
 
   /** Returns a detached tentative ticket only in its exact scope; accepted, replaced or absent tickets are undefined. */

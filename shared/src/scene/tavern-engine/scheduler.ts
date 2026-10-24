@@ -93,13 +93,19 @@ export interface TavernScheduleRoster {
   reactIds: readonly string[];
 }
 
-/** Numeric/boolean signals already checked for knowledge access; OpenHer is the turn-start snapshot. */
+/**
+ * Numeric/boolean signals already checked for knowledge access; OpenHer is the fixed turn-start snapshot.
+ * addressed, interrupted and relationToPrevious belong to the current selection, not the initial turn.
+ * The engine refreshes them from the unconsumed inbox, service history and optional directional relations.
+ */
 export interface TavernActorSignals {
   actorId: string;
   addressed: boolean;
   interrupted: boolean;
   openHerStart?: Pick<EmotionState, 'frustration'> | null;
   relationToPrevious?: { targetId: string; depth: number; valence: number } | null;
+  /** Authorized directional snapshots keyed by target; null means the single supplied relation above. */
+  relations?: readonly { targetId: string; depth: number; valence: number }[] | null;
   candidatePriority?: number | null;
 }
 
@@ -157,6 +163,9 @@ export interface TavernBudgetInput {
   now: () => number;
   hostId: string;
   configurationId: string;
+  /** Population-specific effective settings; null/omission uses configurationId. IDs contain no secrets. */
+  renderConfigurationId?: string | null;
+  beatConfigurationId?: string | null;
   renderSamples?: readonly TavernLatencySample[] | null;
   beatSamples?: readonly TavernLatencySample[] | null;
 }
@@ -499,8 +508,10 @@ export function createTavernTurnBudget(input: TavernBudgetInput): TavernTurnBudg
   requireId(hostId);
   requireId(configurationId);
   if (typeof now !== 'function') throw new TypeError('invalid_scheduler_clock');
-  const renderDurations = successfulDurations(renderSamples ?? [], hostId, configurationId);
-  const beatDurations = successfulDurations(beatSamples ?? [], hostId, configurationId);
+  const renderConfigurationId = requireId(input.renderConfigurationId ?? configurationId);
+  const beatConfigurationId = requireId(input.beatConfigurationId ?? configurationId);
+  const renderDurations = successfulDurations(renderSamples ?? [], hostId, renderConfigurationId);
+  const beatDurations = successfulDurations(beatSamples ?? [], hostId, beatConfigurationId);
   const renderReserveMs = percentile(renderDurations, RENDER_PERCENTILE, DEFAULT_RENDER_RESERVE_MS);
   const beatSoftDeadlineMs = startedAtMs + SOFT_TURN_MS - renderReserveMs;
   const beatHardDeadlineMs = startedAtMs + HARD_TURN_MS - renderReserveMs;

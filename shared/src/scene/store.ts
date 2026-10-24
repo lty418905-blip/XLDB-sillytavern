@@ -62,9 +62,154 @@ import {commitmentStoryClock,storyNow} from './story-clock-consumers.ts';
 import {storyLanguageOf} from '../memory/text-units.ts';
 import type {StoryLanguage} from '../memory/text-units.ts';
 import {defaultSceneHooks} from './extension.ts';
+import type { EventSourceObservation, Observation } from './types.ts';
+import type { AcceptedTavernTurn } from './tavern-engine/store.ts';
+import { TavernPerception } from './tavern-engine/perception.ts';
 import type {ContactEmotionProjection,SceneAuthorityExtensionFactory,SceneAuthorityHooks,SceneSubjectBinding} from './extension.ts';
 
 export type {SceneSubjectBinding} from './extension.ts';
+
+/**
+ * Resolves event observations against current ledger content and independently authorized readers.
+ * Private content is bounded by its author/whisperTo; public readers use saved final perception results.
+ * An optional fresh route is saved in the caller's commit transaction, never on the read path.
+ * Each referenced turn is indexed once: O(observations + event bytes + routed reader entries).
+ * Malformed imported references return no observation; legacy entries retain their original representation.
+ */
+function currentEventObservations(
+  database: DatabaseSync,
+  scope: SceneScope,
+  source: SceneSource,
+  observations: Observation[],
+  routedReaders?: ReadonlyMap<string, ReturnType<TavernPerception['memoryReaders']>[number]>,
+): Observation[] {
+  const key = scopeKey(scope);
+  const turns = new Map<string, Map<string, {actorId: string; quote: string; readers: Set<string>}>>();
+  const references = new Set<string>();
+  let hasLedger: boolean | undefined;
+  const sourceCurrent = (id: string, revision: number) => Boolean(database.prepare(
+    "SELECT 1 FROM scene_sources WHERE scope=? AND id=? AND revision=? AND status='accepted'",
+  ).get(key, id, revision));
+
+  return observations.flatMap<Observation>(observation => {
+    if (!Object.hasOwn(observation, 'ref')) return [observation];
+
+    // Only the address and permission-neutral labels come from the caller. Read errors escape unchanged.
+    const {ref: reference, id, kind: knowledgeKind, sequence} = observation as EventSourceObservation;
+    const {turnId, turnRevision, eventId, phase, itemRef, effectIndex} = reference ?? {};
+    if (!reference
+      || typeof turnId !== 'string' || turnId.length === 0
+      || !Number.isSafeInteger(turnRevision) || turnRevision < 1
+      || typeof eventId !== 'string' || eventId.length === 0
+      || !['event', 'item', 'beforeItem', 'afterItem'].includes(phase)
+      || (phase === 'event' ? itemRef != null : !Number.isSafeInteger(itemRef) || itemRef! < 0)
+      || (phase === 'beforeItem' || phase === 'afterItem'
+        ? !Number.isSafeInteger(effectIndex) || effectIndex! < 0 : effectIndex != null)
+      || typeof id !== 'string' || id.length === 0
+      || !['heard', 'observed'].includes(knowledgeKind)
+      || !Number.isSafeInteger(sequence) || sequence < 1) return [];
+
+    const referenceKey = JSON.stringify([turnId, turnRevision, eventId, phase, itemRef ?? null, effectIndex ?? null]);
+    if (references.has(referenceKey)) return [];
+    references.add(referenceKey);
+
+    if (hasLedger === undefined) {
+      hasLedger = Boolean(database.prepare(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='scene_tavern_turns'",
+      ).get());
+    }
+    if (!hasLedger || !sourceCurrent(source.id, source.revision)) return [];
+
+    // Ledger rows are stored JSON. A corrupt or stale address is unreadable, never a legacy fallback.
+    try {
+      const kind = source.role === 'user' ? 'interpret' : 'npc';
+      const turnKey = JSON.stringify([turnId, turnRevision, kind]);
+      let events = turns.get(turnKey);
+      if (!events) {
+        events = new Map();
+        turns.set(turnKey, events);
+        // Superseded interpretations invalidate old NPC turns before a replacement beat exists.
+        const row = database.prepare(
+          'SELECT turn_revision,body FROM scene_tavern_turns WHERE scope=? AND turn_id=? AND kind=? '
+          + 'AND turn_revision=(SELECT MAX(turn_revision) FROM scene_tavern_turns WHERE scope=? AND turn_id=?)',
+        ).get(key, turnId, kind, key, turnId) as {turn_revision: number; body: string} | undefined;
+        if (!row || row.turn_revision !== turnRevision) return [];
+        const turn: AcceptedTavernTurn & {
+          memoryReaders?: {address: string; actorId: string; quote: string; readers: string[]}[];
+        } = JSON.parse(row.body);
+        if (turn.turnId !== turnId || turn.turnRevision !== turnRevision
+          || scopeKey(turn.scope) !== key || turn.kind !== kind
+          || turn.source.id !== source.id || turn.source.revision !== source.revision) return [];
+        const savedRoutes = new Map((turn.memoryReaders ?? []).map(route => [route.address, route]));
+        const nextRoutes: NonNullable<typeof turn.memoryReaders> = [];
+
+        for (const event of turn.kind === 'interpret' ? turn.events : turn.beats) {
+          if (event.envelope.status !== 'accepted' || event.envelope.turnId !== turn.turnId
+            || event.origin.turnRevision !== turn.turnRevision || scopeKey(event.origin.scope) !== key
+            || !sourceCurrent(event.origin.sourceId, event.origin.sourceRevision)) continue;
+          const add = (
+            phase: string,
+            itemRef: number | null,
+            effectIndex: number | null,
+            content: {kind: string; actorId: string; text?: string; whisperTo?: readonly string[]},
+          ) => {
+            if (content.kind === 'Unknown') return;
+            const address = JSON.stringify([event.envelope.id, phase, itemRef, effectIndex]);
+            const routeKey = JSON.stringify([turnId, turnRevision, event.envelope.id, phase, itemRef, effectIndex]);
+            const route = routedReaders === undefined ? savedRoutes.get(address) : routedReaders.get(routeKey);
+            const quote = content.text ?? '';
+            const whisperTo = content.whisperTo ?? [];
+            const authorized = whisperTo.length > 0
+              ? [content.actorId, ...whisperTo]
+              : route && route.actorId === content.actorId && route.quote === quote ? route.readers : [];
+            events!.set(address, {actorId: content.actorId, quote, readers: new Set(authorized)});
+            if (whisperTo.length === 0) {
+              nextRoutes.push({address, actorId: content.actorId, quote, readers: [...authorized]});
+            }
+          };
+          if ('payload' in event) {
+            add('event', null, null, event.payload);
+          } else {
+            for (const item of event.items) add('item', item.itemIndex, null, item);
+            for (const effect of event.effects) {
+              add(effect.phase, effect.itemRef, effect.effectIndex, effect.effect);
+            }
+          }
+        }
+        if (routedReaders !== undefined) {
+          // The enclosing analysis transaction rolls this back if any observation or candidate is rejected.
+          turn.memoryReaders = nextRoutes;
+          database.prepare('UPDATE scene_tavern_turns SET body=? WHERE scope=? AND turn_id=? '
+            + 'AND turn_revision=? AND kind=?').run(JSON.stringify(turn), key, turnId, turnRevision, kind);
+        }
+      }
+      const event = events.get(JSON.stringify([eventId, phase, itemRef ?? null, effectIndex ?? null]));
+      if (!event || event.readers.size === 0) return [];
+
+      return [{
+        channel: 'event' as const,
+        ref: {
+          turnId,
+          turnRevision,
+          eventId,
+          phase,
+          ...(itemRef == null ? {} : {itemRef}),
+          ...(effectIndex == null ? {} : {effectIndex}),
+        },
+        id,
+        kind: knowledgeKind,
+        sequence,
+        actorId: event.actorId,
+        quote: event.quote,
+        evidence: event.quote,
+        attributed: true,
+        readers: [...event.readers],
+      }];
+    } catch {
+      return [];
+    }
+  });
+}
 
 /** Read-only terminal-skip test; work is O(P + R + K) in this source's pending, ready and skipped entries. */
 function hasCompletedEmotionSkip(analysis: SceneState['sources'][number]['analysis'], characterId: string): boolean {
@@ -1107,98 +1252,165 @@ export class SceneAuthority {
     });
   }
 
-  commit(scope: SceneScope, expectedVersion: number, results: {id:string;revision:number;analysis:SceneAnalysis}[]) {
+  /**
+   * Atomically accepts analyses at expectedVersion; optional event perception supplies final public readers.
+   * Callers supply event addresses and labels; the ledger supplies authors, quotes and complete reader sets.
+   * The route and analysis are saved together; an invalid source rejects the transaction without advancing it.
+   */
+  commit(
+    scope: SceneScope,
+    expectedVersion: number,
+    results: {id: string; revision: number; analysis: SceneAnalysis}[],
+    eventPerception?: TavernPerception,
+  ) {
     return this.transaction(() => {
       const state = this.state(scope);
       if (state.version !== expectedVersion) throw new Error('context_changed_retry');
-      const prepared=results.map(result=>{
-        const source=state.sources.find(item=>item.id===result.id);
-        if(!source||source.status!=='accepted'||source.revision!==result.revision)throw new Error('context_changed_retry');
-        return {...result,analysis:localAnalysis(result.analysis,source,this.hooks.decodeUserModelCandidates,state.roster)};
+      const routes = eventPerception == null
+        ? undefined : TavernPerception.prototype.memoryReaders.call(eventPerception, scope);
+      // Index the full route once for the whole batch, rather than once for each source analysis.
+      const routedReaders = routes === undefined ? undefined : new Map(routes.map(route => [JSON.stringify([
+        route.source.turnId,
+        route.source.turnRevision,
+        route.source.eventId,
+        route.source.phase,
+        route.source.itemRef ?? null,
+        route.source.effectIndex ?? null,
+      ]), route]));
+      const prepared = results.map(result => {
+        const {id, revision, analysis} = result;
+        const source = state.sources.find(item => item.id === id);
+        if (!source || source.status !== 'accepted' || source.revision !== revision) {
+          throw new Error('context_changed_retry');
+        }
+        const normalized = localAnalysis(analysis, source, this.hooks.decodeUserModelCandidates, state.roster);
+        const plan = normalized.plan;
+        const observations = plan.observations;
+        // Every downstream validator consumes ledger-derived event facts; legacy entries pass through unchanged.
+        const currentObservations = currentEventObservations(this.db, scope, source, observations, routedReaders);
+        if (currentObservations.length !== observations.length) throw new Error('invalid_scene_memory_source');
+        normalized.plan = {...plan, observations: currentObservations};
+        return {id, revision, analysis: normalized};
       });
       if (prepared.some(result => Object.values(result.analysis.characters)
         .some(analysis => analysis.emotion && Object.hasOwn(analysis.emotion, 'appraisalRule')))) {
         stampStoreFormat(this.db, CURRENT_STORE_FORMAT, STORE_WRITER_VERSION);
       }
-      const settings=this.worldSettings(scope);
-      const effective=[...state.sources];
-      // The whole final timeline of this commit, complete before the first clock read and never assigned to afterwards:
-      // the story-clock reading is cached by this array's identity, so it must not be the array the loop mutates.
-      const timeline=state.sources.map(source=>{
-        const result=prepared.find(item=>item.id===source.id);
-        return result?{...source,processing:'ready' as const,analysis:result.analysis}:source;
+
+      const settings = this.worldSettings(scope);
+      const effective = [...state.sources];
+      // The clock caches by array identity, so the final timeline must exist before the first clock read.
+      const timeline = state.sources.map(source => {
+        const result = prepared.find(item => item.id === source.id);
+        return result ? {...source, processing: 'ready' as const, analysis: result.analysis} : source;
       });
-      // The legacy times of this commit come from one object over the final timeline: a prefix of `effective` and the
-      // same prefix of `timeline` hold the same world effects and the same clock analyses.
-      const commitTimes=this.storyClock.legacyTimeline(scope,timeline);
-      for(const [index,source] of state.sources.entries()){
-        const result=prepared.find(item=>item.id===source.id);if(!result)continue;
-        effective[index]={...source,processing:'ready',analysis:result.analysis};
-        result.analysis=validateCommitmentAnalysis(source,result.analysis,state.roster,{
-          realClockTimeMs:source.acceptedAtMs,
+      const commitTimes = this.storyClock.legacyTimeline(scope, timeline);
+      for (const [index, source] of state.sources.entries()) {
+        const result = prepared.find(item => item.id === source.id);
+        if (!result) continue;
+        effective[index] = {...source, processing: 'ready', analysis: result.analysis};
+        result.analysis = validateCommitmentAnalysis(source, result.analysis, state.roster, {
+          realClockTimeMs: source.acceptedAtMs,
           // Replay this source's accepted story effects; never consult current time.
-          storyClockTimeMs:settings?.mode==='story'?commitTimes.at(index,source.acceptedAtMs):undefined,
-          timeZone:source.acceptedTimeZone,
+          storyClockTimeMs: settings?.mode === 'story' ? commitTimes.at(index, source.acceptedAtMs) : undefined,
+          timeZone: source.acceptedTimeZone,
         });
-        effective[index]={...source,processing:'ready',analysis:result.analysis};
+        effective[index] = {...source, processing: 'ready', analysis: result.analysis};
       }
-      const windowSelections=new Map<string,Set<string>>();
-      for(const source of effective){
-        if(source.status!=='accepted'||source.processing!=='ready'||!source.analysis)continue;
-        const schedule=source.analysis.emotionSchedule;
-        const pending=source.analysis.emotionPendingIds??[];
-        const ready=source.analysis.emotionCandidateReadyIds??[];
-        if(pending.some(id=>!source.analysis!.characters[id]||!schedule?.deferredIds.includes(id)))
+
+      const windowSelections = new Map<string, Set<string>>();
+      for (const source of effective) {
+        if (source.status !== 'accepted' || source.processing !== 'ready' || !source.analysis) continue;
+        const schedule = source.analysis.emotionSchedule;
+        const pending = source.analysis.emotionPendingIds ?? [];
+        const ready = source.analysis.emotionCandidateReadyIds ?? [];
+        if (pending.some(id => !source.analysis!.characters[id] || !schedule?.deferredIds.includes(id))) {
           throw new Error('invalid_scene_emotion_schedule');
-        if(new Set(ready).size!==ready.length||ready.some(id=>!pending.includes(id)||
-          source.analysis!.skippedStages?.some(item=>item.stage==='emotion'&&item.characterId===id)))
+        }
+        if (new Set(ready).size !== ready.length || ready.some(id => !pending.includes(id)
+          || source.analysis!.skippedStages?.some(item => item.stage === 'emotion' && item.characterId === id))) {
           throw new Error('invalid_scene_emotion_schedule');
-        if(!schedule)continue;
-        if(!schedule.windowId||new Set(schedule.eligibleIds).size!==schedule.eligibleIds.length||
-          new Set(schedule.selectedIds).size!==schedule.selectedIds.length||new Set(schedule.forcedIds).size!==schedule.forcedIds.length||
-          new Set(schedule.deferredIds).size!==schedule.deferredIds.length||
-          schedule.selectedIds.some(id=>!schedule.eligibleIds.includes(id)||
-            (schedule.deferredIds.includes(id)&&!source.analysis?.skippedStages?.some(item=>item.stage==='emotion'&&item.characterId===id)))||
-          schedule.forcedIds.some(id=>!schedule.selectedIds.includes(id)))throw new Error('invalid_scene_emotion_schedule');
-        const selected=windowSelections.get(schedule.windowId)??new Set<string>();
-        for(const id of schedule.selectedIds)if(!schedule.forcedIds.includes(id))selected.add(id);
-        if(selected.size>4)throw new Error('invalid_scene_emotion_budget');
-        windowSelections.set(schedule.windowId,selected);
+        }
+        if (!schedule) continue;
+        if (!schedule.windowId
+          || new Set(schedule.eligibleIds).size !== schedule.eligibleIds.length
+          || new Set(schedule.selectedIds).size !== schedule.selectedIds.length
+          || new Set(schedule.forcedIds).size !== schedule.forcedIds.length
+          || new Set(schedule.deferredIds).size !== schedule.deferredIds.length
+          || schedule.selectedIds.some(id => !schedule.eligibleIds.includes(id)
+            || (schedule.deferredIds.includes(id) && !source.analysis?.skippedStages?.some(item =>
+              item.stage === 'emotion' && item.characterId === id)))
+          || schedule.forcedIds.some(id => !schedule.selectedIds.includes(id))) {
+          throw new Error('invalid_scene_emotion_schedule');
+        }
+        const selected = windowSelections.get(schedule.windowId) ?? new Set<string>();
+        for (const id of schedule.selectedIds) {
+          if (!schedule.forcedIds.includes(id)) selected.add(id);
+        }
+        if (selected.size > 4) throw new Error('invalid_scene_emotion_budget');
+        windowSelections.set(schedule.windowId, selected);
       }
-      const acceptedResults=prepared;
-      const foldInput=this.worldLedgerInput(scope,effective,settings);
-      if(foldInput.settings){
-        const folded=foldWorldState(foldInput.settings,foldInput.sources,foldInput.options);
-        if(folded.issues.length) throw new Error('invalid_world_'+folded.issues[0]!.code.replace(/^invalid_world_/,''));
+
+      const acceptedResults = prepared;
+      const foldInput = this.worldLedgerInput(scope, effective, settings);
+      if (foldInput.settings) {
+        const folded = foldWorldState(foldInput.settings, foldInput.sources, foldInput.options);
+        if (folded.issues.length) {
+          throw new Error('invalid_world_' + folded.issues[0]!.code.replace(/^invalid_world_/, ''));
+        }
       }
       for (const result of acceptedResults) {
         const source = state.sources.find(item => item.id === result.id);
-        if (!source || source.status !== 'accepted' || source.revision !== result.revision) throw new Error('context_changed_retry');
+        if (!source || source.status !== 'accepted' || source.revision !== result.revision) {
+          throw new Error('context_changed_retry');
+        }
         if (result.analysis.plan.unresolved.length) throw new Error('invalid_scene_unresolved');
-        if(result.analysis.physiologyOperations!==undefined)
-          result.analysis.physiologyOperations=this.physiology.validateStored(result.analysis.physiologyOperations,source,result.analysis.plan,state.roster);
-        if(result.analysis.geographyOperations!==undefined)
-          result.analysis.geographyOperations=this.geography.validateStored(result.analysis.geographyOperations,source,result.analysis.plan,state.roster);
+        if (result.analysis.physiologyOperations !== undefined) {
+          result.analysis.physiologyOperations = this.physiology.validateStored(
+            result.analysis.physiologyOperations, source, result.analysis.plan, state.roster,
+          );
+        }
+        if (result.analysis.geographyOperations !== undefined) {
+          result.analysis.geographyOperations = this.geography.validateStored(
+            result.analysis.geographyOperations, source, result.analysis.plan, state.roster,
+          );
+        }
         const allowedIds = new Set(result.analysis.plan.observations.flatMap(observation => observation.readers));
-        for (const [characterId,analysis] of Object.entries(result.analysis.characters)) {
-          if (!allowedIds.has(characterId) || !state.roster.characters.some(character => character.id === characterId)) throw new Error('invalid_scene_character');
-          const quotes = result.analysis.plan.observations.filter(observation => observation.readers.includes(characterId)).map(observation => observation.quote);
-          if (analysis.memories.some(memory => !quotes.some(quote => quote.includes(memory.detail)) ||
-            memory.protectedFacts.some(fact => !quotes.some(quote => quote.includes(fact))) ||
-            (memory.episode?.evidenceQuotes??[]).some(evidence=>!quotes.some(quote=>quote.includes(evidence))))) throw new Error('invalid_scene_memory_source');
-          if (analysis.relationships !== undefined) analysis.relationships=validateRelationships(analysis.relationships,
-            relationshipValidationContext(source,result.analysis.plan,state.roster,characterId));
+        for (const [characterId, analysis] of Object.entries(result.analysis.characters)) {
+          if (!allowedIds.has(characterId)
+            || !state.roster.characters.some(character => character.id === characterId)) {
+            throw new Error('invalid_scene_character');
+          }
+          const quotes = result.analysis.plan.observations
+            .filter(observation => observation.readers.includes(characterId)).map(observation => observation.quote);
+          if (analysis.memories.some(memory => !quotes.some(quote => quote.includes(memory.detail))
+            || memory.protectedFacts.some(fact => !quotes.some(quote => quote.includes(fact)))
+            || (memory.episode?.evidenceQuotes ?? []).some(evidence =>
+              !quotes.some(quote => quote.includes(evidence))))) {
+            throw new Error('invalid_scene_memory_source');
+          }
+          if (analysis.relationships !== undefined) {
+            analysis.relationships = validateRelationships(analysis.relationships,
+              relationshipValidationContext(source, result.analysis.plan, state.roster, characterId));
+          }
         }
-        this.migrateControls(scope,source,result.analysis);
-        const dependencies=[...(source.dependencies??[])];
-        for(const observation of result.analysis.plan.observations) for(const reference of observation.identityEvidence??[]) {
-          const origin=state.sources.find(item=>item.id===reference.sourceId && item.status==='accepted' && item.revision===reference.revision);
-          if(!origin || origin.id===source.id) throw new Error('invalid_scene_evidence');
-          if(!dependencies.some(item=>item.id===origin.id)) dependencies.push({id:origin.id,revision:origin.revision});
+
+        this.migrateControls(scope, source, result.analysis);
+        const dependencies = [...(source.dependencies ?? [])];
+        for (const observation of result.analysis.plan.observations) {
+          for (const reference of observation.identityEvidence ?? []) {
+            const origin = state.sources.find(item => item.id === reference.sourceId
+              && item.status === 'accepted' && item.revision === reference.revision);
+            if (!origin || origin.id === source.id) throw new Error('invalid_scene_evidence');
+            if (!dependencies.some(item => item.id === origin.id)) {
+              dependencies.push({id: origin.id, revision: origin.revision});
+            }
+          }
         }
-        const {analysis:_analysis,observedAtMs:_observed,status:_status,processing:_processing,...message}=source;
+        const {analysis: _analysis, observedAtMs: _observed, status: _status, processing: _processing, ...message} = source;
         this.db.prepare("UPDATE scene_sources SET processing='ready',analysis=?,message=? WHERE scope=? AND id=? AND revision=?")
-          .run(JSON.stringify(result.analysis),JSON.stringify({...message,dependencies}),scopeKey(scope),result.id,result.revision);
+          .run(JSON.stringify(result.analysis), JSON.stringify({...message, dependencies}),
+            scopeKey(scope), result.id, result.revision);
       }
       if (acceptedResults.length) {
         this.rebuildEmotionStates(scope);
@@ -1209,7 +1421,6 @@ export class SceneAuthority {
       return this.state(scope).version;
     });
   }
-
   /**
    * `storyClock` (the post-SC failure path, SC3b): in a story scope every source this call moves from 'pending' to
    * 'failed' also gets analysis.storyClock = {kind:'degraded',reason,issues}, in the same transaction. Without it, or
@@ -1300,7 +1511,11 @@ export class SceneAuthority {
     return entries;
   }
 
-  /** Derive retention origins and turn counts from accepted rows; the optional reply source cannot rehearse itself. */
+  /**
+   * Derives memories and retention counts for one character; the optional reply cannot rehearse itself.
+   * State is an authority read or its in-process derivative, not an import boundary; lifecycle/backup write rows.
+   * Event authors, text and readers are re-derived from current ledger rows. Invalid characters throw.
+   */
   snapshot(
     scope: SceneScope,
     characterId: string,
@@ -1314,7 +1529,8 @@ export class SceneAuthority {
       throw new Error('invalid_scene_character');
     }
     const roleScope = npcScope(scope, characterId);
-    const sources = state.sources.filter(source => source.status === 'accepted' && source.processing === 'ready' && source.analysis);
+    const sources = state.sources.filter(source =>
+      source.status === 'accepted' && source.processing === 'ready' && source.analysis);
     const controls = this.db.prepare('SELECT id,revision,access FROM scene_controls WHERE scope=? AND character=?')
       .all(scopeKey(scope), characterId) as {
         id: string;
@@ -1329,6 +1545,10 @@ export class SceneAuthority {
     // Each visible excerpt and each candidate cue is folded once per snapshot. Matching uses those cached strings.
     // Sources are visited once for the lookup; each memory matches only its cues and its own recorded entries.
     const foldedSources = new Map<number, string[]>();
+    const currentObservations = new Map(sources.map(source => [
+      source,
+      currentEventObservations(this.db, scope, source, source.analysis!.plan?.observations ?? []),
+    ]));
     const records = new Map<string, Map<number, {
       weak: boolean;
       details?: RecallDetailRange[];
@@ -1375,8 +1595,8 @@ export class SceneAuthority {
     for (const [sourceIndex, source] of sources.entries()) {
       if (source.id === currentSource?.id && source.revision === currentSource.revision)
         continue;
-      const excerpts = source.analysis?.plan?.observations
-        .filter(observation => observation.readers.includes(characterId)).map(observation => foldCue(observation.quote));
+      const excerpts = currentObservations.get(source)
+        ?.filter(observation => observation.readers.includes(characterId)).map(observation => foldCue(observation.quote));
       if (excerpts?.length)
         foldedSources.set(sourceIndex, excerpts);
       // Malformed imported lists do not affect reads; the write path remains strict.
@@ -1414,13 +1634,17 @@ export class SceneAuthority {
       const plan = source.analysis!.plan;
       if (!plan)
         continue;
-      const observations = plan.observations.filter(observation => observation.readers.includes(characterId));
+      const observations = currentObservations.get(source)!.filter(observation => observation.readers.includes(characterId));
       const analysis = Object.hasOwn(source.analysis!.characters, characterId)
         ? source.analysis!.characters[characterId] : undefined;
       if (!analysis)
         continue;
       for (const [index, candidate] of analysis.memories.entries()) {
-        const observation = observations.find(item => item.quote.includes(candidate.detail));
+        const observation = observations.find(item => item.quote.includes(candidate.detail)
+          && (item.channel !== 'event' || (
+            candidate.protectedFacts.every(fact => item.quote.includes(fact))
+            && (candidate.episode?.evidenceQuotes ?? []).every(quote => item.quote.includes(quote))
+          )));
         if (!observation)
           continue;
         const id = `${source.id}:${characterId}#${index}`;
@@ -1506,9 +1730,21 @@ export class SceneAuthority {
               knownAtMs: Math.max(source.acceptedAtMs, source.observedAtMs),
               author: {
                 role: source.role,
-                actorId: source.role === 'user' ? 'player' : source.automatic ? 'narrator' : source.speakerId!,
+                actorId: observation.channel === 'event' ? observation.actorId
+                  : source.role === 'user' ? 'player' : source.automatic ? 'narrator' : source.speakerId!,
               },
-              knowledge: {
+              knowledge: observation.channel === 'event' ? {
+                kind: observation.kind,
+                actorId: observation.actorId,
+                observationId: observation.id,
+                channel: 'event',
+                turnId: observation.ref.turnId,
+                turnRevision: observation.ref.turnRevision,
+                eventId: observation.ref.eventId,
+                phase: observation.ref.phase,
+                ...(observation.ref.itemRef == null ? {} : {itemRef: observation.ref.itemRef}),
+                ...(observation.ref.effectIndex == null ? {} : {effectIndex: observation.ref.effectIndex}),
+              } : {
                 kind: observation.kind,
                 ...(source.role === 'user' && source.envelope.mode === 'direct'
                   ? {actorId: 'player'} : observation.actorId ? {actorId: observation.actorId} : {}),

@@ -576,6 +576,8 @@ function applyRestoreRules(filename: string, rules?: RestoreRules, extension?: B
       if (!invalidated.deletedSourceIds.size && !invalidated.sourceRevisions.size)
         continue;
 
+      const currentRevisions = new Map(sceneRows(db, scopeKey(tavernScope))
+        .map(source => [source.id, source.revision]));
       const checkpoints = db.prepare('SELECT id,snapshot FROM scene_checkpoints WHERE scope=?')
         .all(scopeKey(tavernScope)) as { id: string; snapshot: string }[];
 
@@ -600,9 +602,11 @@ function applyRestoreRules(filename: string, rules?: RestoreRules, extension?: B
         try {
           // A snapshot can retain a source's analysis without retaining that source's ledger rows.
           unsafe = (snapshot.sources ?? []).some(source => {
+            // Keep the current review state, but never an independently invalid historical revision.
             if (source.status !== 'deleted'
               && (invalidated.deletedSourceIds.has(source.id)
-                || invalidated.sourceRevisions.has(JSON.stringify([source.id, source.revision]))))
+                || (invalidated.sourceRevisions.has(JSON.stringify([source.id, source.revision]))
+                  && (source.status !== 'needs_review' || currentRevisions.get(source.id) !== source.revision))))
               return true;
 
             const message = JSON.parse(source.message) as { dependencies?: { id: string; revision: number }[] };
@@ -1058,6 +1062,13 @@ function removeUnsafeCheckpoints(
 ): void {
   const deletedIds = invalidated.deletedSourceIds;
   const revisions = invalidated.sourceRevisions;
+  const currentRevisions = new Map<string, number>();
+
+  if (revisions.size) {
+    for (const source of sceneRows(db, scope))
+      currentRevisions.set(source.id, source.revision);
+  }
+
   const checkpoints = db.prepare(
     'SELECT id,snapshot FROM scene_checkpoints WHERE scope=?'
   ).all(scope) as unknown as { id: string; snapshot: string }[];
@@ -1075,9 +1086,11 @@ function removeUnsafeCheckpoints(
         remove = true;
       else {
         const unsafe = new Set(snapshot.sources.filter(
-          source => typeof source.id === 'string'
-            && (deletedIds.has(source.id) || revisions.has(JSON.stringify([source.id, source.revision])))
-            && source.status !== 'deleted'
+          // Current review rows already reflect invalidation; historical invalid pairs remain unsafe.
+          source => typeof source.id === 'string' && source.status !== 'deleted'
+            && (deletedIds.has(source.id)
+              || (revisions.has(JSON.stringify([source.id, source.revision]))
+                && (source.status !== 'needs_review' || currentRevisions.get(source.id) !== source.revision)))
         )
           .map(
             source => source.id as string

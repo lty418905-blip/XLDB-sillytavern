@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "6959ab176d94c484a721a4d7000f5ed87b407c66b87c4ac329bd875cd75d7211",
+  "sourceManifestSha256": "526339617e5dd12be44db0b0ef4e0e52a4749f60351bc44887f68fa9e2619ee6",
   "files": [
     {
       "file": ".gitattributes",
@@ -354,8 +354,8 @@
     },
     {
       "file": "shared/src/memory/access.ts",
-      "sha256": "4dd3f4efdabfcb78300fd643d5ea96d5685dec762a218567ffe0e9bc975bdfe7",
-      "bytes": 15075
+      "sha256": "b03d9f2f7f8dfa1e12a5a359361bad0daa2e3fad4d4a66786a5a0ebd8f5aff0c",
+      "bytes": 17476
     },
     {
       "file": "shared/src/memory/context.ts",
@@ -449,8 +449,8 @@
     },
     {
       "file": "shared/src/scene/backup.ts",
-      "sha256": "d4d1c1990590882d95a6a2be35a116a333d2a9acdcffd6510d2959a4e8ebff14",
-      "bytes": 58524
+      "sha256": "bbaffa9ab2102352e0e37b0efb800d971c962019ae252dba22e2a0317970edec",
+      "bytes": 59273
     },
     {
       "file": "shared/src/scene/calendar-store.ts",
@@ -534,8 +534,8 @@
     },
     {
       "file": "shared/src/scene/lifecycle.ts",
-      "sha256": "6b8ec77b564c1dda3fa9ac670da5fb0ac4dcdfefaba0a4001d166c6baf61289d",
-      "bytes": 33968
+      "sha256": "1455e22964cfc1ac910be4006d5c95466d42c24c4d0348658ee909358ee4ebdf",
+      "bytes": 35879
     },
     {
       "file": "shared/src/scene/outward.ts",
@@ -544,8 +544,8 @@
     },
     {
       "file": "shared/src/scene/perspective.ts",
-      "sha256": "d3e5bd6709d298c47545f014c75b9b15b6579bbda02a3c7dd038ee5ce174822a",
-      "bytes": 19772
+      "sha256": "2f6a96e817f15ecb15010ea2d4e97e34e4aedf062baf39ac4fd36d3e1d718b6d",
+      "bytes": 23896
     },
     {
       "file": "shared/src/scene/processing.ts",
@@ -574,8 +574,8 @@
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "0b4176d39034535976da6f7795d6c907dc684c3207bc59c83adad77353d29c9a",
-      "bytes": 174892
+      "sha256": "1c5f9dfbab81cb8f9b95290f863c79983408f02094e92521ce494418b69b0154",
+      "bytes": 185910
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
@@ -603,44 +603,54 @@
       "bytes": 6013
     },
     {
+      "file": "shared/src/scene/tavern-engine/actions.ts",
+      "sha256": "5f2e85c48198aa51247a578cdf005e94e52cd9b161f20715d4ea5c898ab78871",
+      "bytes": 56652
+    },
+    {
       "file": "shared/src/scene/tavern-engine/codec.ts",
       "sha256": "baa2e623283194e2194907026c86194c1f8b07eaaa5861a00cf9c684ff653311",
       "bytes": 30776
     },
     {
       "file": "shared/src/scene/tavern-engine/engine.ts",
-      "sha256": "9295eb03efae67f0860be26f8513f3791d36f42bd5232902c178d7ca9ab7dcfb",
-      "bytes": 48915
+      "sha256": "b027f297ae4591bc54817be321452a78e1f9e62b09c953d1cf7eb135aaaaf7ba",
+      "bytes": 53313
     },
     {
       "file": "shared/src/scene/tavern-engine/model-input.ts",
-      "sha256": "ff6b1f044879fcdd0bc760bff25d60ac7e0df734c97dcc1e9455281cc1cfa074",
-      "bytes": 18561
+      "sha256": "beaa02119aeb0901df72d42892229ad47f9c19bd8479ad425700bf590cf2cdbd",
+      "bytes": 18486
     },
     {
       "file": "shared/src/scene/tavern-engine/perception.ts",
-      "sha256": "e892a06d31ba2f556929f6cd4ccba8d29c1dd24e8658e9beb28df9f7fbf66758",
-      "bytes": 16663
+      "sha256": "a989c6f280362675705fa39c55d96f7bbdf84edf8b5838ab33aac63713948de8",
+      "bytes": 24795
+    },
+    {
+      "file": "shared/src/scene/tavern-engine/preset.ts",
+      "sha256": "b583123fc731552b103a5b327158e594cace810c0d3bc06858b3b7d0dd42513b",
+      "bytes": 23271
     },
     {
       "file": "shared/src/scene/tavern-engine/projection.ts",
-      "sha256": "02e1c53f6f422c5d39ceac0ce543c87094be65b812935b7e7a28d1049f96f0a2",
-      "bytes": 18511
+      "sha256": "3b3e12c29d8346a795247698647d5b95e8ce91b8f0fb06833912e430533067f6",
+      "bytes": 19858
     },
     {
       "file": "shared/src/scene/tavern-engine/render.ts",
-      "sha256": "76b35c7b5d03773ceb03a3f03ac754c023d610a7535735f30e0030a7cb951f89",
-      "bytes": 16412
+      "sha256": "0f643a741782dd06ae2d75bfa84e9316ec848c5563d7d57a403f324811a0fe8d",
+      "bytes": 20083
     },
     {
       "file": "shared/src/scene/tavern-engine/scheduler.ts",
-      "sha256": "bc213f2c1451ae851a5ebce95f580e8b7a9653a384076a4867040a6425bba5ed",
-      "bytes": 24711
+      "sha256": "5ae0501eb5147cc3895c8ba4a50921e3c086caf7116ccdc28d27e9091281a234",
+      "bytes": 25502
     },
     {
       "file": "shared/src/scene/tavern-engine/store.ts",
-      "sha256": "c55ae74a0e60b68ba6019ea3e50c407faf6a998b02fc3a73530ed3b96a86f804",
-      "bytes": 54438
+      "sha256": "9affc29778c1c7b2c61826c0e361f74d39bc8e20e4023d32785e45b212e1e1d5",
+      "bytes": 54734
     },
     {
       "file": "shared/src/scene/tavern-engine/types.ts",
@@ -659,13 +669,13 @@
     },
     {
       "file": "shared/src/scene/types.ts",
-      "sha256": "16c54503f381adfb7f674d4f8cff2085e656534d46db2a06cb74a154534690a9",
-      "bytes": 8829
+      "sha256": "2a1580fec879a7ec9d72213c45fd10bd8287906a94ae8ae31daebc538cc7dd96",
+      "bytes": 9667
     },
     {
       "file": "shared/src/scene/views.ts",
-      "sha256": "73c00ff4360b88caffc98f74de00cb8301e37af148865759fd595129113b3e67",
-      "bytes": 16998
+      "sha256": "54859610eb6594243af6fdf6b18e86206ac740e9309919dcac621cc9195564ac",
+      "bytes": 18015
     },
     {
       "file": "shared/src/scene/workbench.ts",
@@ -694,8 +704,8 @@
     },
     {
       "file": "shared/src/scene/world-state.ts",
-      "sha256": "6137592f2c315eb7730a50e5e5e02162046f1d42e7a584adc2adb0954d84040f",
-      "bytes": 61509
+      "sha256": "c5a1c06af7fe93defdc058c36d776d7197784c8cb72f506bdd626b120fc7b30d",
+      "bytes": 61991
     },
     {
       "file": "shared/third-party/agentjev/agentjev/model.py",
@@ -744,8 +754,8 @@
     },
     {
       "file": "sillytavern/src/server.ts",
-      "sha256": "2fee9d668b76028fb868f938aaaec1ccbddfa41cf0918d54803508eb188258e9",
-      "bytes": 40751
+      "sha256": "a982faac7498ef5fc0679f9a917348027c2621087008b07e45f7b7cd468dbbad",
+      "bytes": 46758
     },
     {
       "file": "START-XLDB.cmd",
@@ -804,12 +814,12 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "af37bfea82e5bacffbee3544ed2dced7fc76b1beae95df88a1bed79e5d931e4a",
+      "sha256": "340097b2960e3e1ccccb1a420b1d1ff909ef009d23f41247b6c0d3b80bf0350a",
       "bytes": 346583
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "3117f454b7c48c51371f2c6603f59d448ea4e24c5d172b1431646423dba3ebae",
+      "sha256": "a7564806c7a6fbab13179ed4d77606f48799a03a5eabf662f6b007a6293658c6",
       "bytes": 351767
     }
   ]

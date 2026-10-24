@@ -163,6 +163,108 @@ function indexContent(input: TavernPerceptionInput): Map<string, EventContent> {
   return result;
 }
 
+// Rebuild the closed decoded variants instead of forwarding unknown routing fields to an observer.
+// Content identities such as a transfer's endpoints describe the event; routing identities use one visibility rule.
+function observedContent(
+  content: EventPayload | BeatItem,
+  visibleRecipient: (recipientId: string) => boolean,
+): EventPayload | BeatItem {
+  if ('itemIndex' in content) {
+    return {
+      kind: content.kind,
+      itemIndex: content.itemIndex,
+      actorId: content.actorId,
+      text: content.text,
+      addressees: content.addressees.filter(visibleRecipient),
+      ...(content.whisperTo == null ? {} : { whisperTo: content.whisperTo.filter(visibleRecipient) }),
+    };
+  }
+
+  if (content.kind === 'Unknown') {
+    return { kind: content.kind, actorId: content.actorId, text: content.text, reason: content.reason };
+  }
+
+  const evidence = {
+    actorId: content.actorId,
+    confidence: content.confidence,
+    ...(content.evidence == null ? {} : {
+      evidence: content.evidence.map(source => source.channel === 'message'
+        ? {
+          channel: source.channel,
+          sourceId: source.sourceId,
+          revision: source.revision,
+          start: source.start,
+          end: source.end,
+        }
+        : {
+          channel: source.channel,
+          turnId: source.turnId,
+          turnRevision: source.turnRevision,
+          eventId: source.eventId,
+        }),
+    }),
+  };
+
+  switch (content.kind) {
+    case 'PlayerUtterance':
+    case 'NpcSpeech':
+      return {
+        ...evidence,
+        kind: content.kind,
+        text: content.text,
+        addressees: content.addressees.filter(visibleRecipient),
+        ...(content.whisperTo == null ? {} : { whisperTo: content.whisperTo.filter(visibleRecipient) }),
+      };
+    case 'PlayerAction':
+      return {
+        ...evidence,
+        kind: content.kind,
+        text: content.text,
+        action: { kind: content.action.kind },
+        targets: content.targets,
+        objects: content.objects,
+      };
+    case 'NpcAction':
+      return { ...evidence, kind: content.kind, text: content.text, targets: content.targets };
+    case 'TimeAdvance':
+      return { ...evidence, kind: content.kind, minutes: content.minutes, temporality: content.temporality };
+    case 'Enter':
+    case 'Exit':
+      return { ...evidence, kind: content.kind, entityId: content.entityId, placeId: content.placeId };
+    case 'Transfer':
+      return { ...evidence, kind: content.kind, itemId: content.itemId, fromId: content.fromId, toId: content.toId };
+    case 'CommitmentEvent': {
+      const operation = content.operation;
+      const term = operation.term;
+      return {
+        ...evidence,
+        kind: content.kind,
+        operation: {
+          operationId: operation.operationId,
+          action: operation.action,
+          quote: operation.quote,
+          evidence: operation.evidence.map(entry => ({ actorId: entry.actorId, quote: entry.quote })),
+          ...(operation.commitmentId == null ? {} : { commitmentId: operation.commitmentId }),
+          ...(operation.targetId == null ? {} : { targetId: operation.targetId }),
+          ...(operation.targetRevision == null ? {} : { targetRevision: operation.targetRevision }),
+          ...(operation.content == null ? {} : { content: operation.content }),
+          ...(operation.participants == null ? {} : { participants: operation.participants }),
+          ...(operation.obligors == null ? {} : { obligors: operation.obligors }),
+          ...(operation.agreement == null ? {} : { agreement: operation.agreement }),
+          ...(term == null ? {} : { term: term.kind === 'deadline' ? {
+            kind: term.kind,
+            clock: term.clock,
+            deadlineQuote: term.deadlineQuote,
+            ...(term.reminderQuote == null ? {} : { reminderQuote: term.reminderQuote }),
+            ...(term.dueAtMs == null ? {} : { dueAtMs: term.dueAtMs }),
+            ...(term.remindAtMs == null ? {} : { remindAtMs: term.remindAtMs }),
+          } : { kind: term.kind } }),
+        },
+      };
+    }
+  }
+}
+
 function buildActors(input: TavernPerceptionInput): Map<string, ActorState> {
   const projection = projectTavernWorld(input.baseline, input.steps);
   const contents = indexContent(input);
@@ -178,6 +280,20 @@ function buildActors(input: TavernPerceptionInput): Map<string, ActorState> {
     if (permissions.has(key)) throw new Error('perception_duplicate_permission');
     permissions.set(key, permission);
   }
+  // Only arrivals actually folded from these steps establish fresh event-derived positions.
+  // A pre-history event position still needs the caller's explicit freshness evidence.
+  const arrivalPositions = new Set<string>();
+  for (const phase of projection.phases) {
+    const entry = contents.get(addressKey(phaseAddress(phase)));
+    if (entry?.content.kind !== 'Enter') continue;
+    arrivalPositions.add(JSON.stringify([
+      entry.content.entityId,
+      phase.reference.turnId,
+      phase.reference.turnRevision,
+      phase.reference.eventId,
+    ]));
+  }
+
   const knowledge = new Map<string, Set<string>>();
   const geography = input.geography;
   const freshPositions = new Set((geography?.freshPositions ?? []).map(entry =>
@@ -197,7 +313,15 @@ function buildActors(input: TavernPerceptionInput): Map<string, ActorState> {
   }
 
   function currentPlace(position: TavernProjectedPosition | undefined): string | undefined {
-    if (!position || !freshPositions.has(JSON.stringify([position.entityId, basisKey(position.basis)]))) {
+    if (!position) return undefined;
+    const reference = position.basis.event;
+    const arrived = position.basis.kind === 'event' && reference != null && arrivalPositions.has(JSON.stringify([
+      position.entityId,
+      reference.turnId,
+      reference.turnRevision,
+      reference.eventId,
+    ]));
+    if (!arrived && !freshPositions.has(JSON.stringify([position.entityId, basisKey(position.basis)]))) {
       return undefined;
     }
     return position.position.state === 'at' || position.position.state === 'within'
@@ -223,20 +347,19 @@ function buildActors(input: TavernPerceptionInput): Map<string, ActorState> {
     const actorPlace = currentPlace(positions.get(entry.actorId));
     const arrivingPlace = entry.content.kind === 'Enter'
       && entry.content.entityId === speakerId
-      && !present.has(speakerId)
       ? entry.content.placeId
       : undefined;
 
     function inRange(actorId: string, sound: boolean): boolean {
-      // A self-arrival is observed at its destination by incumbents, before the entrant has a position there.
-      // Other events still require a present author, so departure cannot authorize later speech.
+      if (!phase.presenceKnown || !present.has(actorId)) return false;
+      // Destination incumbents see a self-arrival using their pre-effect positions. A present mover is
+      // also visible at the origin; neither set authorizes earlier content or post-departure speech.
       if (arrivingPlace !== undefined) {
-        if (!phase.presenceKnown || !present.has(actorId)) return false;
         if (geography == null) return true;
-        return currentPlace(positions.get(actorId)) === arrivingPlace;
+        if (currentPlace(positions.get(actorId)) === arrivingPlace) return true;
       }
 
-      if (!phase.presenceKnown || !present.has(speakerId) || !present.has(actorId)) return false;
+      if (!present.has(speakerId)) return false;
       if (geography == null) return true;
       const readerPlace = currentPlace(positions.get(actorId));
       if (actorPlace === undefined || readerPlace === undefined) return false;
@@ -262,11 +385,37 @@ function buildActors(input: TavernPerceptionInput): Map<string, ActorState> {
       readers: recipients,
     };
     const knowingActors = new Set(recipients);
-    for (const actorId of recipients) actors.get(actorId)!.inbox.push(observation);
+    function observationFor(viewerId: string): EventObservation {
+      const viewerPlace = currentPlace(positions.get(viewerId));
+      function visibleRecipient(recipientId: string): boolean {
+        if (recipientId === viewerId) return true;
+        // Authorship establishes the chosen addressees, but does not reveal unobserved eavesdroppers.
+        const addressees = 'addressees' in observation.content ? observation.content.addressees : [];
+        if (viewerId === speakerId
+          && (addressees.includes(recipientId) || whisperedReaders.has(recipientId))) return true;
+        if (!phase.presenceKnown || !present.has(viewerId) || !present.has(recipientId)) return false;
+        if (geography == null) return true;
+        return viewerPlace !== undefined && viewerPlace === currentPlace(positions.get(recipientId));
+      }
+
+      const visibleReaders = recipients.filter(visibleRecipient);
+      return {
+        eventId: observation.eventId,
+        sequence: observation.sequence,
+        source: observation.source,
+        actorId: observation.actorId,
+        perceptionKind: observation.perceptionKind,
+        quote: observation.quote,
+        content: observedContent(observation.content, visibleRecipient),
+        readers: visibleReaders,
+      };
+    }
+
+    for (const actorId of recipients) actors.get(actorId)!.inbox.push(observationFor(actorId));
 
     // Authorship is separate from whisper delivery; it must never widen whisperTo or another actor's basis.
     if (actors.has(entry.actorId) && readableBasis(entry.actorId, permission.basis)) {
-      actors.get(entry.actorId)!.authoredEvents.push(observation);
+      actors.get(entry.actorId)!.authoredEvents.push(observationFor(entry.actorId));
       knowingActors.add(entry.actorId);
     }
     knowledge.set(key, knowingActors);
@@ -291,7 +440,10 @@ function buildActors(input: TavernPerceptionInput): Map<string, ActorState> {
     // Every channel uses the same all-bases gate, including error reasons and opaque structured candidates.
     if (material.basis.length === 0) continue;
     for (const actorId of new Set(material.readers)) {
-      if (actors.has(actorId) && readableBasis(actorId, material.basis)) actors.get(actorId)!.materials.push(material);
+      if (actors.has(actorId) && readableBasis(actorId, material.basis)) {
+        // A material's permission list is routing metadata, not evidence that its readers know one another.
+        actors.get(actorId)!.materials.push({ ...material, readers: [actorId] });
+      }
     }
   }
   return actors;
@@ -366,6 +518,46 @@ export class TavernPerception {
     });
   }
 
+  /**
+   * Returns detached final content readers, including authorized authorship, for this exact scope.
+   * One pass over routed entries costs O(routed bytes); it changes no delivery cursor or route.
+   * A different scope throws. Unknown/denied events are absent, rather than granting roster-wide access.
+   */
+  memoryReaders(scope: import('../../memory/access.ts').Scope): readonly {
+    source: EventObservation['source'];
+    actorId: string;
+    quote: string;
+    readers: readonly string[];
+  }[] {
+    const key = JSON.stringify([scope.worldId, scope.sessionId, scope.branchId, scope.characterId]);
+    if (key !== this.#scopeKey) throw new Error('perception_scope_mismatch');
+    const routes = new Map<string, {
+      source: EventObservation['source'];
+      actorId: string;
+      quote: string;
+      readers: Set<string>;
+    }>();
+
+    for (const [actorId, state] of this.#actors) {
+      for (const event of [...state.inbox, ...state.authoredEvents]) {
+        if (event.perceptionKind === 'diagnostic') continue;
+        let route = routes.get(event.eventId);
+        if (!route) {
+          route = {source: event.source, actorId: event.actorId, quote: event.quote, readers: new Set()};
+          routes.set(event.eventId, route);
+        }
+        route.readers.add(actorId);
+      }
+    }
+
+    return [...routes.values()].map(route => ({
+      source: {...route.source},
+      actorId: route.actorId,
+      quote: route.quote,
+      readers: [...route.readers],
+    }));
+  }
+
   /** Returns player-readable event content and content-free whisper markers; never the unfiltered beat. */
   playerView(): TavernPlayerEventView {
     const state = this.#actor(this.#playerId);
@@ -377,7 +569,8 @@ export class TavernPerception {
   }
 
   /**
-   * Prepares new inbox/authored events plus the last windowSize visible events of turnId (count, default 32).
+   * Prepares new inbox/authored events of turnId plus its last windowSize visible events (count, default 32).
+   * Earlier turns remain available through view for recall, but are never redelivered after a cursor reset.
    * Zero disables only the repeat window. Preparation and retries do not advance the cursor; acknowledge the
    * opaque receipt only after a legal dispatch has consumed this exact input. Invalid IDs/counts throw codes.
    */
@@ -392,14 +585,16 @@ export class TavernPerception {
     this.#receipts.set(receipt, {
       epoch: this.#epoch,
       actorId,
-      sequence: ordered.at(-1)?.sequence ?? state.deliveryCursor,
+      // Only this turn's delivered inbox, authorship or repeat window may acknowledge a sequence.
+      sequence: turnEvents.at(-1)?.sequence ?? state.deliveryCursor,
     });
     return {
       input: structuredClone({
         actorId,
         deliveryCursor: state.deliveryCursor,
-        inbox: state.inbox.filter(event => event.sequence > state.deliveryCursor),
-        authoredEvents: state.authoredEvents.filter(event => event.sequence > state.deliveryCursor),
+        inbox: state.inbox.filter(event => event.source.turnId === turnId && event.sequence > state.deliveryCursor),
+        authoredEvents: state.authoredEvents.filter(event =>
+          event.source.turnId === turnId && event.sequence > state.deliveryCursor),
         turnWindow: windowSize === 0 ? [] : turnEvents.slice(-windowSize),
         materials: state.materials,
       }),

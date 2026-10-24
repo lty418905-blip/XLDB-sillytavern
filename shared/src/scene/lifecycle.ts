@@ -232,38 +232,72 @@ export class SceneLifecycle {
     });
   }
 
+  /**
+   * Copies live state or one checkpoint to a new branch, erasing invalid child rows before rebuilding.
+   * The parent keeps its version and state; only unsafe checkpoints are removed. Errors roll back both scopes.
+   */
   fork(scope: SceneScope, newBranchId: string, checkpointId?: string): SceneScope {
     if (!newBranchId.trim() || newBranchId.length > 200) throw new Error('invalid_scene_branch');
+
     return this.transaction(() => {
       const target = { ...scope, branchId: newBranchId };
+
       if (this.db.prepare('SELECT 1 FROM scene_worlds WHERE key=?').get(scopeKey(target))) {
         throw new Error('scene_branch_exists');
       }
+
       let snapshot = checkpointId === undefined
         ? this.capture(scope)
         : JSON.parse(this.storedCheckpoint(scope, checkpointId).snapshot) as SceneCheckpointSnapshot;
       snapshot = this.withCurrentTombstones(scope, snapshot);
+      const deleted = this.deletedSourceIds(scope);
+      const invalidated = { deletedSourceIds: new Set(deleted), sourceRevisions: new Set<string>() };
+      const sources = this.db.prepare('SELECT id,revision,status,message FROM scene_sources WHERE scope=? ORDER BY rowid')
+        .all(scopeKey(scope)) as { id: string; revision: number; status: string; message: string }[];
+
+      // Reuse erasure's read-only filter so checkpoint decisions never mutate the parent ledger or analyses.
+      filterTavernEngineSnapshot(captureTavernEngineRows(this.db, scope), sources, deleted, invalidated);
       this.insertFork(target, snapshot);
+      eraseTavernEngineSources(this.db, target, deleted);
       this.rebuildEmotionStates?.(target);
-      this.redactUnsafeCheckpoints(scope, this.deletedSourceIds(scope));
+      this.redactUnsafeCheckpoints(scope, deleted, invalidated);
+
       return target;
     });
   }
 
-  /** A deletion is an erasure boundary, so retained checkpoints cannot replay it. */
-  redactUnsafeCheckpoints(scope: SceneScope, sourceIds: Iterable<string>): void {
+  /**
+   * Removes checkpoints that could replay erased sources or revisions. A supplied read-only invalidation
+   * leaves live rows untouched; otherwise erasure retains its existing behavior. Database errors propagate.
+   */
+  redactUnsafeCheckpoints(
+    scope: SceneScope,
+    sourceIds: Iterable<string>,
+    checkpointInvalidation?: ReturnType<typeof eraseTavernEngineSources>,
+  ): void {
     const deleted = new Set(sourceIds);
 
-    if (!deleted.size)
+    if (!deleted.size
+      && !checkpointInvalidation?.deletedSourceIds.size
+      && !checkpointInvalidation?.sourceRevisions.size)
       return;
 
-    const invalidated = eraseTavernEngineSources(this.db, scope, deleted);
+    const invalidated = checkpointInvalidation ?? eraseTavernEngineSources(this.db, scope, deleted);
+    const currentRevisions = new Map<string, number>();
+
+    if (invalidated.sourceRevisions.size) {
+      const sources = this.db.prepare('SELECT id,revision FROM scene_sources WHERE scope=?')
+        .all(scopeKey(scope)) as { id: string; revision: number }[];
+
+      for (const source of sources)
+        currentRevisions.set(source.id, source.revision);
+    }
 
     const checkpoints = this.db.prepare('SELECT id,snapshot FROM scene_checkpoints WHERE scope=?')
       .all(scopeKey(scope)) as { id: string; snapshot: string }[];
 
     for (const checkpoint of checkpoints) {
-      if (!this.snapshotReferencesDeletedSource(checkpoint.snapshot, invalidated))
+      if (!this.snapshotReferencesDeletedSource(checkpoint.snapshot, invalidated, currentRevisions))
         continue;
       this.db.prepare('DELETE FROM scene_checkpoints WHERE id=?').run(checkpoint.id);
     }
@@ -757,6 +791,7 @@ export class SceneLifecycle {
   private snapshotReferencesDeletedSource(
     serialized: string,
     invalidated: ReturnType<typeof eraseTavernEngineSources>,
+    currentRevisions: ReadonlyMap<string, number>,
   ): boolean {
     const deleted = invalidated.deletedSourceIds;
     const revisions = invalidated.sourceRevisions;
@@ -768,8 +803,11 @@ export class SceneLifecycle {
 
       const unsafe = new Set(snapshot.sources
         .filter(
+          // Current review rows already reflect invalidation; historical invalid pairs must still be erased.
           source => typeof source.id === 'string' && source.status !== 'deleted'
-            && (deleted.has(source.id) || revisions.has(JSON.stringify([source.id, source.revision])))
+            && (deleted.has(source.id)
+              || (revisions.has(JSON.stringify([source.id, source.revision]))
+                && (source.status !== 'needs_review' || currentRevisions.get(source.id) !== source.revision)))
         )
         .map(
           source => source.id

@@ -7,6 +7,7 @@ import type { AbsenceExplanationOperation } from '../emotion/absence-explanation
 import type { PhysiologyOperation } from '../common/physiology.ts';
 import type { GeographyOperation } from '../common/geography.ts';
 import type { StoredLedger, LedgerMarks } from './world-ledger.ts';
+import type { TavernEventAddress } from './tavern-engine/types.ts';
 
 /** A user-model candidate is opaque to the shared core; the companion extension decodes and narrows it. */
 export type SceneProfileCandidate=unknown;
@@ -88,7 +89,9 @@ export interface ObservationCandidate {
   identityEvidence?: {sourceId:string;quote:string;revision?:number}[];
 }
 /** A source-bound experience for its readers; optional attribution does not change visibility. */
-export interface Observation {
+export interface LegacyObservation {
+  /** Absence is the historical message-offset encoding; no marker is added when reading it. */
+  channel?: 'message';
   /**
    * When present, actorId names the speaker or actor. Its absence means narration, multiple actors, or uncertainty.
    * Observations without this marker are legacy data and retain the older codec's identity semantics.
@@ -113,6 +116,22 @@ export interface Observation {
   identityEvidence?: {sourceId:string;quote:string;revision?:number}[];
   readers: string[];
 }
+/**
+ * A routed event experience. The complete structural reference replaces prose offsets; sequence is an event count.
+ * Readers and text come from the perception route, never from display prose or a model-provided audience.
+ */
+export interface EventSourceObservation extends Omit<LegacyObservation, 'channel' | 'start' | 'end' | 'actorId'> {
+  channel: 'event';
+  ref: TavernEventAddress;
+  sequence: number;
+  actorId: string;
+  start?: never;
+  end?: never;
+}
+
+/** Legacy message spans and routed event references are distinct; omitted channel always means legacy. */
+export type Observation = LegacyObservation | EventSourceObservation;
+
 export interface PerspectivePlan { observations: Observation[]; unresolved: string[];
   presentation?: {sentenceCount:number|null;dialogueOnly:boolean|null};
   generationRequests?: Record<string,string> }

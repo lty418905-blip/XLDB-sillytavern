@@ -1,6 +1,7 @@
 import {foldForMatch,includesForMatch,sourceQuote,scriptQuoteSearch} from '../common/script-fold.ts';
 import type {
   KnowledgeKind,
+  EventSourceObservation,
   Observation,
   ObservationCandidate,
   PerspectivePlan,
@@ -10,6 +11,7 @@ import type {
   SceneRoster,
 } from './types.ts';
 import { emotionSettingsOf } from '../emotion/openher.ts';
+import type { EventObservation } from './tavern-engine/types.ts';
 
 const MAX_CHARACTERS = 32;
 const MAX_ALIASES = 16;
@@ -68,14 +70,102 @@ export function perspectiveOf(value: unknown, message: SceneMessage, roster: Sce
   return { observations, unresolved };
 }
 
+/**
+ * Captures one routed event's source, classification and audience as plain data in O(reader entries).
+ * Reader arrays use one length read and one read per element. Getter/Proxy errors escape unchanged;
+ * malformed values remain data for the event decoder to reject, without invoking caller iterators.
+ */
+export function snapshotEventObservation(value: Omit<EventObservation, 'content'>): Omit<EventObservation, 'content'> {
+  const {source, eventId, actorId, sequence, perceptionKind, quote, readers: suppliedReaders} = value;
+  const {channel, turnId, turnRevision, eventId: sourceEventId, phase, itemRef, effectIndex} = source ?? {};
+  let readers = suppliedReaders;
+  if (Array.isArray(suppliedReaders)) {
+    const length = suppliedReaders.length;
+    if (!Number.isSafeInteger(length) || length < 0) throw new Error('invalid_event_observation');
+    const detachedReaders: string[] = [];
+    for (let index = 0; index < length; index++) detachedReaders.push(suppliedReaders[index]!);
+    readers = detachedReaders;
+  }
+  return {
+    eventId,
+    actorId,
+    sequence,
+    perceptionKind,
+    quote,
+    readers,
+    source: {channel, turnId, turnRevision, eventId: sourceEventId, phase, itemRef, effectIndex},
+  };
+}
+
+/**
+ * Decodes one trusted routed event into a scene observation for an authorized actor. Work is O(readers + text).
+ * Invalid/missing references, diagnostic events and actors outside both delivery and authorship throw a code.
+ * Getter/Proxy failures propagate unchanged. No display body is consulted; output never aliases the route.
+ */
+export function eventObservationOf(value: Omit<EventObservation, 'content'>, characterId: string): EventSourceObservation {
+  const snapshot = snapshotEventObservation(value);
+  const {source, eventId: observationId, actorId, sequence, perceptionKind, quote, readers} = snapshot;
+  const {channel, turnId, turnRevision, eventId, phase, itemRef, effectIndex} = source ?? {};
+  if (!source || channel !== 'event'
+    || typeof turnId !== 'string' || turnId.length === 0
+    || !Number.isSafeInteger(turnRevision) || turnRevision < 1
+    || typeof eventId !== 'string' || eventId.length === 0
+    || !['event', 'item', 'beforeItem', 'afterItem'].includes(phase)
+    || (phase === 'event' ? itemRef != null : !Number.isSafeInteger(itemRef) || itemRef! < 0)
+    || (phase === 'beforeItem' || phase === 'afterItem'
+      ? !Number.isSafeInteger(effectIndex) || effectIndex! < 0 : effectIndex != null)
+    || typeof observationId !== 'string' || observationId.length === 0
+    || typeof actorId !== 'string' || actorId.length === 0
+    || !Number.isSafeInteger(sequence) || sequence < 1
+    || !['heard', 'observed'].includes(perceptionKind)
+    || typeof quote !== 'string'
+    || !Array.isArray(readers)
+    || (actorId !== characterId && !readers.includes(characterId))) {
+    throw new Error('invalid_event_observation');
+  }
+
+  return {
+    channel: 'event',
+    ref: {
+      turnId,
+      turnRevision,
+      eventId,
+      phase,
+      ...(itemRef == null ? {} : {itemRef}),
+      ...(effectIndex == null ? {} : {effectIndex}),
+    },
+    sequence,
+    id: observationId,
+    kind: perceptionKind === 'heard' ? 'heard' : 'observed',
+    quote,
+    actorId,
+    attributed: true,
+    evidence: quote,
+    readers: [characterId],
+  };
+}
+
+/**
+ * Joins this reader's validated quotes, ordered by legacy UTF-16 spans or event sequence counts.
+ * Unresolved plans throw; an actor with no visible observations receives an empty string.
+ */
 export function visibleText(plan: PerspectivePlan, characterId: string): string {
   if (plan.unresolved.length) fail('invalid_scene_unresolved');
   const seen = new Set<string>();
   return [...plan.observations]
     .filter(observation => observation.readers.includes(characterId))
-    .sort((left, right) => left.start - right.start || left.end - right.end || left.id.localeCompare(right.id))
+    .sort((left, right) => {
+      if (left.channel === 'event' || right.channel === 'event') {
+        if (left.channel !== 'event') return -1;
+        if (right.channel !== 'event') return 1;
+        return left.sequence - right.sequence || left.id.localeCompare(right.id);
+      }
+      return left.start - right.start || left.end - right.end || left.id.localeCompare(right.id);
+    })
     .flatMap(observation => {
-      const key = `${observation.start}:${observation.end}:${observation.quote}`;
+      const key = observation.channel === 'event'
+        ? JSON.stringify(observation.ref)
+        : `${observation.start}:${observation.end}:${observation.quote}`;
       if (seen.has(key)) return [];
       seen.add(key);
       return [observation.quote];
@@ -164,6 +254,8 @@ function checkedSpeaker(message: SceneMessage, roster: SceneRoster, envelope: Sc
 
 function observationOf(value: unknown, message: SceneMessage, roster: SceneRoster, envelope: SceneEnvelope, history:SceneMessage[]): Observation {
   const input = record(value, 'invalid_scene_perspective');
+  // Event sources require the trusted routed decoder; they cannot fall back to message offsets.
+  if (input.channel === 'event') fail('invalid_event_observation');
   const candidate: ObservationCandidate = {
     ...(input.playerVisible === true ? {playerVisible:true} : {}),
     id: idText(input.id, 'invalid_scene_perspective'),

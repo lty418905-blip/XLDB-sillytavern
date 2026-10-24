@@ -262,6 +262,11 @@ export function foldWorldState(
         if ('span' in region) return observedReaders(validated, source, region.span);
         const readers = new Set<string>();
         for (const observation of source.plan.observations) {
+          // Event references have no message offsets; their consumer adapter must handle them explicitly.
+          if (observation.channel === 'event') {
+            throw new Error('event_observation_consumer_pending_en31');
+          }
+
           for (const id of observedReaders(validated, source, observation)) readers.add(id);
           if (typeof observation.playerEvidence === 'string' && observation.playerEvidence) {
             const match = scriptQuoteSearch(source.text.slice(observation.start, observation.end), observation.playerEvidence, 2).matches;
@@ -446,6 +451,11 @@ export function foldWorldStateRunning(settings: WorldSettings, sources: readonly
         if ('span' in region) return observedReaders(validated, source, region.span);
         const readers = new Set<string>();
         for (const observation of source.plan.observations) {
+          // Event references have no message offsets; their consumer adapter must handle them explicitly.
+          if (observation.channel === 'event') {
+            throw new Error('event_observation_consumer_pending_en31');
+          }
+
           for (const id of observedReaders(validated, source, observation)) readers.add(id);
           if (typeof observation.playerEvidence === 'string' && observation.playerEvidence) {
             const match = scriptQuoteSearch(source.text.slice(observation.start, observation.end), observation.playerEvidence, 2).matches;

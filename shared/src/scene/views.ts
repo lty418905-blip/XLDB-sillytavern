@@ -1,6 +1,7 @@
 import {foldForMatch,includesForMatch} from '../common/script-fold.ts';
 import { segmentOutward } from './outward.ts';
-import { envelopeOf } from './perspective.ts';
+import { envelopeOf, eventObservationOf, snapshotEventObservation } from './perspective.ts';
+import type { TavernActorEventView } from './tavern-engine/types.ts';
 import type { KnowledgeKind, Observation, PerspectivePlan, SceneCharacter, SceneMessage, SceneRoster } from './types.ts';
 
 const MAX_HISTORY = 6;
@@ -39,6 +40,24 @@ interface DecodedView {
   kind: KnowledgeKind;
   fragments: BoundFragment[];
   isPublic: boolean;
+}
+
+/**
+ * Projects a trusted actor route into an event-only plan, in sequence order. Work is O(n log n + routed bytes).
+ * Own authorship remains separate from whisper delivery; duplicate inbox/authorship entries appear only once.
+ * Diagnostics are not memory sources. Malformed references and forged readership throw in the event decoder.
+ */
+export function eventViewsOf(view: TavernActorEventView): PerspectivePlan {
+  const {actorId, inbox, authoredEvents} = view;
+  const events = new Map([...inbox, ...authoredEvents].map(event => {
+    const snapshot = snapshotEventObservation(event);
+    return [snapshot.eventId, snapshot];
+  }));
+  const observations = [...events.values()]
+    .filter(event => event.perceptionKind !== 'diagnostic')
+    .sort((left, right) => left.sequence - right.sequence)
+    .map(event => eventObservationOf(event, actorId));
+  return {observations, unresolved: []};
 }
 
 /** Compact automatic-scene view input; stable ids and source bindings remain local. */

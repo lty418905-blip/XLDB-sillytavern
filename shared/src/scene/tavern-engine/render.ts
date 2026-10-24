@@ -75,12 +75,13 @@ export interface TavernRenderPacket {
   whisperMarkers: readonly TavernRenderWhisper[];
 }
 
-/** Actual UTF-16 character comparisons and visited items, with no clock or timer involved. */
+/** Actual UTF-16 comparisons, visited items and label-coverage steps, with no clock or timer involved. */
 export interface TavernRenderWork {
   prefixComparisons: number;
   bodyComparisons: number;
   itemsVisited: number;
   actionSpeakerScans: number;
+  labelCoverageSteps: number;
 }
 
 /** A mechanical match span in UTF-16 units, end-exclusive; it is not evidence of a semantic action. */
@@ -258,8 +259,14 @@ function copyPacket(input: TavernRenderInput): TavernRenderPacket {
 }
 
 // KMP avoids quadratic work on repeated-prefix prose. Prefix preparation costs < 2m comparisons;
-// a forward search costs < 2n comparisons. Neither quotes, whitespace nor Unicode forms are normalized.
-function findLiteral(body: string, pattern: string, start: number, work: TavernRenderWork): number {
+// a forward search costs < 2n comparisons, including rejected matches. Only the caller may omit outer quotes.
+function findLiteral(
+  body: string,
+  pattern: string,
+  start: number,
+  work: TavernRenderWork,
+  acceptMatch: ((position: number) => boolean) | null = null,
+): number {
   const prefixes = new Array<number>(pattern.length).fill(0);
   let matched = 0;
   for (let index = 1; index < pattern.length; index++) {
@@ -286,9 +293,84 @@ function findLiteral(body: string, pattern: string, start: number, work: TavernR
       if (matched === 0) break;
       matched = prefixes[matched - 1];
     }
-    if (matched === pattern.length) return index - pattern.length + 1;
+    if (matched === pattern.length) {
+      const position = index - pattern.length + 1;
+      if (acceptMatch == null || acceptMatch(position)) return position;
+      // Rejected occurrences still share their prefix work, including overlapping longer labels.
+      matched = prefixes[matched - 1];
+    }
   }
   return -1;
+}
+
+// This closed list implements the allowed outer wrappers; inner characters never pass through a folding step.
+const outerQuotePairs = [['「', '」'], ['『', '』'], ['“', '”'], ['"', '"']] as const;
+
+function findSpeech(body: string, original: string, cursor: number, work: TavernRenderWork) {
+  let text = original;
+  for (const [opening, closing] of outerQuotePairs) {
+    if (text.length >= 2 && text[0] === opening && text.at(-1) === closing) {
+      text = text.slice(1, -1);
+      break;
+    }
+  }
+
+  if (text.length > 0) {
+    return { start: findLiteral(body, text, cursor, work), length: text.length };
+  }
+
+  // An empty quoted utterance must consume an actual wrapper, so duplicates cannot match empty prose.
+  let start = -1;
+  for (const [opening, closing] of outerQuotePairs) {
+    const position = findLiteral(body, opening + closing, cursor, work);
+    if (position >= 0 && (start < 0 || position < start)) start = position;
+  }
+  return { start, length: 2 };
+}
+
+function actionLabelCoverage(packet: TavernRenderPacket, body: string, work: TavernRenderWork) {
+  const actionLabels = new Set<string>();
+  const labels = new Set<string>();
+  for (const item of packet.items) {
+    labels.add(item.actor.displayLabel);
+    if (item.kind === 'action') actionLabels.add(item.actor.displayLabel);
+  }
+  if (actionLabels.size === 0) return null;
+
+  for (const marker of packet.whisperMarkers) {
+    labels.add(marker.actor.displayLabel);
+    for (const recipient of marker.recipients) labels.add(recipient.displayLabel);
+  }
+
+  const coveringLabels = new Set<string>();
+  for (const label of labels) {
+    for (const actionLabel of actionLabels) {
+      work.labelCoverageSteps++;
+      if (label.length <= actionLabel.length) continue;
+      if (findLiteral(label, actionLabel, 0, work) < 0) continue;
+      coveringLabels.add(label);
+      break;
+    }
+  }
+  if (coveringLabels.size === 0) return null;
+
+  // Store ends rather than expanding each interval: long, overlapping labels must not cost O(n * label length).
+  const coverage = new Array<number>(body.length);
+  for (const label of coveringLabels) {
+    findLiteral(body, label, 0, work, position => {
+      work.labelCoverageSteps++;
+      coverage[position] = Math.max(coverage[position] ?? 0, position + label.length);
+      return false;
+    });
+  }
+
+  let furthestEnd = 0;
+  for (let position = 0; position < body.length; position++) {
+    work.labelCoverageSteps++;
+    furthestEnd = Math.max(furthestEnd, coverage[position] ?? 0);
+    coverage[position] = furthestEnd;
+  }
+  return coverage;
 }
 
 function verify(packet: TavernRenderPacket, body: string): TavernRenderVerification {
@@ -298,7 +380,13 @@ function verify(packet: TavernRenderPacket, body: string): TavernRenderVerificat
     speechMatches: [],
     actionSpeakerMatches: [],
     semanticQuality: 'not_checked',
-    work: { prefixComparisons: 0, bodyComparisons: 0, itemsVisited: 0, actionSpeakerScans: 0 },
+    work: {
+      prefixComparisons: 0,
+      bodyComparisons: 0,
+      itemsVisited: 0,
+      actionSpeakerScans: 0,
+      labelCoverageSteps: 0,
+    },
   };
   if (typeof body !== 'string') {
     result.reason = 'invalid_body';
@@ -309,17 +397,18 @@ function verify(packet: TavernRenderPacket, body: string): TavernRenderVerificat
   for (const item of packet.items) {
     result.work.itemsVisited++;
     if (item.kind !== 'speech') continue;
-    const start = findLiteral(body, item.text, cursor, result.work);
+    const { start, length } = findSpeech(body, item.text, cursor, result.work);
     if (start < 0) {
       result.reason = 'speech_missing_or_out_of_order';
       return result;
     }
-    const end = start + item.text.length;
+    const end = start + length;
     result.speechMatches.push({ source: item.source, actorId: item.actor.actorId, start, end });
     // Consume the whole occurrence: duplicates and overlapping substrings cannot share one utterance.
     cursor = end;
   }
 
+  const labelCoverage = actionLabelCoverage(packet, body, result.work);
   const speakerPositions = new Map<string, number>();
   for (const item of packet.items) {
     result.work.itemsVisited++;
@@ -327,7 +416,15 @@ function verify(packet: TavernRenderPacket, body: string): TavernRenderVerificat
     const actorId = item.actor.actorId;
     if (!speakerPositions.has(actorId)) {
       result.work.actionSpeakerScans++;
-      speakerPositions.set(actorId, findLiteral(body, item.actor.displayLabel, 0, result.work));
+      const label = item.actor.displayLabel;
+      const position = findLiteral(body, label, 0, result.work, start => {
+        if (labelCoverage == null) return true;
+        result.work.labelCoverageSteps++;
+        const end = start + label.length;
+        // A covering interval must extend strictly left or right; the actor's own exact label remains valid.
+        return labelCoverage[start] <= end && (start === 0 || labelCoverage[start - 1] < end);
+      });
+      speakerPositions.set(actorId, position);
     }
     const start = speakerPositions.get(actorId)!;
     if (start < 0) {
@@ -371,9 +468,11 @@ export class TavernRenderVerifier {
 
   /**
    * Checks unlimited-length prose; never changes event or decision state. All spans use UTF-16 code units.
-   * KMP work is O((1 + a)n + p), with a distinct action actors bounded by MAX_RENDER_ITEMS, n body length,
-   * p total checked pattern length. Speech consumes one forward scan; each distinct action actor scans once.
-   * Counters report real comparisons, not elapsed time. Non-string bodies return invalid_body.
+   * KMP work is O((1 + a + l)n + (1 + a)p), with a action actors bounded by MAX_RENDER_ITEMS, l referenced labels,
+   * n body length, p total pattern length. Each distinct covering label and action actor scans once.
+   * Nonempty speech shares one forward scan; empty quoted speech uses four scans per bounded item.
+   * Coverage uses O(n) space only for nested labels. Counters report comparisons and interval visits, not time.
+   * No character folding occurs. Non-string bodies return invalid_body.
    */
   verify(body: string): TavernRenderVerification {
     return structuredClone(verify(this.#packet, body));

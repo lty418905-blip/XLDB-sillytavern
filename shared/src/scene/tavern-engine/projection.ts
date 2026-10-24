@@ -21,10 +21,15 @@ export interface TavernProjectionBasis {
   event?: EventReference;
 }
 
-/** Explicit, source-checked presence, independent of roster membership and of the legacy host envelope. */
+/**
+ * Source-checked presence independent of roster membership and of the legacy host envelope.
+ * Selected seeds source the player unless any explicitly marks absence; null means omission.
+ * Explicit true and false together reject the selected set rather than resolving by order.
+ */
 export interface TavernPresenceSeed {
   basis: TavernProjectionBasis;
   presentIds: readonly string[];
+  playerPresent?: boolean | null;
   positions?: readonly { entityId: string; position: GeographyPosition }[] | null;
 }
 
@@ -55,7 +60,10 @@ export interface TavernWorldSnapshot {
   applied: readonly { key: string; fingerprint: string }[];
 }
 
-/** Bootstrap catalogs are identities, not presence evidence. Null optional inputs are equivalent to omission. */
+/**
+ * Catalogs provide identities only. A supplied presence seed also sources the player's initial presence,
+ * unless explicitly marked absent; without any seed presence stays unknown. Null optionals mean omission.
+ */
 export interface TavernWorldBootstrap {
   scope: Scope;
   roster: SceneRoster;
@@ -168,6 +176,9 @@ function normalizePosition(position: GeographyPosition, places: ReadonlySet<stri
     if (field !== 'routeId') requireMember(value, places);
     result[field] = value;
   }
+  if (result.routeId == null && (result.fromId == null || result.toId == null)) {
+    throw new TypeError('invalid_projection_position');
+  }
   return result;
 }
 
@@ -189,6 +200,9 @@ export function bootstrapTavernWorld(input: TavernWorldBootstrap): TavernWorldSn
   const possessions = new Map<string, TavernProjectedPossession>();
   const seeds = copied.existing != null ? [copied.existing] : copied.settings ?? [];
   const presenceSeeds: TavernPresenceSeed[] = [];
+  const explicitPresence = seeds.some(seed => seed.playerPresent === true);
+  const explicitAbsence = seeds.some(seed => seed.playerPresent === false);
+  if (explicitPresence && explicitAbsence) throw new Error('invalid_projection_seed');
 
   for (const seed of seeds) {
     const basis = normalizeBasis(seed.basis, copied.scope);
@@ -197,8 +211,18 @@ export function bootstrapTavernWorld(input: TavernWorldBootstrap): TavernWorldSn
       : seed.basis.kind === 'card' || seed.basis.kind === 'scene';
     if (!allowed) throw new Error('invalid_projection_seed');
 
+    if (seed.playerPresent != null && typeof seed.playerPresent !== 'boolean') {
+      throw new Error('invalid_projection_seed');
+    }
+    // An explicit absence applies to the selected scene, including seeds with an omitted default.
+    // Every retained seed uses the same decision so its provenance cannot reintroduce the player.
+    const seedPresentIds = [...new Set(explicitAbsence
+      ? seed.presentIds.filter(entityId => entityId !== copied.playerId)
+      : [...seed.presentIds, copied.playerId])];
     for (const entityId of seed.presentIds) {
       requireMember(entityId, entities);
+    }
+    for (const entityId of seedPresentIds) {
       present.add(entityId);
     }
 
@@ -215,7 +239,8 @@ export function bootstrapTavernWorld(input: TavernWorldBootstrap): TavernWorldSn
     }
     presenceSeeds.push({
       basis,
-      presentIds: seed.presentIds,
+      presentIds: seedPresentIds,
+      ...(seed.playerPresent == null ? {} : { playerPresent: seed.playerPresent }),
       ...(seed.positions == null ? {} : { positions: seedPositions }),
     });
   }

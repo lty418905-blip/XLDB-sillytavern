@@ -5,7 +5,7 @@
 import type { AcceptedMessage } from '../../core/types.ts';
 import type { PerspectivePlan } from '../types.ts';
 import { decodeInterpretationCandidate, resolveTavernBeatScript, TAVERN_INTERPRETATION_FORMAT } from './codec.ts';
-import type { TavernBeatQuotation, TavernBeatScript } from './codec.ts';
+import type { TavernBeatScript } from './codec.ts';
 import type {
   TavernAcceptedPlayerInterpretation,
   TavernEnginePorts,
@@ -62,7 +62,6 @@ export interface TavernBeatActorContract {
   frontIntent?: NonNullable<DecodedBeat['intent']> | null;
   persona?: string | null;
   history?: readonly string[] | null;
-  quotations?: readonly TavernBeatQuotation[] | null;
 }
 
 /** Stable per-actor starting data; only the supplied, already filtered materials and history enter this prefix. */

@@ -1,3 +1,10 @@
+import {
+  normalizeTavernPreset,
+  presetHash,
+  deterministicPresetMapping,
+  decodePresetClassification,
+} from '../../shared/src/scene/tavern-engine/preset.ts';
+import type { ModelRunner } from '../../shared/src/core/models.ts';
 import {foldForMatch} from '../../shared/src/common/script-fold.ts';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -215,9 +222,77 @@ function consumeInstallPairing(filename: string, origin: string, code: unknown):
   return true;
 }
 
+/** SLOT-PRESET-CLASSIFY, 待 Claude. Empty until approved wording exists; never supplied by an HTTP client. */
+export const SLOT_PRESET_CLASSIFY_INSTRUCTIONS = '';
+
+/** Trusted server-side test seam: a fake runner and inert slot text, never accepted from request JSON. */
+export interface PresetClassificationDependencies {
+  runner: ModelRunner;
+  instructions: string;
+}
+
+type PresetRequest = {
+  preset: unknown;
+  generationType?: unknown;
+  classifications?: unknown;
+  corrections?: unknown;
+};
+
+function presetRequestOf(input: Record<string, unknown>): PresetRequest {
+  const allowed = new Set(['preset', 'generationType', 'classifications', 'corrections']);
+  if (!Object.hasOwn(input, 'preset') || Object.keys(input).some(key => !allowed.has(key))) {
+    throw new Error('invalid_tavern_preset');
+  }
+  const { preset, generationType, classifications, corrections } = input;
+  return {
+    preset,
+    ...(generationType == null ? {} : { generationType }),
+    ...(classifications == null ? {} : { classifications }),
+    ...(corrections == null ? {} : { corrections }),
+  };
+}
+
+// This import route must not use the general runner's opt-in pair capture: classification is stateless.
+// One non-streaming request uses the same front configuration, fixed sampling and thinking switch.
+const runPresetClassification: ModelRunner = async (config, prompts, json) => {
+  const endpoint = config.baseUrl.endsWith('/chat/completions')
+    ? config.baseUrl : config.baseUrl + '/chat/completions';
+  const url = new URL(endpoint);
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    throw new Error('classification_failed');
+  }
+  const response = await fetch(url, {
+    method: 'POST',
+    redirect: 'error',
+    signal: AbortSignal.timeout(180000), // Same millisecond budget as the existing text runner.
+    headers: {
+      'Content-Type': 'application/json',
+      ...(config.key ? { Authorization: 'Bearer ' + config.key } : {}),
+    },
+    body: JSON.stringify({
+      model: config.model,
+      messages: prompts,
+      stream: false,
+      temperature: 0.2, // Existing structured text-stage sampling, not imported preset sampling.
+      max_tokens: 16384, // Existing text-stage output-token ceiling.
+      ...(json ? { response_format: { type: 'json_object' } } : {}),
+      ...(config.thinking ? (url.hostname === 'api.scnet.cn'
+        ? { enable_thinking: config.thinking === 'enabled' } : { thinking: { type: config.thinking } }) : {}),
+    }),
+  });
+  if (!response.ok) throw new Error('classification_failed');
+  const body = await response.json();
+  const choice = body?.choices?.[0];
+  if (choice?.finish_reason !== 'stop' || typeof choice.message?.content !== 'string') {
+    throw new Error('classification_failed');
+  }
+  return choice.message.content;
+};
+
 export function createServer(core: Core, options: {token:string;configPath:string;origins:string[];onShutdown?:()=>void;
   /** Self-check the saved embedding and reranker once at startup (the product entry point sets it). */
-  checkRetrievalOnStart?:boolean;retrievalCheckTimeoutMs?:number}) {
+  checkRetrievalOnStart?:boolean;retrievalCheckTimeoutMs?:number;
+  presetClassification?: PresetClassificationDependencies}) {
   const retrievalHealth=new RetrievalHealth();
   const runtimeLog=new ObservedRuntimeLog(retrievalHealth);
   let profile = loadConfigProfile(options.configPath);
@@ -283,8 +358,58 @@ export function createServer(core: Core, options: {token:string;configPath:strin
       let input: Record<string,unknown>;
       try { input = await bodyOf(request); }
       catch (error) {
+        if (request.url === '/v1/scene/preset-inspect' || request.url === '/v1/scene/preset-classify') {
+          return send(400, { error: 'invalid_tavern_preset' });
+        }
         if (request.url === '/v1/model-catalog') return send(400,{error:'model_catalog_invalid_input'});
         throw error;
+      }
+      if (request.url === '/v1/scene/preset-inspect' || request.url === '/v1/scene/preset-classify') {
+        if (request.method !== 'POST') return send(405, { error: 'method_not_allowed' });
+        // Return before scope parsing, runtime logging, interactions, authority and any storage access.
+        let inspection;
+        let presetRequest: PresetRequest;
+        try {
+          presetRequest = presetRequestOf(input);
+          const normalized = normalizeTavernPreset(presetRequest.preset, presetRequest.generationType);
+          const mapping = deterministicPresetMapping(normalized.snapshot, presetRequest);
+          inspection = {
+            snapshot: normalized.snapshot,
+            hash: presetHash(normalized.snapshot),
+            mapping,
+            diagnostics: normalized.diagnostics,
+          };
+        } catch {
+          // Neither input values nor exceptions (including hostile getters) can enter a response or log.
+          return send(400, { error: 'invalid_tavern_preset' });
+        }
+        if (request.url === '/v1/scene/preset-inspect') return send(200, inspection);
+        try {
+          const dependencies = options.presetClassification;
+          const instructions = dependencies?.instructions ?? SLOT_PRESET_CLASSIFY_INSTRUCTIONS;
+          if (!instructions.trim()) return send(409, { error: 'classification_prompt_pending' });
+          const pending = inspection.mapping.needsClassification;
+          const existing = inspection.mapping.classifications;
+          if (!pending.length) return send(200, { ...inspection, classifications: existing });
+          if (!config.front.baseUrl || !config.front.model) {
+            return send(409, { error: 'classification_model_not_configured' });
+          }
+          const runner = dependencies?.runner ?? runPresetClassification;
+          const result = await runner({ ...config.front }, [
+            { role: 'system', content: instructions },
+            { role: 'user', content: JSON.stringify(pending) },
+          ], true);
+          const classifications = decodePresetClassification(result, pending.map(prompt => prompt.promptHash));
+          // Existing labels stay in place, and corrections still win when the new model rows are added.
+          const mapping = deterministicPresetMapping(inspection.snapshot, {
+            generationType: presetRequest.generationType,
+            classifications: [...existing, ...classifications],
+            corrections: presetRequest.corrections,
+          });
+          return send(200, { ...inspection, mapping, classifications: [...existing, ...classifications] });
+        } catch {
+          return send(502, { error: 'classification_failed' });
+        }
       }
       if (request.url === '/v1/model-catalog') {
         if (request.method !== 'POST') return send(405,{error:'method_not_allowed'});

@@ -39,13 +39,26 @@ export interface RecallDetailSelection extends RecallDetailRange {
   new: boolean;
 }
 
+/** An authoritative memory record; source identity and millisecond timestamps remain separate from retained text. */
 export interface Memory {
   id: string;
   scope: Scope;
   source: { messageId: string; revision: number; occurredAtMs: number | null; knownAtMs: number;
     author?: {role:'user'|'assistant';actorId:string};
     reference?: {fileHash:string;table:string;row:string};
-    knowledge?: {kind:string;actorId?:string;observationId:string;start:number;end:number} };
+    /** Event addresses retain their structural phase; legacy sources keep their original JSON shape. */
+    knowledge?: {kind: string; actorId?: string; observationId: string} & (
+      | {channel?: 'message'; start: number; end: number}
+      | {
+        channel: 'event';
+        turnId: string;
+        turnRevision: number;
+        eventId: string;
+        phase: 'event' | 'beforeItem' | 'item' | 'afterItem';
+        itemRef?: number;
+        effectIndex?: number;
+      }
+    ) };
   status: 'accepted' | 'candidate' | 'deleted' | 'superseded';
   access: Access;
   /** User-set granularity takes precedence over automatic retention. */
@@ -152,6 +165,8 @@ export function projectMemories(
       ...memory,
       access: retainedAccess(memory, snapshot.memoryTimeMs ?? request.asOfMs).access
     };
+    const knowledge = memory.source.knowledge;
+    const knowledgeChannel = knowledge?.channel;
     // Construct an allow-listed result: spreading the record would copy hidden text.
     const view: MemoryView = {
       id,
@@ -168,14 +183,51 @@ export function projectMemories(
             row: memory.source.reference.row
           }
         } : {}),
-        ...(memory.source.knowledge ? {
-          knowledge: {
-            kind: memory.source.knowledge.kind,
-            ...(memory.source.knowledge.actorId ? {actorId: memory.source.knowledge.actorId} : {}),
-            observationId: memory.source.knowledge.observationId,
-            start: memory.source.knowledge.start,
-            end: memory.source.knowledge.end,
-          }
+        ...(knowledge ? {
+          knowledge: knowledgeChannel === 'event' ? (() => {
+            const {
+              kind, actorId, observationId, turnId, turnRevision, eventId, phase, itemRef, effectIndex,
+            } = knowledge;
+            // Keep one snapshot for validation and output, including getters on imported JS objects.
+            // This boundary stays dependency-free for the browser bundle.
+            if (typeof turnId !== 'string' || turnId.length === 0
+              || !Number.isSafeInteger(turnRevision) || turnRevision < 1
+              || typeof eventId !== 'string' || eventId.length === 0
+              || typeof actorId !== 'string' || actorId.length === 0
+              || typeof observationId !== 'string' || observationId.length === 0
+              || !['event', 'item', 'beforeItem', 'afterItem'].includes(phase)
+              || (phase === 'event' ? itemRef != null : !Number.isSafeInteger(itemRef) || itemRef! < 0)
+              || (phase === 'beforeItem' || phase === 'afterItem'
+                ? !Number.isSafeInteger(effectIndex) || effectIndex! < 0 : effectIndex != null)) {
+              throw new Error('invalid_event_memory_source');
+            }
+
+            // SLOT-SOURCE, 待 Claude
+            return {
+              kind,
+              actorId,
+              observationId,
+              channel: 'event' as const,
+              turnId,
+              turnRevision,
+              eventId,
+              phase,
+              ...(itemRef == null ? {} : {itemRef}),
+              ...(effectIndex == null ? {} : {effectIndex}),
+            };
+          })() : (() => {
+            // An event reference cannot be downgraded to the legacy whitelist by its discriminator.
+            if (Object.hasOwn(knowledge, 'turnId') || Object.hasOwn(knowledge, 'turnRevision')
+              || Object.hasOwn(knowledge, 'eventId')) throw new Error('invalid_event_memory_source');
+            const {kind, actorId, observationId, start, end} = knowledge;
+            return {
+              kind,
+              ...(actorId ? {actorId} : {}),
+              observationId,
+              start,
+              end,
+            };
+          })()
         } : {}),
       },
       access: memory.access,
