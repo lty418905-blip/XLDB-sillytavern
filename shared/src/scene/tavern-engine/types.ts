@@ -95,7 +95,9 @@ export type BeatEffect = EventEvidence & (
 export type DecodeIssue =
   | 'invalid_shape' | 'invalid_context' | 'unknown_kind' | 'phase_disabled' | 'invalid_confidence'
   | 'low_confidence' | 'missing_evidence' | 'invalid_reference' | 'too_many_references'
-  | 'unknown_entity' | 'invalid_length' | 'invalid_source' | 'invalid_item_ref' | 'invalid_phase';
+  | 'unknown_entity' | 'invalid_length' | 'invalid_source' | 'invalid_item_ref' | 'invalid_phase'
+  | 'evidence_not_found' | 'evidence_ambiguous' | 'evidence_span_mismatch'
+  | 'effect_world_mismatch' | 'effect_actor_not_allowed' | 'world_unavailable';
 
 /** A diagnostic event preserves supplied text and provenance without carrying an executable effect. */
 export interface UnknownEvent {

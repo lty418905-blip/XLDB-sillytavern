@@ -1,5 +1,33 @@
 import {foldForMatch} from '../common/script-fold.ts';
 import type { StoryClockDate, StoryClockFullDate, StoryClockTime, StoryClockTimeOfDay, StoryClockStoredAdvanceUnit, StoryClockQuoteSite, StoryClockExcludedReason, StoryClockNowOp } from './story-clock-types.ts';
+import type {StoryClockAnalysis} from './story-clock-types.ts';
+
+/**
+ * Converts an accepted structured time event into the existing clock analysis, without parsing prose.
+ * Minutes are nonnegative and must convert to safe integer milliseconds. Absent/non-time events return null;
+ * invalid time values throw a code. Recollection/plan and zero duration never advance. Work is O(1).
+ */
+export function eventTimeAnalysis(
+  value: {kind: string; minutes?: number; temporality?: string} | null | undefined,
+  quote: string,
+): StoryClockAnalysis | null {
+  if (value == null) return null;
+
+  const {kind, minutes, temporality} = value;
+  if (kind !== 'TimeAdvance') return null;
+  // The clock stores integer milliseconds; 60,000 is the unit conversion, not a heuristic duration.
+  if (typeof minutes !== 'number' || minutes < 0 || !Number.isSafeInteger(minutes * 60_000)
+    || !['current', 'recollection', 'plan'].includes(temporality ?? '')) {
+    throw new Error('invalid_event_time');
+  }
+  return {
+    origin: null,
+    elapsed: {category: 'none', minutes: 0, basis: 'implicit', quote: null},
+    cues: temporality === 'current' && minutes > 0 ? [{kind: 'advance', value: minutes, unit: 'minutes', quote}] : [],
+    excluded: [],
+    issues: [],
+  };
+}
 
 export type ClockGuardClass = 'recall' | 'reported' | 'hypothetical' | 'plan' | 'habitual';
 export interface ParsedClockTime { hour: number; minute: number; nextDay: boolean }

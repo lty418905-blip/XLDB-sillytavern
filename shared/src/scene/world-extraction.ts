@@ -2,6 +2,65 @@ import {foldForMatch,scriptQuoteSearch,sourceQuote,type ScriptQuoteMatch} from '
 import type { Prompt } from '../core/models.ts';
 import type { SceneMessage } from './types.ts';
 import type { WorldSettings } from './world-state.ts';
+import {eventConsumerKey, type EventConsumerSource} from './tavern-engine/perception.ts';
+import {eventTimeAnalysis} from './time-expressions.ts';
+import type {StatePlan} from '../common/state-types.ts';
+import type {StoryClockFoldSource} from './story-clock-types.ts';
+
+/**
+ * Projects decoded event components without interpreting B or promoting deferred P2 operations.
+ * Attribution and audience stay on StateObservation; structured commitments retain the existing candidate type.
+ * This is inert input for component validation, not a new state authority. Getter failures propagate.
+ */
+export function eventWorldComponents(source: EventConsumerSource): {
+  source: EventConsumerSource;
+  plan: StatePlan;
+  transfer: Extract<EventConsumerSource['content'], {kind: 'Transfer'}> | null;
+  commitment: Extract<EventConsumerSource['content'], {kind: 'CommitmentEvent'}>['operation'] | null;
+  clock: StoryClockFoldSource | null;
+} {
+  const {content, observation} = source;
+  const analysis = eventTimeAnalysis(content, observation.quote);
+  return {
+    source,
+    plan: {observations: [observation]},
+    transfer: content.kind === 'Transfer' ? content : null,
+    commitment: content.kind === 'CommitmentEvent' ? content.operation : null,
+    clock: analysis === null ? null : {
+      sourceId: eventConsumerKey(source),
+      revision: source.revision,
+      role: source.role,
+      clock: {kind: 'analysis', analysis},
+    },
+  };
+}
+
+/**
+ * Validates a component result solely against its current accepted event quote and event-only history.
+ * The returned source keeps the real message revision and structural address alongside existing results.
+ * No prompt or model call is produced. Invalid responses use the existing decoder's error contract.
+ */
+export function decodeEventWorldStage(
+  result: Record<string, unknown>,
+  source: EventConsumerSource,
+  settings: WorldSettings | null,
+  history: readonly EventConsumerSource[] | null = [],
+): {source: EventConsumerSource; result: WorldStageResult} {
+  const textSource = (event: EventConsumerSource): WorldStageSource => ({
+    id: eventConsumerKey(event),
+    revision: event.revision,
+    role: event.role,
+    text: event.observation.quote,
+  });
+  const request: WorldStageRequest = {
+    contract: 4,
+    source: textSource(source),
+    history: (history ?? []).map(textSource),
+    settings,
+    opening: null,
+  };
+  return {source, result: decodeWorldStage(result, request)};
+}
 import { clockGuardClass, excludedReasonForGuard, isNarrativeDateQuote, measureUnits, parseClockTime, parseNarrativeCue, parseStoryDate, parseTimeOfDayWord } from './time-expressions.ts';
 import type { NarrativeCueParse, OriginCandidate, ParsedDate } from './time-expressions.ts';
 import { STORY_CLOCK_ADVANCE_UNITS, STORY_CLOCK_CUE_KINDS, STORY_CLOCK_DEGRADE_REASONS, STORY_CLOCK_ELAPSED_CATEGORIES, STORY_CLOCK_EXCLUDED_REASONS, STORY_CLOCK_TIMES_OF_DAY } from './story-clock-types.ts';

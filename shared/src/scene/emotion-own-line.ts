@@ -1,4 +1,5 @@
 import type {PerspectivePlan, SceneCharacter, SceneRoster, SceneSource} from './types.ts';
+import type {EventConsumerSource, EventConsumerProjection} from './tavern-engine/perception.ts';
 
 /** Accepted authorship fields; malformed historical speaker values are treated as unknown authorship. */
 export interface EmotionLineSource {
@@ -6,6 +7,8 @@ export interface EmotionLineSource {
   automatic?: unknown;
   speakerId?: unknown;
   replyTo?: {id: string; revision: number} | null;
+  /** A resolved event takes precedence over legacy whole-message speaker and automatic-reply fields. */
+  event?: EventConsumerSource | null;
 }
 
 /** Resolves an exact antecedent to its active roster ids, or null when it cannot establish authorship. */
@@ -21,6 +24,11 @@ export function isOwnEmotionLine(
   characterId: string,
   resolve?: EmotionLineResolver | null,
 ): boolean {
+  const event = source.event;
+  if (event != null) {
+    return event.role === 'assistant' && event.observation.actorId === characterId
+      && (event.content.kind === 'speech' || event.content.kind === 'NpcSpeech');
+  }
   if (source.role !== 'assistant') return false;
   if (source.automatic !== true) {
     return typeof source.speakerId === 'string' && source.speakerId.length > 0 && source.speakerId === characterId;
@@ -28,6 +36,22 @@ export function isOwnEmotionLine(
   if (!source.replyTo || !resolve) return false;
   const active = resolve(source.replyTo);
   return active?.length === 1 && active[0] === characterId;
+}
+
+/**
+ * Selects this NPC's emitted speech and returns a new projection with the same ledger source identities.
+ * Reader membership never establishes authorship. Empty results retain ownership, so composition cannot
+ * reopen a source body. O(events); no source body or antecedent is consulted. Getter errors propagate.
+ */
+export function ownEventEmotionLines(
+  projection: EventConsumerProjection,
+  characterId: string,
+): EventConsumerProjection {
+  const {events, ledgerSourceIds} = projection;
+  return {
+    events: events.filter(event => isOwnEmotionLine({role: event.role, event}, characterId)),
+    ledgerSourceIds,
+  };
 }
 
 /**

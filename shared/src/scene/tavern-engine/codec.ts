@@ -634,16 +634,63 @@ function interpretationKeys(input: Record<string, unknown>, allowed: readonly st
   if (Object.keys(input).some(key => !keys.has(key))) reject('invalid_shape');
 }
 
+// KMP counts overlapping matches in O(source units + quote units), with O(quote units) scratch space.
+// Stop after the second match: a missing span cannot choose between occurrences, even if they overlap.
+function uniqueQuoteOffset(source: string, quote: string): number {
+  if (quote.length === 0 || quote.length > source.length) reject('evidence_not_found');
+  const prefixes = new Uint32Array(quote.length);
+  let matched = 0;
+  for (let index = 1; index < quote.length; index++) {
+    const unit = quote.charCodeAt(index);
+    while (matched > 0 && unit !== quote.charCodeAt(matched)) matched = prefixes[matched - 1];
+    if (unit === quote.charCodeAt(matched)) matched++;
+    prefixes[index] = matched;
+  }
+
+  matched = 0;
+  let start = -1;
+  for (let index = 0; index < source.length; index++) {
+    const unit = source.charCodeAt(index);
+    while (matched > 0 && unit !== quote.charCodeAt(matched)) matched = prefixes[matched - 1];
+    if (unit === quote.charCodeAt(matched)) matched++;
+    if (matched !== quote.length) continue;
+    if (start !== -1) reject('evidence_ambiguous');
+    start = index - quote.length + 1;
+    matched = prefixes[matched - 1];
+  }
+
+  if (start === -1) reject('evidence_not_found');
+  return start;
+}
+
 function interpretationEvidence(value: unknown, current: Context): ObservationSource {
   const input = record(value);
   interpretationKeys(input, ['sourceId', 'revision', 'start', 'end', 'quote']);
-  const result = observationSource({ ...input, channel: 'message' }, current);
-  if (result.channel !== 'message' || typeof input.quote !== 'string'
-    || current.messageText.slice(result.start, result.end) !== input.quote) {
+  const sourceId = identifier(input.sourceId);
+  const revision = integer(input.revision, 1);
+  if (sourceId !== current.origin.sourceId || revision !== current.origin.sourceRevision
+    || typeof input.quote !== 'string') {
     reject('invalid_reference');
   }
 
-  return result;
+  const quote = input.quote;
+  let start: number;
+  let end: number;
+  if (input.start != null || input.end != null) {
+    if (typeof input.start !== 'number' || !Number.isSafeInteger(input.start) || input.start < 0
+      || typeof input.end !== 'number' || !Number.isSafeInteger(input.end) || input.end <= input.start
+      || input.end > current.messageText.length
+      || current.messageText.slice(input.start, input.end) !== quote) {
+      reject('evidence_span_mismatch');
+    }
+    start = input.start;
+    end = input.end;
+  } else {
+    start = uniqueQuoteOffset(current.messageText, quote);
+    end = start + quote.length;
+  }
+
+  return { channel: 'message', sourceId, revision, start, end };
 }
 
 function interpretationPayload(value: unknown, current: Context): EventPayload {
@@ -712,7 +759,8 @@ function interpretationPayload(value: unknown, current: Context): EventPayload {
 /**
  * Decodes one M1 response using the existing event vocabulary and host identity; never applies effects.
  * The response is {format, events:[{payload, confidence, evidence, temporality}]}. Evidence is one exact
- * UTF-16 half-open message span with quote; temporality is current/recollection/plan. Only current acts pass.
+ * Quote is mandatory; omitted/null offsets resolve only a unique exact match, including overlapping matches.
+ * Stored evidence remains a UTF-16 half-open message span. Only current acts pass temporality validation.
  * Invalid envelopes fail for retry. Invalid individual candidates retain their position as Unknown.
  * Work is O(catalog entries + response fields + source text): at most 12 events, each text at most 800 units.
  * Source text/catalogs have no chat-wide cap. Own-property readers reject accessors without invoking them.

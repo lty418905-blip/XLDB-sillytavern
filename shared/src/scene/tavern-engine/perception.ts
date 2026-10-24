@@ -1,4 +1,7 @@
 import { projectTavernWorld } from './projection.ts';
+import { createHash } from 'node:crypto';
+import type { EventSourceObservation, SceneState } from '../types.ts';
+import type { AcceptedTavernTurn } from './store.ts';
 import type {
   TavernProjectedPosition,
   TavernProjectionBasis,
@@ -22,6 +25,162 @@ import type {
 
 /** Provisional verbatim window: at most 32 events per dispatch in the requested turn, never a chat limit. */
 export const DEFAULT_PERCEPTION_WINDOW = 32;
+
+/**
+ * One current accepted event for a component. id/revision identify the real accepted message; observation.ref
+ * identifies its structural event. Text and attribution come from ledger rows, never from rendered prose.
+ * acceptedAtMs is Unix milliseconds. The content is a decoded P1 value, not a new candidate or a prompt.
+ */
+export interface EventConsumerSource {
+  id: string;
+  revision: number;
+  role: 'user' | 'assistant';
+  acceptedAtMs: number;
+  observation: EventSourceObservation;
+  content: EventPayload | BeatItem;
+}
+
+/**
+ * Reader-visible events with the ledger's source identities, including sources with no visible events.
+ * Source ids retain ownership across revisions; event access still requires the exact current revision.
+ * Ownership grants no event access. Rebuilding events must retain the same outer source identities;
+ * a bare event array is not a projection. Both fields are ordinary enumerable object properties.
+ */
+export interface EventConsumerProjection {
+  readonly events: readonly EventConsumerSource[];
+  readonly ledgerSourceIds: ReadonlySet<string>;
+}
+
+/**
+ * Stable event-text container identity for existing numeric parsers. Its offsets address only the event quote.
+ * The real message and complete address stay on EventConsumerSource; no display offsets are manufactured.
+ * Work is O(identity bytes); malformed references/getters throw before hashing.
+ */
+export function eventConsumerKey(source: EventConsumerSource): string {
+  const reference = addressKey(source.observation.ref);
+  return 'event:' + createHash('sha256').update(JSON.stringify([source.id, source.revision, reference])).digest('hex');
+}
+
+/**
+ * Pure reader projection over current turns already selected by the lifecycle-aware consumer entry.
+ * Private readers are the author and whisper recipients; public readers are the routes saved by store.commit.
+ * Neither caller-supplied quote/author/readers nor B text is read. Missing/stale events produce no source.
+ * Rebuild after any lifecycle change; this detached result is for one synchronous consumption pass.
+ * Ownership includes same-scope historical ledger sources even when their events are no longer current.
+ * Work is O(sources + ledger bytes + references + readers), plus per-source O(events log events) ordering.
+ * Getter errors and malformed stored JSON propagate unchanged; this is not an import boundary.
+ */
+export function projectEventConsumerSources(
+  state: SceneState,
+  turns: readonly AcceptedTavernTurn[],
+  readerId: string,
+  ledgerTurns: readonly AcceptedTavernTurn[] = turns,
+): EventConsumerProjection {
+  const expectedScope = state.scope;
+  const scopeKey = JSON.stringify([
+    expectedScope.worldId,
+    expectedScope.sessionId,
+    expectedScope.branchId,
+    expectedScope.characterId,
+  ]);
+  const ledgerSourceIds = new Set<string>();
+  for (const turn of ledgerTurns) {
+    const scope = turn.scope;
+    if (JSON.stringify([scope.worldId, scope.sessionId, scope.branchId, scope.characterId]) === scopeKey) {
+      ledgerSourceIds.add(turn.source.id);
+    }
+  }
+
+  const events = new Map<string, {
+    sourceId: string;
+    revision: number;
+    content: EventPayload | BeatItem;
+    readers: string[];
+  }>();
+
+  for (const turn of turns) {
+    const stored = turn as typeof turn & {
+      memoryReaders?: {address: string; actorId: string; quote: string; readers: string[]}[];
+    };
+    const routes = new Map((stored.memoryReaders ?? []).map(route => [route.address, route]));
+    const add = (
+      reference: TavernEventAddress,
+      content: EventPayload | BeatItem,
+    ): void => {
+      if (content.kind === 'Unknown') return;
+      const {eventId, phase, itemRef, effectIndex} = reference;
+      const route = routes.get(JSON.stringify([eventId, phase, itemRef ?? null, effectIndex ?? null]));
+      const quote = 'text' in content ? content.text : '';
+      const whisperTo = 'whisperTo' in content ? content.whisperTo ?? [] : [];
+      const readers = whisperTo.length > 0
+        ? [...new Set([content.actorId, ...whisperTo])]
+        : route?.actorId === content.actorId && route.quote === quote ? [...route.readers] : [];
+      events.set(addressKey(reference), {
+        sourceId: turn.source.id,
+        revision: turn.source.revision,
+        content,
+        readers,
+      });
+    };
+
+    for (const event of turn.kind === 'interpret' ? turn.events : turn.beats) {
+      if (event.envelope.status !== 'accepted' || event.envelope.turnId !== turn.turnId
+        || event.origin.turnRevision !== turn.turnRevision) continue;
+      const reference = {turnId: turn.turnId, turnRevision: turn.turnRevision, eventId: event.envelope.id};
+      if ('payload' in event) {
+        add({...reference, phase: 'event'}, event.payload);
+      } else {
+        const emitted = new Set(event.items.map(item => item.itemIndex));
+        for (const item of event.items) add({...reference, phase: 'item', itemRef: item.itemIndex}, item);
+        for (const link of event.effects) {
+          if (!emitted.has(link.itemRef)) continue;
+          add({...reference, phase: link.phase, itemRef: link.itemRef, effectIndex: link.effectIndex}, link.effect);
+        }
+      }
+    }
+  }
+
+  const result: EventConsumerSource[] = [];
+  const seen = new Set<string>();
+  for (const source of state.sources) {
+    if (source.status !== 'accepted' || source.processing !== 'ready') continue;
+    const selected: EventConsumerSource[] = [];
+    for (const observation of source.analysis?.plan?.observations ?? []) {
+      if (!Object.hasOwn(observation, 'ref')) continue;
+      const {ref, id, kind, sequence} = observation as EventSourceObservation;
+      const key = addressKey(ref);
+      const event = events.get(key);
+      if (!event || event.sourceId !== source.id || event.revision !== source.revision
+        || !event.readers.includes(readerId) || seen.has(key)) continue;
+      if (!['heard', 'observed'].includes(kind) || !Number.isSafeInteger(sequence) || sequence < 1) continue;
+      seen.add(key);
+      const quote = 'text' in event.content ? event.content.text : '';
+      selected.push({
+        id: source.id,
+        revision: source.revision,
+        role: source.role,
+        acceptedAtMs: source.acceptedAtMs,
+        observation: {
+          channel: 'event',
+          ref: {...ref},
+          id,
+          kind,
+          sequence,
+          quote,
+          evidence: quote,
+          actorId: event.content.actorId,
+          attributed: true,
+          readers: [...event.readers],
+          recipients: event.readers.filter(reader => reader !== event.content.actorId),
+        },
+        content: structuredClone(event.content),
+      });
+    }
+    selected.sort((left, right) => left.observation.sequence - right.observation.sequence);
+    result.push(...selected);
+  }
+  return {events: result, ledgerSourceIds};
+}
 
 interface EventContent {
   actorId: string;
@@ -459,6 +618,8 @@ function buildActors(input: TavernPerceptionInput): Map<string, ActorState> {
  */
 export class TavernPerception {
   #actors = new Map<string, ActorState>();
+  #acceptedTurns: { turnId: string; turnRevision: number; version: number }[] = [];
+  #turnStarts = new Map<string, number>();
   #playerId = '';
   #scopeKey = '';
   #epoch = {};
@@ -492,6 +653,21 @@ export class TavernPerception {
           if (sameInbox && sameAuthorship) next.deliveryCursor = previous.deliveryCursor;
         }
       }
+      const turnStarts = new Map<string, number>();
+      const acceptedTurns = new Map<string, { turnId: string; turnRevision: number; version: number }>();
+      for (const step of copied.steps) {
+        // Only a committed NPC phase completes a turn; its interpretation is not another round.
+        if (step.kind !== 'accepted') continue;
+        const { turnId, turnRevision, version } = step.turn;
+        if (step.turn.kind === 'interpret') {
+          turnStarts.set(JSON.stringify([turnId, turnRevision]), version);
+          continue;
+        }
+        const previous = acceptedTurns.get(turnId);
+        if (!previous || version > previous.version) acceptedTurns.set(turnId, { turnId, turnRevision, version });
+      }
+      this.#turnStarts = turnStarts;
+      this.#acceptedTurns = [...acceptedTurns.values()].sort((left, right) => left.version - right.version);
       this.#actors = actors;
       this.#playerId = copied.playerId;
       this.#scopeKey = scopeKey;
@@ -516,6 +692,25 @@ export class TavernPerception {
       authoredEvents: state.authoredEvents,
       materials: state.materials,
     });
+  }
+
+  /**
+   * Returns this actor's verbatim observations from the preceding three committed, valid ledger turns.
+   * Three is the provisional contract window, counted globally even when an actor perceived no event.
+   * Source validity is the caller's existing ledger filter; emitted/current turns never consume a slot.
+   * O(accepted turns + actor observations log observations); no message-array length or model text is used.
+   */
+  recentTurnWindow(actorId: string, currentTurnId: string, currentTurnRevision: number): readonly EventObservation[] {
+    const state = this.#actor(actorId);
+    const start = this.#turnStarts.get(JSON.stringify([currentTurnId, currentTurnRevision]));
+    if (start === undefined) throw new Error('perception_missing_turn');
+    // Regeneration of an earlier turn must not see later accepted rounds still present in a source snapshot.
+    const turns = this.#acceptedTurns.filter(turn => turn.turnId !== currentTurnId && turn.version < start).slice(-3);
+    const selected = new Set(turns.map(turn => JSON.stringify([turn.turnId, turn.turnRevision])));
+    const events = new Map([...state.inbox, ...state.authoredEvents].map(event => [event.eventId, event]));
+    return structuredClone([...events.values()]
+      .filter(event => selected.has(JSON.stringify([event.source.turnId, event.source.turnRevision])))
+      .sort((left, right) => left.sequence - right.sequence));
   }
 
   /**

@@ -1,4 +1,5 @@
 import {foldForMatch} from './script-fold.ts';
+import {STORY_CLOCK_MAX_MS} from '../scene/story-clock-types.ts';
 import type {DatabaseSync} from 'node:sqlite';
 import {randomUUID} from 'node:crypto';
 import {scopeKey} from '../core/types.ts';
@@ -9,10 +10,21 @@ import type {GenerationView} from '../scene/generation-view.ts';
 import type {InitializationCharacter,InitializationEntry,InitializationEvidence} from '../scene/initialization.ts';
 import type {SceneRoster as FullSceneRoster} from '../scene/types.ts';
 
+/** SLOT-PHYS, pending Claude */
+export const SLOT_PHYS_V2 = '';
+
+/** Product rule: each accepted-source story gap credits at most 43,200,000 milliseconds (12 hours), v2 only. */
+export const PHYSIOLOGY_JUMP_CAP_MS = 43_200_000;
+
 export const physiologyNeeds=['hydration','nutrition','bladder','bowel','sleep','energy'] as const;
 export type PhysiologyNeed=typeof physiologyNeeds[number];
 export type PhysiologyVisibility='private'|'player'|'all_tracked';
 export type PhysiologyFeature='sustainedEffects'|'reproductive'|'sexualArousal';
+
+/** Explicit v2 extraction/validation scope; omission or null preserves the legacy contract and errors. */
+export interface PhysiologyTavernV2 {
+  scope: SceneScope;
+}
 
 export interface PhysiologyConfiguration {
   enabled:boolean;
@@ -30,12 +42,27 @@ type ReproductiveStatus='cycle_started'|'pregnancy_possible'|'pregnancy_confirme
 type ArousalLevel='low'|'medium'|'high';
 
 interface OperationBase {
-  sourceId:string;sourceRevision:number;characterId:string;ref:string;evidence:string;readers:string[];atMs:number|null;temporality:'current';
+  sourceId: string;
+  sourceRevision: number;
+  characterId: string;
+  ref: string;
+  evidence: string;
+  readers: string[];
+  atMs: number | null;
+  temporality: 'current';
+  /** Tavern v2 only: the event author whose self-report this operation quotes; absence is the legacy encoding. */
+  authorId?: string;
+  /** V2 structural source item, zero-based; omitted for an event without an item. */
+  itemRef?: number;
 }
-export type PhysiologyOperation=(OperationBase&{kind:'need';need:PhysiologyNeed;action:NeedAction})
-  |(OperationBase&{kind:'effect';effect:EffectKind;action:'start'|'update'|'end';severity?:EffectSeverity})
-  |(OperationBase&{kind:'reproductive';action:'set'|'clear';status?:ReproductiveStatus})
-  |(OperationBase&{kind:'sexualArousal';action:'set'|'clear';level?:ArousalLevel});
+/** Closed source-backed body changes; v2 adds author provenance and zero-based effect item references. */
+export type PhysiologyOperation =
+  | (OperationBase & {kind: 'need'; need: PhysiologyNeed; action: NeedAction})
+  | (OperationBase & {
+    kind: 'effect'; effect: EffectKind; action: 'start' | 'update' | 'end'; severity?: EffectSeverity;
+  })
+  | (OperationBase & {kind: 'reproductive'; action: 'set' | 'clear'; status?: ReproductiveStatus})
+  | (OperationBase & {kind: 'sexualArousal'; action: 'set' | 'clear'; level?: ArousalLevel});
 
 export type PhysiologyCorrectionPatch=
   |{kind:'need';need:PhysiologyNeed;state:'unknown'|'settled'|'noticeable'|'urgent'|'strained';sleeping?:boolean}
@@ -50,9 +77,20 @@ export interface PhysiologyCorrectionInput {
 interface StoredCorrection {
   id:string;characterId:string;patch:PhysiologyCorrectionPatch;visibility:PhysiologyVisibility;reason:string;
   readers:string[];atMs:number|null;afterSourceId:string|null;createdAtMs:number;
+  /** Only new corrections of a v2 need carry this clock version; absent on every legacy record. */
+  clockVersion?: 'tavern-v2';
 }
 
 interface SettingsRow {revision:number;body:string}
+
+type PhysiologyStatusOptions = {
+  readerId?: string;
+  nowMs?: number;
+  generationView?: GenerationView;
+  inspectCharacterId?: string;
+  clock?: {kind: 'story' | 'realtime'; known: boolean; timeMs: number | null; timeZone: string};
+  };
+
 interface PhysiologyDependencies {
   state:(scope:SceneScope)=>{version:number;roster:SceneRoster;sources:Array<SceneMessage&{status:string;processing:string;analysis?:{physiologyOperations?:PhysiologyOperation[]}|null}>};
   modeOf:(scope:SceneScope)=>'roleplay'|'companion'|undefined;
@@ -96,151 +134,397 @@ export class PhysiologyStore {
     return this.dependencies.fullRoleplay(scope) && this.dependencies.tavernAvailable !== true;
   }
 
-  configuration(scope:SceneScope):{revision:number;config:PhysiologyConfiguration}{
-    const row=this.db.prepare('SELECT revision,body FROM scene_physiology_settings WHERE scope=?').get(scopeKey(scope)) as SettingsRow|undefined;
-    const roster=this.dependencies.state(scope).roster;
-    if(this.dependencies.fullRoleplay(scope)){
-      // Keep the historical read order and one binding lookup; skip parsing while Tavern physiology is suspended.
+  /** Reads settings using the original scope key; corrupt stored JSON keeps its native parse error. */
+  configuration(scope: SceneScope): {revision: number; config: PhysiologyConfiguration} {
+    const row = this.db.prepare('SELECT revision,body FROM scene_physiology_settings WHERE scope=?')
+      .get(scopeKey(scope)) as SettingsRow | undefined;
+    // Configuration has its own host load, even when a projection already supplied a generation view.
+    const state = snapshotData(this.dependencies.state(scope), 'state');
+    const roster = state.roster;
+    if (this.dependencies.fullRoleplay(scope)) {
       if (this.dependencies.tavernAvailable !== true) {
         return {revision: row?.revision ?? 0, config: structuredClone(defaultConfiguration)};
       }
-      // Validate only: the available Tavern path still rejects a corrupt stored row, but always forces every field on.
-      if (row) {
-        configurationOf(JSON.parse(row.body), roster, true);
-      }
-      return {revision:row?.revision??0,config:{enabled:true,dailyNeeds:[...physiologyNeeds],
-      sustainedEffects:true,reproductive:true,sexualArousal:true,trackedCharacterIds:roster.characters.map(actor=>actor.id)}};
+      if (row) configurationOf(JSON.parse(row.body), roster, true);
+      return {
+        revision: row?.revision ?? 0,
+        config: {
+          enabled: true,
+          dailyNeeds: [...physiologyNeeds],
+          sustainedEffects: true,
+          reproductive: true,
+          sexualArousal: true,
+          trackedCharacterIds: roster.characters.map(actor => actor.id),
+        },
+      };
     }
     const config = row ? configurationOf(JSON.parse(row.body), roster, true) : structuredClone(defaultConfiguration);
-    return {revision:row?.revision??0,config};
+    return {revision: row?.revision ?? 0, config};
   }
 
-  configure(scope:SceneScope,value:unknown,expectedRevision:number){
+  /** Saves detached settings at the expected revision; validation and transaction errors propagate. */
+  configure(scope: SceneScope, value: unknown, expectedRevision: number) {
+    // A suspended Tavern rejects before the entry clone, so the input is never read.
     if (this.tavernUnavailable(scope)) throw new Error('invalid_physiology_unavailable');
-    return this.dependencies.transaction(()=>{
-      const state=this.dependencies.state(scope);if(!state.version)throw new Error('invalid_scene_not_configured');
-      const current=this.configuration(scope);assertRevision(expectedRevision,current.revision);
-      const config=configurationOf(value,state.roster);
-      if(JSON.stringify(config)===JSON.stringify(current.config))return {revision:current.revision,config};
-      this.dependencies.checkpoint(scope,'角色生理设置变更');
-      const revision=current.revision+1;
-      this.db.prepare(`INSERT INTO scene_physiology_settings VALUES(?,?,?)
-        ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,body=excluded.body`).run(scopeKey(scope),revision,JSON.stringify(config));
+    [value, expectedRevision] = snapshotData([value, expectedRevision], 'data');
+    return this.dependencies.transaction(() => {
+      const state = snapshotData(this.dependencies.state(scope), 'state');
+      if (!state.version) throw new Error('invalid_scene_not_configured');
+      const current = this.configuration(scope);
+      assertRevision(expectedRevision, current.revision);
+      const config = configurationOf(value, state.roster);
+      if (JSON.stringify(config) === JSON.stringify(current.config)) return {revision: current.revision, config};
+
+      this.dependencies.checkpoint(scope, '角色生理设置变更');
+      const revision = current.revision + 1;
+      this.db.prepare(
+        'INSERT INTO scene_physiology_settings VALUES(?,?,?) '
+        + 'ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,body=excluded.body',
+      ).run(scopeKey(scope), revision, JSON.stringify(config));
       this.dependencies.bump(scope);
-      return {revision,config};
+      return {revision, config};
     });
   }
 
-  correct(scope:SceneScope,value:unknown,expectedRevision:number){
+  /** Saves a detached virtual-body correction in clock milliseconds; revision or validation failure rejects it. */
+  correct(scope: SceneScope, value: unknown, expectedRevision: number) {
+    // A suspended Tavern rejects before the entry clone, so the input is never read.
     if (this.tavernUnavailable(scope)) throw new Error('invalid_physiology_unavailable');
-    return this.dependencies.transaction(()=>{
-      const state=this.dependencies.state(scope),current=this.configuration(scope);assertRevision(expectedRevision,current.revision);
-      const correction=correctionOf(value,state.roster,current.config,this.clock(scope,Date.now()));
-      const existing=correction.id?this.db.prepare('SELECT body FROM scene_physiology_corrections WHERE scope=? AND id=?')
-        .get(scopeKey(scope),correction.id) as {body:string}|undefined:undefined;
-      const prior=existing?JSON.parse(existing.body) as StoredCorrection:undefined;
-      const id=correction.id||randomUUID();
-      const lastSource=state.sources.at(-1)?.id??null;
-      const stored:StoredCorrection={...correction,id,afterSourceId:prior?.afterSourceId??lastSource,createdAtMs:prior?.createdAtMs??Date.now()};
-      this.dependencies.checkpoint(scope,'角色生理状态纠正');
+    [value, expectedRevision] = snapshotData([value, expectedRevision], 'data');
+    return this.dependencies.transaction(() => {
+      const state = snapshotData(this.dependencies.state(scope), 'state');
+      const current = this.configuration(scope);
+      assertRevision(expectedRevision, current.revision);
+      const correction = correctionOf(value, state.roster, current.config, this.clock(scope, Date.now()));
+      const existing = correction.id
+        ? this.db.prepare('SELECT body FROM scene_physiology_corrections WHERE scope=? AND id=?')
+          .get(scopeKey(scope), correction.id) as {body: string} | undefined
+        : undefined;
+      const prior = existing ? JSON.parse(existing.body) as StoredCorrection : undefined;
+      const id = correction.id || randomUUID();
+      const lastSource = state.sources.at(-1)?.id ?? null;
+      // Existing corrections keep their recorded clock, including the absence of a version on legacy records.
+      const clockVersion = prior ? prior.clockVersion : this.correctionClockVersion(scope, state, correction);
+      const stored: StoredCorrection = {
+        ...correction,
+        id,
+        afterSourceId: prior?.afterSourceId ?? lastSource,
+        createdAtMs: prior?.createdAtMs ?? Date.now(),
+        ...(clockVersion === undefined ? {} : {clockVersion}),
+      };
+
+      this.dependencies.checkpoint(scope, '角色生理状态纠正');
       this.db.prepare('INSERT OR REPLACE INTO scene_physiology_corrections VALUES(?,?,?,?)')
-        .run(scopeKey(scope),id,stored.characterId,JSON.stringify(stored));
-      const revision=this.advanceRevision(scope,current.config,current.revision);
+        .run(scopeKey(scope), id, stored.characterId, JSON.stringify(stored));
+      const revision = this.advanceRevision(scope, current.config, current.revision);
       this.dependencies.bump(scope);
-      return {revision,correction:stored};
+      return {revision, correction: stored};
     });
   }
 
-  clearCorrection(scope:SceneScope,characterId:string,id:string,expectedRevision:number){
+  private correctionClockVersion(
+    scope: SceneScope,
+    state: ReturnType<PhysiologyDependencies['state']>,
+    correction: Pick<StoredCorrection, 'characterId' | 'patch'>,
+  ): 'tavern-v2' | undefined {
+    if (correction.patch.kind !== 'need') return undefined;
+    let story: ReturnType<PhysiologyStore['storyTimeOf']> | undefined;
+    // O(sources + operations): select this need's latest accepted anchor without depending on the reader's visibility.
+    for (let sourceIndex = state.sources.length - 1; sourceIndex >= 0; sourceIndex--) {
+      const source = state.sources[sourceIndex]!;
+      if (source.status !== 'accepted' || source.processing !== 'ready') continue;
+      const operations = source.analysis?.physiologyOperations ?? [];
+      for (let operationIndex = operations.length - 1; operationIndex >= 0; operationIndex--) {
+        const operation = operations[operationIndex]!;
+        if (operation.characterId !== correction.characterId || operation.kind !== 'need'
+          || operation.need !== correction.patch.need) continue;
+        if (operation.authorId == null) return undefined;
+        if (story === undefined) story = this.storyTimeOf(scope, state);
+        if (story === null) return undefined;
+        const atMs = story.at(operation.sourceId, operation.sourceRevision);
+        if (atMs !== null && !isStoryClockMs(atMs)) continue;
+
+        return 'tavern-v2';
+      }
+    }
+    return undefined;
+  }
+
+  /** Deletes one correction at the expected revision; a missing character/id pair throws without writing. */
+  clearCorrection(scope: SceneScope, characterId: string, id: string, expectedRevision: number) {
+    // A suspended Tavern rejects before the entry clone, so the input is never read.
     if (this.tavernUnavailable(scope)) throw new Error('invalid_physiology_unavailable');
-    return this.dependencies.transaction(()=>{
-      const current=this.configuration(scope);assertRevision(expectedRevision,current.revision);
-      const row=this.db.prepare('SELECT character FROM scene_physiology_corrections WHERE scope=? AND id=?')
-        .get(scopeKey(scope),id) as {character:string}|undefined;
-      if(!row||row.character!==characterId)throw new Error('physiology_correction_not_found');
-      this.dependencies.checkpoint(scope,'角色生理纠正撤销');
-      this.db.prepare('DELETE FROM scene_physiology_corrections WHERE scope=? AND id=?').run(scopeKey(scope),id);
-      const revision=this.advanceRevision(scope,current.config,current.revision);
+    [characterId, id, expectedRevision] = snapshotData([characterId, id, expectedRevision], 'data');
+    return this.dependencies.transaction(() => {
+      const current = this.configuration(scope);
+      assertRevision(expectedRevision, current.revision);
+      const row = this.db.prepare('SELECT character FROM scene_physiology_corrections WHERE scope=? AND id=?')
+        .get(scopeKey(scope), id) as {character: string} | undefined;
+      if (!row || row.character !== characterId) throw new Error('physiology_correction_not_found');
+
+      this.dependencies.checkpoint(scope, '角色生理纠正撤销');
+      this.db.prepare('DELETE FROM scene_physiology_corrections WHERE scope=? AND id=?').run(scopeKey(scope), id);
+      const revision = this.advanceRevision(scope, current.config, current.revision);
       this.dependencies.bump(scope);
-      return {revision,status:'deleted' as const};
+      return {revision, status: 'deleted' as const};
     });
   }
 
-  status(scope:SceneScope,options:{readerId?:string;nowMs?:number;generationView?:GenerationView;inspectCharacterId?:string;
-    clock?:{kind:'story'|'realtime';known:boolean;timeMs:number|null;timeZone:string}}={}){
-    const state=options.generationView?.state??this.dependencies.state(scope),stored=this.configuration(scope),readerId=options.readerId??'player';
-    const clock=options.clock??this.clock(scope,options.nowMs??Date.now());
-    const config=stored.config;
-    const names=new Map(state.roster.characters.map(character=>[character.id,character.name]));
-    // Explicit local user inspection only. Generation context never supplies this option.
-    const inspectId=options.inspectCharacterId;
-    if(inspectId!==undefined&&!names.has(inspectId))throw new Error('invalid_dashboard_character');
-    if(!config.enabled)return {schema:'xldb-physiology-v1' as const,revision:stored.revision,sceneVersion:state.version,config,mode:this.dependencies.modeOf(scope)??null,clock,characters:[]};
-    const projected=new Map(config.trackedCharacterIds.map(id=>[id,emptyCharacter(id,names.get(id)!) ]));
-    this.applyInitialization(scope,state.roster as FullSceneRoster,projected,readerId,inspectId);
-    const corrections=this.corrections(scope).filter(item=>!options.generationView?.excludedSourceIds.has(item.afterSourceId??''));
-    // A story scope computes on the unified clock of `state`: an operation at its source, a correction at the source
-    // it follows. The stored atMs values are then only shown (need anchors), never computed with. O(sources x corrections).
-    const story=this.storyTimeOf(scope,state);
-    const sourceIds=state.sources.map(source=>source.id);
-    const operationAt=(operation:PhysiologyOperation)=>story===null?undefined:story.at(operation.sourceId,operation.sourceRevision);
-    const correctionAt=(correction:StoredCorrection)=>{
-      if(story===null)return undefined;
-      if(correction.afterSourceId===null)return story.originMs;
-      const index=sourceIds.indexOf(correction.afterSourceId);
-      // Its source has no clock entry (deleted, or no longer accepted): the nearest earlier source that has one.
-      // Its source is not in the state at all: the correction is applied after every source, so the last one that has one.
-      for(let position=index<0?sourceIds.length-1:index;position>=0;position--){
-        const at=story.at(sourceIds[position]!);
-        if(at!==null)return at;
+  /** Projects detached source/correction data in clock milliseconds; uncopyable inputs throw with a cause/diagnostic. */
+  status(scope: SceneScope, options: PhysiologyStatusOptions = {}) {
+    [options] = snapshotData([options], 'data');
+    const state = options.generationView?.state ?? snapshotData(this.dependencies.state(scope), 'state');
+    // A public status call is a full data boundary: the story-clock capability also receives this module's clone.
+    return this.projectStatus(scope, options, state, state).status;
+  }
+
+  // Status and context consume the same detached state and one resolved story-clock callback set.
+  // `state` is this module's own clone; `capabilityState` is the object handed to the story-clock capability.
+  // Of a generation view the projection reads only the excluded source set; the view's state arrives as `state`.
+  private projectStatus(
+    scope: SceneScope,
+    options: Omit<PhysiologyStatusOptions, 'generationView'> & {
+      generationView?: Pick<GenerationView, 'excludedSourceIds'>;
+    },
+    state: ReturnType<PhysiologyDependencies['state']>,
+    capabilityState: ReturnType<PhysiologyDependencies['state']>,
+  ) {
+    const stored = this.configuration(scope);
+    const readerId = options.readerId ?? 'player';
+    const clock = options.clock ?? this.clock(scope, options.nowMs ?? Date.now());
+    const config = stored.config;
+    const names = new Map(state.roster.characters.map(character => [character.id, character.name]));
+    // Explicit local inspection never changes the readers used by generation context.
+    const inspectId = options.inspectCharacterId;
+    if (inspectId !== undefined && !names.has(inspectId)) throw new Error('invalid_dashboard_character');
+    if (!config.enabled) {
+      return {
+        status: {
+          schema: 'xldb-physiology-v1' as const,
+          revision: stored.revision,
+          sceneVersion: state.version,
+          config,
+          mode: this.dependencies.modeOf(scope) ?? null,
+          clock,
+          characters: [],
+        },
+        story: null,
+      };
+    }
+
+    const projected = new Map(config.trackedCharacterIds.map(id => [id, emptyCharacter(id, names.get(id)!)]));
+    this.applyInitialization(scope, state.roster as FullSceneRoster, projected, readerId, inspectId);
+    const corrections = this.corrections(scope)
+      .filter(item => !options.generationView?.excludedSourceIds.has(item.afterSourceId ?? ''));
+    const story = this.storyTimeOf(scope, capabilityState);
+    // Only v2 operations and explicitly versioned corrections opt in; unversioned legacy data keeps its old clock.
+    const hasV2 = story !== null && (state.sources.some(source => source.status === 'accepted'
+      && source.processing === 'ready'
+      && source.analysis?.physiologyOperations?.some(operation => operation.authorId != null))
+      || corrections.some(correction => correction.clockVersion === 'tavern-v2'));
+    const timeline = hasV2 ? physiologyTimeline(state.sources, story!) : undefined;
+    // V2 corrections use one bucket per source so a long corrected history remains O(sources + corrections).
+    const correctionsBySource = timeline ? new Map<string | null, StoredCorrection[]>() : undefined;
+    if (correctionsBySource) {
+      for (const correction of corrections) {
+        const sourceId = correction.afterSourceId;
+        const bucket = correctionsBySource.get(sourceId) ?? [];
+        bucket.push(correction);
+        correctionsBySource.set(sourceId, bucket);
+      }
+    }
+    const sourceSnapshots = timeline?.snapshotSources ?? state.sources;
+    const sourceIds = sourceSnapshots.map(source => source.id);
+    const operationAt = (operation: PhysiologyOperation) => {
+      if (story === null) return undefined;
+      if (timeline && operation.authorId != null) {
+        return timeline.sources.get(operation.sourceId)?.get(operation.sourceRevision)?.atMs ?? null;
+      }
+      return story.at(operation.sourceId, operation.sourceRevision);
+    };
+    const correctionAt = (correction: StoredCorrection) => {
+      if (story === null) return undefined;
+      if (correction.afterSourceId === null) return story.originMs;
+      if (timeline) return timeline.afterSource.get(correction.afterSourceId)?.atMs ?? timeline.lastAtMs;
+      const index = sourceIds.indexOf(correction.afterSourceId);
+      // A deleted source falls back to the nearest earlier clock entry; an absent source follows the last entry.
+      for (let position = index < 0 ? sourceIds.length - 1 : index; position >= 0; position--) {
+        const at = story.at(sourceIds[position]!);
+        if (at !== null) return at;
       }
       return story.originMs;
     };
-    const before=corrections.filter(item=>item.afterSourceId===null);
-    for(const correction of before)this.applyCorrection(projected,correction,readerId,inspectId===correction.characterId,correctionAt(correction));
-    for(const source of state.sources){
-      if(source.status==='accepted'&&source.processing==='ready')for(const operation of source.analysis?.physiologyOperations??[])
-        this.applyOperation(projected,operation,readerId,inspectId===operation.characterId,operationAt(operation));
-      for(const correction of corrections.filter(item=>item.afterSourceId===source.id))this.applyCorrection(projected,correction,readerId,inspectId===correction.characterId,correctionAt(correction));
+    const correctionProgress = (correction: StoredCorrection) => {
+      // Persisted legacy records never acquire capped progress from later v2 events or another reader's view.
+      if (!timeline || correction.clockVersion !== 'tavern-v2') return undefined;
+      if (correction.afterSourceId === null) return 0;
+      return timeline.afterSource.get(correction.afterSourceId)?.elapsedMs ?? timeline.elapsedMs;
+    };
+    const applyCorrection = (correction: StoredCorrection) => this.applyCorrection(
+      projected,
+      correction,
+      readerId,
+      inspectId === correction.characterId,
+      correctionAt(correction),
+      correctionProgress(correction),
+    );
+
+    for (const correction of corrections.filter(item => item.afterSourceId === null)) applyCorrection(correction);
+    for (const source of sourceSnapshots) {
+      if (source.status === 'accepted' && source.processing === 'ready') {
+        for (const operation of source.analysis?.physiologyOperations ?? []) {
+          const progress = timeline?.sources.get(operation.sourceId)?.get(operation.sourceRevision);
+          // Reject the entire v2 operation before recording provenance or changing any body state.
+          if (operation.authorId != null && progress?.invalidTime) continue;
+
+          this.applyOperation(
+            projected,
+            operation,
+            readerId,
+            inspectId === operation.characterId,
+            operationAt(operation),
+            progress?.elapsedMs,
+          );
+        }
+      }
+      const sourceCorrections = correctionsBySource?.get(source.id)
+        ?? (correctionsBySource ? [] : corrections.filter(item => item.afterSourceId === source.id));
+      for (const correction of sourceCorrections) {
+        applyCorrection(correction);
+      }
     }
-    const knownSourceIds=new Set(state.sources.map(source=>source.id));
-    for(const correction of corrections.filter(item=>item.afterSourceId!==null&&!knownSourceIds.has(item.afterSourceId)))this.applyCorrection(projected,correction,readerId,inspectId===correction.characterId,correctionAt(correction));
-    const characters=[...projected.values()].filter(character=>inspectId===undefined||character.characterId===inspectId).map(character=>projectCharacter(character,config,story===null?clock.timeMs:story.nowMs));
-    return {schema:'xldb-physiology-v1' as const,revision:stored.revision,sceneVersion:state.version,config,mode:this.dependencies.modeOf(scope)??null,clock,characters};
+    const knownSourceIds = new Set(sourceIds);
+    for (const correction of corrections.filter(item => item.afterSourceId !== null
+      && !knownSourceIds.has(item.afterSourceId))) applyCorrection(correction);
+    const characters = [...projected.values()]
+      .filter(character => inspectId === undefined || character.characterId === inspectId)
+      .map(character => projectCharacter(character, config, story === null ? clock.timeMs : story.nowMs, timeline));
+    return {
+      status: {
+        schema: 'xldb-physiology-v1' as const,
+        revision: stored.revision,
+        sceneVersion: state.version,
+        config,
+        mode: this.dependencies.modeOf(scope) ?? null,
+        clock,
+        characters,
+        ...(timeline?.diagnostics.length ? {diagnostics: timeline.diagnostics} : {}),
+      },
+      story,
+    };
   }
 
-  context(scope:SceneScope,characterId:string,nowMs=Date.now(),generationView?:GenerationView,
-    clock?:{kind:'story'|'realtime';known:boolean;timeMs:number|null;timeZone:string}):string{
-    const status=this.status(scope,{readerId:characterId,nowMs,generationView,clock});
-    if(!status.config.enabled)return '';
-    const character=status.characters.find(item=>item.characterId===characterId);
-    if(!character||!character.known)return '';
-    const {sources:_sources,correctionIds:_correctionIds,...promptState}=character;
-    // A story scope prints no stored millisecond value: the character perceives the stage, computed on the unified clock.
-    const story=this.storyTimeOf(scope,generationView?.state??this.dependencies.state(scope));
-    const shown=story===null?promptState:{...promptState,
-      needs:Object.fromEntries(Object.entries(promptState.needs).map(([need,{anchorTimeMs:_anchorTimeMs,...value}])=>[need,value])),
-      effects:promptState.effects.map(({atMs:_atMs,...effect})=>effect),
-      ...(promptState.reproductive?{reproductive:(({atMs:_atMs,...value})=>value)(promptState.reproductive)}:{}),
-      ...(promptState.sexualArousal?{sexualArousal:(({atMs:_atMs,...value})=>value)(promptState.sexualArousal)}:{})};
+  /** Renders only the character's permitted virtual-body state; returns an empty string when disabled or unknown. */
+  context(
+    scope: SceneScope,
+    characterId: string,
+    nowMs = Date.now(),
+    generationView?: GenerationView,
+    clock?: {kind: 'story' | 'realtime'; known: boolean; timeMs: number | null; timeZone: string},
+  ): string {
+    [characterId, nowMs, clock] = snapshotData([characterId, nowMs, clock], 'data');
+    // The view's state is the host's own object. The story-clock store memoises its readings by the identity of the
+    // sources array, and the generation clock has already read this same state, so the capability receives it
+    // unchanged: a clone would cost one extra ledger read per NPC per turn. This module reads only its own clone.
+    // The view's state and excluded sources are read once each; its timeline is never read.
+    const hostState = generationView?.state;
+    // A null view is an omitted one. The projection receives only the view's excluded source set, under the member it
+    // has always read, so its filter and the type errors of a malformed set stay as they were.
+    const viewExclusions = generationView == null
+      ? undefined
+      : {excludedSourceIds: snapshotData(generationView.excludedSourceIds, 'data')};
+    // Without a view the capability receives the loaded state itself, and this module again reads only its clone.
+    const capabilityState = hostState ?? this.dependencies.state(scope);
+    const state = snapshotData(capabilityState, 'state');
+    const projection = {readerId: characterId, nowMs, clock, generationView: viewExclusions};
+    const {status} = this.projectStatus(scope, projection, state, capabilityState);
+    if (!status.config.enabled) return '';
+    const character = status.characters.find(item => item.characterId === characterId);
+    if (!character || !character.known) return '';
+    const {sources: _sources, correctionIds: _correctionIds, ...promptState} = character;
+    // Refresh after projection: the host may now return a different story/non-story rendering decision.
+    // Without a view a fresh host load goes to the capability; this module never reads it.
+    const story = this.storyTimeOf(scope, hostState ?? this.dependencies.state(scope), false);
+    // A story scope prints no stored millisecond value; the character perceives stages on the unified clock.
+    const shown = story === null ? promptState : {
+      ...promptState,
+      needs: Object.fromEntries(Object.entries(promptState.needs)
+        .map(([need, {anchorTimeMs: _anchorTimeMs, ...value}]) => [need, value])),
+      effects: promptState.effects.map(({atMs: _atMs, ...effect}) => effect),
+      ...(promptState.reproductive ? {
+        reproductive: (({atMs: _atMs, ...value}) => value)(promptState.reproductive),
+      } : {}),
+      ...(promptState.sexualArousal ? {
+        sexualArousal: (({atMs: _atMs, ...value}) => value)(promptState.sexualArousal),
+      } : {}),
+    };
     return `\n[XLDB 虚拟角色生理状态] 仅用于扮演角色 ${character.name}，不是现实用户身体资料。basis=default 的日常需求是未观察到特殊情况时的角色默认基线，不是已发生事实；其余是已接受来源或用户纠正后的可知状态。unknown 不得补写。${JSON.stringify(shown)}`;
   }
 
-  async extract(source:SceneMessage,plan:PerspectivePlan,roster:SceneRoster,config:PhysiologyConfiguration,atMs:number|null,
-    modelConfig:ModelConfig,run:ModelRunner):Promise<PhysiologyOperation[]> {
-    if(!config.enabled)return [];
-    const observations=plan.observations.filter(item=>item.readers.some(id=>config.trackedCharacterIds.includes(id)));
-    if(!observations.length)return [];
-    const input={source:{id:source.id,revision:source.revision,role:source.role},trackedCharacters:roster.characters
-      .filter(item=>config.trackedCharacterIds.includes(item.id)).map(item=>({id:item.id,name:item.name,aliases:item.aliases})),
-      features:config,observations:observations.map(item=>({ref:item.id,text:item.quote,readers:item.readers,playerVisible:item.playerVisible===true}))};
-    const raw=await run(modelConfig,[{role:'system',content:physiologyPrompt},{role:'user',content:JSON.stringify(input)}],true);
-    return decodeOperations(parseJson(raw),source,plan,roster,config,atMs);
+  /** Extracts closed operations from supplied evidence; v2 is explicit and runner/parser errors propagate unchanged. */
+  async extract(
+    source: SceneMessage,
+    plan: PerspectivePlan,
+    roster: SceneRoster,
+    config: PhysiologyConfiguration,
+    atMs: number | null,
+    modelConfig: ModelConfig,
+    run: ModelRunner,
+    tavernV2?: PhysiologyTavernV2 | null,
+  ): Promise<PhysiologyOperation[]> {
+    [source, plan, roster, config, atMs, tavernV2] = snapshotData(
+      [source, plan, roster, config, atMs, tavernV2], 'data',
+    );
+    if (tavernV2 != null) {
+      source = snapshotData(source, 'source');
+      plan = snapshotObservations(plan);
+      validateV2Source(source);
+    }
+    if (!config.enabled) return [];
+    const observations = plan.observations.filter(item => item.readers
+      .some(id => config.trackedCharacterIds.includes(id))
+      || (tavernV2 != null && config.trackedCharacterIds.includes(observationAuthor(source, item) ?? '')));
+    if (!observations.length) return [];
+    const trackedCharacters = roster.characters.filter(item => config.trackedCharacterIds.includes(item.id))
+      .map(item => ({id: item.id, name: item.name, aliases: item.aliases}));
+    // The omitted branch retains the historical JSON property order and therefore its model-cache fingerprint.
+    const input = tavernV2 == null
+      ? {source: {id: source.id, revision: source.revision, role: source.role}, trackedCharacters, features: config,
+        observations: observations.map(item => ({ref: item.id, text: item.quote, readers: item.readers,
+          playerVisible: item.playerVisible === true}))}
+      : {contract: {schema: 'xldb-physiology-v2', scope: scopeKey(tavernV2.scope)},
+        source: {id: source.id, revision: source.revision, role: source.role, speakerId: source.speakerId ?? null},
+        trackedCharacters, features: config,
+        observations: observations.map(item => ({ref: item.id, text: item.quote, kind: item.kind,
+          actorId: observationAuthor(source, item), attributed: item.attributed === true,
+          recipients: item.recipients ?? null, itemRef: observationItemRef(item) ?? null,
+          readers: item.readers, playerVisible: item.playerVisible === true}))};
+    const prompt = tavernV2 == null ? physiologyPrompt : SLOT_PHYS_V2;
+    const raw = await run(modelConfig, [
+      {role: 'system', content: prompt},
+      {role: 'user', content: JSON.stringify(input)},
+    ], true);
+    return decodeOperations(parseJson(raw), source, plan, roster, config, atMs, tavernV2);
   }
 
-  validateStored(value:unknown,source:SceneMessage,plan:PerspectivePlan,roster:SceneRoster):PhysiologyOperation[]{
-    if(!Array.isArray(value)||value.length>12)throw new Error('invalid_physiology_operations');
-    return value.map(item=>validateStoredOperation(item,source,plan,roster));
+  /** Validates at most the existing 12 operations per source; v2 additionally requires author and source revision. */
+  validateStored(
+    value: unknown,
+    source: SceneMessage,
+    plan: PerspectivePlan,
+    roster: SceneRoster,
+    tavernV2?: PhysiologyTavernV2 | null,
+  ): PhysiologyOperation[] {
+    [value, source, plan, roster, tavernV2] = snapshotData([value, source, plan, roster, tavernV2], 'data');
+    if (tavernV2 != null) {
+      source = snapshotData(source, 'source');
+      plan = snapshotObservations(plan);
+      validateV2Source(source);
+    }
+    if (!Array.isArray(value) || value.length > 12) throw new Error('invalid_physiology_operations');
+    return value.map(item => validateStoredOperation(
+      tavernV2 == null ? item : snapshotData(item, 'operation'), source, plan, roster, tavernV2,
+    ));
   }
 
   private applyInitialization(scope:SceneScope,roster:FullSceneRoster,characters:Map<string,MutableCharacter>,readerId:string,inspectId?:string){
@@ -286,29 +570,89 @@ export class PhysiologyStore {
     }
   }
 
-  private applyOperation(characters:Map<string,MutableCharacter>,operation:PhysiologyOperation,readerId:string,inspect=false,storyAtMs?:number|null){
-    const character=characters.get(operation.characterId);if(!character||(!inspect&&!operation.readers.includes(readerId)))return;
-    character.sources.set(`${operation.sourceId}:${operation.sourceRevision}`,{id:operation.sourceId,revision:operation.sourceRevision});
-    if(operation.kind==='need')applyNeed(character,operation.need,operation.action,storyAtMs===undefined?operation.atMs:storyAtMs,false,storyAtMs===undefined?undefined:operation.atMs);
-    else if(operation.kind==='effect'){
-      if(operation.action==='end')character.effects.delete(operation.effect);
-      else character.effects.set(operation.effect,{kind:operation.effect,severity:operation.severity??'moderate',detail:operation.evidence,atMs:operation.atMs,corrected:false});
-    }else if(operation.kind==='reproductive')character.reproductive=operation.action==='clear'?undefined:{status:operation.status!,detail:operation.evidence,atMs:operation.atMs,corrected:false};
-    else character.sexualArousal=operation.action==='clear'?undefined:{level:operation.level!,atMs:operation.atMs,corrected:false};
+  private applyOperation(
+    characters: Map<string, MutableCharacter>,
+    operation: PhysiologyOperation,
+    readerId: string,
+    inspect = false,
+    storyAtMs?: number | null,
+    progressMs?: number,
+  ) {
+    const character = characters.get(operation.characterId);
+    if (!character || (!inspect && !operation.readers.includes(readerId))) return;
+    character.sources.set(operation.sourceId + ':' + operation.sourceRevision, {
+      id: operation.sourceId,
+      revision: operation.sourceRevision,
+    });
+    if (operation.kind === 'need') {
+      // A source author is only a v2 marker; a non-story scope always keeps its real-time clock.
+      const tavernV2 = operation.authorId != null && storyAtMs !== undefined;
+      applyNeed(
+        character,
+        operation.need,
+        operation.action,
+        storyAtMs === undefined ? operation.atMs : storyAtMs,
+        false,
+        storyAtMs === undefined ? undefined : operation.atMs,
+        tavernV2 ? progressMs ?? null : undefined,
+      );
+    } else if (operation.kind === 'effect') {
+      if (operation.action === 'end') character.effects.delete(operation.effect);
+      else character.effects.set(operation.effect, {
+        kind: operation.effect,
+        severity: operation.severity ?? 'moderate',
+        detail: operation.evidence,
+        atMs: operation.atMs,
+        corrected: false,
+      });
+    } else if (operation.kind === 'reproductive') {
+      character.reproductive = operation.action === 'clear' ? undefined : {
+        status: operation.status!, detail: operation.evidence, atMs: operation.atMs, corrected: false,
+      };
+    } else {
+      character.sexualArousal = operation.action === 'clear' ? undefined : {
+        level: operation.level!, atMs: operation.atMs, corrected: false,
+      };
+    }
   }
 
-  private applyCorrection(characters:Map<string,MutableCharacter>,correction:StoredCorrection,readerId:string,inspect=false,storyAtMs?:number|null){
-    const character=characters.get(correction.characterId);if(!character||(!inspect&&!correction.readers.includes(readerId)))return;
-    character.corrections.add(correction.id);const patch=correction.patch;
-    if(patch.kind==='need'){
-      if(patch.state==='unknown')character.needs.delete(patch.need);
-      else character.needs.set(patch.need,{stage:patch.state,atMs:storyAtMs===undefined?correction.atMs:storyAtMs,sleeping:patch.sleeping===true,corrected:true,
-        ...(storyAtMs===undefined?{}:{shownAtMs:correction.atMs})});
-    }else if(patch.kind==='effect'){
-      if(patch.action==='clear')character.effects.delete(patch.effect);
-      else character.effects.set(patch.effect,{kind:patch.effect,severity:patch.severity??'moderate',detail:patch.detail??correction.reason,atMs:correction.atMs,corrected:true});
-    }else if(patch.kind==='reproductive')character.reproductive=patch.status==='unknown'?undefined:{status:patch.status,detail:patch.detail??correction.reason,atMs:correction.atMs,corrected:true};
-    else character.sexualArousal=patch.level==='unknown'?undefined:{level:patch.level,atMs:correction.atMs,corrected:true};
+  private applyCorrection(
+    characters: Map<string, MutableCharacter>,
+    correction: StoredCorrection,
+    readerId: string,
+    inspect = false,
+    storyAtMs?: number | null,
+    progressMs?: number,
+  ) {
+    const character = characters.get(correction.characterId);
+    if (!character || (!inspect && !correction.readers.includes(readerId))) return;
+    character.corrections.add(correction.id);
+    const patch = correction.patch;
+    if (patch.kind === 'need') {
+      if (patch.state === 'unknown') character.needs.delete(patch.need);
+      else character.needs.set(patch.need, {
+        stage: patch.state,
+        atMs: storyAtMs === undefined ? correction.atMs : storyAtMs,
+        sleeping: patch.sleeping === true,
+        corrected: true,
+        ...(storyAtMs === undefined ? {} : {shownAtMs: correction.atMs}),
+        ...(progressMs === undefined ? {} : {progressMs}),
+      });
+    } else if (patch.kind === 'effect') {
+      if (patch.action === 'clear') character.effects.delete(patch.effect);
+      else character.effects.set(patch.effect, {
+        kind: patch.effect, severity: patch.severity ?? 'moderate',
+        detail: patch.detail ?? correction.reason, atMs: correction.atMs, corrected: true,
+      });
+    } else if (patch.kind === 'reproductive') {
+      character.reproductive = patch.status === 'unknown' ? undefined : {
+        status: patch.status, detail: patch.detail ?? correction.reason, atMs: correction.atMs, corrected: true,
+      };
+    } else {
+      character.sexualArousal = patch.level === 'unknown' ? undefined : {
+        level: patch.level, atMs: correction.atMs, corrected: true,
+      };
+    }
   }
 
   private corrections(scope:SceneScope):StoredCorrection[]{
@@ -319,52 +663,257 @@ export class PhysiologyStore {
     const next=revision+1;this.db.prepare(`INSERT INTO scene_physiology_settings VALUES(?,?,?)
       ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,body=excluded.body`).run(scopeKey(scope),next,JSON.stringify(config));return next;
   }
-  private clock(scope:SceneScope,now:number){
-    try{return this.dependencies.clock(scope,now);}catch{return {kind:'story' as const,known:false,timeMs:null,timeZone:Intl.DateTimeFormat().resolvedOptions().timeZone};}
+  private clock(scope: SceneScope, now: number) {
+    let value: ReturnType<PhysiologyDependencies['clock']>;
+    try {
+      value = this.dependencies.clock(scope, now);
+    } catch {
+      return {
+        kind: 'story' as const,
+        known: false,
+        timeMs: null,
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      };
+    }
+    return snapshotData(value, 'data');
   }
   /**
    * The unified clock of a story scope; null for any other scope. A reading that throws (unreadable or rejected world
    * settings, a storage fault) is a story scope whose time is unknown: every computing time is null, so no stage
    * progresses. Only this one call is guarded: an error thrown anywhere else propagates.
    */
-  private storyTimeOf(scope:SceneScope,state:ReturnType<PhysiologyDependencies['state']>):{nowMs:number|null;originMs:number|null;at:(sourceId:string,revision?:number)=>number|null}|null{
-    try{return this.dependencies.storyTime?.(scope,state)??null;}catch{return {nowMs:null,originMs:null,at:()=>null};}
+  private storyTimeOf(
+    scope: SceneScope,
+    state: ReturnType<PhysiologyDependencies['state']>,
+    projectReadings = true,
+  ): {nowMs: number | null; originMs: number | null; at: (sourceId: string, revision?: number) => number | null} | null {
+    let story: ReturnType<NonNullable<PhysiologyDependencies['storyTime']>>;
+    try {
+      story = this.dependencies.storyTime?.(scope, state) ?? null;
+    } catch {
+      return {nowMs: null, originMs: null, at: () => null};
+    }
+    if (story === null) return null;
+    // Rendering needs only story presence; preserve HEAD without reading unused callback data.
+    if (!projectReadings) return story;
+    const nowMs = story.nowMs;
+    const originMs = story.originMs;
+    const read = story.at;
+    const readings = new Map<string, Map<number | undefined, number | null>>();
+    return {
+      nowMs,
+      originMs,
+      at(sourceId, revision) {
+        let revisions = readings.get(sourceId);
+        if (revisions?.has(revision)) return revisions.get(revision)!;
+        // Mixed legacy/v2 operations may request the same clock value; resolve each pair only once.
+        const value = read.call(story, sourceId, revision);
+        if (!revisions) {
+          revisions = new Map();
+          readings.set(sourceId, revisions);
+        }
+        revisions.set(revision, value);
+        return value;
+      },
+    };
   }
 }
 
+interface StoryProgress {
+  atMs: number | null;
+  elapsedMs: number;
+  invalidTime?: true;
+}
+
+interface PhysiologyTimeline {
+  sources: Map<string, Map<number, StoryProgress>>;
+  afterSource: Map<string, StoryProgress>;
+  elapsedMs: number;
+  lastAtMs: number | null;
+  snapshotSources: ReturnType<PhysiologyDependencies['state']>['sources'];
+  diagnostics: Array<
+    | {code: 'invalid_physiology_story_time'; sourceId: string; sourceRevision: number}
+    | {code: 'invalid_physiology_snapshot'; input: 'source'; sourceIndex: number}
+  >;
+}
+
+interface MutableNeed {
+  stage: typeof needStages[number];
+  atMs: number | null;
+  sleeping: boolean;
+  corrected: boolean;
+  basis?: 'default' | 'source';
+  shownAtMs?: number | null;
+  /** Cumulative capped story milliseconds at the anchor; absence is the legacy clock. */
+  progressMs?: number | null;
+}
+
 interface MutableCharacter {
-  characterId:string;name:string;needs:Map<PhysiologyNeed,{stage:typeof needStages[number];atMs:number|null;sleeping:boolean;corrected:boolean;basis?:'default'|'source';shownAtMs?:number|null}>;
-  effects:Map<EffectKind,{kind:EffectKind;severity:EffectSeverity|'unknown';detail:string;atMs:number|null;corrected:boolean}>;
-  reproductive?:{status:ReproductiveStatus;detail:string;atMs:number|null;corrected:boolean};
-  sexualArousal?:{level:ArousalLevel;atMs:number|null;corrected:boolean};sources:Map<string,{id:string;revision:number}>;corrections:Set<string>;
+  characterId: string;
+  name: string;
+  needs: Map<PhysiologyNeed, MutableNeed>;
+  effects: Map<EffectKind, {
+    kind: EffectKind; severity: EffectSeverity | 'unknown'; detail: string; atMs: number | null; corrected: boolean;
+  }>;
+  reproductive?: {status: ReproductiveStatus; detail: string; atMs: number | null; corrected: boolean};
+  sexualArousal?: {level: ArousalLevel; atMs: number | null; corrected: boolean};
+  sources: Map<string, {id: string; revision: number}>;
+  corrections: Set<string>;
 }
-function emptyCharacter(characterId:string,name:string):MutableCharacter{return {characterId,name,needs:new Map(),effects:new Map(),sources:new Map(),corrections:new Set()};}
-function projectCharacter(character:MutableCharacter,config:PhysiologyConfiguration,timeMs:number|null){
-  const needs=Object.fromEntries([...character.needs].filter(([need])=>config.dailyNeeds.includes(need)).map(([need,value])=>{
-    const stage=needStageAt(need,value,timeMs);
-    return [need,{stage,sleeping:value.sleeping,anchorTimeMs:value.shownAtMs===undefined?value.atMs:value.shownAtMs,corrected:value.corrected,...(value.basis?{basis:value.basis}:{})}];
-  }));
-  const effects=config.sustainedEffects?[...character.effects.values()].map(({detail:_detail,...effect})=>effect):[];
-  const reproductive=config.reproductive&&character.reproductive?((({detail:_detail,...value})=>value)(character.reproductive)):undefined;
-  const sexualArousal=config.sexualArousal?character.sexualArousal:undefined;
-  const known=Object.keys(needs).length>0||effects.length>0||reproductive!==undefined||sexualArousal!==undefined;
-  return {characterId:character.characterId,name:character.name,known,needs,effects,...(reproductive?{reproductive}:{}),...(sexualArousal?{sexualArousal}:{}),
-    sources:[...character.sources.values()],correctionIds:[...character.corrections]};
+
+function emptyCharacter(characterId: string, name: string): MutableCharacter {
+  return {characterId, name, needs: new Map(), effects: new Map(), sources: new Map(), corrections: new Set()};
 }
-function applyNeed(character:MutableCharacter,need:PhysiologyNeed,action:NeedAction,atMs:number|null,corrected:boolean,shownAtMs?:number|null){
-  const previous=character.needs.get(need);let rank=previous?needStages.indexOf(needStageAt(need,previous,atMs)):0;
-  if(action==='worsen')rank=Math.min(3,rank+1);else if(action==='improve')rank=Math.max(0,rank-1);else rank=0;
-  character.needs.set(need,{stage:needStages[rank]!,atMs,
-    sleeping:action==='sleep'?true:action==='wake'?false:(previous?.sleeping??false),corrected,
-    ...(shownAtMs===undefined?{}:{shownAtMs})});
+
+function projectCharacter(
+  character: MutableCharacter,
+  config: PhysiologyConfiguration,
+  timeMs: number | null,
+  timeline?: PhysiologyTimeline,
+) {
+  const needs = Object.fromEntries([...character.needs]
+    .filter(([need]) => config.dailyNeeds.includes(need))
+    .map(([need, value]) => {
+      const elapsedMs = timeline && value.progressMs != null
+        ? Math.max(0, timeline.elapsedMs - value.progressMs)
+        : undefined;
+      const stage = needStageAt(need, value, timeMs, elapsedMs);
+      return [need, {
+        stage,
+        sleeping: value.sleeping,
+        anchorTimeMs: value.shownAtMs === undefined ? value.atMs : value.shownAtMs,
+        corrected: value.corrected,
+        ...(value.basis ? {basis: value.basis} : {}),
+      }];
+    }));
+  const effects = config.sustainedEffects
+    ? [...character.effects.values()].map(({detail: _detail, ...effect}) => effect)
+    : [];
+  const reproductive = config.reproductive && character.reproductive
+    ? (({detail: _detail, ...value}) => value)(character.reproductive)
+    : undefined;
+  const sexualArousal = config.sexualArousal ? character.sexualArousal : undefined;
+  const known = Object.keys(needs).length > 0 || effects.length > 0
+    || reproductive !== undefined || sexualArousal !== undefined;
+  return {
+    characterId: character.characterId,
+    name: character.name,
+    known,
+    needs,
+    effects,
+    ...(reproductive ? {reproductive} : {}),
+    ...(sexualArousal ? {sexualArousal} : {}),
+    sources: [...character.sources.values()],
+    correctionIds: [...character.corrections],
+  };
 }
-function needStageAt(need:PhysiologyNeed,value:{stage:typeof needStages[number];atMs:number|null;sleeping:boolean},timeMs:number|null){
-  let stage=value.stage;
-  if(timeMs===null||value.atMs===null||value.sleeping||value.atMs>timeMs)return stage;
-  const elapsed=(timeMs-value.atMs)/3_600_000,thresholds=needThresholdHours[need];
-  const timed:typeof needStages[number]=elapsed>=thresholds[2]?'strained':elapsed>=thresholds[1]?'urgent':elapsed>=thresholds[0]?'noticeable':'settled';
-  if(needStages.indexOf(timed)>needStages.indexOf(stage))stage=timed;
+
+function applyNeed(
+  character: MutableCharacter,
+  need: PhysiologyNeed,
+  action: NeedAction,
+  atMs: number | null,
+  corrected: boolean,
+  shownAtMs?: number | null,
+  progressMs?: number | null,
+) {
+  const previous = character.needs.get(need);
+  const elapsedMs = progressMs != null && previous?.progressMs != null
+    ? Math.max(0, progressMs - previous.progressMs)
+    : undefined;
+  let rank = previous ? needStages.indexOf(needStageAt(need, previous, atMs, elapsedMs)) : 0;
+  // Existing closed stage ranks are unchanged: worsen/improve move one rank and other actions settle the need.
+  if (action === 'worsen') rank = Math.min(needStages.length - 1, rank + 1);
+  else if (action === 'improve') rank = Math.max(0, rank - 1);
+  else rank = 0;
+  character.needs.set(need, {
+    stage: needStages[rank]!,
+    atMs,
+    sleeping: action === 'sleep' ? true : action === 'wake' ? false : (previous?.sleeping ?? false),
+    corrected,
+    ...(shownAtMs === undefined ? {} : {shownAtMs}),
+    ...(progressMs === undefined ? {} : {progressMs}),
+  });
+}
+
+function needStageAt(
+  need: PhysiologyNeed,
+  value: {stage: typeof needStages[number]; atMs: number | null; sleeping: boolean},
+  timeMs: number | null,
+  cappedElapsedMs?: number,
+) {
+  let stage = value.stage;
+  if (timeMs === null || value.atMs === null || value.sleeping) return stage;
+  if (cappedElapsedMs === undefined && value.atMs > timeMs) return stage;
+  // The existing need thresholds are expressed in hours; clocks and the v2 cap use milliseconds.
+  const elapsed = (cappedElapsedMs === undefined ? timeMs - value.atMs : cappedElapsedMs) / 3_600_000;
+  const thresholds = needThresholdHours[need];
+  const timed: typeof needStages[number] = elapsed >= thresholds[2] ? 'strained'
+    : elapsed >= thresholds[1] ? 'urgent' : elapsed >= thresholds[0] ? 'noticeable' : 'settled';
+  if (needStages.indexOf(timed) > needStages.indexOf(stage)) stage = timed;
   return stage;
+}
+
+function physiologyTimeline(
+  sources: ReturnType<PhysiologyDependencies['state']>['sources'],
+  story: {originMs: number | null; at: (sourceId: string, revision?: number) => number | null},
+): PhysiologyTimeline {
+  const timeline: PhysiologyTimeline = {
+    sources: new Map(),
+    afterSource: new Map(),
+    elapsedMs: 0,
+    lastAtMs: null,
+    snapshotSources: [],
+    diagnostics: [],
+  };
+  const originMs = story.originMs;
+  timeline.lastAtMs = isStoryClockMs(originMs) ? originMs : null;
+  let previousAtMs: number | null = null;
+  // O(total source graph size) time and space; clone before inspecting any field in this v2 fold.
+  // Each accepted source makes one callback lookup, independent of the number of need anchors.
+  for (const [sourceIndex, originalSource] of sources.entries()) {
+    let source: typeof originalSource;
+    try {
+      source = snapshotData(originalSource, 'source');
+    } catch {
+      timeline.diagnostics.push({code: 'invalid_physiology_snapshot', input: 'source', sourceIndex});
+      previousAtMs = null;
+      continue;
+    }
+    timeline.snapshotSources.push(source);
+    if (source.status === 'accepted') {
+      const reading = story.at(source.id, source.revision);
+      const invalidTime = reading !== null && !isStoryClockMs(reading);
+      const atMs = invalidTime ? null : reading;
+      if (invalidTime) {
+        timeline.diagnostics.push({
+          code: 'invalid_physiology_story_time',
+          sourceId: source.id,
+          sourceRevision: source.revision,
+        });
+      }
+
+      if (atMs !== null && previousAtMs !== null) {
+        timeline.elapsedMs += Math.min(Math.max(atMs - previousAtMs, 0), PHYSIOLOGY_JUMP_CAP_MS);
+      }
+      // Unknown or invalid time breaks adjacency without erasing the already credited finite prefix.
+      previousAtMs = atMs;
+      if (atMs !== null) timeline.lastAtMs = atMs;
+
+      let revisions = timeline.sources.get(source.id);
+      if (!revisions) {
+        revisions = new Map();
+        timeline.sources.set(source.id, revisions);
+      }
+      revisions.set(source.revision, {
+        atMs,
+        elapsedMs: timeline.elapsedMs,
+        ...(invalidTime ? {invalidTime: true} : {}),
+      });
+    }
+    timeline.afterSource.set(source.id, {atMs: timeline.lastAtMs, elapsedMs: timeline.elapsedMs});
+  }
+  return timeline;
 }
 
 function configurationOf(value:unknown,roster:SceneRoster,tolerateRemovedCharacters=false):PhysiologyConfiguration{
@@ -422,58 +971,200 @@ function patchOf(value:unknown,config:PhysiologyConfiguration):PhysiologyCorrect
   throw new Error('invalid_physiology_patch');
 }
 
-function decodeOperations(value:unknown,source:SceneMessage,plan:PerspectivePlan,roster:SceneRoster,config:PhysiologyConfiguration,atMs:number|null):PhysiologyOperation[]{
-  const input=record(value,'invalid_physiology_operations');
-  if(Object.keys(input).some(key=>key!=='operations')||!Array.isArray(input.operations)||input.operations.length>12)throw new Error('invalid_physiology_operations');
-  return input.operations.map(candidate=>{
-    const raw=record(candidate,'invalid_physiology_operation'),ref=bounded(raw.ref,300,'invalid_physiology_operation');
-    const observation=plan.observations.find(item=>item.id===ref);if(!observation)throw new Error('invalid_physiology_source');
-    const characterId=bounded(raw.characterId,200,'invalid_scene_character');
-    if(!config.trackedCharacterIds.includes(characterId)||!observation.readers.includes(characterId)||!roster.characters.some(item=>item.id===characterId))throw new Error('invalid_scene_character');
-    if(raw.temporality!=='current'||!currentPhysiologyEvidence(source,observation,characterId))throw new Error('invalid_physiology_temporality');
-    const readers=[...new Set([characterId,...observation.readers,...(observation.playerVisible?['player']:[])])];
-    const base:OperationBase={sourceId:source.id,sourceRevision:source.revision,characterId,ref,evidence:observation.quote,readers,atMs,temporality:'current'};
-    return candidateOperation(raw,base,config);
+function decodeOperations(
+  value: unknown,
+  source: SceneMessage,
+  plan: PerspectivePlan,
+  roster: SceneRoster,
+  config: PhysiologyConfiguration,
+  atMs: number | null,
+  tavernV2?: PhysiologyTavernV2 | null,
+): PhysiologyOperation[] {
+  const input = record(value, 'invalid_physiology_operations');
+  // Preserve the existing per-source candidate limit, not a limit on chat history.
+  if (Object.keys(input).some(key => key !== 'operations')
+    || !Array.isArray(input.operations) || input.operations.length > 12) {
+    throw new Error('invalid_physiology_operations');
+  }
+  return input.operations.map(candidate => {
+    const raw = record(
+      tavernV2 == null ? candidate : snapshotData(candidate, 'operation'), 'invalid_physiology_operation',
+    );
+    const ref = bounded(raw.ref, 300, 'invalid_physiology_operation');
+    const observation = plan.observations.find(item => item.id === ref);
+    if (!observation) throw new Error('invalid_physiology_source');
+    const characterId = bounded(raw.characterId, 200, 'invalid_scene_character');
+    const author = tavernV2 == null ? null : observationAuthor(source, observation);
+    if (!config.trackedCharacterIds.includes(characterId)
+      || !(observation.readers.includes(characterId) || (tavernV2 != null && author === characterId))
+      || !roster.characters.some(item => item.id === characterId)) {
+      throw new Error('invalid_scene_character');
+    }
+    if (raw.temporality !== 'current') throw new Error('invalid_physiology_temporality');
+    const supported = tavernV2 == null
+      ? currentPhysiologyEvidence(source, observation, characterId)
+      : v2PhysiologyEvidence(source, observation, characterId);
+    if (!supported) throw new Error('invalid_physiology_temporality');
+    if (tavernV2 != null && raw.authorId != null && raw.authorId !== author) {
+      throw new Error('invalid_physiology_source');
+    }
+    const readers = [...new Set([
+      characterId, ...observation.readers, ...(observation.playerVisible ? ['player'] : []),
+    ])];
+    const base: OperationBase = {
+      sourceId: source.id,
+      sourceRevision: source.revision,
+      characterId,
+      ref,
+      evidence: observation.quote,
+      readers,
+      atMs,
+      temporality: 'current',
+      ...(author === null ? {} : {authorId: author}),
+    };
+    return candidateOperation(raw, base, config, tavernV2 != null,
+      tavernV2 == null ? undefined : observationItemRef(observation));
   });
 }
-function candidateOperation(raw:Record<string,unknown>,base:OperationBase,config:PhysiologyConfiguration):PhysiologyOperation{
-  const common=['sourceId','sourceRevision','characterId','ref','evidence','readers','atMs','temporality','kind'];
-  if(raw.kind==='need'){
-    exactKeys(raw,[...common,'need','action'],'invalid_physiology_operation');
-    const need=bounded(raw.need,30,'invalid_physiology_need') as PhysiologyNeed;
-    if(!config.dailyNeeds.includes(need)||!['satisfy','worsen','improve','sleep','wake'].includes(String(raw.action)))throw new Error('invalid_physiology_operation');
-    return {...base,kind:'need',need,action:raw.action as NeedAction};
+
+function operationActionMatches(value: unknown, allowed: readonly string[], tavernV2: boolean): boolean {
+  if (tavernV2) return typeof value === 'string' && allowed.includes(value);
+
+  // Preserve the historical legacy contract, including malformed-input behavior, outside the explicit v2 boundary.
+  return allowed.includes(String(value));
+}
+
+function candidateOperation(
+  raw: Record<string, unknown>,
+  base: OperationBase,
+  config: PhysiologyConfiguration,
+  tavernV2 = false,
+  itemRef?: number,
+): PhysiologyOperation {
+  const common = ['sourceId', 'sourceRevision', 'characterId', 'ref', 'evidence', 'readers', 'atMs',
+    'temporality', 'kind'];
+  if (tavernV2) {
+    common.push('authorId', 'itemRef');
+    if (raw.itemRef != null && raw.itemRef !== itemRef) throw new Error('invalid_physiology_operation');
+    if (itemRef !== undefined) base = {...base, itemRef};
   }
-  if(raw.kind==='effect'){
-    exactKeys(raw,[...common,'effect','action','severity'],'invalid_physiology_operation');
-    const effect=bounded(raw.effect,40,'invalid_physiology_operation') as EffectKind;
-    if(!config.sustainedEffects||!effectKinds.has(effect)||!['start','update','end'].includes(String(raw.action)))throw new Error('invalid_physiology_operation');
-    if(raw.severity!==undefined&&!effectSeverities.has(raw.severity as EffectSeverity))throw new Error('invalid_physiology_operation');
-    return {...base,kind:'effect',effect,action:raw.action as 'start'|'update'|'end',...(raw.severity?{severity:raw.severity as EffectSeverity}:{})};
+  if (raw.kind === 'need') {
+    exactKeys(raw, [...common, 'need', 'action'], 'invalid_physiology_operation');
+    const need = bounded(raw.need, 30, 'invalid_physiology_need') as PhysiologyNeed;
+    if (!config.dailyNeeds.includes(need)
+      || !operationActionMatches(raw.action, ['satisfy', 'worsen', 'improve', 'sleep', 'wake'], tavernV2)) {
+      throw new Error('invalid_physiology_operation');
+    }
+    return {...base, kind: 'need', need, action: raw.action as NeedAction};
   }
-  if(raw.kind==='reproductive'){
-    exactKeys(raw,[...common,'action','status'],'invalid_physiology_operation');
-    if(!config.reproductive||!['set','clear'].includes(String(raw.action))||(raw.action==='set'&&!reproductiveStatuses.has(raw.status as ReproductiveStatus)))throw new Error('invalid_physiology_operation');
-    return {...base,kind:'reproductive',action:raw.action as 'set'|'clear',...(raw.action==='set'?{status:raw.status as ReproductiveStatus}:{})};
+  if (raw.kind === 'effect') {
+    exactKeys(raw, [...common, 'effect', 'action', 'severity'],
+      'invalid_physiology_operation');
+    const effect = bounded(raw.effect, 40, 'invalid_physiology_operation') as EffectKind;
+    if (!config.sustainedEffects || !effectKinds.has(effect)
+      || !operationActionMatches(raw.action, ['start', 'update', 'end'], tavernV2)) {
+      throw new Error('invalid_physiology_operation');
+    }
+    const hasSeverity = tavernV2 ? raw.severity != null : raw.severity !== undefined;
+    if (hasSeverity && ((tavernV2 && typeof raw.severity !== 'string')
+      || !effectSeverities.has(raw.severity as EffectSeverity))) {
+      throw new Error('invalid_physiology_operation');
+    }
+    return {
+      ...base,
+      kind: 'effect',
+      effect,
+      action: raw.action as 'start' | 'update' | 'end',
+      ...(raw.severity ? {severity: raw.severity as EffectSeverity} : {}),
+    };
   }
-  if(raw.kind==='sexualArousal'){
-    exactKeys(raw,[...common,'action','level'],'invalid_physiology_operation');
-    if(!config.sexualArousal||!['set','clear'].includes(String(raw.action))||(raw.action==='set'&&!arousalLevels.has(raw.level as ArousalLevel)))throw new Error('invalid_physiology_operation');
-    return {...base,kind:'sexualArousal',action:raw.action as 'set'|'clear',...(raw.action==='set'?{level:raw.level as ArousalLevel}:{})};
+  if (raw.kind === 'reproductive') {
+    exactKeys(raw, [...common, 'action', 'status'], 'invalid_physiology_operation');
+    if (!config.reproductive || !operationActionMatches(raw.action, ['set', 'clear'], tavernV2)
+      || (raw.action === 'set' && ((tavernV2 && typeof raw.status !== 'string')
+        || !reproductiveStatuses.has(raw.status as ReproductiveStatus)))) {
+      throw new Error('invalid_physiology_operation');
+    }
+    return {
+      ...base,
+      kind: 'reproductive',
+      action: raw.action as 'set' | 'clear',
+      ...(raw.action === 'set' ? {status: raw.status as ReproductiveStatus} : {}),
+    };
+  }
+  if (raw.kind === 'sexualArousal') {
+    exactKeys(raw, [...common, 'action', 'level'], 'invalid_physiology_operation');
+    if (!config.sexualArousal || !operationActionMatches(raw.action, ['set', 'clear'], tavernV2)
+      || (raw.action === 'set' && ((tavernV2 && typeof raw.level !== 'string')
+        || !arousalLevels.has(raw.level as ArousalLevel)))) {
+      throw new Error('invalid_physiology_operation');
+    }
+    return {
+      ...base,
+      kind: 'sexualArousal',
+      action: raw.action as 'set' | 'clear',
+      ...(raw.action === 'set' ? {level: raw.level as ArousalLevel} : {}),
+    };
   }
   throw new Error('invalid_physiology_operation');
 }
-function validateStoredOperation(value:unknown,source:SceneMessage,plan:PerspectivePlan,roster:SceneRoster):PhysiologyOperation{
-  const raw=record(value,'invalid_physiology_operation'),ref=bounded(raw.ref,300,'invalid_physiology_operation');
-  const observation=plan.observations.find(item=>item.id===ref);if(!observation||raw.sourceId!==source.id||raw.sourceRevision!==source.revision||raw.evidence!==observation.quote
-    ||(raw.atMs!==null&&(!Number.isSafeInteger(raw.atMs)||(raw.atMs as number)<0))||!Array.isArray(raw.readers))throw new Error('invalid_physiology_source');
-  const characterId=bounded(raw.characterId,200,'invalid_scene_character');
-  if(raw.temporality!=='current'||!currentPhysiologyEvidence(source,observation,characterId))throw new Error('invalid_physiology_temporality');
-  const readers=[...new Set([characterId,...observation.readers,...(observation.playerVisible?['player']:[])])];
-  if(!roster.characters.some(item=>item.id===characterId)||JSON.stringify(raw.readers)!==JSON.stringify(readers))throw new Error('invalid_physiology_source');
-  return candidateOperation(raw,{sourceId:source.id,sourceRevision:source.revision,characterId,ref,evidence:observation.quote,readers,atMs:raw.atMs as number|null,temporality:'current'},{
-    enabled:true,dailyNeeds:[...physiologyNeeds],sustainedEffects:true,reproductive:true,sexualArousal:true,trackedCharacterIds:roster.characters.map(item=>item.id),
-  });
+
+function validateStoredOperation(
+  value: unknown,
+  source: SceneMessage,
+  plan: PerspectivePlan,
+  roster: SceneRoster,
+  tavernV2?: PhysiologyTavernV2 | null,
+): PhysiologyOperation {
+  const raw = record(value, 'invalid_physiology_operation');
+  const ref = bounded(raw.ref, 300, 'invalid_physiology_operation');
+  const observation = plan.observations.find(item => item.id === ref);
+  if (!observation || raw.sourceId !== source.id || raw.sourceRevision !== source.revision
+    || raw.evidence !== observation.quote
+    || (raw.atMs !== null && (!Number.isSafeInteger(raw.atMs) || (raw.atMs as number) < 0))
+    || !Array.isArray(raw.readers)) {
+    throw new Error('invalid_physiology_source');
+  }
+  const characterId = bounded(raw.characterId, 200, 'invalid_scene_character');
+  const author = tavernV2 == null ? null : observationAuthor(source, observation);
+  if (tavernV2 != null && (author === null || raw.authorId !== author)) {
+    throw new Error('invalid_physiology_source');
+  }
+  if (raw.temporality !== 'current') throw new Error('invalid_physiology_temporality');
+  const supported = tavernV2 == null
+    ? currentPhysiologyEvidence(source, observation, characterId)
+    : v2PhysiologyEvidence(source, observation, characterId);
+  if (!supported) throw new Error('invalid_physiology_temporality');
+  if (tavernV2 != null && !observation.readers.includes(characterId) && author !== characterId) {
+    throw new Error('invalid_physiology_source');
+  }
+  const readers = [...new Set([characterId, ...observation.readers, ...(observation.playerVisible ? ['player'] : [])])];
+  if (!roster.characters.some(item => item.id === characterId)
+    || JSON.stringify(raw.readers) !== JSON.stringify(readers)) {
+    throw new Error('invalid_physiology_source');
+  }
+  const itemRef = tavernV2 == null ? undefined : observationItemRef(observation);
+  if (tavernV2 != null && itemRef !== undefined && raw.itemRef !== itemRef) {
+    throw new Error('invalid_physiology_operation');
+  }
+  return candidateOperation(raw, {
+    sourceId: source.id,
+    sourceRevision: source.revision,
+    characterId,
+    ref,
+    evidence: observation.quote,
+    readers,
+    atMs: raw.atMs as number | null,
+    temporality: 'current',
+    ...(author === null ? {} : {authorId: author}),
+  }, {
+    enabled: true,
+    dailyNeeds: [...physiologyNeeds],
+    sustainedEffects: true,
+    reproductive: true,
+    sexualArousal: true,
+    trackedCharacterIds: roster.characters.map(item => item.id),
+  }, tavernV2 != null, itemRef);
 }
 
 const physiologyPrompt=`你只提取虚拟角色正文中有逐字依据的生理状态变化，不能推断现实用户身体，不能补角色未说明的身体资料。只返回 JSON {"operations":[]}，最多12项。
@@ -489,8 +1180,83 @@ function record(value:unknown,code:string):Record<string,unknown>{if(!value||typ
 function bounded(value:unknown,max:number,code:string):string{if(typeof value!=='string'||!value.trim()||value.length>max)throw new Error(code);return value;}
 function assertRevision(actual:number,expected:number){if(!Number.isSafeInteger(expected)||expected<0)throw new Error('invalid_physiology_revision');if(actual!==expected)throw new Error('context_changed_retry');}
 function exactKeys(value:Record<string,unknown>,allowed:string[],code:string){if(Object.keys(value).some(key=>!allowed.includes(key)))throw new Error(code);}
-function currentPhysiologyEvidence(source:SceneMessage,observation:PerspectivePlan['observations'][number],characterId:string):boolean{
-  const factSource=observation.kind==='observed'||(source.role==='assistant'&&source.speakerId===characterId);
-  if(!factSource)return false;
-  return !/(?:明天|以后|将来|将会|打算|计划|如果|假如|要是|可能会|去年|前年|曾经|回忆|当时|过去|小时候|梦见|想象|tomorrow|yesterday|last\s+year|used\s+to|plan\s+to|if\s+.+\b(?:would|will)\b)/iu.test(foldForMatch(observation.quote));
+type PhysiologyObservation = PerspectivePlan['observations'][number] & {
+  channel?: 'message' | 'event';
+  ref?: {itemRef?: number | null};
+};
+
+// Structured cloning visits each own enumerable input property once, including nested evidence.
+// The error carries a stable diagnostic without reading an uncopyable object to identify it.
+function snapshotData<T>(value: T, input: 'data' | 'state' | 'source' | 'observation' | 'operation'): T {
+  try {
+    return structuredClone(value);
+  } catch (cause) {
+    const diagnostics = [{code: 'invalid_physiology_snapshot', input}];
+    // Never attach metadata to a caller-owned error, even when its existing properties are writable.
+    const error = new Error('invalid_physiology_snapshot', {cause});
+    throw Object.assign(error, {diagnostics});
+  }
+}
+
+function snapshotObservations(plan: PerspectivePlan): PerspectivePlan {
+  return {...plan, observations: plan.observations.map(observation => snapshotData(observation, 'observation'))};
+}
+
+// Safe integer story milliseconds include both endpoints; negative zero is not a valid clock reading.
+function isStoryClockMs(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value)
+    && value >= 0 && value <= STORY_CLOCK_MAX_MS && !Object.is(value, -0);
+}
+
+function validateV2Source(source: SceneMessage) {
+  if (!Number.isSafeInteger(source.revision) || source.revision < 1) {
+    throw new Error('invalid_physiology_source');
+  }
+}
+
+function observationAuthor(source: SceneMessage, observation: PhysiologyObservation): string | null {
+  const actorId = observation.actorId;
+  // Routed events name their author even without the optional legacy attribution marker.
+  if (observation.channel === 'event' || observation.attributed === true) {
+    return typeof actorId === 'string' && actorId.length > 0 ? actorId : null;
+  }
+  if (source.role === 'assistant' && observation.kind === 'heard' && typeof actorId === 'string' && actorId) {
+    return actorId;
+  }
+  if (source.role === 'assistant') return source.speakerId ?? null;
+  if (source.role === 'user') return 'player';
+  return null;
+}
+
+function v2PhysiologyEvidence(
+  source: SceneMessage,
+  observation: PhysiologyObservation,
+  characterId: string,
+): boolean {
+  const author = observationAuthor(source, observation);
+  if (author === null || !currentStatement(observation.quote)) return false;
+  // Objective observations can describe another body; hearsay only supports the actual speaker's own body.
+  return observation.kind === 'observed' || (observation.kind === 'heard' && author === characterId);
+}
+
+function observationItemRef(observation: PhysiologyObservation): number | undefined {
+  const value = observation.ref?.itemRef;
+  if (value == null) return undefined;
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error('invalid_physiology_operation');
+  return value;
+}
+
+function currentStatement(quote: string): boolean {
+  // Reuse the historical lexical check without changing legacy prompt, matching or parse-error behavior.
+  return !/(?:明天|以后|将来|将会|打算|计划|如果|假如|要是|可能会|去年|前年|曾经|回忆|当时|过去|小时候|梦见|想象|tomorrow|yesterday|last\s+year|used\s+to|plan\s+to|if\s+.+\b(?:would|will)\b)/iu.test(foldForMatch(quote));
+}
+function currentPhysiologyEvidence(
+  source: SceneMessage,
+  observation: PerspectivePlan['observations'][number],
+  characterId: string,
+): boolean {
+  const factSource = observation.kind === 'observed'
+    || (source.role === 'assistant' && source.speakerId === characterId);
+  if (!factSource) return false;
+  return currentStatement(observation.quote);
 }

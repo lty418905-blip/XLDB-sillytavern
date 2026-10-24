@@ -8,6 +8,8 @@ import type { TavernBeatActorContract, TavernBeatInput, TavernBeatPrefix, Tavern
 import { TavernPerception } from './perception.ts';
 import { projectTavernWorld } from './projection.ts';
 import type { TavernWorldSnapshot } from './projection.ts';
+import { checkTavernPlayerEffects, checkTavernPlayerWorld } from './player-effects.ts';
+import type { TavernPlayerWorld } from './player-effects.ts';
 import {
   buildTavernScheduleRoster,
   createTavernTurnBudget,
@@ -227,6 +229,16 @@ export type TavernBeatCheck = {
 export interface TavernEnginePorts {
   ledger: TavernEngineLedgerPort;
   clock: TavernEngineClockPort;
+  /**
+   * Synchronous authority snapshot before acceptance; the port belongs to the service adapter.
+   * Throws/bad shapes downgrade spatial/ownership effects only. acceptPlayer must still check expectedVersion.
+   */
+  readPlayerWorld(input: {
+    scope: Scope;
+    turnId: string;
+    turnRevision: number;
+    expectedVersion: number;
+  }): TavernPlayerWorld;
   interpret(input: {
     identity: TavernTurnIdentity;
     message: AcceptedMessage;
@@ -668,6 +680,21 @@ export class TavernEngine {
       return { accepted, fallback: accepted.interpretation.outcome === 'fallback' };
     }
     for (const event of events) requireEventIdentity(event, turn.identity, 'tentative');
+    let playerWorld: TavernPlayerWorld | null = null;
+    try {
+      playerWorld = checkTavernPlayerWorld(this.#ports.readPlayerWorld({
+        scope: structuredClone(turn.identity.scope),
+        turnId: turn.identity.turnId,
+        turnRevision: turn.identity.turnRevision,
+        expectedVersion: turn.version,
+      }), turn.identity.scope, turn.request.playerId);
+    } catch {
+      // Reading a snapshot must not prevent acceptance of the already accepted player source.
+      // Never substitute the later preparation snapshot or let unchecked hard effects reach the ledger.
+      playerWorld = null;
+    }
+    this.#checkCancellation(turn);
+    events = checkTavernPlayerEffects(events, turn.request.playerId, playerWorld);
     const accepted = structuredClone(this.#ports.ledger.acceptPlayer({
       scope: structuredClone(turn.identity.scope),
       turnId: turn.identity.turnId,
@@ -740,6 +767,7 @@ export class TavernEngine {
         materials: initial.materials.filter(material =>
           material.channel === 'memory' || material.channel === 'recall' || material.channel === 'emotion'),
         turnWindow: initial.turnWindow,
+        ...(contract.names == null ? {} : { names: structuredClone(contract.names) }),
       });
       if (contract.beatConfigurationId !== contract.frontConfigurationId) {
         if (contract.frontIntent == null) {

@@ -1,4 +1,5 @@
 import {foldForMatch, scriptQuoteSearch} from '../common/script-fold.ts';
+import {eventConsumerKey, type EventConsumerSource} from './tavern-engine/perception.ts';
 import {amountExpressionWork,
   type AmountExpression, type QuantityExpression, type RateExpression, type AmountUnit} from '../common/amount-expressions.ts';
 import {executeCalculation, replayCalculation, listCalculationLeaves,
@@ -25,7 +26,30 @@ export type LedgerDoubt = 'payer_unsure'|'account_unsure'|'agency_unsure'|'direc
   |'unit_or_total_unsure'|'quantity_unsure'|'item_unsure'|'maybe_restates'|'maybe_not_settled';
 export type LedgerRelationKind = 'refund_of'|'balance_of'|'settles'|'restates'|'in_addition_to'|'paired_with';
 export interface LedgerSourceRef {sourceId:string; revision:number}
-export interface LedgerText extends LedgerSourceRef {role:'user'|'assistant'; text:string; speakerId?:string; replyTo?:{id:string; revision:number}}
+export interface LedgerText extends LedgerSourceRef {
+  role: 'user' | 'assistant';
+  text: string;
+  speakerId?: string;
+  replyTo?: {id: string; revision: number};
+  /** Present only for an event-local text container; all numeric spans address its quote, never display B. */
+  event?: EventConsumerSource;
+}
+
+/**
+ * Gives numeric consumers one event's original text and stable identity. The complete message/revision/ref
+ * remains in event; attribution uses the existing observation.actorId/attributed/recipients fields.
+ * O(identity bytes + event bytes); malformed references or getters propagate.
+ */
+export function ledgerEventText(event: EventConsumerSource): LedgerText {
+  return {
+    sourceId: eventConsumerKey(event),
+    revision: event.revision,
+    role: event.role,
+    text: event.observation.quote,
+    speakerId: event.observation.actorId,
+    event,
+  };
+}
 export interface LedgerQuote {span:LedgerSpan; quote:string}
 export type LedgerParty = {account:string} | {external:LedgerQuote|null}
   | {unconfigured:{kind:'organisation'|'shared'|'private'; label:LedgerQuote|null}};
@@ -833,6 +857,10 @@ function staticEntry(proposedEntry: NormalizedLedgerProposedEntry, proposalConte
         storedEntry.actor.id = null;
     checks.actorGrounded = labels.length > 0 && (proposedEntry.actor.basis === 'name' ? !!actorQuote &&
         labels.some(label => foldForMatch(label) === foldForMatch(actorQuote.quote)) :
+        proposalContext.source.event != null ?
+            proposedEntry.actor.id === proposalContext.source.event.observation.actorId &&
+            (proposedEntry.actor.basis === 'self' ? !!actorQuote && actorQuote.quote.includes('我') :
+                proposedEntry.actor.basis === 'speaker' && proposedEntry.actor.quote === null) :
         proposedEntry.actor.id === 'player' &&
             (proposedEntry.actor.basis === 'self' ? proposalContext.source.role === 'user' && !!actorQuote &&
                 actorQuote.quote.includes('我') :

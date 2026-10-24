@@ -1,6 +1,7 @@
 import {foldForMatch,includesForMatch,scriptQuoteSearch,sourceQuote} from '../common/script-fold.ts';
 import { calculate } from '../core/arithmetic.ts';
-import type { PerspectivePlan } from './types.ts';
+import type { EventSourceObservation, PerspectivePlan } from './types.ts';
+import {eventConsumerKey, type EventConsumerSource} from './tavern-engine/perception.ts';
 import {legacyTemporalGuard} from './time-expressions.ts';
 import {
   createSourceHoleLedger,
@@ -13,6 +14,7 @@ import {
   foldLedgerPrefix,
   legacyLedgerKey,
   markLedgerCorrections,
+  ledgerEventText,
   projectLedger,
   type LedgerFoldBridge,
   type LedgerLegacyHooks,
@@ -145,6 +147,27 @@ export interface WorldSourceEffects {
   ledger?: StoredLedger;
   ledgerMarks?: LedgerMarks;
   replyTo?: {id:string;revision:number};
+  /** Resolved current event; text is its quote and sourceId is its stable event-container identity. */
+  event?: EventConsumerSource;
+}
+
+/**
+ * Adapts one current event to existing numeric folding. Candidate evidence is local to the event quote;
+ * the observation itself has no offsets. An empty event never borrows display prose as evidence.
+ * O(event bytes + candidate bytes). Inputs remain caller-owned; use the result only in this consumption pass.
+ */
+export function worldEventSource(
+  event: EventConsumerSource,
+  candidates: readonly unknown[] | null = [],
+  ledger?: StoredLedger | null,
+): WorldSourceEffects {
+  return {
+    ...ledgerEventText(event),
+    acceptedAtMs: event.acceptedAtMs,
+    plan: {observations: [event.observation], unresolved: []},
+    candidates: candidates ?? [],
+    ...(ledger == null ? {} : {ledger}),
+  };
 }
 
 export interface WorldEffectReceipt {
@@ -262,9 +285,9 @@ export function foldWorldState(
         if ('span' in region) return observedReaders(validated, source, region.span);
         const readers = new Set<string>();
         for (const observation of source.plan.observations) {
-          // Event references have no message offsets; their consumer adapter must handle them explicitly.
           if (observation.channel === 'event') {
-            throw new Error('event_observation_consumer_pending_en31');
+            for (const id of eventReaders(validated, source, observation)) readers.add(id);
+            continue;
           }
 
           for (const id of observedReaders(validated, source, observation)) readers.add(id);
@@ -451,9 +474,9 @@ export function foldWorldStateRunning(settings: WorldSettings, sources: readonly
         if ('span' in region) return observedReaders(validated, source, region.span);
         const readers = new Set<string>();
         for (const observation of source.plan.observations) {
-          // Event references have no message offsets; their consumer adapter must handle them explicitly.
           if (observation.channel === 'event') {
-            throw new Error('event_observation_consumer_pending_en31');
+            for (const id of eventReaders(validated, source, observation)) readers.add(id);
+            continue;
           }
 
           for (const id of observedReaders(validated, source, observation)) readers.add(id);
@@ -801,10 +824,30 @@ function readBase(raw:unknown,source:WorldSourceEffects):
   return {candidate:raw,effectId,quote:source.text.slice(evidence.start,evidence.end),classification:raw.timeClassification,evidence};
 }
 
+// Event-local numeric spans never identify an observation. The structural address owns the whole quote.
+function eventReaders(
+  validated: ValidatedSettings,
+  source: WorldSourceEffects,
+  observation: EventSourceObservation,
+): string[] {
+  const event = source.event;
+  if (event == null || source.sourceId !== eventConsumerKey(event) || source.revision !== event.revision
+    || source.text !== event.observation.quote
+    || JSON.stringify(observation.ref) !== JSON.stringify(event.observation.ref)) return [];
+  return event.observation.readers.filter(id => id === WORLD_PLAYER_ID || validated.actorIds.has(id));
+}
+
 function observedReaders(validated:ValidatedSettings,source:WorldSourceEffects,evidence:WorldEffectEvidence):string[] {
   const readers=new Set<string>();
   if (!source.plan||!Array.isArray(source.plan.observations)) return [];
   for (const observation of source.plan.observations) {
+    if (observation?.channel === 'event') {
+      if (isTime(evidence.start) && isTime(evidence.end) && evidence.start < evidence.end
+        && evidence.end <= observation.quote.length) {
+        for (const id of eventReaders(validated, source, observation)) readers.add(id);
+      }
+      continue;
+    }
     if (!observation||observation.kind!=='observed'||typeof observation.quote!=='string'
       || !isTime(observation.start)||!isTime(observation.end)||observation.start>=observation.end
       || observation.end>source.text.length||source.text.slice(observation.start,observation.end)!==observation.quote
@@ -830,6 +873,10 @@ function playerEvidenceCovers(text:string,observationStart:number,observationEnd
 
 function ownerGrounded(validated:ValidatedSettings,source:WorldSourceEffects,ownerId:string,ownerQuote:string,effectQuote:string):boolean {
   if (!includesForMatch(effectQuote,ownerQuote)) return false;
+  if (ownerQuote === '我' && source.event != null) {
+    return ownerId === source.event.observation.actorId && source.text.startsWith('我')
+      && source.text.indexOf(effectQuote) === 0;
+  }
   if(ownerQuote==='我')return ownerId===WORLD_PLAYER_ID&&source.role==='user'&&source.text.startsWith('我')&&source.text.indexOf(effectQuote)===0;
   const original=sourceQuote(effectQuote,ownerQuote)!;
   const labels:[[string,readonly string[]],...[string,readonly string[]][]]=[[WORLD_PLAYER_ID,[validated.settings.playerName]],...validated.actorLabels];
@@ -883,6 +930,15 @@ function validateSource(source:WorldSourceEffects):WorldIssue[] {
     ||(source.role!=='user'&&source.role!=='assistant')||typeof source.text!=='string'||!isTime(source.acceptedAtMs)
     ||!isRecord(source.plan)||!Array.isArray(source.plan.observations)||!Array.isArray(source.candidates)||source.candidates.length>64) {
     return [{sourceId:isRecord(source)&&typeof source.sourceId==='string'?source.sourceId:'',revision:isRecord(source)&&Number.isSafeInteger(source.revision)?source.revision:0,code:'invalid_world_source'}];
+  }
+  if (source.event != null && (source.sourceId !== eventConsumerKey(source.event)
+    || source.revision !== source.event.revision || source.role !== source.event.role
+    || source.text !== source.event.observation.quote)) {
+    return [issue(source, undefined, 'invalid_world_event_source')];
+  }
+  if (source.event == null && source.plan.observations.some(observation => observation.channel === 'event')
+    && (source.candidates.length > 0 || source.ledger != null || source.ledgerMarks != null)) {
+    return [issue(source, undefined, 'invalid_world_event_source')];
   }
   return [];
 }

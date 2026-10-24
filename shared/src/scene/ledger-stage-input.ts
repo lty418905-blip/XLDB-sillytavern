@@ -10,7 +10,11 @@ import {
   type RateExpression,
   type AmountUnit,
 } from '../common/amount-expressions.ts';
-import {ledgerReferenceValues, foldLedgerPrefix, accountsFromFold} from './world-ledger.ts';
+import {ledgerReferenceValues, foldLedgerPrefix, accountsFromFold, ledgerEventText} from './world-ledger.ts';
+import {projectEventConsumerSources} from './tavern-engine/perception.ts';
+import type {EventConsumerSource, EventConsumerProjection} from './tavern-engine/perception.ts';
+import {filterTavernEngineSnapshot} from './tavern-engine/store.ts';
+import type {AcceptedTavernTurn, captureTavernEngineRows} from './tavern-engine/store.ts';
 import type {
   LedgerAccount,
   LedgerDetail,
@@ -27,7 +31,62 @@ import type {
 } from './world-ledger.ts';
 import {foldWorldState, type WorldSettings, type WorldSourceEffects} from './world-state.ts';
 import type {ReferenceValues, ReferenceValue, JsonValue} from '../core/calculation-requests.ts';
-import type {SceneCharacter} from './types.ts';
+import type {SceneCharacter, SceneState} from './types.ts';
+
+function consumerScopeIdentity(scope: SceneState['scope']): string {
+  const values = [scope.worldId, scope.sessionId, scope.branchId, scope.characterId];
+  for (const value of values) {
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new TypeError('invalid_projection_identity');
+    }
+  }
+  return JSON.stringify(values);
+}
+
+/**
+ * Selects current accepted ledger turns for component consumers, using the store's lifecycle filter.
+ * The state and rows must be fresh reads in the same scope. No display text is read. Work is linear in
+ * sources, dependencies and ledger bytes; corrupt rows/getters propagate, absent rows return an empty list.
+ */
+export function currentConsumerTurns(
+  state: SceneState,
+  rows: ReturnType<typeof captureTavernEngineRows> | null,
+): AcceptedTavernTurn[] {
+  const sources = state.sources.map(source => ({
+    id: source.id,
+    revision: source.revision,
+    status: source.status,
+    message: JSON.stringify({dependencies: source.dependencies ?? []}),
+  }));
+  const filtered = filterTavernEngineSnapshot(rows, sources);
+  const turns = (filtered?.turns ?? []).map(row => JSON.parse(row.body) as AcceptedTavernTurn);
+  const latest = new Map<string, number>();
+  // Even a newer, subsequently invalidated interpretation supersedes the preceding NPC turn.
+  for (const row of rows?.turns ?? []) {
+    latest.set(row.turn_id, Math.max(latest.get(row.turn_id) ?? 0, row.turn_revision));
+  }
+  const scope = consumerScopeIdentity(state.scope);
+  return turns.filter(turn => consumerScopeIdentity(turn.scope) === scope
+    && turn.turnRevision === latest.get(turn.turnId));
+}
+
+
+/**
+ * Resolves one reader's current accepted events before component consumption. Store lifecycle filtering
+ * remains the single implementation; the engine's pure perception graph does not import storage or clocks.
+ * No display text is read. Ownership comes from all same-scope ledger rows, independently of visible events
+ * and lifecycle filtering. Absent rows produce no sources; malformed rows and getter errors propagate.
+ * Work is linear in sources, ledger bytes and references, plus each source's event ordering.
+ */
+export function eventConsumerSources(
+  state: SceneState,
+  rows: ReturnType<typeof captureTavernEngineRows> | null,
+  readerId: string,
+): EventConsumerProjection {
+  const currentTurns = currentConsumerTurns(state, rows);
+  const ledgerTurns = (rows?.turns ?? []).map(row => JSON.parse(row.body) as AcceptedTavernTurn);
+  return projectEventConsumerSources(state, currentTurns, readerId, ledgerTurns);
+}
 
 // Ruled context on each side of a reading, in Unicode code points.
 const READING_CONTEXT_CODE_POINTS = 12;
@@ -61,6 +120,20 @@ export interface LedgerStageMessage {
   automatic?: boolean;
   speakerId?: string;
   replyTo?: {id: string; revision: number};
+  /** When present, numeric text comes solely from this current accepted event, not text or speakerId above. */
+  event?: EventConsumerSource;
+}
+
+/** Builds the inert ledger-stage message for one resolved event; no model is called and no state is written. */
+export function ledgerEventMessage(event: EventConsumerSource): LedgerStageMessage {
+  return {
+    id: event.id,
+    revision: event.revision,
+    role: event.role,
+    text: event.observation.quote,
+    status: 'accepted',
+    event,
+  };
 }
 
 /** Program-selected marks and independent booking/calculation flags; no model-supplied numeric value is accepted. */
@@ -173,6 +246,7 @@ function sourceKey(
 
 function textOf(
   message: LedgerStageMessage): LedgerText {
+  if (message?.event != null) return ledgerEventText(message.event);
   if (!message || typeof message.id !== 'string' || !message.id || !Number.isSafeInteger(message.revision)
     || message.revision <= 0 || typeof message.text !== 'string'
     || !['user', 'assistant'].includes(message.role)) throw new Error('ledger_input_invalid');
@@ -567,6 +641,11 @@ function recentText(
 function speaker(
   message: LedgerStageMessage,
   request: LedgerInputRequest): string | null {
+  if (message.event != null) {
+    const actorId = message.event.observation.actorId;
+    return actorId === 'player' ? request.playerName
+      : request.characters.find(character => character.id === actorId)?.name ?? null;
+  }
   if (message.role === 'user') return request.playerName;
   if (message.automatic) return null;
   return request.characters.find(character => character.id === message.speakerId)?.name ?? null;
@@ -761,7 +840,7 @@ function ledgerModelInput(
       ref: `m-${recent.length - index}`,
       role: message.role,
       speaker: speaker(message, request),
-      text: recentText(message.text),
+      text: recentText(message.event == null ? message.text : message.event.observation.quote),
     })),
     amounts: readings.amounts,
     quantities: readings.quantities,

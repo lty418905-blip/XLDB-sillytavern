@@ -26,6 +26,7 @@ import {
   finalizeLedgerRun,
   decodeLedger,
   ledgerEventPositions,
+  ledgerEventText,
   type LedgerAccount,
   type LedgerAccountEvent,
   type LedgerCorrection,
@@ -875,9 +876,13 @@ export function ledgerPin(
   try {
     return processingFingerprint(
       {
-        source: {id: request.source.id, revision: request.source.revision, text: request.source.text},
+        source: request.source.event == null
+          ? {id: request.source.id, revision: request.source.revision, text: request.source.text}
+          : ledgerEventText(request.source.event),
         recent: request.history.filter(message => message.status === 'accepted').slice(-LEDGER_RECENT_MESSAGE_COUNT)
-          .map(message => [message.id, message.revision]),
+          .map(message => message.event == null
+            ? [message.id, message.revision]
+            : ledgerEventText(message.event)),
         roster: [
           {id: 'player', names: [request.playerName]},
           ...request.characters.map(

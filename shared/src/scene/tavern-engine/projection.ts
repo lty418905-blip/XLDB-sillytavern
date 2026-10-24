@@ -493,3 +493,63 @@ export function projectTavernWorld(
   world.applied = [...applied].map(([key, fingerprint]) => ({ key, fingerprint }));
   return { world, phases };
 }
+
+/** Actor-visible mutable holdings and locations only; every entry retains its authority basis. */
+export interface TavernActorWorldProjection {
+  actorId: string;
+  positions: readonly TavernProjectedPosition[];
+  possessions: readonly TavernProjectedPossession[];
+}
+
+/**
+ * Projects the current world through this actor's observation copies. Existing self-state is known;
+ * event-derived changes require the matching observed effect, not merely another item in the same beat.
+ * Other actors' seed state stays private. O(world entries + observations); no history is folded here.
+ * Unknown actors/scope mismatches throw; inputs and returned values never share mutable objects.
+ */
+export function projectTavernActorWorld(
+  world: TavernWorldSnapshot,
+  view: import('./types.ts').TavernActorEventView,
+): TavernActorWorldProjection {
+  if (!world.entityIds.includes(view.actorId)) throw new Error('projection_unknown_actor');
+  const knownPositions = new Set<string>();
+  const knownHolders = new Set<string>();
+  const key = (reference: EventReference, entityId: string, value: unknown): string => JSON.stringify([
+    reference.turnId,
+    reference.turnRevision,
+    reference.eventId,
+    entityId,
+    value,
+  ]);
+
+  for (const event of [...view.inbox, ...view.authoredEvents]) {
+    const content = event.content;
+    if (content.kind === 'Enter' || content.kind === 'Exit') {
+      knownPositions.add(key(event.source, content.entityId, content.kind === 'Enter'
+        ? { state: 'at', placeId: content.placeId }
+        : { state: 'unknown' }));
+    } else if (content.kind === 'Transfer') {
+      knownHolders.add(key(event.source, content.itemId, content.toId));
+    }
+  }
+
+  function sourced(basis: TavernProjectionBasis): void {
+    requireScope(basis.scope, world.scope);
+  }
+
+  return structuredClone({
+    actorId: view.actorId,
+    positions: world.positions.filter(entry => {
+      sourced(entry.basis);
+      if (entry.basis.kind !== 'event') return entry.entityId === view.actorId;
+      return entry.basis.event != null
+        && knownPositions.has(key(entry.basis.event, entry.entityId, entry.position));
+    }),
+    possessions: world.possessions.filter(entry => {
+      sourced(entry.basis);
+      if (entry.basis.kind !== 'event') return entry.holderId === view.actorId;
+      return entry.basis.event != null
+        && knownHolders.has(key(entry.basis.event, entry.itemId, entry.holderId));
+    }),
+  });
+}
