@@ -33,9 +33,26 @@ export const SLOT_M2_INSTRUCTIONS = '';
 /** SLOT-RETRY, 待 Claude. Empty wording slot; mechanical reason codes are separate data. */
 export const SLOT_RETRY_INSTRUCTIONS = '';
 
+/** SLOT-INTENT, 待 Claude. Empty until approved wording exists; it is not a production prompt. */
+export const SLOT_INTENT_INSTRUCTIONS = '';
+
+/**
+ * One first-dispatch front request: authorized actor data only, with no model settings or credentials.
+ * The injected port returns {goal, next}; the engine validates it with the existing beat intent codec.
+ * Prefix stays fixed; tail reflects the world immediately before this actor's first beat.
+ */
+export interface TavernIntentInput {
+  instructions: typeof SLOT_INTENT_INSTRUCTIONS;
+  identity: TavernInterpretationRequest['identity'];
+  actorId: string;
+  configurationId: string;
+  prefix: TavernBeatPrefix;
+  tail: TavernPerceptionDispatch['input'];
+}
+
 /**
  * Per-actor M2 contract supplied by preparation. Configuration IDs identify resolved settings, never secrets.
- * A different front configuration requires its already-completed intent. No front call occurs in this adapter.
+ * Different settings use a precomputed front intent or the engine's first-dispatch intent port.
  * history is newest-first current, authorized player text; null optional fields mean omission.
  */
 export interface TavernBeatActorContract {

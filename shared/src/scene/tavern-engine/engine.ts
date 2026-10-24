@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
 import type { AcceptedMessage } from '../../core/types.ts';
 import type { Scope } from '../../memory/access.ts';
 import { checkTavernBeatScript, decodeBeatCandidate, MAX_TAVERN_TURN_UNITS } from './codec.ts';
-import { buildTavernBeatInput } from './model-input.ts';
-import type { TavernBeatActorContract, TavernBeatInput, TavernBeatPrefix } from './model-input.ts';
+import { buildTavernBeatInput, SLOT_INTENT_INSTRUCTIONS } from './model-input.ts';
+import type { TavernBeatActorContract, TavernBeatInput, TavernBeatPrefix, TavernIntentInput } from './model-input.ts';
 import { TavernPerception } from './perception.ts';
 import { projectTavernWorld } from './projection.ts';
 import type { TavernWorldSnapshot } from './projection.ts';
@@ -226,6 +226,8 @@ export interface TavernEnginePorts {
     lowConfidenceBroadcast: boolean;
     signal: AbortSignal;
   }): Promise<TavernPreparedTurn>;
+  /** Optional first-beat front call for different settings; returns {goal, next}, with no independent retry. */
+  intent?: ((input: { modelInput: TavernIntentInput; signal: AbortSignal }) => unknown | PromiseLike<unknown>) | null;
   beat(input: {
     identity: TavernTurnIdentity;
     actorId: string;
@@ -723,23 +725,13 @@ export class TavernEngine {
         turnWindow: initial.turnWindow,
       });
       if (contract.beatConfigurationId !== contract.frontConfigurationId) {
-        if (contract.frontIntent == null) throw new StopTurn('invalid_preparation');
-        // Reuse the codec's exact goal/next units for front output; no independent front retry is introduced.
-        const checked = decodeBeatCandidate({ items: [], intent: contract.frontIntent }, {
-          envelope: { id: 'intent', turnId: turn.identity.turnId, beatIndex: 1, source: 'beat', status: 'tentative' },
-          scope: turn.identity.scope,
-          turnRevision: turn.identity.turnRevision,
-          ruleVersion: prepared.ruleVersion,
-          message: turn.request.message,
-          actorId: contract.actorId,
-          entityIds: world.entityIds,
-          itemIds: world.possessions.map(item => item.itemId),
-          placeIds: world.placeIds,
-          eventReferences: [],
-          scheduledActorCount: 1,
-        });
-        if (!checked.ok || checked.value.intent == null) throw new StopTurn('invalid_preparation');
-        intents.set(contract.actorId, checked.value.intent);
+        if (contract.frontIntent == null) {
+          if (this.#ports.intent == null) throw new StopTurn('invalid_preparation');
+        } else {
+          intents.set(contract.actorId, this.#checkedIntent(
+            contract.frontIntent, turn, prepared, world, contract.actorId, 'invalid_preparation',
+          ));
+        }
       }
     }
 
@@ -769,7 +761,7 @@ export class TavernEngine {
       this.#unserved(turn, roster);
       const delivery = perception.prepareDispatch(decision.actorId, turn.identity.turnId);
       const firstForActor = !completedActors.has(decision.actorId);
-      const intent = intents.get(decision.actorId);
+      let intent = intents.get(decision.actorId);
       const contract = contracts.get(decision.actorId);
       if (prepared.beatContracts != null && contract == null) throw new StopTurn('invalid_preparation');
       const dispatchInput = {
@@ -793,6 +785,30 @@ export class TavernEngine {
       let retryReasons: string[] = [];
       let completed = false;
       try {
+        // Only the first actual dispatch can spend a front call. Retries and later events stay on beat.
+        if (firstForActor && contract != null && modelInput != null && intent == null
+          && contract.beatConfigurationId !== contract.frontConfigurationId) {
+          const rawIntent = await this.#wait(turn, lease.deadlineMs, 'beat_deadline', true, async signal => {
+            const runner = this.#ports.intent;
+            if (runner == null) throw new StopTurn('invalid_preparation');
+            return runner.call(this.#ports, {
+              modelInput: {
+                instructions: SLOT_INTENT_INSTRUCTIONS,
+                identity: structuredClone(turn.identity),
+                actorId: decision.actorId,
+                configurationId: contract.frontConfigurationId,
+                prefix: structuredClone(modelInput.prefix),
+                tail: structuredClone(modelInput.tail),
+              },
+              signal,
+            });
+          });
+          intent = this.#checkedIntent(rawIntent, turn, prepared, world, decision.actorId, 'invalid_beat');
+          intents.set(decision.actorId, intent);
+          dispatchInput.intent = structuredClone(intent);
+          modelInput.intent = structuredClone(intent);
+        }
+
         while (!completed) {
           move(turn, 'Beat');
           const raw = await this.#wait(turn, lease.deadlineMs, 'beat_deadline', true, signal => this.#ports.beat({
@@ -983,6 +999,33 @@ export class TavernEngine {
       if (recovered == null) throw error;
       return checkedReceipt(recovered, turn.identity, body);
     }
+  }
+
+  #checkedIntent(
+    raw: unknown,
+    turn: ActiveTurn,
+    prepared: TavernPreparedTurn,
+    world: TavernWorldSnapshot,
+    actorId: string,
+    reason: 'invalid_preparation' | 'invalid_beat',
+  ): NonNullable<DecodedBeat['intent']> {
+    // Front and beat share the same goal/next bounds; no second parser or retry policy is introduced.
+    const checked = decodeBeatCandidate({ items: [], intent: raw }, {
+      envelope: { id: 'intent', turnId: turn.identity.turnId, beatIndex: 1, source: 'beat', status: 'tentative' },
+      scope: turn.identity.scope,
+      turnRevision: turn.identity.turnRevision,
+      ruleVersion: prepared.ruleVersion,
+      message: turn.request.message,
+      actorId,
+      entityIds: world.entityIds,
+      itemIds: world.possessions.map(item => item.itemId),
+      placeIds: world.placeIds,
+      eventReferences: [],
+      scheduledActorCount: 1,
+    });
+    if (!checked.ok || checked.value.intent == null) throw new StopTurn(reason);
+
+    return checked.value.intent;
   }
 
   #unserved(turn: ActiveTurn, roster: TavernScheduleRoster): void {
