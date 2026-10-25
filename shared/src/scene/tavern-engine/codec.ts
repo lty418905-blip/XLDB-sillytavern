@@ -120,6 +120,9 @@ function context(value: EventDecodeContext) {
   finite(message.acceptedAtMs, 0, Number.MAX_SAFE_INTEGER);
   const catalog = (values: unknown) => new Set(array(values, Number.MAX_SAFE_INTEGER).map(identifier));
   const entityIds = catalog(input.entityIds);
+  const itemIds = catalog(input.itemIds);
+  const placeIds = catalog(input.placeIds);
+  const holderIds = new Set([...entityIds, ...itemIds, ...placeIds]);
   const actorId = identifier(input.actorId);
   if (!entityIds.has(actorId)) reject('invalid_context');
 
@@ -147,8 +150,9 @@ function context(value: EventDecodeContext) {
     scheduledActorCount: input.scheduledActorCount,
     messageText: message.text,
     entityIds,
-    itemIds: catalog(input.itemIds),
-    placeIds: catalog(input.placeIds),
+    itemIds,
+    placeIds,
+    holderIds,
     eventReferences: new Set(array(input.eventReferences, Number.MAX_SAFE_INTEGER).map(reference).map(referenceKey)),
   };
 }
@@ -291,14 +295,15 @@ function decodePayload(input: Record<string, unknown>, current: Context, effectO
   const kind = input.kind;
   // Dropping a deferred phase would turn an attempt into an ordinary effect. Keep it diagnostic instead.
   if (input.phase != null || input.attemptRef != null) reject('phase_disabled');
-  if (kind === 'PhysiologyEvent' || kind === 'CalendarEvent' || kind === 'ConsumeItem'
+  if (kind === 'PhysiologyEvent' || kind === 'CalendarEvent'
     || kind === 'Attempt' || kind === 'Result') reject('phase_disabled');
   if (kind === 'Unknown') return unknown(input, current, 'unknown_kind');
 
   const supported = ['PlayerUtterance', 'PlayerAction', 'NpcSpeech', 'NpcAction',
-    'Enter', 'Exit', 'Transfer', 'CommitmentEvent', 'TimeAdvance'];
+    'Enter', 'Exit', 'Transfer', 'ConsumeItem', 'CommitmentEvent', 'TimeAdvance'];
   if (typeof kind !== 'string' || !supported.includes(kind)) reject('unknown_kind');
-  const hard = kind === 'Enter' || kind === 'Exit' || kind === 'Transfer' || kind === 'CommitmentEvent';
+  const hard = kind === 'Enter' || kind === 'Exit' || kind === 'Transfer'
+    || kind === 'ConsumeItem' || kind === 'CommitmentEvent';
   if (effectOnly && !hard) reject('unknown_kind');
   const common = evidence(input, current, references);
 
@@ -312,8 +317,11 @@ function decodePayload(input: Record<string, unknown>, current: Context, effectO
     if (kind === 'Transfer') {
       return { ...common, kind,
         itemId: references.entity(input.itemId, current.itemIds),
-        fromId: references.entity(input.fromId, current.entityIds),
-        toId: references.entity(input.toId, current.entityIds) };
+        fromId: references.entity(input.fromId, current.holderIds),
+        toId: references.entity(input.toId, current.holderIds) };
+    }
+    if (kind === 'ConsumeItem') {
+      return { ...common, kind, itemId: references.entity(input.itemId, current.itemIds) };
     }
     return { ...common, kind: 'CommitmentEvent', operation: commitment(input.operation, current, references) };
   }
@@ -723,6 +731,9 @@ function interpretationPayload(value: unknown, current: Context): EventPayload {
         break;
       case 'Transfer':
         interpretationKeys(candidate, [...common, 'itemId', 'fromId', 'toId']);
+        break;
+      case 'ConsumeItem':
+        interpretationKeys(candidate, [...common, 'itemId']);
         break;
       case 'CommitmentEvent':
         interpretationKeys(candidate, [...common, 'operation']);

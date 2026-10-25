@@ -6,7 +6,7 @@ import type { TavernBeatQuotation } from './codec.ts';
 import { buildTavernBeatInput, SLOT_INTENT_INSTRUCTIONS } from './model-input.ts';
 import type { TavernBeatActorContract, TavernBeatInput, TavernBeatPrefix, TavernIntentInput } from './model-input.ts';
 import { TavernPerception } from './perception.ts';
-import { projectTavernWorld } from './projection.ts';
+import { checkTavernPossessionBeat, projectTavernWorld } from './projection.ts';
 import type { TavernWorldSnapshot } from './projection.ts';
 import { checkTavernPlayerEffects, checkTavernPlayerWorld } from './player-effects.ts';
 import type { TavernPlayerWorld } from './player-effects.ts';
@@ -240,6 +240,8 @@ export interface TavernEnginePorts {
     expectedVersion: number;
   }): TavernPlayerWorld;
   interpret(input: {
+    /** Same checked authority fact as hard-effect validation; unavailable snapshots supply false. */
+    firstTurn: boolean;
     identity: TavernTurnIdentity;
     message: AcceptedMessage;
     attempt: number;
@@ -645,7 +647,23 @@ export class TavernEngine {
     const cached = this.#ports.ledger.readPlayer(structuredClone(turn.identity));
     let events: readonly EngineEvent[] = [];
     let fallback = false;
+    let playerWorld: TavernPlayerWorld | null = null;
     if (cached == null) {
+      // Read once before M1 so every retry and the hard-effect check use the same authority fact.
+      try {
+        playerWorld = checkTavernPlayerWorld(this.#ports.readPlayerWorld({
+          scope: structuredClone(turn.identity.scope),
+          turnId: turn.identity.turnId,
+          turnRevision: turn.identity.turnRevision,
+          expectedVersion: turn.version,
+        }), turn.identity.scope, turn.request.playerId);
+      } catch {
+        // Reading a snapshot must not prevent acceptance of the already accepted player source.
+        // Never substitute the later preparation snapshot or let unchecked hard effects reach the ledger.
+        playerWorld = null;
+      }
+      // An unavailable world grants no opening-turn exception; hard effects still receive null.
+      this.#checkCancellation(turn);
       fallback = true;
       for (let attempt = 0; attempt < INTERPRETATION_ATTEMPTS; attempt++) {
         turn.summary.interpretationAttempts++;
@@ -655,6 +673,7 @@ export class TavernEngine {
           'turn_deadline',
           true,
           signal => this.#ports.interpret({
+            firstTurn: playerWorld?.firstTurn ?? false,
             identity: structuredClone(turn.identity),
             message: structuredClone(turn.request.message),
             attempt,
@@ -680,19 +699,6 @@ export class TavernEngine {
       return { accepted, fallback: accepted.interpretation.outcome === 'fallback' };
     }
     for (const event of events) requireEventIdentity(event, turn.identity, 'tentative');
-    let playerWorld: TavernPlayerWorld | null = null;
-    try {
-      playerWorld = checkTavernPlayerWorld(this.#ports.readPlayerWorld({
-        scope: structuredClone(turn.identity.scope),
-        turnId: turn.identity.turnId,
-        turnRevision: turn.identity.turnRevision,
-        expectedVersion: turn.version,
-      }), turn.identity.scope, turn.request.playerId);
-    } catch {
-      // Reading a snapshot must not prevent acceptance of the already accepted player source.
-      // Never substitute the later preparation snapshot or let unchecked hard effects reach the ledger.
-      playerWorld = null;
-    }
     this.#checkCancellation(turn);
     events = checkTavernPlayerEffects(events, turn.request.playerId, playerWorld);
     const accepted = structuredClone(this.#ports.ledger.acceptPlayer({
@@ -899,10 +905,26 @@ export class TavernEngine {
             beat: structuredClone(decoded.value),
           })) : null;
           this.#check(turn);
-          const invalidEffects = decoded.ok && check != null
+          let invalidEffects = decoded.ok && check != null
             ? this.#invalidEffects(decoded.value, check, contract != null) : [];
-          const invalid = decoded.ok && check != null
+          let invalid = decoded.ok && check != null
             ? this.#invalidActions(decoded.value, check, invalidEffects) : [];
+          // Other mechanical checks and Unknown can remove an ownership prerequisite as a whole action.
+          // Supply that complete initial exclusion set before replaying any surviving dependent effects.
+          if (decoded.ok && check != null && check.kind !== 'retry'
+            && (invalid.length > 0 || invalidEffects.length > 0)) {
+            const closure = checkTavernPossessionBeat(world, decoded.value, {
+              actions: invalid,
+              effects: invalidEffects,
+            });
+            if (closure.kind === 'invalid_effects') {
+              invalidEffects = [...new Map([
+                ...invalidEffects,
+                ...closure.effects,
+              ].map(effect => [effect.effectIndex, effect])).values()];
+              invalid = this.#invalidActions(decoded.value, check, invalidEffects);
+            }
+          }
           const contractReasons: string[] = [];
           if (decoded.ok && contract != null && modelInput != null && check != null) {
             if (modelInput.intentRequired && decoded.value.intent == null) contractReasons.push('missing_intent');
@@ -932,7 +954,7 @@ export class TavernEngine {
 
           const rejected = new Set(invalid.map(action => action.itemRef));
           const rejectedEffects = new Set(invalidEffects.map(effect => effect.effectIndex));
-          // The checker supplied the full closure. Drop only those links; original item/effect indices survive.
+          // The local closure includes every removed action. Original item/effect indices survive.
           const beat = {
             ...decoded.value,
             ...(decoded.value.intent == null && intent != null ? { intent: structuredClone(intent) } : {}),

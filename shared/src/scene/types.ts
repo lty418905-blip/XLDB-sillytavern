@@ -136,7 +136,16 @@ export interface PerspectivePlan { observations: Observation[]; unresolved: stri
   presentation?: {sentenceCount:number|null;dialogueOnly:boolean|null};
   generationRequests?: Record<string,string> }
 /** Per-role accepted analysis; actors without emotion retain memory and preference data only. */
-export type SceneCharacterAnalysis = Omit<Analysis, 'emotion'> & { emotion?: Analysis['emotion'] };
+export type SceneCharacterAnalysis = Omit<Analysis, 'emotion' | 'memories'> & {
+  emotion?: Analysis['emotion'];
+  memories: Array<Analysis['memories'][number] & {
+    /**
+     * Explicit event addresses. The authority writes knowledge at commit for a single-event memory it resolves from
+     * the plan; callers may supply knowledge or a complete knowledgeSet. All other source metadata is reconstructed.
+     */
+    source?: {knowledge?: TavernEventAddress; knowledgeSet?: TavernEventAddress[]};
+  }>;
+};
 
 export interface SceneAnalysis {
   plan: PerspectivePlan;

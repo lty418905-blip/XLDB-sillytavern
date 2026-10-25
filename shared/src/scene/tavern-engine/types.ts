@@ -84,10 +84,11 @@ export type EventCommitment = Pick<CommitmentCandidate,
   'operationId' | 'action' | 'commitmentId' | 'targetId' | 'targetRevision' | 'quote' | 'evidence'
   | 'content' | 'participants' | 'obligors' | 'agreement' | 'term'>;
 
-/** P1 hard-effect candidates only; these records are decoded proposals, not authorized state writes. */
+/** P1 hard effects and P2 existing-item consumption; these records are decoded proposals, not authorized state writes. */
 export type BeatEffect = EventEvidence & (
   | { kind: 'Enter' | 'Exit'; entityId: string; placeId: string }
   | { kind: 'Transfer'; itemId: string; fromId: string; toId: string }
+  | { kind: 'ConsumeItem'; itemId: string }
   | { kind: 'CommitmentEvent'; operation: EventCommitment }
 );
 
@@ -107,7 +108,7 @@ export interface UnknownEvent {
   reason: DecodeIssue;
 }
 
-/** Closed P1 payloads. Utterances preserve literal text; actions and effects still require consumer validation. */
+/** Closed P1 payloads plus P2 existing-item consumption. Utterances preserve literal text; actions and effects still require consumer validation. */
 export type EventPayload = BeatEffect | UnknownEvent | (EventEvidence & (
   | { kind: 'PlayerUtterance' | 'NpcSpeech'; addressees: readonly string[];
       whisperTo?: readonly string[]; text: string }
@@ -117,11 +118,10 @@ export type EventPayload = BeatEffect | UnknownEvent | (EventEvidence & (
   | { kind: 'TimeAdvance'; minutes: number; temporality: 'current' | 'recollection' | 'plan' }
 ));
 
-/** Reserved P2 payloads reuse closed operations; the current decoder returns phase_disabled for every branch. */
+/** Remaining reserved P2 payloads; physiology/calendar operations still decode as phase_disabled. */
 export type DeferredPhaseTwoPayload =
   | { kind: 'PhysiologyEvent'; operation: PhysiologyOperation }
-  | { kind: 'CalendarEvent'; claim: Omit<CalendarClaim, 'sourceId' | 'sourceRevision' | 'sourceHash'> }
-  | { kind: 'ConsumeItem'; itemId: string };
+  | { kind: 'CalendarEvent'; claim: Omit<CalendarClaim, 'sourceId' | 'sourceRevision' | 'sourceHash'> };
 
 /** Reserved P3 action phases; no attempt or result can be activated by a model-supplied field. */
 export type DeferredPhaseThreePayload =

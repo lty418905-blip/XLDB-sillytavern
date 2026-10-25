@@ -58,7 +58,10 @@ export interface Memory {
         itemRef?: number;
         effectIndex?: number;
       }
-    ) };
+    );
+    /** Two to sixteen ledger-ordered event sources; mutually exclusive with knowledge. */
+    knowledgeSet?: Array<Extract<NonNullable<Memory['source']['knowledge']>, {channel: 'event'}>>;
+  };
   status: 'accepted' | 'candidate' | 'deleted' | 'superseded';
   access: Access;
   /** User-set granularity takes precedence over automatic retention. */
@@ -167,6 +170,7 @@ export function projectMemories(
     };
     const knowledge = memory.source.knowledge;
     const knowledgeChannel = knowledge?.channel;
+    const knowledgeSet = memory.source.knowledgeSet;
     // Construct an allow-listed result: spreading the record would copy hidden text.
     const view: MemoryView = {
       id,
@@ -183,6 +187,43 @@ export function projectMemories(
             row: memory.source.reference.row
           }
         } : {}),
+        ...(knowledgeSet == null ? {} : {
+          knowledgeSet: (() => {
+            // The store owns ordering and authority. This whitelist only copies an already accepted set.
+            if (knowledge != null || !Array.isArray(knowledgeSet)
+              || knowledgeSet.length < 2 || knowledgeSet.length > 16) {
+              throw new Error('invalid_event_memory_source');
+            }
+            return knowledgeSet.map(reference => {
+              const {
+                kind, actorId, observationId, channel, turnId, turnRevision, eventId, phase, itemRef, effectIndex,
+              } = reference;
+              if (channel !== 'event' || typeof turnId !== 'string' || turnId.length === 0
+                || !Number.isSafeInteger(turnRevision) || turnRevision < 1
+                || typeof eventId !== 'string' || eventId.length === 0
+                || typeof actorId !== 'string' || actorId.length === 0
+                || typeof observationId !== 'string' || observationId.length === 0
+                || !['event', 'item', 'beforeItem', 'afterItem'].includes(phase)
+                || (phase === 'event' ? itemRef != null : !Number.isSafeInteger(itemRef) || itemRef! < 0)
+                || (phase === 'beforeItem' || phase === 'afterItem'
+                  ? !Number.isSafeInteger(effectIndex) || effectIndex! < 0 : effectIndex != null)) {
+                throw new Error('invalid_event_memory_source');
+              }
+              return {
+                kind,
+                actorId,
+                observationId,
+                channel: 'event' as const,
+                turnId,
+                turnRevision,
+                eventId,
+                phase,
+                ...(itemRef == null ? {} : {itemRef}),
+                ...(effectIndex == null ? {} : {effectIndex}),
+              };
+            });
+          })(),
+        }),
         ...(knowledge ? {
           knowledge: knowledgeChannel === 'event' ? (() => {
             const {

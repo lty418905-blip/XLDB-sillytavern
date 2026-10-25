@@ -392,6 +392,8 @@ function observedContent(
       return { ...evidence, kind: content.kind, entityId: content.entityId, placeId: content.placeId };
     case 'Transfer':
       return { ...evidence, kind: content.kind, itemId: content.itemId, fromId: content.fromId, toId: content.toId };
+    case 'ConsumeItem':
+      return { ...evidence, kind: content.kind, itemId: content.itemId };
     case 'CommitmentEvent': {
       const operation = content.operation;
       const term = operation.term;

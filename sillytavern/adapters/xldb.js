@@ -291,11 +291,21 @@
     if (state.epoch !== epoch || !sameScope(currentScope(scope.worldId), scope)) throw new Error('恢复期间聊天已切换，请重新预览恢复');
   }
 
-  async function persistAttachment(scope, disabled = false, nativeEnabled = state.native.enabled) {
+  // Saves the attachment of scope (disabled, native chat on or off) into the open chat's metadata, when scope belongs to
+  // that chat. origin: the token of the calling action. Every caller checks its token right before the call (a disable
+  // starts its own token right before it), so the save is the caller's own; the caller checks the token again after
+  // awaiting the save.
+  async function persistAttachment(origin, scope, disabled = false, nativeEnabled = state.native.enabled) {
+    assertStarted(origin);
     if (!scopeMatchesCurrentChat(scope)) return;
     const metadata = nativeHost().chatMetadata ||= {};
-    metadata.xldbAttachment = { version: 1, scope: { ...scope }, disabled: Boolean(disabled), nativeEnabled: Boolean(nativeEnabled) };
-    await saveNativeMetadata();
+    metadata.xldbAttachment = {
+      version: 1,
+      scope: { ...scope },
+      disabled: Boolean(disabled),
+      nativeEnabled: Boolean(nativeEnabled),
+    };
+    return saveNativeMetadata();
   }
 
   function selectedAvatar() {
@@ -313,9 +323,12 @@
     }
   }
 
-  function assertHydrated() {
-    if (!sameScope(nativeHost().chatMetadata?.xldbHydrate, state.scope)) return;
-    disable('恢复结果待载入，请重试当前聊天。', false);
+  // Stops the calling action when the token's binding waits for a restore to be loaded: the chat is disabled with the
+  // action's token (so the disable counts as the action's own) and the action fails. origin: the token of the caller.
+  function assertHydrated(origin) {
+    assertStarted(origin);
+    if (!sameScope(nativeHost().chatMetadata?.xldbHydrate, origin.scope)) return;
+    disable('恢复结果待载入，请重试当前聊天。', false, origin);
     throw new Error('恢复结果待载入，请重新绑定当前聊天');
   }
 
@@ -325,21 +338,203 @@
     if (state.epoch !== epoch || !sameScope(state.scope, scope) || !sameScope(current, scope)) throw new Error(message);
   }
 
+  // Origin tokens: the one rule for work and writes that arrive after an await. An action starts its token
+  // synchronously, before its first await (captureOrigin), and hands it to every helper it calls; a helper takes the
+  // token as its first parameter and never starts one of its own (assertStarted). The token holds the host chat that
+  // was open then (its identity, which never changes), the scope bound then, the epoch and its kind. An ordinary token
+  // stays valid while the host still shows its chat and its binding (originIsCurrent). A binding-replacing token (a bind
+  // or a recovery: they start from whatever binding is there and move the host's branch metadata themselves) stays valid
+  // while nothing has moved since its action started (originUnchanged). Every await of an action or a helper is followed
+  // directly, as the next statement, by a check of its token (assertOrigin), so nothing of a stale action runs after the
+  // await. request() sends nothing for a token that is not valid (originValid), rebaseOrigin changes no binding and no
+  // native gate unless every token is unchanged, and a queued native job's body never runs for a token that is not
+  // current. setStatus, disable and the button wrapper's error display drop their write once the token no longer names
+  // the open, bound chat (originIsCurrent). A call of request, setStatus or disable without a token behaves as before;
+  // an object never started by captureOrigin is never valid.
+
+  // The fixed error of a primitive that refused a stale token. It names no host, chat or core text.
+  const ORIGIN_STALE_MESSAGE = '聊天已切换或已停用，操作已取消';
+
+  // The fixed error of a helper called with anything that is not a started token. It is a programming error of the
+  // caller (a token that was not handed on), never a chat switch, so it differs from ORIGIN_STALE_MESSAGE.
+  const ORIGIN_UNSTARTED_MESSAGE = 'XLDB 内部错误：操作缺少来源令牌，已停止';
+
+  // The record behind each started token: { host, scope, epoch, replacesBinding }. Only captureOrigin adds a record;
+  // only rebaseOrigin (binding and epoch) and refreshOriginEpoch (epoch) change one, and nothing changes its host chat or
+  // its kind. Code that holds the token can read its fields but never move them.
+  const originRecords = new WeakMap();
+
+  // The host chat open now, as { sessionId, characterId }, read straight from the host the way currentScope reads it
+  // but without its checks: a group chat, or a chat whose branch metadata is invalid, still has an identity of its own
+  // (its chat id). With no chat open both fields are empty strings.
+  function hostChatIdentity() {
+    const host = nativeHost();
+    let chatId = '';
+    try {
+      chatId = typeof host.getCurrentChatId === 'function' ? host.getCurrentChatId() : host.chatId;
+    } catch {
+      // A host that cannot name its chat now counts as no chat open.
+    }
+    const avatar = selectedAvatar();
+    const characterId = avatar ? `avatar:${avatar}` : host.characterId ? `id:${host.characterId}` : '';
+    return { sessionId: String(chatId || ''), characterId };
+  }
+
+  // True when both identities name the same host chat.
+  function sameHostChat(left, right) {
+    if (left.sessionId !== right.sessionId) return false;
+    return left.characterId === right.characterId;
+  }
+
+  // Starts the token of an action and returns it. Call it synchronously when the action starts, before any await. It
+  // records the host chat open now, the bound scope (null while no chat is bound), the epoch and the token's kind:
+  // options.replacesBinding: true starts a binding-replacing token, which only a bind and a recovery start (see
+  // originValid); every other token is ordinary. A token that is already started is returned unchanged, kind included,
+  // so a later call never moves its chat. A value that is not an extensible object (nothing, a public caller's stray
+  // argument) gets a new token. The token shows captured, host, scope and epoch as read-only fields.
+  function captureOrigin(origin = {}, options = {}) {
+    if (originRecords.has(origin)) return origin;
+    const record = {
+      host: hostChatIdentity(),
+      scope: state.scope ? { ...state.scope } : null,
+      epoch: state.epoch,
+      replacesBinding: options.replacesBinding === true,
+    };
+    const fields = {
+      captured: { value: true, enumerable: true },
+      host: { get: () => ({ ...record.host }), enumerable: true },
+      scope: { get: () => (record.scope ? { ...record.scope } : null), enumerable: true },
+      epoch: { get: () => record.epoch, enumerable: true },
+    };
+    let token = origin && typeof origin === 'object' ? origin : {};
+    try {
+      Object.defineProperties(token, fields);
+    } catch {
+      // A frozen object, or one that already defines these fields, cannot carry the token; a new object does.
+      token = Object.defineProperties({}, fields);
+    }
+    originRecords.set(token, record);
+    return token;
+  }
+
+  // True when the token was started by captureOrigin and the host still shows the chat it started in.
+  function originHostIsOpen(origin) {
+    const record = originRecords.get(origin);
+    return Boolean(record) && sameHostChat(record.host, hostChatIdentity());
+  }
+
+  // True while nothing has moved since the token's action started it, or since that action itself last moved it
+  // (rebaseOrigin): the same epoch (a disable, a chat-change event and a settings change bump it), the
+  // token's host chat still open (a switch whose CHAT_CHANGED has not arrived yet changes it) and the chat still bound
+  // to the token's binding, or still unbound (another bind changes it). Unlike originIsCurrent it does not ask the host
+  // to show the bound scope: an action that replaces the binding (a bind, a recovery) starts from whatever binding is
+  // there, even one the host no longer shows, and its own interaction step may move the host's branch metadata before
+  // it fails. No token (null or undefined) counts as unchanged; an object never started by captureOrigin never does.
+  function originUnchanged(origin) {
+    if (origin === null || origin === undefined) return true;
+    const record = originRecords.get(origin);
+    if (!record) return false;
+    if (record.epoch !== state.epoch) return false;
+    if (!sameHostChat(record.host, hostChatIdentity())) return false;
+    if (!record.scope) return !state.scope;
+    return sameScope(record.scope, state.scope);
+  }
+
+  // The one way an action changes the binding (state.scope, state.enabled) or the native gate itself: its bind, its
+  // recovery, the branch its interaction step moves the binding to, its disable, opening or closing native chat for it,
+  // and taking any of these back after it failed. change runs only while every given token is unchanged
+  // (originUnchanged; null and undefined entries count as no token), and
+  // it runs synchronously right after that check, so no other write can fall between the check and the change.
+  // Afterwards each token names the binding and the epoch the change left, so the action's later work still counts as
+  // work for its chat; its host chat never moves. Returns whether change ran. A token that is no longer unchanged
+  // changes nothing: a disable the user made meanwhile, another binding or a chat switch (even one whose CHAT_CHANGED
+  // has not arrived yet) is never undone or overwritten.
+  function rebaseOrigin(origins, change) {
+    const tokens = origins.filter(origin => origin !== null && origin !== undefined);
+    if (!tokens.every(origin => originUnchanged(origin))) return false;
+    change();
+    for (const origin of tokens) {
+      const record = originRecords.get(origin);
+      record.scope = state.scope ? { ...state.scope } : null;
+      record.epoch = state.epoch;
+    }
+    return true;
+  }
+
+  // For an action that reads the chat again after a wait: when the host still shows the token's chat with the same
+  // binding (the same bound scope, or still none), an epoch bump inside that chat (a settings change) moves the token's
+  // epoch along. The host chat and the binding are never changed here. Returns whether the token is current afterwards.
+  function refreshOriginEpoch(origin) {
+    if (!originHostIsOpen(origin)) return false;
+    const record = originRecords.get(origin);
+    const sameBinding = record.scope ? sameScope(record.scope, state.scope) : !state.scope;
+    if (!sameBinding) return false;
+    record.epoch = state.epoch;
+    return originIsCurrent(origin);
+  }
+
+  // True when the write may go ahead. No token (null or undefined): yes, as before. An object never started by
+  // captureOrigin: no. A started token needs the same epoch, the host still showing its host chat and the same binding:
+  // a bound token also needs the same bound scope with the host still showing that scope (the assertHostScope rule); an
+  // unbound token needs that no chat is bound.
+  function originIsCurrent(origin) {
+    if (origin === null || origin === undefined) return true;
+    const record = originRecords.get(origin);
+    if (!record) return false;
+    if (record.epoch !== state.epoch) return false;
+    if (!sameHostChat(record.host, hostChatIdentity())) return false;
+    if (!record.scope) return !state.scope;
+    try {
+      assertHostScope(record.scope, record.epoch);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // True while the token's action may go on: its next request, its next write. The predicate is the token's kind: an
+  // ordinary token is valid while originIsCurrent (the host still shows its chat and its binding); a binding-replacing
+  // token (captureOrigin's options.replacesBinding) is valid while originUnchanged, so its own interaction step may move
+  // the host's branch metadata before it moves the binding. No token (null or undefined) is valid, as before, for code
+  // outside the origin rule. An object never started by captureOrigin is never valid, and neither is a token while the
+  // host cannot name its open chat (its callback throws).
+  function originValid(origin) {
+    if (origin === null || origin === undefined) return true;
+    const record = originRecords.get(origin);
+    if (!record) return false;
+    try {
+      if (record.replacesBinding) return originUnchanged(origin);
+      return originIsCurrent(origin);
+    } catch {
+      return false;
+    }
+  }
+
+  // Throws message unless the token is valid (originValid). It follows every await of an action and its helpers
+  // directly, as the next statement, so nothing of a stale action runs after the await. message keeps an existing
+  // user-facing text that a test pins; every other check uses the fixed ORIGIN_STALE_MESSAGE.
+  function assertOrigin(origin, message = ORIGIN_STALE_MESSAGE) {
+    if (!originValid(origin)) throw new Error(message);
+  }
+
+  // Throws the fixed ORIGIN_UNSTARTED_MESSAGE unless origin is a token started by captureOrigin (null and undefined
+  // throw too). Every helper of the origin rule calls it first, so a helper called without its action's token stops
+  // before it reads the host or sends anything.
+  function assertStarted(origin) {
+    if (!originRecords.has(origin)) throw new Error(ORIGIN_UNSTARTED_MESSAGE);
+  }
+
   function assertToken() {
     if (!state.token) throw new Error('请填写 XLDB 访问令牌');
   }
 
-  function assertCandidateCurrent(candidate) {
-    assertBound();
-    if (!candidate || state.candidate !== candidate || !sameScope(candidate.scope, state.scope)) throw new Error('候选已失效');
-    if (candidate.kind === 'scene' && candidate.selectionVersion !== state.scene.selectionVersion) throw new Error('场景范围已变更，候选已失效');
-  }
-
-  function assertSceneSelectionCurrent(selectionVersion) {
-    if (!state.scene.enabled || selectionVersion !== state.scene.selectionVersion) throw new Error('场景范围已变更，候选已取消');
-  }
-
-  async function request(path, method, payload) {
+  // origin: optional origin token of the calling action. A token that is no longer valid (originValid: an ordinary
+  // token whose chat or binding the host no longer shows, a binding-replacing token whose chat, binding or epoch moved)
+  // is refused here with the fixed ORIGIN_STALE_MESSAGE, before the fetch and before any host or connector callback, so
+  // a stale action never starts core work. An object never started by captureOrigin is refused too. Without a token the
+  // request starts as before (code outside the origin rule).
+  async function request(path, method, payload, origin = null) {
+    if (!originValid(origin)) throw new Error(ORIGIN_STALE_MESSAGE);
     assertToken();
     if (typeof helpers.fetch !== 'function') throw new Error('浏览器不支持本地核心请求');
     const init = { method, headers: { Authorization: `Bearer ${state.token}` } };
@@ -349,36 +544,62 @@
       init.body = JSON.stringify({ ...payload, ...(interactionRevision === undefined ? {} : {interactionRevision}) });
     }
     let response;
-    try { response = await helpers.fetch(`${CORE_ORIGIN}${path}`, init); } catch {
-      state.connected=false;
+    try {
+      response = await helpers.fetch(`${CORE_ORIGIN}${path}`, init);
+    } catch {
+      state.connected = false;
       globalThis.XLDBConnector?.notifyDisconnected?.('offline');
       throw new Error('XLDB 核心不可用');
     }
     if (!response || !response.ok) {
-      if(response?.status===401){state.connected=false;globalThis.XLDBConnector?.notifyDisconnected?.('unauthorized');}
-      const failure=response ? await response.json().catch(()=>({})) : {};
-      throw new Error(typeof failure.error==='string' && /^[a-z_0-9]+$/.test(failure.error) ? `XLDB：${failure.error}` : 'XLDB 核心请求失败');
+      if (response?.status === 401) {
+        state.connected = false;
+        globalThis.XLDBConnector?.notifyDisconnected?.('unauthorized');
+      }
+      const failure = response ? await response.json().catch(() => ({})) : {};
+      throw new Error(typeof failure.error === 'string' && /^[a-z_0-9]+$/.test(failure.error) ? `XLDB：${failure.error}` : 'XLDB 核心请求失败');
     }
     let result;
-    try { result = await response.json(); } catch { throw new Error('XLDB 核心响应无效'); }
-    // A turn response carries the core's retrieval health; the status line follows it.
-    if (result && typeof result === 'object' && result.retrievalStatus && typeof result.retrievalStatus === 'object') {
-      state.retrieval = result.retrievalStatus; renderRetrievalBadge();
+    try {
+      result = await response.json();
+    } catch {
+      throw new Error('XLDB 核心响应无效');
+    }
+    // A turn response carries the core's retrieval health; the status line follows it. The reply of an action whose
+    // token is no longer valid (the user left its chat while it was answered) shows nothing: the badge belongs to the
+    // chat open now. A request without a token updates it as before; the caller still receives the reply either way.
+    const healthReported = result && typeof result === 'object' &&
+      result.retrievalStatus && typeof result.retrievalStatus === 'object';
+    if (healthReported && originValid(origin)) {
+      state.retrieval = result.retrievalStatus;
+      renderRetrievalBadge();
     }
     return result;
   }
 
-  function setStatus(message, level) {
+  // origin: optional origin token (captureOrigin); a status from an action whose chat is no longer open is dropped.
+  function setStatus(message, level, origin = null) {
+    if (!originIsCurrent(origin)) return;
     if (state.panel && state.panel.status) {
       const text=String(message||'');
       state.panel.status.textContent = friendlyError(text);
-      state.panel.status.setAttribute('data-level',level||(/失败|错误|冲突|不可用|待核对/.test(text)?'error':/已保存|已完成|已接入/.test(text)?'success':'info'));
+      // context_budget_exceeded is an informational explanation of a deliberate stop, not a failure,
+      // so it keeps the info level.
+      const informationalCode=/XLDB：context_budget_exceeded(?=$|[^a-z_0-9])/.test(text);
+      // Any other message carrying an XLDB code is an error whatever words surround it. This pattern is one simple
+      // character repeat with a lookahead (no nested quantifiers), so the test stays linear.
+      const hasErrorCode=!informationalCode&&/XLDB：[a-z_0-9]+(?=$|[^a-z_0-9])/.test(text);
+      const fallbackLevel=/失败|错误|冲突|不可用|待核对/.test(text)?'error'
+        :/已保存|已完成|已接入/.test(text)?'success'
+        :'info';
+      state.panel.status.setAttribute('data-level',hasErrorCode?'error':level||fallbackLevel);
     }
     renderHeaderBadges();
     if(state.panel?.dashboardArea&&state.dashboard.tab==='overview')renderDashboard();
   }
 
-  // Exact error envelopes preserve all other messages. Matching scans O(n) UTF-16 code units at most.
+  // A code may follow any caller prefix; the prefix is kept and the code alone becomes its explanation. Matching scans
+  // O(n) UTF-16 code units at most, and a message without a code is returned unchanged.
   function friendlyError(message) {
     const explanations = {
       model_catalog_invalid_input:'请检查 API 地址与密钥格式，再重新获取模型列表。',
@@ -397,14 +618,24 @@
       invalid_scene_processing:'本轮资料尚未处理完成。请在高级设置中查看处理进度并重试失败项。',
       context_budget_exceeded: '这个角色每一轮都要带上的资料（偏好、人物关系、情绪和最近的记忆）加起来太长，其余记忆全部让出后仍然放不下。请在工作台缩短或停用较长的偏好，或减少 NPC 名单里的人物，然后重试。',
     };
+    const text = String(message ?? '');
     const nativePrefix = '已停止本轮生成：';
-    if (message === nativePrefix + 'XLDB：context_budget_exceeded') {
+    if (text === nativePrefix + 'XLDB：context_budget_exceeded') {
       return nativePrefix + explanations.context_budget_exceeded;
     }
-
-    const code = message.match(/^XLDB：([a-z_0-9]+)$/)?.[1];
-    const localized = code && RETRIEVAL_TEXT[playerLanguage()].codes[code];
-    return localized || (code && explanations[code] ? explanations[code] : message);
+    // The prefix is one lazy repeat followed by the literal marker, and the code one simple character repeat followed
+    // by fixed text or a lookahead. Neither nests, so the scan stays linear.
+    const pattern = /^([\s\S]*?)XLDB：([a-z_0-9]+)(?=$|[^a-z_0-9])/;
+    const match = text.match(pattern);
+    if (!match) return text;
+    const prefix = match[1];
+    const code = match[2];
+    const codes = RETRIEVAL_TEXT[playerLanguage()].codes;
+    const localized = Object.hasOwn(codes, code) ? codes[code] : '';
+    const fallback = Object.hasOwn(explanations, code) ? explanations[code] : '';
+    const explanation = localized || fallback;
+    if (!explanation) return text;
+    return prefix + explanation + text.slice(match[0].length);
   }
 
   // Player-language retrieval sentences (DESIGN §13); machine fields stay in the diagnostic detail, never a key.
@@ -623,7 +854,8 @@
       if (!envelope || !envelope.targetId || !['direct', 'scene'].includes(envelope.mode) || !Array.isArray(envelope.presentIds)) return [];
       return [{ id: String(binding.id), revision: Number(binding.revision) || 1, role, text: swipe?.id === String(binding.id) ? swipe.text : String(message.mes || ''), acceptedAtMs: Number(binding.acceptedAtMs) || Date.now(),
         envelope: { targetId: String(envelope.targetId), mode: envelope.mode, presentIds: envelope.presentIds.map(id => String(id)),
-          ...(envelope.playerName ? { playerName: String(envelope.playerName) } : binding.automatic && host.name1 ? { playerName: String(host.name1) } : {}) },
+          // Only a stored name is sent; the live persona never fills it in, so a persona switch cannot rewrite accepted history.
+          ...(envelope.playerName ? { playerName: String(envelope.playerName) } : {}) },
         ...(binding.speakerId ? { speakerId: String(binding.speakerId) } : {}),
         ...(binding.automatic ? { automatic: true } : {}),
         ...(Array.isArray(binding.dependencies) ? { dependencies: binding.dependencies.map(item => ({ id: String(item.id), revision: Number(item.revision) || 1 })) } : {}),
@@ -631,10 +863,15 @@
     });
   }
 
-  async function discoverScene() {
-    const scope = { ...state.scope }; const epoch = state.epoch;
-    const scene = await request('/v1/scene/inspect', 'POST', { scope });
-    assertHostScope(scope, epoch, '读取场景期间聊天已切换，请重新绑定');
+  // Reads the scene of the token's binding (roster, saved version, sources, review list) into the panel. Older automatic
+  // bindings get the player name the core stored for them, and a local snapshot identical to the core's is recorded as
+  // its receipt. origin: the token of the calling action; every await is followed by its check.
+  async function discoverScene(origin) {
+    assertStarted(origin);
+    assertOrigin(origin);
+    const scope = origin.scope;
+    const scene = await request('/v1/scene/inspect', 'POST', { scope }, origin);
+    assertOrigin(origin);
     if (!scene || !scene.roster) throw new Error('scene response unavailable');
     state.panel?.noteWorldSettings?.(scene.worldSettings);
     setSceneRoster(scene.roster);
@@ -642,10 +879,32 @@
     state.scene.version=sameScope(saved?.scope,scope)?saved.version:null;
     state.scene.pendingSync=null;
     const sources=(scene.sources||[]).filter(source=>source.status!=='deleted');
+    // Older automatic bindings were saved without playerName and used to borrow the live persona name.
+    // Freeze the name the core already stored for that source into the binding once, byte for byte,
+    // so a later persona switch cannot change the envelope the core compares.
+    const sourcesById=new Map(sources.map(source=>[source.id,source]));
+    let frozenCount=0;
+    for(const message of nativeHost().chat||[]) {
+      const binding=message?.extra?.xldbScene;
+      if(!binding||!binding.automatic||!sameScope(binding.scope,scope))continue;
+      const envelope=binding.envelope;
+      if(!envelope||typeof envelope!=='object'||envelope.playerName)continue;
+      const storedName=sourcesById.get(binding.id)?.envelope?.playerName;
+      if(typeof storedName!=='string'||!storedName)continue;
+      envelope.playerName=storedName;
+      const swipe=message.swipe_info?.[message.swipe_id];
+      if(swipe)swipe.extra={...message.extra};
+      frozenCount+=1;
+    }
+    if(frozenCount>0) {
+      await saveNativeMetadata();
+      assertOrigin(origin);
+    }
     const local=sceneManagedMessages();
     // Bootstrap only an identical snapshot. Never fetch a fresh version to bless stale local text.
     if(sources.length===local.length&&sources.every(source=>local.some(message=>message.id===source.id&&message.text===source.text&&message.role===source.role&&JSON.stringify(message.envelope)===JSON.stringify(source.envelope)))) {
-      await recordSceneReceipt({...scene,bindings:sources},scope,epoch);
+      await recordSceneReceipt(origin, { ...scene, bindings: sources });
+      assertOrigin(origin);
     }
     state.scene.needsReview = Array.isArray(scene.needsReview) ? scene.needsReview.map(id => String(id)) : [];
     state.initialization.hasInitialized = Boolean(scene.hasInitialization);
@@ -656,46 +915,100 @@
     return scene;
   }
 
+  // Binds the chat open now to worldId: reads the interaction (which may move the binding to its branch), loads a
+  // restore that waits for this binding, reads the scene, syncs, reads the clock and saves the attachment.
+  // options.preserveNativeGate keeps native chat on for a retry when the sync fails (an automatic attach). The bind's
+  // token is binding-replacing: it starts from whatever binding is there and follows the bind's own binding.
   async function bind(worldId,options={}) {
+    // The chat this bind starts in, recorded before any await; it follows the bind's own binding below.
+    const origin = captureOrigin({}, { replacesBinding: true });
     return withBusy(async () => {
+      assertOrigin(origin);
       assertToken();
-      const previous = { scope: state.scope, enabled: state.enabled, candidate: state.candidate, scene: state.scene, initialization: state.initialization, resources: state.resources };
-      const epoch = state.epoch;
-      let scope = currentScope(worldId);
+      // The scene, initialization and resources a failed bind puts back.
+      const previous = {
+        scene: state.scene,
+        initialization: state.initialization,
+        resources: state.resources,
+      };
+      const scope = currentScope(worldId);
       state.panel?.resetWorldForm?.();
       state.panel?.resetWorkbench?.();
-      state.scope = scope;
-      state.enabled = true;
+      // The bind's own binding; its token follows it (the token's host chat stays the chat the bind started in).
+      const bound = rebaseOrigin([origin], () => {
+        state.scope = scope;
+        state.enabled = true;
+      });
+      if (!bound) throw new Error(ORIGIN_STALE_MESSAGE);
       state.candidate = null;
-      state.initialization = { catalog: [], selectedIds: [], preview: null, hasInitialized: false, provenance: null, refresh: null };
+      state.initialization = {
+        catalog: [],
+        selectedIds: [],
+        preview: null,
+        hasInitialized: false,
+        provenance: null,
+        refresh: null,
+      };
       state.resources = null;
       let stage='binding';
       try {
-        const interaction=await request('/v1/scene/interaction','POST',{scope});
-        assertHostScope(scope,epoch);
-        await selectInteraction(interaction,scope,epoch);
-        scope={...state.scope};
-        if(sameScope(nativeHost().chatMetadata?.xldbRecoveryConflict,scope)||recoverySafetyPending(scope))throw new Error('上次恢复仅部分写入，请预览核心正文并核对后重试');
-        if (sameScope(nativeHost().chatMetadata?.xldbHydrate, scope)) {
-          const scene=await request('/v1/scene/inspect','POST',{scope});
-          if(scene.roster?.characters?.length)await materializeScene(scope,scene);
-          else {delete nativeHost().chatMetadata.xldbHydrate;await saveNativeMetadata();}
+        const interaction=await request('/v1/scene/interaction','POST',{scope},origin);
+        assertOrigin(origin);
+        // The interaction may move the binding to its branch; the token follows that move.
+        await selectInteraction(origin, interaction);
+        assertOrigin(origin);
+        // The binding this bind holds now: the interaction's branch.
+        const boundScope = origin.scope;
+        if(sameScope(nativeHost().chatMetadata?.xldbRecoveryConflict,boundScope)||recoverySafetyPending(boundScope))throw new Error('上次恢复仅部分写入，请预览核心正文并核对后重试');
+        if (sameScope(nativeHost().chatMetadata?.xldbHydrate, boundScope)) {
+          const scene=await request('/v1/scene/inspect','POST',{scope:boundScope},origin);
+          assertOrigin(origin, '恢复时聊天已切换，请重新绑定');
+          if(scene.roster?.characters?.length) {
+            await materializeScene(origin, scene);
+            assertOrigin(origin);
+          } else {
+            delete nativeHost().chatMetadata.xldbHydrate;
+            await saveNativeMetadata();
+            assertOrigin(origin);
+          }
         }
-        await discoverScene();
+        await discoverScene(origin);
+        assertOrigin(origin);
         stage='sync';
-        await syncInternal();
+        await syncInternal(origin);
+        assertOrigin(origin);
         stage='bound';
-        await refreshClock();
-        await persistAttachment(state.scope, false, state.native.enabled);
+        // The clock is display only. A failed clock read never fails or rolls back a bind whose sync already committed;
+        // a clock read that outlasted the bind's chat still stops the bind.
+        try {
+          await refreshClock(origin);
+          assertOrigin(origin);
+        } catch (error) {
+          if (!originValid(origin)) throw error;
+          // The clock area keeps its previous text; the bind goes on.
+        }
+        await persistAttachment(origin, boundScope, false, state.native.enabled);
+        // The user may leave the chat while its attachment is saved; that bind is abandoned, not reported as attached.
+        assertOrigin(origin);
       } catch (error) {
-        if (state.epoch === epoch&&sameScope(state.scope,scope)) {
+        if (!originValid(origin)) throw error;
+        // The binding this bind made, on the interaction's branch once that step moved it.
+        const ownScope = origin.scope;
+        // The bind takes back its own binding, or keeps native chat on for a retry of its failed sync, only while that
+        // binding is still its own. After a chat switch (even one whose CHAT_CHANGED has not arrived yet), a disable or
+        // another binding, the binding and the native gate belong to that chat, not to this bind.
+        rebaseOrigin([origin], () => {
           const metadata=nativeHost().chatMetadata||{};
           const retrySync=options.preserveNativeGate&&stage==='sync'&&state.scene.enabled&&state.scene.roster.length&&
-            !sameScope(metadata.xldbHydrate,scope)&&!sameScope(metadata.xldbRecoveryConflict,scope)&&
-            !recoverySafetyPending(scope)&&!/context_changed_retry/.test(error.message);
+            !sameScope(metadata.xldbHydrate,ownScope)&&!sameScope(metadata.xldbRecoveryConflict,ownScope)&&
+            !recoverySafetyPending(ownScope)&&!/context_changed_retry/.test(error.message);
           if(retrySync){
-            state.native.enabled=true;state.native.automatic=true;state.native.error=error.message;state.native.materials=null;
-            state.native.queue=Promise.reject(error);state.native.queue.catch(()=>{});
+            state.native.enabled=true;
+            state.native.automatic=true;
+            state.native.error=error.message;
+            state.native.materials=null;
+            state.native.queue=Promise.reject(error);
+            state.native.queue.catch(()=>{});
           }else{
             state.scope = null;
             state.enabled = false;
@@ -707,72 +1020,136 @@
             state.resources = previous.resources;
             renderSceneControls();
           }
-        }
+        });
         throw error;
       }
-      setStatus(state.scene.enabled ? '已接入当前聊天并恢复 NPC 名单。' : '已接入当前聊天；等待原生聊天识别当前正文中的人物。');
+      const finalScope = origin.scope;
+      setStatus(state.scene.enabled ? '已接入当前聊天并恢复 NPC 名单。' : '已接入当前聊天；等待原生聊天识别当前正文中的人物。', undefined, origin);
       state.connected = true;
       refreshButtons();
-      if (state.panel?.branchInput) state.panel.branchInput.value = scope.branchId;
-      return scope;
+      if (state.panel?.branchInput) state.panel.branchInput.value = finalScope.branchId;
+      return finalScope;
     });
   }
 
-  async function selectInteraction(interaction,previousScope,epoch) {
-    if(!interaction || interaction.mode!=='roleplay' || !Number.isSafeInteger(interaction.revision) ||
-      !interaction.scope || !sameScope({...interaction.scope,branchId:previousScope.branchId},previousScope))throw new Error('核心未返回有效模式，请升级匹配的核心与JS');
-    assertHostScope(previousScope,epoch);
-    const metadata=nativeHost().chatMetadata ||= {};
-    metadata.xldbBranchId=interaction.scope.branchId;
+  // Moves the binding to the branch of the interaction the core returned for the token's binding. The branch is saved
+  // into the host's metadata first; after the save the binding (state.scope, state.interaction) moves only through
+  // rebaseOrigin, so the token follows it. Accepted messages of the chat's other branches are hidden and those of the
+  // new branch shown. origin: the token of the calling action (a bind, a recovery or a mode change).
+  async function selectInteraction(origin, interaction) {
+    assertStarted(origin);
+    const previousScope = origin.scope;
+    const valid = Boolean(previousScope) && interaction && interaction.mode === 'roleplay' &&
+      Number.isSafeInteger(interaction.revision) && interaction.scope &&
+      sameScope({ ...interaction.scope, branchId: previousScope.branchId }, previousScope);
+    if (!valid) throw new Error('核心未返回有效模式，请升级匹配的核心与JS');
+    assertOrigin(origin);
+    const metadata = nativeHost().chatMetadata ||= {};
+    metadata.xldbBranchId = interaction.scope.branchId;
     await saveNativeMetadata();
-    if(state.epoch!==epoch || !sameScope(currentScope(previousScope.worldId),interaction.scope))throw new Error('保存模式期间聊天已切换，请重新绑定');
-    state.scope={...interaction.scope};state.interaction=interaction;state.clock=null;
-    if(!sameScope(previousScope,state.scope))state.panel?.resetWorkbench?.();
-    if(!sameScope(previousScope,state.scope))metadata.xldbHydrate={...state.scope};
-    const visibility=[];
-    for(const [index,message] of (nativeHost().chat||[]).entries()) {
-      const binding=message.extra?.xldb;
-      if(binding?.scope?.worldId!==state.scope.worldId||binding.scope.sessionId!==state.scope.sessionId||binding.scope.characterId!==state.scope.characterId)continue;
-      const hidden=!sameScope(binding.scope,state.scope);
-      if(Boolean(message.is_hidden)!==hidden)visibility.push({message_id:index,is_hidden:hidden});
+    assertOrigin(origin);
+    // The host shows the branch just saved, unless its branch metadata was written again during the save.
+    if (!sameScope(currentScope(previousScope.worldId), interaction.scope)) throw new Error('保存模式期间聊天已切换，请重新绑定');
+    const moved = rebaseOrigin([origin], () => {
+      state.scope = { ...interaction.scope };
+      state.interaction = interaction;
+      state.clock = null;
+    });
+    if (!moved) throw new Error(ORIGIN_STALE_MESSAGE);
+    const scope = origin.scope;
+    if (!sameScope(previousScope, scope)) {
+      state.panel?.resetWorkbench?.();
+      metadata.xldbHydrate = { ...scope };
     }
-    if(visibility.length) {requireSceneRestoreHost();await helpers.setChatMessages(visibility,{refresh:'affected'});assertHostScope(state.scope,epoch);await saveNativeMetadata();}
+    const visibility = [];
+    for (const [index, message] of (nativeHost().chat || []).entries()) {
+      const binding = message.extra?.xldb;
+      if (binding?.scope?.worldId !== scope.worldId || binding.scope.sessionId !== scope.sessionId || binding.scope.characterId !== scope.characterId) continue;
+      const hidden = !sameScope(binding.scope, scope);
+      if (Boolean(message.is_hidden) !== hidden) visibility.push({ message_id: index, is_hidden: hidden });
+    }
+    if (visibility.length) {
+      requireSceneRestoreHost();
+      await helpers.setChatMessages(visibility, { refresh: 'affected' });
+      assertOrigin(origin);
+      await saveNativeMetadata();
+      assertOrigin(origin);
+    }
     renderInteraction();
   }
 
+  // Changes the interaction's mode (mode) or its settings (settings) for the bound chat. Native chat is turned off and the
+  // epoch moves on first, so every earlier candidate, turn and queued job is void; the change's token moves along with
+  // that step. A failure in the change's own chat disables it for review; a change whose chat was left writes nothing.
   async function changeInteraction(mode,settings) {
     assertBound();
     if(state.modeChanging)throw new Error('模式设置正在保存');
     if(!state.interaction)throw new Error('请重新绑定以读取模式');
-    state.modeChanging=true;
-    const previousScope={...state.scope};
-    const previousRevision=state.interaction.revision,previousVersion=state.scene.version;
-    state.epoch+=1;const epoch=state.epoch;
-    state.candidate=null;state.native.turn=null;state.native.stopped=true;state.native.enabled=false;
-    nativeHost().stopGeneration?.();setPreview('');refreshButtons();
-    try{
-      if(!settings)await syncInternal();
-      const result=await request(settings?'/v1/scene/interaction-settings':'/v1/scene/interaction-switch','POST',{
-        scope:previousScope,expectedRevision:state.interaction.revision,...(settings?{settings}:{mode})});
-      await selectInteraction(result,previousScope,epoch);
+    // The token of this change, started before its first await; it follows the change's own epoch move below.
+    const origin = captureOrigin({});
+    const previousRevision = state.interaction.revision;
+    const previousVersion = state.scene.version;
+    const started = rebaseOrigin([origin], () => {
+      state.epoch += 1;
+      state.candidate = null;
+      state.native.turn = null;
+      state.native.stopped = true;
+      state.native.enabled = false;
+    });
+    if (!started) throw new Error(ORIGIN_STALE_MESSAGE);
+    state.modeChanging = true;
+    nativeHost().stopGeneration?.();
+    setPreview('');
+    refreshButtons();
+    try {
+      if (!settings) {
+        await syncInternal(origin);
+        assertOrigin(origin);
+      }
+      const route = settings ? '/v1/scene/interaction-settings' : '/v1/scene/interaction-switch';
+      const body = {
+        scope: origin.scope,
+        expectedRevision: state.interaction.revision,
+        ...(settings ? { settings } : { mode }),
+      };
+      const result = await request(route, 'POST', body, origin);
+      assertOrigin(origin);
+      await selectInteraction(origin, result);
+      assertOrigin(origin);
       // Reset before the scene is read again, so the legacy-companion notice armed from worldSettings.mode stays visible.
       state.panel?.resetWorldForm?.();
-      if(settings){
-        state.scene.pendingSync=null;
-        if(state.scene.enabled)await recordSceneReceipt({version:previousVersion+(result.revision===previousRevision?0:1)},state.scope,epoch);
-      }else{
-        const data=await request('/v1/scene/inspect','POST',{scope:state.scope});
-        assertHostScope(state.scope,epoch);
+      if (settings) {
+        state.scene.pendingSync = null;
+        const version = previousVersion + (result.revision === previousRevision ? 0 : 1);
+        if (state.scene.enabled) await recordSceneReceipt(origin, { version });
+        assertOrigin(origin);
+      } else {
+        const data = await request('/v1/scene/inspect', 'POST', { scope: origin.scope }, origin);
+        assertOrigin(origin);
         state.panel?.noteWorldSettings?.(data.worldSettings);
-        if(data.roster?.characters?.length)await materializeScene(state.scope,data);
-        else {delete nativeHost().chatMetadata.xldbHydrate;await discoverScene();}
+        if (data.roster?.characters?.length) {
+          await materializeScene(origin, data);
+          assertOrigin(origin);
+        } else {
+          delete nativeHost().chatMetadata.xldbHydrate;
+          await discoverScene(origin);
+          assertOrigin(origin);
+        }
       }
-      await refreshClock();
-      if(state.scene.enabled)await refreshDashboard();
-      setStatus(settings?'设置已保存，旧候选已取消；请重新启用原生聊天。':'已切换为跑团／角色扮演；请重新启用原生聊天。');
+      await refreshClock(origin);
+      assertOrigin(origin);
+      if (state.scene.enabled) await refreshDashboard(origin);
+      assertOrigin(origin);
+      setStatus(settings ? '设置已保存，旧候选已取消；请重新启用原生聊天。' : '已切换为跑团／角色扮演；请重新启用原生聊天。', undefined, origin);
       return result;
-    }catch(error){disable('模式状态待核对，请重试当前聊天。', false);throw error;}
-    finally{state.modeChanging=false;refreshButtons();}
+    } catch (error) {
+      if (!originValid(origin)) throw error;
+      disable('模式状态待核对，请重试当前聊天。', false, origin);
+      throw error;
+    } finally {
+      state.modeChanging = false;
+      refreshButtons();
+    }
   }
 
   const switchMode=mode=>{
@@ -782,13 +1159,20 @@
   const setTimeZone=timeZone=>changeInteraction(undefined,{timeZone:typeof timeZone==='string'&&timeZone.trim()?timeZone.trim():null});
   const setDirectorEnabled=enabled=>changeInteraction(undefined,{directorEnabled:Boolean(enabled)});
 
-  async function refreshClock() {
-    if(!state.enabled||!state.interaction)return;
-    const scope={...state.scope},epoch=state.epoch,requestId=(state.clockRequestId||0)+1;
-    state.clockRequestId=requestId;
-    const clock=await request('/v1/scene/interaction-clock','POST',{scope});
-    assertHostScope(scope,epoch);
-    if(requestId===state.clockRequestId){state.clock={...clock,sampledAt:Date.now()};renderClock();}
+  // Reads the story clock of the token's binding and shows it; only the latest read is shown. origin: the token of the
+  // calling action; a reply that arrives after the token went stale shows nothing and ends with the stale error.
+  async function refreshClock(origin) {
+    assertStarted(origin);
+    if (!state.enabled || !state.interaction) return;
+    assertOrigin(origin);
+    const requestId = (state.clockRequestId || 0) + 1;
+    state.clockRequestId = requestId;
+    const clock = await request('/v1/scene/interaction-clock', 'POST', { scope: origin.scope }, origin);
+    assertOrigin(origin);
+    if (requestId === state.clockRequestId) {
+      state.clock = { ...clock, sampledAt: Date.now() };
+      renderClock();
+    }
     return clock;
   }
 
@@ -814,43 +1198,66 @@
     renderClock();
   }
 
-  async function syncInternal(refreshDisplay=true) {
+  // Sends the managed messages of the token's binding to the core (the scene reconcile, or the legacy reconcile with its
+  // reprocessing) and records the receipt. refreshDisplay=false leaves the clock and dashboard refresh to the caller.
+  // origin: the token of the calling action; a restore-pending chat is disabled with it, so that disable counts as the
+  // action's own, and the receipt is recorded only while the token is valid.
+  async function syncInternal(origin, refreshDisplay = true) {
+    assertStarted(origin);
+    assertOrigin(origin);
     assertBound();
-    assertHydrated();
+    assertHydrated(origin);
     if (state.scene.enabled) {
-      const scope={...state.scope},epoch=state.epoch,messages=sceneManagedMessages();
+      const scope = origin.scope;
+      const messages = sceneManagedMessages();
       if(!Number.isSafeInteger(state.scene.version))throw new Error('缺少同步基准，请核对当前分支并恢复权威正文后重试');
       const signature=JSON.stringify([scope,messages]);
       if(state.scene.pendingSync?.signature!==signature)state.scene.pendingSync={signature,operationId:newId('sync'),expectedVersion:state.scene.version};
       const pending=state.scene.pendingSync;
-      const result = await request('/v1/scene/reconcile', 'POST', { scope, messages, expectedVersion:pending.expectedVersion,operationId:pending.operationId });
-      await recordSceneReceipt(result,scope,epoch,refreshDisplay);
+      const body = { scope, messages, expectedVersion: pending.expectedVersion, operationId: pending.operationId };
+      const result = await request('/v1/scene/reconcile', 'POST', body, origin);
+      assertOrigin(origin, '同步期间聊天已切换，未更新当前聊天绑定');
+      await recordSceneReceipt(origin, result, refreshDisplay);
+      assertOrigin(origin);
       state.scene.pendingSync=null;
       if (result.status === 'failed') throw new Error(`场景同步未完成：${result.error || '未知错误'}。请检查配置或正文视角后重试。`);
       state.scene.needsReview = Array.isArray(result.needsReview) ? result.needsReview.map(id => String(id)) : [];
       return result;
     }
-    const result = await request('/v1/reconcile', 'POST', { scope: state.scope, messages: managedMessages().map(({ id, role, text }) => ({ id, role, text })) });
+    const messages = managedMessages().map(({ id, role, text }) => ({ id, role, text }));
+    const result = await request('/v1/reconcile', 'POST', { scope: origin.scope, messages }, origin);
+    assertOrigin(origin);
     for (const message of Array.isArray(result.reprocess) ? result.reprocess : []) {
       assertBound();
-      const receipt = await request('/v1/process', 'POST', { scope: state.scope, message });
+      const receipt = await request('/v1/process', 'POST', { scope: origin.scope, message }, origin);
+      assertOrigin(origin);
       assertBound();
       if (receipt.status === 'failed' || receipt.status === 'conflict') throw new Error('同步未完成，请稍后重试');
     }
     return result;
   }
 
-  async function recordSceneReceipt(receipt,scope=state.scope,epoch=state.epoch,refreshDisplay=true) {
-    assertHostScope(scope,epoch,'同步期间聊天已切换，未更新当前聊天绑定');
+  // Records a committed core receipt in the host: message revisions, the scene version, skipped stages and xldbSync.
+  // refreshDisplay=true then refreshes the clock and the dashboard. The caller waits for that refresh, except a caller
+  // inside the self-insert window (state.selfInserting), whose refresh runs in the background so the window closes
+  // without waiting on a display request. Display errors stay in their own areas and never fail the committed write;
+  // a chat switch during the save or the awaited refresh still rejects, so the caller stops instead of touching the next
+  // chat. origin: the token of the calling action; the receipt is recorded for the token's binding only.
+  async function recordSceneReceipt(origin, receipt, refreshDisplay = true) {
+    assertStarted(origin);
+    assertOrigin(origin, '同步期间聊天已切换，未更新当前聊天绑定');
     if(!Number.isSafeInteger(receipt?.version))throw new Error('核心未返回权威版本，请更新核心后重试');
+    const scope = origin.scope;
     const bindings=new Map((receipt.bindings||[]).map(binding=>[binding.id,binding]));
     for(const message of nativeHost().chat||[]) {
       const binding=message.extra?.xldbScene;
       if(!sameScope(binding?.scope,scope))continue;
       const current=bindings.get(binding.id);
       if(current&&current.status!=='deleted') {
-        binding.revision=current.revision;binding.dependencies=current.dependencies||[];
-        const swipe=message.swipe_info?.[message.swipe_id];if(swipe)swipe.extra={...message.extra};
+        binding.revision=current.revision;
+        binding.dependencies=current.dependencies||[];
+        const swipe=message.swipe_info?.[message.swipe_id];
+        if(swipe)swipe.extra={...message.extra};
       }
     }
     if (state.scene.version !== receipt.version) invalidateInitializationPreview();
@@ -859,303 +1266,114 @@
     if(receipt.progress?.sources){
       const skipped=receipt.progress.sources.flatMap(source=>source.stages.filter(stage=>stage.status==='skipped'));
       state.dashboard.progressSkipped=skipped;
-      if(state.dashboard.data)state.dashboard.data.skippedStages=skipped;renderSkippedStages(skipped);
+      if(state.dashboard.data)state.dashboard.data.skippedStages=skipped;
+      // Shown with or without dashboard data, so the skipped-stage notice follows every sync.
+      renderSkippedStages(skipped);
     }
     if(!receipt.progress?.sources)renderSkippedStages(state.dashboard.data?.skippedStages||[]);
     state.scene.needsReview=receipt.needsReview||state.scene.needsReview;
     const metadata=nativeHost().chatMetadata||=( {} );
     metadata.xldbSync={scope:{...scope},version:receipt.version};
     await saveNativeMetadata();
-    assertHostScope(scope,epoch,'保存绑定期间聊天已切换');
-    if(refreshDisplay){
-      await refreshClock();
-      if(state.scene.enabled&&state.panel?.dashboardArea)await refreshDashboard();
+    assertOrigin(origin);
+    if(!refreshDisplay)return;
+    if(state.selfInserting) {
+      refreshSceneDisplayInBackground(origin);
+      return;
+    }
+    await refreshSceneDisplay(origin);
+    // A switch while the caller waited for the display must stop the caller's own continuation (for example clearing
+    // pendingSync), which would otherwise act on the next chat.
+    assertOrigin(origin);
+  }
+
+  // Refreshes the clock and then the dashboard of the token's binding. A clock failure does not skip the dashboard; each
+  // display keeps its own error (refreshDashboard renders its error in the dashboard area), and no display error
+  // escapes. A token that went stale ends the refresh with the stale error, so another chat's display is never rendered
+  // from it. origin: the token of the calling action.
+  async function refreshSceneDisplay(origin) {
+    assertStarted(origin);
+    try {
+      assertOrigin(origin);
+      try {
+        await refreshClock(origin);
+        assertOrigin(origin);
+      } catch (error) {
+        if (!originValid(origin)) throw error;
+        // The clock is display only; the dashboard below still refreshes.
+      }
+      if (state.scene.enabled && state.panel?.dashboardArea) await refreshDashboard(origin);
+      assertOrigin(origin);
+    } catch (error) {
+      if (!originValid(origin)) throw error;
+      // A dashboard error is already shown in the dashboard area.
     }
   }
 
-  function refreshSceneDisplayInBackground(scope,epoch) {
-    void (async()=>{
-      assertHostScope(scope,epoch);
-      await refreshClock();
-      assertHostScope(scope,epoch);
-      if(state.scene.enabled&&state.panel?.dashboardArea)await refreshDashboard();
-    })().catch(()=>{});
+  // Starts refreshSceneDisplay without waiting for it, for callers that must not be held open by a display request. A
+  // refresh whose token went stale ends quietly. origin: the token of the calling action.
+  function refreshSceneDisplayInBackground(origin) {
+    assertStarted(origin);
+    void refreshSceneDisplay(origin).catch(() => {});
   }
 
-  async function reconfirmSceneSource(sourceId) {
+  // Confirms one source that waits for review against the sources valid now, and shows the result. originToken: the
+  // review button's started token; a direct call starts its own token here, before any await. After the wait for queued
+  // native work the token moves along with a settings change in the same chat; the request, the receipt, the reload,
+  // the render and the status all take it, so nothing of a confirmation whose chat the user left reaches the chat open
+  // now.
+  async function reconfirmSceneSource(sourceId, originToken = {}) {
+    const origin = captureOrigin(originToken);
     return withBusy(async()=>{
-      assertBound();await state.native.queue.catch(()=>{});
-      const scope={...state.scope},epoch=state.epoch;
-      const result=await request('/v1/scene/reconfirm','POST',{scope,sourceId,expectedVersion:state.scene.version,operationId:newId('review')});
-      await recordSceneReceipt(result,scope,epoch);
-      renderSceneMaterials(await inspectInternal());
+      assertOrigin(origin);
+      assertBound();
+      await state.native.queue.catch(()=>{});
+      if (!refreshOriginEpoch(origin)) throw new Error(ORIGIN_STALE_MESSAGE);
+      const scope = origin.scope;
+      const body = { scope, sourceId, expectedVersion: state.scene.version, operationId: newId('review') };
+      const result = await request('/v1/scene/reconfirm', 'POST', body, origin);
+      assertOrigin(origin);
+      await recordSceneReceipt(origin, result);
+      assertOrigin(origin);
+      const data = await inspectInternal(origin);
+      assertOrigin(origin);
+      renderSceneMaterials(data);
       if(result.status==='failed')throw new Error(`来源已确认，整理仍失败：${result.error}`);
-      setStatus('已按当前有效来源重新确认并整理。');return result;
-    });
-  }
-
-  async function sync() {
-    return withBusy(async () => {
-      setStatus('正在同步当前正文与未完成阶段……');
-      if (state.native.enabled) await state.native.queue.catch(() => {});
-      const result = await syncInternal();
-      await refreshClock();
-      if (state.native.enabled) { state.native.error = ''; state.native.queue = Promise.resolve(); }
-      setStatus(result.removed ? `同步完成，已失效 ${result.removed} 条受管记录。` : '同步完成。');
+      setStatus('已按当前有效来源重新确认并整理。', undefined, origin);
       return result;
     });
   }
 
-  async function generate(input, persona) {
+  // originToken: the sync button's started token (button with options.origin); a direct call starts its own token here,
+  // before any await, so every write of this sync after an await is compared with the chat it started in.
+  async function sync(originToken = {}) {
+    const origin = captureOrigin(originToken);
     return withBusy(async () => {
-      assertBound();
-      if (!String(input || '').trim()) throw new Error('请输入本轮内容');
-      state.candidate = null;
-      setPreview('');
-      await ensureInitializationFreshForGeneration();
-      await syncInternal();
-      assertBound();
-      if (state.scene.enabled) return generateScene(String(input));
-      if (state.interaction?.mode === 'roleplay') throw new Error('跑团需要至少一名 NPC，请先保存名单或启用原生聊天读取角色卡');
-      const submitted = await submitUser(String(input));
-      const candidate = { id: newId('candidate'), scope: { ...state.scope }, input: String(input), answer: '', inserted: false, messages: null, submitted, epoch:state.epoch };
-      state.candidate = candidate;
-      // Host generation hooks can append unrelated state after generateRaw assembles prompts.
-      const {answer} = await request('/v1/generate', 'POST', {scope:candidate.scope, input:candidate.input, persona:String(persona || '')});
-      assertCandidateCurrent(candidate);
-      if (typeof answer !== 'string') throw new Error('前台模型未返回文本');
-      candidate.answer = answer;
-      candidate.messages = [submitted, {id:newId('message'),revision:1,role:'assistant',text:answer,acceptedAtMs:Date.now()}];
-      setPreview(answer);
-      setStatus('候选已生成；请预览后明确接受或拒绝。');
-      refreshButtons();
-      return answer;
-    });
-  }
-
-  async function submitUser(input, envelope) {
-    assertBound();
-    const scope={...state.scope},epoch=state.epoch;
-    const key=envelope?'xldbScene':'xldb';
-    const managed=envelope?sceneManagedMessages():managedMessages();
-    let message=managed.at(-1);
-    const raw=nativeHost().chat.find(item=>sameScope(item.extra?.[key]?.scope,scope)&&item.extra[key].id===message?.id);
-    if(!message || message.role!=='user' || message.text!==input || !raw?.extra?.xldbSubmitted ||
-      (envelope && JSON.stringify(message.envelope)!==JSON.stringify(envelope))) {
-      if(typeof helpers.createChatMessages!=='function')throw new Error('未找到 Tavern Helper 的 createChatMessages');
-      message={id:newId('message'),revision:1,role:'user',text:input,acceptedAtMs:Date.now(),...(envelope?{envelope}:{})};
-      state.selfInserting=true;
-      try { await helpers.createChatMessages([{role:'user',message:input,extra:{xldbSubmitted:true,[key]:{...message,scope}}}],{insert_before:'end',refresh:'affected'}); }
-      finally {state.selfInserting=false;}
-      assertHostScope(scope,epoch);
-      await saveNativeMetadata();
-    }
-    setStatus('用户正文已提交，正在同步本轮记忆与情绪……');
-    await syncInternal();
-    assertHostScope(scope,epoch);
-    return (envelope?sceneManagedMessages():managedMessages()).find(item=>item.id===message.id);
-  }
-
-  async function generateScene(input) {
-    const selectionVersion = state.scene.selectionVersion;
-    const envelope = sceneEnvelope();
-    const scope={...state.scope},epoch=state.epoch;
-    const submitted=await submitUser(input,envelope);
-    assertHostScope(scope,epoch);assertSceneSelectionCurrent(selectionVersion);
-    const result = await request('/v1/scene/prepare', 'POST', { scope, envelope, input,
-      userSubmission:{expectedVersion:state.scene.version,operationId:newId('prepare'),userMessageId:submitted.id,acceptedAtMs:submitted.acceptedAtMs} });
-    assertHostScope(scope,epoch);
-    assertBound();
-    assertSceneSelectionCurrent(selectionVersion);
-    if(result.status==='failed')throw new Error(`本轮同步失败：${result.error||'请重试'}；用户正文已保留。`);
-    renderSceneMaterials(result);
-    if (Array.isArray(result.unresolved) && result.unresolved.length) {
-      setStatus(`场景需要补充说明：${result.unresolved.join('；')}`);
-      return '';
-    }
-    if (!result.draftId || typeof result.answer !== 'string' || !result.answer.trim() || !result.userMessage || !result.assistantMessage) {
-      throw new Error('场景候选不可接受，请补充明确场景');
-    }
-    const messages = [result.userMessage, result.assistantMessage].map(message => ({
-      ...message,
-      id: String(message.id || ''),
-      revision: Number(message.revision) || 1,
-      acceptedAtMs: Number(message.acceptedAtMs) || Date.now(),
-      envelope: message.envelope || envelope,
-    }));
-    if (messages[0].id!==submitted.id || messages[0].role !== 'user' || messages[0].text !== input || messages[1].role !== 'assistant' || messages[1].text !== result.answer) {
-      throw new Error('场景候选正文无效');
-    }
-    const candidate = { kind: 'scene', id: String(result.draftId), draftId: String(result.draftId), scope: { ...state.scope }, input, answer: result.answer,
-      envelope, targetId: envelope.targetId, selectionVersion, messages, inserted: false, epoch };
-    state.candidate = candidate;
-    setPreview(result.answer);
-    setStatus(`已生成 ${activeNpc().name} 的场景候选；请预览后明确接受。`);
-    refreshButtons();
-    return result.answer;
-  }
-
-  async function regenerateScene() {
-    return withBusy(async () => {
-      assertBound();
-      if (!state.scene.enabled) throw new Error('当前聊天尚未启用场景模式');
-      state.candidate = null; setPreview('');
+      assertOrigin(origin);
+      setStatus('正在同步当前正文与未完成阶段……', undefined, origin);
       if (state.native.enabled) await state.native.queue.catch(() => {});
-      await ensureInitializationFreshForGeneration();
-      await syncInternal();
-      assertBound();
-      const current = sceneManagedMessages();
-      const replacedMessage = current.at(-1); const user = current.at(-2);
-      if (!replacedMessage || replacedMessage.role !== 'assistant' || !user || user.role !== 'user') throw new Error('没有可重新生成的上一条回复');
-      const selectionVersion = state.scene.selectionVersion;
-      const result = await request('/v1/scene/regenerate', 'POST', { scope: state.scope });
-      assertBound(); assertSceneSelectionCurrent(selectionVersion);
-      renderSceneMaterials(result);
-      if (Array.isArray(result.unresolved) && result.unresolved.length) {
-        setStatus(`重新生成需要补充说明：${result.unresolved.join('；')}`);
-        return '';
-      }
-      if (!result.draftId || typeof result.answer !== 'string' || !result.answer.trim() || !result.userMessage || !result.assistantMessage) throw new Error('重新生成候选不可接受');
-      const messages = [result.userMessage, result.assistantMessage].map(message => ({
-        ...message, id: String(message.id || ''), revision: Number(message.revision) || 1,
-        acceptedAtMs: Number(message.acceptedAtMs) || Date.now(), envelope: message.envelope || replacedMessage.envelope,
-      }));
-      if (String(result.replacementId || '') !== replacedMessage.id || messages[0].role !== 'user' || messages[0].id !== user.id
-        || messages[0].text !== user.text || messages[0].revision !== user.revision || messages[1].role !== 'assistant'
-        || messages[1].id !== replacedMessage.id || messages[1].text !== result.answer || messages[1].revision <= replacedMessage.revision) {
-        throw new Error('重新生成候选正文无效');
-      }
-      const candidate = { kind: 'scene', operation: 'regenerate', id: String(result.draftId), draftId: String(result.draftId), scope: { ...state.scope },
-        input: user.text, answer: result.answer, envelope: messages[1].envelope, targetId: messages[1].speakerId || messages[1].envelope.targetId,
-        selectionVersion, messages, replacementId: replacedMessage.id, replacedMessage: { ...replacedMessage }, inserted: false };
-      state.candidate = candidate;
-      setPreview(result.answer);
-      setStatus('已重新生成上一条回复；接受后才会替换原正文，拒绝则保留原回复。');
-      refreshButtons();
-      return result.answer;
-    });
-  }
-
-  function candidateMessages(candidate) {
-    if (candidate.messages) return candidate.messages;
-    const acceptedAtMs = Date.now();
-    candidate.messages = [
-      { id: newId('message'), revision: 1, role: 'user', text: candidate.input, acceptedAtMs },
-      { id: newId('message'), revision: 1, role: 'assistant', text: candidate.answer, acceptedAtMs },
-    ];
-    return candidate.messages;
-  }
-
-  function assertCandidateMessagesCurrent(candidate, messages) {
-    const current = candidate.kind === 'scene' ? sceneManagedMessages() : managedMessages();
-    for (const expected of messages) {
-      const actual = current.find(message => message.id === expected.id);
-      if (!actual || actual.role !== expected.role || actual.text !== expected.text || actual.revision !== expected.revision) {
-        throw new Error('已接受正文已被修改或删除；请同步更改后再继续');
-      }
-    }
-  }
-
-  async function accept() {
-    return withBusy(async () => {
-      const candidate = state.candidate;
-      assertCandidateCurrent(candidate);
-      if (!candidate.answer) throw new Error('没有可接受的候选');
-      if (candidate.kind === 'scene') return acceptScene(candidate);
-      const messages = candidateMessages(candidate);
-      if (!candidate.inserted) {
-        if (typeof helpers.createChatMessages !== 'function') throw new Error('未找到 Tavern Helper 的 createChatMessages');
-        state.selfInserting = true;
-        try {
-          await helpers.createChatMessages(messages.filter(message => message.role !== 'user' || !candidate.submitted).map(message => ({
-            role: message.role,
-            message: message.text,
-            extra: { xldb: { id: message.id, revision: message.revision, scope: candidate.scope, acceptedAtMs: message.acceptedAtMs } },
-          })), { insert_before: 'end', refresh: 'affected' });
-        } finally { state.selfInserting = false; }
-        candidate.inserted = true;
-        assertCandidateCurrent(candidate);
-      }
-      for (const message of messages.filter(message=>message.role!=='user'||!candidate.submitted)) {
-        assertCandidateMessagesCurrent(candidate, messages);
-        const receipt = await request('/v1/process', 'POST', { scope: candidate.scope, message });
-        assertCandidateCurrent(candidate);
-        assertCandidateMessagesCurrent(candidate, messages);
-        if (receipt.status === 'failed' || receipt.status === 'conflict') {
-          setStatus('正文已接受，核心仍待同步；请点击“同步更改”重试。');
-          return receipt;
-        }
-      }
-      state.candidate = null;
-      setPreview('');
-      setStatus('正文已接受并提交到 XLDB。');
-      refreshButtons();
-      return { status: 'committed' };
-    });
-  }
-
-  async function acceptScene(candidate) {
-    const messages = candidate.messages;
-    if (!candidate.inserted) {
-      if (candidate.operation === 'regenerate' && typeof helpers.setChatMessages !== 'function') throw new Error('未找到 Tavern Helper 的 setChatMessages');
-      if (candidate.operation !== 'regenerate' && typeof helpers.createChatMessages !== 'function') throw new Error('未找到 Tavern Helper 的 createChatMessages');
-      assertCandidateCurrent(candidate);
-      state.selfInserting = true;
+      // The user may have left the chat, or it was unbound, while the queued native work finished; this sync then
+      // belongs to no open chat. A settings change in the same chat only moves the token's epoch along.
+      if (!refreshOriginEpoch(origin)) throw new Error('聊天已切换或已停用，同步已取消');
+      const result = await syncInternal(origin);
+      assertOrigin(origin);
+      // The sync above is committed (its receipt, version and operation are recorded), so the story clock read after it
+      // is display only: a failed read leaves the clock display as it was and never reports the sync as failed. A chat
+      // switch while the clock was read still stops this sync, so it never clears the next chat's native error or queue.
       try {
-        if (candidate.operation === 'regenerate') {
-          const current = sceneManagedMessages();
-          const actualUser = current.find(message => message.id === messages[0].id);
-          const actualReply = current.find(message => message.id === candidate.replacementId);
-          const prior = candidate.replacedMessage;
-          if (!actualUser || actualUser.role !== messages[0].role || actualUser.text !== messages[0].text || actualUser.revision !== messages[0].revision
-            || !actualReply || actualReply.role !== prior.role || actualReply.text !== prior.text || actualReply.revision !== prior.revision) {
-            throw new Error('原回复已被修改或删除；请同步更改后重新生成');
-          }
-          const chat = nativeHost().chat;
-          const index = chat.findIndex(message => sameScope(message.extra?.xldbScene?.scope, candidate.scope) && message.extra.xldbScene.id === candidate.replacementId);
-          if (index < 0) throw new Error('原回复已被修改或删除；请同步更改后重新生成');
-          const replacement = messages[1];
-          await helpers.setChatMessages([{ message_id: index, message: replacement.text, is_hidden: false,
-            extra: { ...chat[index].extra, xldbScene: bindingForSource(replacement, candidate.scope) } }], { refresh: 'affected' });
-        } else {
-          await helpers.createChatMessages(messages.filter(message=>!sceneManagedMessages().some(existing=>existing.id===message.id)).map(message => ({
-            role: message.role,
-            message: message.text,
-            extra: { xldbScene: { id: message.id, revision: message.revision, scope: candidate.scope, envelope: message.envelope, acceptedAtMs: message.acceptedAtMs,
-              ...(message.speakerId ? { speakerId: message.speakerId } : {}), ...(message.dependencies ? { dependencies: message.dependencies } : {}) } },
-          })), { insert_before: 'end', refresh: 'affected' });
-        }
-      } finally { state.selfInserting = false; }
-      candidate.inserted = true;
-    }
-    assertCandidateCurrent(candidate);
-    assertCandidateMessagesCurrent(candidate, messages);
-    const receipt = await request('/v1/scene/accept', 'POST', { scope: candidate.scope, draftId: candidate.draftId, messages });
-    assertCandidateCurrent(candidate);
-    assertCandidateMessagesCurrent(candidate, messages);
-    await recordSceneReceipt(receipt,candidate.scope,candidate.epoch);
-    if (receipt.status === 'failed') {
-      setStatus(`正文已接受，场景核心仍待同步：${receipt.error || '未知错误'}；请点击“同步更改”重试。`);
-      return receipt;
-    }
-    state.candidate = null;
-    setPreview('');
-    setStatus(candidate.operation === 'regenerate' ? '上一条回复已替换并提交到 XLDB。' : '场景正文已接受并提交到 XLDB。');
-    refreshButtons();
-    return receipt;
-  }
-
-  function reject() {
-    if (state.busy) throw new Error('已有操作进行中');
-    const candidate = state.candidate;
-    if (candidate && candidate.inserted) throw new Error('正文已写入聊天，请编辑或删除对应消息后同步，不能作为未接受候选拒绝。');
-    state.candidate = null;
-    setPreview('');
-    if (candidate && candidate.kind === 'scene') {
-      request('/v1/scene/reject', 'POST', { scope: candidate.scope, draftId: candidate.draftId }).catch(() => setStatus('候选已拒绝；通知核心失败但未写入聊天。'));
-    }
-    setStatus('回复候选已拒绝；已提交的用户正文和本轮状态保留。');
-    refreshButtons();
+        await refreshClock(origin);
+        assertOrigin(origin);
+      } catch (error) {
+        if (!originValid(origin)) throw error;
+        // The clock keeps its last shown value; the committed sync still reports success below.
+      }
+      if (state.native.enabled) {
+        state.native.error = '';
+        state.native.queue = Promise.resolve();
+      }
+      setStatus(result.removed ? `同步完成，已失效 ${result.removed} 条受管记录。` : '同步完成。', undefined, origin);
+      return result;
+    });
   }
 
   async function connect(connection) {
@@ -1290,9 +1508,15 @@
     return '已读取配置；密钥仅保留在当前页面内存中。';
   }
 
-  async function inspect() {
+  // Shows the core's current state of the bound chat: the scene materials, or the legacy view. originToken: the started
+  // token of the calling action (a queued native job hands its own); without one, inspect starts its own token here,
+  // before any await.
+  async function inspect(originToken = {}) {
+    const origin = captureOrigin(originToken);
     return withBusy(async () => {
-      const data = await inspectInternal();
+      assertOrigin(origin);
+      const data = await inspectInternal(origin);
+      assertOrigin(origin);
       if (state.scene.enabled) {
         if (data && data.roster) {
           setSceneRoster(data.roster,false);
@@ -1300,14 +1524,17 @@
         }
         renderSceneMaterials(data);
       } else renderInspect(data);
-      setStatus(`当前权威版本：${data.version ?? '未知'}`);
+      setStatus(`当前权威版本：${data.version ?? '未知'}`, undefined, origin);
       return data;
     });
   }
 
-  async function inspectInternal() {
+  // Reads the core's view of the token's binding: the scene inspection, or the legacy inspect. origin: the caller's token.
+  async function inspectInternal(origin) {
+    assertStarted(origin);
+    assertOrigin(origin);
     assertBound();
-    return request(state.scene.enabled ? '/v1/scene/inspect' : '/v1/inspect', 'POST', { scope: state.scope });
+    return request(state.scene.enabled ? '/v1/scene/inspect' : '/v1/inspect', 'POST', { scope: origin.scope }, origin);
   }
 
   function requireSceneRestoreHost() {
@@ -1320,12 +1547,18 @@
       ...(source.automatic ? { automatic: true } : {}), dependencies: source.dependencies || [] };
   }
 
-  async function materializeScene(scope, data, recoveryGuard = null) {
+  // Rebuilds the host chat's managed messages of the token's binding from the core's accepted sources (data), then
+  // records the receipt. recoveryGuard, when given (a recovery), checks around each write that nothing else changed the
+  // managed messages. origin: the token of the calling action; every write follows a check of the token, so a chat
+  // switch stops the rebuild before its next write.
+  async function materializeScene(origin, data, recoveryGuard = null) {
+    assertStarted(origin);
     requireSceneRestoreHost();
     if (!data.roster?.characters?.length || !Array.isArray(data.sources)) throw new Error('分支尚未配置');
-    const epoch = state.epoch;
-    const ensureCurrent = () => assertHostScope(scope, epoch, '恢复时聊天已切换，请重新绑定');
-    ensureCurrent();
+    // The error of a chat switch during the rebuild; a test pins this text.
+    const switchedMessage = '恢复时聊天已切换，请重新绑定';
+    assertOrigin(origin, switchedMessage);
+    const scope = origin.scope;
     const sources = data.sources.filter(source => source.status !== 'deleted');
     recoveryGuard?.assert();
     const wanted = new Set(sources.map(source => source.id));
@@ -1335,160 +1568,389 @@
       nativeHost().chat.forEach((message, index) => {
         const binding = message.extra?.xldbScene;
         if (!binding) return;
-        if (sameScope(binding.scope, scope)) { if (!wanted.has(binding.id)) remove.push(index); }
-        else if (binding.scope.worldId === scope.worldId && binding.scope.sessionId === scope.sessionId && binding.scope.characterId === scope.characterId) remove.push(index);
+        const otherBranch = binding.scope.worldId === scope.worldId && binding.scope.sessionId === scope.sessionId && binding.scope.characterId === scope.characterId;
+        if (sameScope(binding.scope, scope)) {
+          if (!wanted.has(binding.id)) remove.push(index);
+        } else if (otherBranch) {
+          remove.push(index);
+        }
       });
       if (remove.length) {
-        const host=nativeHost();
-        if(typeof host.clearChat!=='function'||typeof host.printMessages!=='function')throw new Error('宿主缺少聊天重绘接口');
-        ensureCurrent();await recoveryWrite(recoveryGuard,remove.map(index=>recoveryEntryKey(host.chat[index],scope)),[],()=>helpers.deleteChatMessages(remove,{refresh:'none'}));
-        ensureCurrent();await recoveryWrite(recoveryGuard,[],[],()=>host.clearChat({clearData:false}));
-        ensureCurrent();await recoveryWrite(recoveryGuard,[],[],()=>host.printMessages());
+        const host = nativeHost();
+        if (typeof host.clearChat !== 'function' || typeof host.printMessages !== 'function') throw new Error('宿主缺少聊天重绘接口');
+        const removedKeys = remove.map(index => recoveryEntryKey(host.chat[index], scope));
+        await recoveryWrite(recoveryGuard, removedKeys, [], () => helpers.deleteChatMessages(remove, { refresh: 'none' }));
+        assertOrigin(origin, switchedMessage);
+        await recoveryWrite(recoveryGuard, [], [], () => host.clearChat({ clearData: false }));
+        assertOrigin(origin, switchedMessage);
+        await recoveryWrite(recoveryGuard, [], [], () => host.printMessages());
+        assertOrigin(origin, switchedMessage);
       }
       for (const [position, source] of sources.entries()) {
-        ensureCurrent();
         const chat = nativeHost().chat;
         // extra.xldbProactive is recognized read-only: chats from before the 2026-09-23 lockdown may carry it, and restoring
         // must still rebind those messages. The Tavern never writes it any more.
         const index = chat.findIndex(message => [message.extra?.xldbScene,message.extra?.xldbCandidate].some(binding=>sameScope(binding?.scope,scope)&&binding.id===source.id) ||
           (sameScope(message.extra?.xldbProactive?.scope,scope) && source.id===`proactive:${message.extra.xldbProactive.deliveryId}`));
         const binding = bindingForSource(source, scope);
-        if (index >= 0) { const extra={...chat[index].extra,xldbScene:binding};delete extra.xldbCandidate;ensureCurrent(); await recoveryWrite(recoveryGuard,[...recoveryTargetKeys(scope,source.id)],[recoveryExpectedEntry(scope,source)],()=>helpers.setChatMessages([{ message_id: index, message: source.text, is_hidden: false, extra }], { refresh: 'affected' })); }
-        else {
+        const targetKeys = [...recoveryTargetKeys(scope, source.id)];
+        const expected = [recoveryExpectedEntry(scope, source)];
+        if (index >= 0) {
+          const extra = { ...chat[index].extra, xldbScene: binding };
+          delete extra.xldbCandidate;
+          const update = { message_id: index, message: source.text, is_hidden: false, extra };
+          await recoveryWrite(recoveryGuard, targetKeys, expected, () => helpers.setChatMessages([update], { refresh: 'affected' }));
+          assertOrigin(origin, switchedMessage);
+        } else {
           const nextIds = new Set(sources.slice(position + 1).map(item => item.id));
           const next = chat.findIndex(message => sameScope(message.extra?.xldbScene?.scope, scope) && nextIds.has(message.extra.xldbScene.id));
-          ensureCurrent();
-          await recoveryWrite(recoveryGuard,[...recoveryTargetKeys(scope,source.id)],[recoveryExpectedEntry(scope,source)],()=>helpers.createChatMessages([{ role: source.role, message: source.text, is_hidden: false, extra: { xldbScene: binding } }], { insert_before: next < 0 ? 'end' : next, refresh: 'affected' }));
+          const created = { role: source.role, message: source.text, is_hidden: false, extra: { xldbScene: binding } };
+          const placement = { insert_before: next < 0 ? 'end' : next, refresh: 'affected' };
+          await recoveryWrite(recoveryGuard, targetKeys, expected, () => helpers.createChatMessages([created], placement));
+          assertOrigin(origin, switchedMessage);
         }
       }
       recoveryGuard?.assert();
-      ensureCurrent(); setSceneRoster(data.roster); renderSceneControls(); renderSceneMaterials(data);
-      ensureCurrent();
-      await recordSceneReceipt({...data,bindings:sources},scope,epoch,!recoveryGuard);
+      setSceneRoster(data.roster);
+      renderSceneControls();
+      renderSceneMaterials(data);
+      await recordSceneReceipt(origin, { ...data, bindings: sources }, !recoveryGuard);
+      assertOrigin(origin, switchedMessage);
       // Restored host prose now equals the core, so an unadopted swipe version no longer stands in for it.
       if(sameScope(nativeHost().chatMetadata?.xldbSwipe?.scope,scope))delete nativeHost().chatMetadata.xldbSwipe;
       recoveryGuard?.assert();
-      if(!recoveryGuard){
-        const metadata=nativeHost().chatMetadata||={};
+      if (!recoveryGuard) {
+        const metadata = nativeHost().chatMetadata ||= {};
         delete metadata.xldbHydrate;
-        try{await saveNativeMetadata();}
-        catch(error){metadata.xldbHydrate={...scope};metadata.xldbRecoveryConflict={...scope};await saveNativeMetadata().catch(()=>{});throw error;}
+        try {
+          await saveNativeMetadata();
+          assertOrigin(origin, switchedMessage);
+        } catch (error) {
+          if (!originValid(origin)) throw error;
+          // The marker could not be taken back: the chat stays blocked for review.
+          metadata.xldbHydrate = { ...scope };
+          metadata.xldbRecoveryConflict = { ...scope };
+          await saveNativeMetadata().catch(() => {});
+          assertOrigin(origin, switchedMessage);
+          throw error;
+        }
       }
-      ensureCurrent();
-    } finally { state.selfInserting = false; }
+    } finally {
+      state.selfInserting = false;
+    }
   }
 
   async function sceneCheckpoint(reason = '手动保存点') {
     return withBusy(async () => { assertBound(); await state.native.queue.catch(() => {}); const result = await request('/v1/scene/checkpoint', 'POST', { scope: state.scope, reason }); setStatus('保存点已建立。'); return result; });
   }
-  async function recoverScene(worldId, preview = null) {
-    return withBusy(async()=>{
-      assertToken();requireSceneRestoreHost();
-      if(state.native.active)nativeHost().stopGeneration?.();
-      state.native.enabled=false;state.native.turn=null;
-      await state.native.queue.catch(()=>{});
-      let scope=preview ? { ...preview.scope } : currentScope(worldId);const epoch=state.epoch;
-      if(preview){
-        assertRecoveryScope(scope,preview.epoch);
-        if(recoveryFingerprint(scope)!==preview.hostFingerprint)throw new Error('本地受管正文已变化，请重新预览恢复');
-        const checked=await request('/v1/scene/inspect','POST',{scope});
-        assertRecoveryScope(scope,preview.epoch);
-        if(checked.version!==preview.version)throw new Error('核心场景已变化，请重新预览恢复');
-        if(recoveryFingerprint(scope)!==preview.hostFingerprint)throw new Error('本地受管正文已变化，请重新预览恢复');
-      }
-      state.scope=scope;state.enabled=true;state.candidate=null;
-      let guard=null,metadata=null,previousConflict=false,previousSafety=false;
-      try {
-        await selectInteraction(await request('/v1/scene/interaction','POST',{scope}),scope,epoch);
-        scope={...state.scope};
-        const data=await request('/v1/scene/inspect','POST',{scope});
-        assertHostScope(scope,epoch);
-        if(preview){
-          assertRecoveryScope(preview.scope,preview.epoch);
-          if(!sameScope(scope,preview.scope)||data.version!==preview.version)throw new Error('核心场景已变化，请重新预览恢复');
-          if(recoveryFingerprint(scope)!==preview.hostFingerprint)throw new Error('本地受管正文已变化，请重新预览恢复');
-          if(JSON.stringify(recoveryChanges(scope,data))!==preview.planSignature)throw new Error('恢复方案已变化，请重新预览恢复');
+  // Rebuilds the host chat from the core's accepted prose. Native chat is paused while the recovery runs. It comes back
+  // on afterwards when it was on before and the same chat is still open: after a success through enableNative, outside
+  // this function's busy scope so enableNative can take the busy flag itself; after a failure that wrote nothing to the
+  // host, by reopening the gate.
+  // originToken: the object the confirm button hands over for the recovery to start; a direct call starts its own token
+  // here, before any await. The token is binding-replacing and follows the recovery's own binding of the recovered
+  // scope; its later status writes, and the error the button shows, are dropped after the user has left the chat the
+  // recovery started in. The recovery pauses native chat, binds and reopens native chat only through rebaseOrigin, sends
+  // each request with its token and checks the token after every await: a wait that outlasts the chat it started in, a
+  // disable the user made meanwhile or another binding stops it with the stale error, and none of them is undone.
+  async function recoverScene(worldId, preview = null, originToken = {}) {
+    const origin = captureOrigin(originToken, { replacesBinding: true });
+    // The error of a recovery whose token went stale before it bound anything.
+    const staleMessage = '恢复期间聊天已切换或已停用，请重新预览恢复';
+    // The native gate as the recovery found it.
+    let nativeWasEnabled = false;
+    let nativeWasAutomatic = false;
+    // True once the recovery has written to the host chat; native chat then stays off until the user retries.
+    let hostWritten = false;
+    // The status the successful recovery reported, extended below with the native chat outcome.
+    let recoveryStatus = '';
+    let data;
+    try {
+      data = await withBusy(async () => {
+        assertOrigin(origin);
+        assertToken();
+        requireSceneRestoreHost();
+        // The recovery's own pause of native chat, for the chat its token names; a token already stale starts nothing.
+        const paused = rebaseOrigin([origin], () => {
+          nativeWasEnabled = state.native.enabled;
+          nativeWasAutomatic = state.native.automatic;
+          if (state.native.active) nativeHost().stopGeneration?.();
+          state.native.enabled = false;
+          state.native.turn = null;
+        });
+        if (!paused) throw new Error(staleMessage);
+        await state.native.queue.catch(() => {});
+        assertOrigin(origin);
+        let scope = preview ? { ...preview.scope } : currentScope(worldId);
+        if (preview) {
+          assertRecoveryScope(scope, preview.epoch);
+          if (recoveryFingerprint(scope) !== preview.hostFingerprint) throw new Error('本地受管正文已变化，请重新预览恢复');
+          const checked = await request('/v1/scene/inspect', 'POST', { scope }, origin);
+          assertOrigin(origin);
+          assertRecoveryScope(scope, preview.epoch);
+          if (checked.version !== preview.version) throw new Error('核心场景已变化，请重新预览恢复');
+          if (recoveryFingerprint(scope) !== preview.hostFingerprint) throw new Error('本地受管正文已变化，请重新预览恢复');
         }
-        if(!data.roster?.characters?.length)throw new Error('该范围尚无可恢复的核心场景');
-        guard=recoveryGuard(scope,preview?.hostFingerprint||recoveryFingerprint(scope));
-        metadata=nativeHost().chatMetadata||={};
-        previousConflict=Boolean(metadata.xldbRecoveryConflict);
-        previousSafety=recoverySafetyPending(scope);
-        setRecoverySafety(scope,true);
-        metadata.xldbHydrate={...scope};
-        metadata.xldbRecoveryConflict={...scope};
-        await saveNativeMetadata();
-        guard?.assert();
-        await materializeScene(scope,data,guard);
-        guard.assert();assertRecoveryScope(scope,epoch);
-        delete metadata.xldbHydrate;delete metadata.xldbRecoveryConflict;
-        await saveNativeMetadata();
-        guard.assert();assertRecoveryScope(scope,epoch);
-        state.native.error='';
-        guard.assert();assertRecoveryScope(scope,epoch);
-        setRecoverySafety(scope,false);
-        let displayError=false;
-        try{await refreshClock();if(state.scene.enabled&&state.panel?.dashboardArea)await refreshDashboard();}
-        catch{displayError=true;}
-        setStatus(displayError?'正文已恢复并保存；状态显示暂时无法刷新，请重新打开面板。':'已从核心恢复当前正文；本地受管改动已覆盖。未接受的候选仍不进入记忆。');return data;
-      } catch(error){
-        state.enabled=false;
-        if(metadata){
-          if(guard?.writes||previousConflict||previousSafety){metadata.xldbHydrate={...scope};metadata.xldbRecoveryConflict={...scope};}
-          else if(sameScope(nativeHost().chatMetadata?.xldbHydrate,scope)){
-            delete metadata.xldbHydrate;delete metadata.xldbRecoveryConflict;
+        // The recovery binds the scope it recovers, only while nothing has moved since it started: the waits above may
+        // have outlasted the chat it started in, a disable the user made meanwhile or another binding, and none of them
+        // is undone.
+        const bound = rebaseOrigin([origin], () => {
+          state.scope = scope;
+          state.enabled = true;
+          state.candidate = null;
+        });
+        if (!bound) throw new Error(staleMessage);
+        let guard = null;
+        let metadata = null;
+        // Marker snapshots from before this recovery. A failure without host writes puts these values back.
+        let previousHydrate = null;
+        let previousConflict = false;
+        let previousSafety = false;
+        try {
+          const interaction = await request('/v1/scene/interaction', 'POST', { scope }, origin);
+          assertOrigin(origin);
+          // The interaction may move the binding to its branch; the token follows that move.
+          await selectInteraction(origin, interaction);
+          assertOrigin(origin);
+          scope = origin.scope;
+          const inspected = await request('/v1/scene/inspect', 'POST', { scope }, origin);
+          assertOrigin(origin);
+          if (preview) {
+            assertRecoveryScope(preview.scope, preview.epoch);
+            if (!sameScope(scope, preview.scope) || inspected.version !== preview.version) throw new Error('核心场景已变化，请重新预览恢复');
+            if (recoveryFingerprint(scope) !== preview.hostFingerprint) throw new Error('本地受管正文已变化，请重新预览恢复');
+            if (JSON.stringify(recoveryChanges(scope, inspected)) !== preview.planSignature) throw new Error('恢复方案已变化，请重新预览恢复');
           }
-          if(nativeHost().chatMetadata===metadata)await saveNativeMetadata().catch(()=>{});
+          if (!inspected.roster?.characters?.length) throw new Error('该范围尚无可恢复的核心场景');
+          guard = recoveryGuard(scope, preview?.hostFingerprint || recoveryFingerprint(scope));
+          metadata = nativeHost().chatMetadata ||= {};
+          // A restore whose result is still waiting to be loaded leaves this marker; it must outlive a failed recovery.
+          previousHydrate = sameScope(metadata.xldbHydrate, scope) ? metadata.xldbHydrate : null;
+          previousConflict = Boolean(metadata.xldbRecoveryConflict);
+          previousSafety = recoverySafetyPending(scope);
+          setRecoverySafety(scope, true);
+          metadata.xldbHydrate = { ...scope };
+          metadata.xldbRecoveryConflict = { ...scope };
+          await saveNativeMetadata();
+          assertOrigin(origin);
+          guard.assert();
+          await materializeScene(origin, inspected, guard);
+          assertOrigin(origin);
+          guard.assert();
+          delete metadata.xldbHydrate;
+          delete metadata.xldbRecoveryConflict;
+          await saveNativeMetadata();
+          assertOrigin(origin);
+          guard.assert();
+          state.native.error = '';
+          setRecoverySafety(scope, false);
+          // The recovery is saved; the clock and the dashboard are display only. A display that fails keeps the saved
+          // recovery and says so; a display that outlasted the recovery's chat ends the recovery with the stale error.
+          let displayError = false;
+          try {
+            await refreshClock(origin);
+            assertOrigin(origin);
+            if (state.scene.enabled && state.panel?.dashboardArea) await refreshDashboard(origin);
+            assertOrigin(origin);
+          } catch (error) {
+            if (!originValid(origin)) throw error;
+            displayError = true;
+          }
+          recoveryStatus = displayError
+            ? '正文已恢复并保存；状态显示暂时无法刷新，请重新打开面板。'
+            : '已从核心恢复当前正文；本地受管改动已覆盖。未接受的候选仍不进入记忆。';
+          setStatus(recoveryStatus, undefined, origin);
+          return inspected;
+        } catch (error) {
+          // A recovery whose chat was left, disabled or bound again meanwhile ends here: its binding, its markers and
+          // its safety marker belong to that chat now. The markers it saved before its first host write keep that chat
+          // blocked for review, the safe state, until the user recovers it again.
+          if (!originValid(origin)) throw error;
+          // The recovery takes back its own binding (on the interaction's branch once that step moved it).
+          rebaseOrigin([origin], () => {
+            state.enabled = false;
+          });
+          hostWritten = Boolean(guard?.writes);
+          // A host write, or a conflict or safety marker from an earlier recovery, keeps the chat blocked for review.
+          const keepBlocked = hostWritten || previousConflict || previousSafety;
+          if (metadata) {
+            if (keepBlocked) {
+              metadata.xldbHydrate = { ...scope };
+              metadata.xldbRecoveryConflict = { ...scope };
+            } else if (sameScope(nativeHost().chatMetadata?.xldbHydrate, scope)) {
+              if (previousHydrate) metadata.xldbHydrate = previousHydrate;
+              else delete metadata.xldbHydrate;
+              delete metadata.xldbRecoveryConflict;
+            }
+            if (nativeHost().chatMetadata === metadata) await saveNativeMetadata().catch(() => {});
+            assertOrigin(origin);
+          }
+          if (!keepBlocked) {
+            try {
+              setRecoverySafety(scope, false);
+            } catch {
+              // The safety marker was never written when browser storage refused it.
+            }
+          }
+          throw error;
         }
-        if(!guard?.writes&&!previousConflict&&!previousSafety)try{setRecoverySafety(scope,false);}catch{}
-        throw error;
+      });
+      assertOrigin(origin);
+    } catch (error) {
+      // A recovery whose token went stale reopens nothing: once the host shows another chat (even before its
+      // CHAT_CHANGED arrives), or the user disabled the chat or bound another meanwhile, the gate is not the recovery's.
+      if (!originValid(origin)) throw error;
+      // Nothing reached the host and the chat is unchanged: the gate goes back as it was, so a generation still passes
+      // through XLDB (or is stopped by a pending marker) instead of going out with the raw chat history.
+      if (nativeWasEnabled && !hostWritten) {
+        rebaseOrigin([origin], () => {
+          state.native.enabled = true;
+        });
       }
-    });
+      throw error;
+    }
+    if (!nativeWasEnabled) return data;
+    // The host must still show the recovered binding itself; a branch move of its metadata since then leaves native chat
+    // off for the user to turn on.
+    if (!originIsCurrent(origin)) return data;
+    if (state.busy) {
+      setStatus(`${recoveryStatus}原生聊天未自动重新启用：另一项操作正在进行，请稍后点击“启用原生聊天”。`, undefined, origin);
+      return data;
+    }
+    try {
+      // The re-enable takes the recovery's token, so it turns native chat on only for the binding the recovery made.
+      const identity = await enableNative({ automatic: nativeWasAutomatic, allowPending: true, origin });
+      assertOrigin(origin);
+      if (!identity?.pending) setStatus(`${recoveryStatus}原生聊天已重新启用。`, undefined, origin);
+    } catch (error) {
+      if (!originValid(origin)) throw error;
+      setStatus(`${recoveryStatus}原生聊天未能重新启用：${error.message}。可点击“启用原生聊天”重试。`, undefined, origin);
+    }
+    return data;
   }
 
-  async function restoreScene(operation, checkpointId, expectedVersion = state.scene.version) {
+  // Restores the bound chat in the core to a checkpoint (operation 'restore') or takes back its last step ('undo'), then
+  // rebuilds the host chat from the core's result. originToken: the confirm button's started token; a direct call starts
+  // its own token here, before any await. After the wait for queued native work the token moves along with a settings
+  // change in the same chat, and it follows the restore's own epoch move. The restore request, the rebuild
+  // (materializeScene) and the status all take it, so a restore whose chat the user left while its recovery marker was
+  // saved is not sent (that chat keeps the marker and stays blocked for a reload), and a restore answered after the
+  // user left never rebuilds, reports or disables anything in the chat open now.
+  async function restoreScene(operation, checkpointId, expectedVersion = state.scene.version, originToken = {}) {
+    const origin = captureOrigin(originToken);
     return withBusy(async () => {
-      assertBound(); requireSceneRestoreHost(); await state.native.queue.catch(() => {}); assertBound();
-      const scope = { ...state.scope }; const epoch = state.epoch;
-      const restoreHost = nativeHost(); const restoreMetadata = restoreHost.chatMetadata ||= {};
+      assertOrigin(origin);
+      assertBound();
+      requireSceneRestoreHost();
+      await state.native.queue.catch(() => {});
+      if (!refreshOriginEpoch(origin)) throw new Error(ORIGIN_STALE_MESSAGE);
+      assertBound();
+      const scope = origin.scope;
+      const restoreHost = nativeHost();
+      const restoreMetadata = restoreHost.chatMetadata ||= {};
       try {
-        restoreMetadata.xldbHydrate = scope; await saveNativeMetadata();
-        const result = await request(`/v1/scene/${operation}`, 'POST', { scope, expectedVersion, ...(checkpointId ? { checkpointId } : {}) });
-        if (state.epoch !== epoch || !sameScope(state.scope, scope)) throw new Error('原分支已恢复，重新绑定后加载正文');
-        state.candidate = null; state.native.turn = null; state.native.error = ''; state.epoch += 1;
-        await materializeScene(scope, result);
-        setStatus(result.cleanupPending ? '正文和状态已恢复；检索清理待重试，请点击同步更改，不要重复撤销。' : operation === 'undo' && !result.undone ? '没有可撤销的操作。' : '已恢复正文及其记忆、情绪和世界状态。');
+        restoreMetadata.xldbHydrate = scope;
+        await saveNativeMetadata();
+        assertOrigin(origin);
+        const body = { scope, expectedVersion, ...(checkpointId ? { checkpointId } : {}) };
+        const result = await request(`/v1/scene/${operation}`, 'POST', body, origin);
+        assertOrigin(origin, '原分支已恢复，重新绑定后加载正文');
+        // The restore voids every earlier candidate and turn by moving the epoch on; its token moves along with it.
+        const moved = rebaseOrigin([origin], () => {
+          state.candidate = null;
+          state.native.turn = null;
+          state.native.error = '';
+          state.epoch += 1;
+        });
+        if (!moved) throw new Error('原分支已恢复，重新绑定后加载正文');
+        await materializeScene(origin, result);
+        assertOrigin(origin);
+        setStatus(result.cleanupPending
+          ? '正文和状态已恢复；检索清理待重试，请点击同步更改，不要重复撤销。'
+          : operation === 'undo' && !result.undone
+            ? '没有可撤销的操作。'
+            : '已恢复正文及其记忆、情绪和世界状态。', undefined, origin);
         return result;
       } catch (error) {
+        // A restore that failed after the user left its chat neither marks nor disables the chat open now; its own
+        // chat keeps the recovery marker saved before the request, so it stays blocked for a reload.
+        if (!originValid(origin)) throw error;
         restoreMetadata.xldbHydrate = scope;
-        disable('恢复结果待载入，请重试当前聊天。', false);
+        disable('恢复结果待载入，请重试当前聊天。', false, origin);
         throw error;
       }
     });
   }
 
-  async function switchSceneBranch(branchId, create = false) {
+  // Moves the bound chat to another branch (branchId; create forks it from the current branch first) and rebuilds the
+  // host chat from that branch's accepted prose. originToken: the branch button's started token; a direct call starts
+  // its own token here, before any await. After the wait for queued native work the token moves along with a settings
+  // change in the same chat. The fork, interaction and inspect requests take it. The host's branch metadata and the
+  // binding then move together, with no wait between them, and the token follows that move; only then is the chat
+  // saved, so every later check (after the save and after the rebuild) is the ordinary token check, and the save, the
+  // rebuild (materializeScene), the panel and the status act only for the chat the switch started in.
+  async function switchSceneBranch(branchId, create = false, originToken = {}) {
+    const origin = captureOrigin(originToken);
     return withBusy(async () => {
-      assertBound(); requireSceneRestoreHost(); await state.native.queue.catch(() => {}); assertBound();
-      branchId = String(branchId || '').trim(); if (!branchId) throw new Error('请填写分支名称');
-      const prior = { ...state.scope }; let scope = { ...prior, branchId }; const epoch = state.epoch;
-      if(create)await request('/v1/scene/fork','POST',{scope:prior,branchId});
-      const interaction=await request('/v1/scene/interaction','POST',{scope});
-      scope=interaction.scope;
-      const result = await request('/v1/scene/inspect','POST',{scope,interactionRevision:interaction.revision});
-      assertHostScope(prior, epoch);
+      assertOrigin(origin);
+      assertBound();
+      requireSceneRestoreHost();
+      await state.native.queue.catch(() => {});
+      if (!refreshOriginEpoch(origin)) throw new Error(ORIGIN_STALE_MESSAGE);
+      assertBound();
+      branchId = String(branchId || '').trim();
+      if (!branchId) throw new Error('请填写分支名称');
+      const prior = origin.scope;
+      let scope = { ...prior, branchId };
+      if (create) await request('/v1/scene/fork', 'POST', { scope: prior, branchId }, origin);
+      assertOrigin(origin);
+      const interaction = await request('/v1/scene/interaction', 'POST', { scope }, origin);
+      assertOrigin(origin);
+      scope = interaction.scope;
+      const inspectBody = { scope, interactionRevision: interaction.revision };
+      const result = await request('/v1/scene/inspect', 'POST', inspectBody, origin);
+      assertOrigin(origin);
       if (!result.roster?.characters?.length) throw new Error('未找到该分支');
-      const branchHost = nativeHost(); const branchMetadata = branchHost.chatMetadata ||= {};
+      const branchHost = nativeHost();
+      const branchMetadata = branchHost.chatMetadata ||= {};
       try {
-        branchMetadata.xldbBranchId = scope.branchId; branchMetadata.xldbHydrate = scope;
+        branchMetadata.xldbBranchId = scope.branchId;
+        branchMetadata.xldbHydrate = scope;
+        let actual = null;
+        try {
+          actual = currentScope(scope.worldId);
+        } catch {
+          // A host that names no attachable chat fails the comparison below.
+        }
+        if (!sameScope(actual, scope)) throw new Error('聊天已切换，请重新绑定');
+        // The switch's own binding of the branch, which voids every earlier candidate and turn; its token follows it.
+        // rebaseOrigin moves nothing unless the epoch, the host chat and the binding are still the ones the token
+        // holds.
+        const moved = rebaseOrigin([origin], () => {
+          state.scope = scope;
+          state.interaction = interaction;
+          state.epoch += 1;
+          state.candidate = null;
+          state.native.turn = null;
+          state.native.error = '';
+        });
+        if (!moved) throw new Error('聊天已切换，请重新绑定');
         if (typeof branchHost.saveChat === 'function') await branchHost.saveChat();
-        let actual = null; try { actual = currentScope(scope.worldId); } catch { /* handled below */ }
-        if (state.epoch !== epoch || !sameScope(state.scope, prior) || !sameScope(actual, scope)) throw new Error('聊天已切换，请重新绑定');
-        state.scope = scope;state.interaction=interaction; state.epoch += 1; state.candidate = null; state.native.turn = null; state.native.error = ''; state.panel?.resetWorldForm?.();state.panel?.resetWorkbench?.();renderInteraction();
-        await materializeScene(scope, result);
+        assertOrigin(origin);
+        state.panel?.resetWorldForm?.();
+        state.panel?.resetWorkbench?.();
+        renderInteraction();
+        await materializeScene(origin, result);
+        assertOrigin(origin);
         if (state.panel?.branchInput) state.panel.branchInput.value = branchId;
-        setStatus(`已切换到分支 ${branchId}。`); return scope;
+        setStatus(`已切换到分支 ${branchId}。`, undefined, origin);
+        return scope;
       } catch (error) {
+        // A switch that failed after the user left its chat neither marks nor disables the chat open now. The check is
+        // the one the switch's own binding move uses (originUnchanged): the host's branch metadata may already name the
+        // new branch while the binding has not moved yet, and the switch's chat must still be marked and disabled then.
+        // Nothing waits between this check and the disable, so the disable acts on that same chat.
+        if (!originUnchanged(origin)) throw error;
         branchMetadata.xldbHydrate = scope;
         disable('分支待载入，请重试当前聊天。', false);
         throw error;
@@ -1601,7 +2063,10 @@
     });
   }
 
+  // Saves the NPC roster of the bound chat and syncs it. The receipt and the sync take the token this save starts at
+  // its call, so they run only for the chat the save started in.
   async function configureScene(roster) {
+    const origin = captureOrigin({});
     return withBusy(async () => {
       assertBound();
       const scope = {...state.scope};
@@ -1615,33 +2080,39 @@
       const response = await request('/v1/scene/configure', 'POST', {scope, expectedVersion, roster: {characters}});
       assertBound();
       setSceneRoster(response && response.roster ? response.roster : { characters });
-      await recordSceneReceipt(response);
+      await recordSceneReceipt(origin, response);
       state.candidate = null;
       setPreview('');
       renderSceneControls();
-      await syncInternal();
+      await syncInternal(origin);
       setStatus('NPC 名单已保存；每名 NPC 使用自己的设定与视角。');
       return state.scene.roster;
     });
   }
 
+  // Changes how much of one memory a character may recall (access) and shows the result. The receipt and the reload take
+  // the token this change starts at its call.
   async function setAccess(memoryId, access, characterId) {
+    const origin = captureOrigin({});
     return withBusy(async () => {
       assertBound();
       const receipt=await request(state.scene.enabled ? '/v1/scene/access' : '/v1/access', 'POST', { scope: state.scope, memoryId, access, ...(state.scene.enabled ? {characterId:characterId || state.scene.targetId,expectedVersion:state.scene.version} : {}) });
-      if(state.scene.enabled)await recordSceneReceipt(receipt);
-      const data = await inspectInternal();
+      if (state.scene.enabled) await recordSceneReceipt(origin, receipt);
+      const data = await inspectInternal(origin);
       if (state.scene.enabled) renderSceneMaterials(data); else renderInspect(data);
       return data;
     });
   }
 
+  // Turns one preference on or off or rewrites it (text), and shows the result. The receipt and the reload take the token
+  // this change starts at its call.
   async function setPreference(id, enabled, text, characterId) {
+    const origin = captureOrigin({});
     return withBusy(async () => {
       assertBound();
       const receipt=await request(state.scene.enabled?'/v1/scene/preference':'/v1/preference', 'POST', { scope: state.scope, id, enabled: Boolean(enabled), ...(text === undefined ? {} : { text }), ...(state.scene.enabled?{characterId:characterId||state.scene.targetId,expectedVersion:state.scene.version}:{}) });
-      if(state.scene.enabled)await recordSceneReceipt(receipt);
-      const data = await inspectInternal();
+      if (state.scene.enabled) await recordSceneReceipt(origin, receipt);
+      const data = await inspectInternal(origin);
       if(state.scene.enabled)renderSceneMaterials(data);else renderInspect(data);
       return data;
     });
@@ -1664,11 +2135,31 @@
     refreshButtons();
   }
 
-  function disable(message = '当前聊天已停用 XLDB；再次启用前不会自动接入。', persist = true) {
-    let scope = state.scope;
-    if (!scope) try { scope = attachmentResolution().scope; } catch { /* No attachable single chat is open. */ }
-    if (persist && scopeMatchesCurrentChat(scope)) void persistAttachment(scope, true, false).catch(error => setStatus(`当前聊天已停用，但保存停用状态失败：${error.message}`));
-    clearBinding(message);
+  // origin: optional origin token of the action that disables. When its chat is no longer open the disable is dropped
+  // (it would clear the binding of the chat open now); otherwise the token follows the action's own unbinding.
+  function disable(message = '当前聊天已停用 XLDB；再次启用前不会自动接入。', persist = true, origin = null) {
+    if (!originIsCurrent(origin)) return;
+    // The chat this disable acts on. Its save-failure status arrives after an await and is dropped once that chat is left.
+    const saveOrigin = captureOrigin({});
+    // The binding the disable ends, as its token holds it; an unbound chat saves its attachment scope instead.
+    let scope = saveOrigin.scope;
+    if (!scope) {
+      try {
+        scope = attachmentResolution().scope;
+      } catch {
+        // No attachable single chat is open.
+      }
+    }
+    if (persist && scopeMatchesCurrentChat(scope)) {
+      // Shows the failed save, only while the chat this disable acted on is still the open chat (checked first).
+      const reportSaveFailure = error => {
+        if (!originIsCurrent(saveOrigin)) return;
+        setStatus(`当前聊天已停用，但保存停用状态失败：${error.message}`, undefined, saveOrigin);
+      };
+      void persistAttachment(saveOrigin, scope, true, false).catch(reportSaveFailure);
+    }
+    // The disable's own unbinding; both tokens follow it, and a failure handler runs only after this line.
+    rebaseOrigin([origin, saveOrigin], () => clearBinding(message));
   }
 
   function currentAttachmentKey() {
@@ -1680,6 +2171,8 @@
 
   async function autoAttachCurrent(reason = 'automatic') {
     if (!state.token) return { attached: false, reason: 'not_connected' };
+    // Binding and enabling read and tag the chat; a reply that is still being generated must finish first.
+    if (state.native.active) throw new Error('酒馆正在生成回复，本轮结束后才能接入');
     const resolution = attachmentResolution();
     if (resolution.conflict) {
       clearBinding('当前聊天保存了互相冲突的 XLDB 范围，未自动接入；请先核对或清除聊天元数据。');
@@ -1692,7 +2185,10 @@
     const metadata = nativeHost().chatMetadata ||= {};
     metadata.xldbBranchId = resolution.scope.branchId;
     const preserveNativeGate=resolution.nativeEnabled!==false&&nativeHost().chat.some(message=>sameScope(message?.extra?.xldbScene?.scope,resolution.scope));
-    if(preserveNativeGate){state.native.enabled=true;state.native.automatic=true;}
+    if(preserveNativeGate){
+      state.native.enabled=true;
+      state.native.automatic=true;
+    }
     const scope = await bind(resolution.scope.worldId,{preserveNativeGate});
     let native = null;
     if (resolution.nativeEnabled !== false) native = await enableNative({ automatic: true, allowPending: true });
@@ -1704,7 +2200,16 @@
     if (state.attachment.running || state.busy || !state.attachment.pending) return null;
     const pending = state.attachment.pending;
     state.attachment.pending = null;
-    if (!pending.key || pending.key !== currentAttachmentKey()) return null;
+    if (!pending.key) {
+      // No single-character chat is open (a group chat, no chat, no character): say why instead of leaving the
+      // "restoring this chat" text from the chat switch on screen.
+      let reason = '当前没有可接入的单角色聊天';
+      try { currentScope('attachment'); }
+      catch (error) { reason = error.message; }
+      setStatus(`${reason}；XLDB 不会接入此聊天。`);
+      return null;
+    }
+    if (pending.key !== currentAttachmentKey()) return null;
     state.attachment.running = true;
     try { return await autoAttachCurrent(pending.reason); }
     catch (error) {
@@ -1725,14 +2230,39 @@
   }
 
   function requestAutoAttachment(reason) {
-    state.attachment.pending = { reason, key: currentAttachmentKey() };
+    const key = currentAttachmentKey();
+    state.attachment.pending = { reason, key };
+    // Re-arm the native prompt gate now, before a busy operation can delay the attach: a chat that already holds
+    // messages accepted under its saved scope must not send its raw history to the model while it waits.
+    // With the chat not yet bound, the prompt handler then stops every generation instead of passing it through.
+    if (key && state.token && !state.native.enabled) {
+      let resolution = null;
+      try { resolution = attachmentResolution(); }
+      catch { resolution = null; }
+      const scope = resolution?.scope;
+      const gateWanted = Boolean(scope) && !resolution.disabled && resolution.nativeEnabled !== false;
+      const managed = gateWanted && (nativeHost().chat || []).some(message => sameScope(message?.extra?.xldbScene?.scope, scope));
+      if (managed) {
+        state.native.enabled = true;
+        state.native.automatic = true;
+      }
+    }
     return drainAutoAttachment();
   }
 
-  async function enableCurrentChat() {
+  // Saves the open chat's attachment as enabled, then asks for its automatic attachment again (the bind and native
+  // chat). originToken: the click's started token (the bind button, the journey card's enable step); a direct call
+  // starts its own token here, before any await. The token covers the attachment save only. Errors before and during
+  // the save are shown in the chat the click came from, through the button. The attachment asked for afterwards reports
+  // its own failures in the chat it attaches, as before, so the token never has to outlive a bind. A save that ends
+  // after the user left the chat asks for no attachment, so the chat open now is not attached again by this enable; a
+  // settings change in the same chat only moves the token's epoch along.
+  async function enableCurrentChat(originToken = {}) {
+    const origin = captureOrigin(originToken);
     const resolution = attachmentResolution();
     if (resolution.conflict) throw new Error('当前聊天保存了互相冲突的 XLDB 范围，请先核对聊天元数据');
-    await persistAttachment(resolution.scope, false, true);
+    await persistAttachment(origin, resolution.scope, false, true);
+    if (!refreshOriginEpoch(origin)) throw new Error(ORIGIN_STALE_MESSAGE);
     return requestAutoAttachment('retry');
   }
 
@@ -1755,7 +2285,13 @@
     }
     setStatus(state.native.enabled?'受管消息已变化，正在自动同步；若需要恢复会明确提示。':'受管消息已变化，请点击“同步更改”后再生成。');
     refreshButtons();
-    if (state.native.enabled) return queueNative(async () => { await syncInternal(); await inspect(); });
+    if (state.native.enabled) return queueNative(async origin => {
+      assertOrigin(origin);
+      await syncInternal(origin);
+      assertOrigin(origin);
+      await inspect(origin);
+      assertOrigin(origin);
+    });
   }
 
   function onNativeDeleted() {
@@ -1803,18 +2339,18 @@
     metadata.xldbHydrate={...scope};
     void saveNativeMetadata().catch(()=>{});
     state.native.swipeChecks+=1;
-    const epoch=state.epoch;
-    const work=queueNative(async()=>{
+    const work=queueNative(async origin=>{
+      assertOrigin(origin);
       const current=nativeHost().chatMetadata||={};
       // A restore or explicit recovery that ran first already made the chat equal the core.
       if(!sameScope(current.xldbHydrate,scope))return;
       // The generating swipe whose reply never arrived is over; its gate is released only while the core is unchanged.
       if(released&&state.native.regeneration===released)state.native.regeneration=null;
       try{
-        const data=await request('/v1/scene/inspect','POST',{scope});
-        assertHostScope(scope,epoch);
+        const data=await request('/v1/scene/inspect','POST',{scope},origin);
+        assertOrigin(origin);
         if(released&&!regenerationUnchanged(released,data,scope)){
-          setStatus('重生成未被接受，且聊天或核心正文已变化；请在“资料与恢复”中预览并恢复核心正文。');
+          setStatus('重生成未被接受，且聊天或核心正文已变化；请在“资料与恢复”中预览并恢复核心正文。',undefined,origin);
           return;
         }
         const reply=(data.sources||[]).filter(source=>source.status==='accepted').at(-1);
@@ -1824,7 +2360,8 @@
         const extra={...message.extra,xldbScene:bindingForSource(reply,scope)};
         if(sameScope(extra.xldbCandidate?.scope,scope)&&extra.xldbCandidate.id===reply.id)delete extra.xldbCandidate;
         message.extra=extra;
-        const stored=message.swipe_info?.[message.swipe_id];if(stored)stored.extra={...extra};
+        const stored=message.swipe_info?.[message.swipe_id];
+        if(stored)stored.extra={...extra};
         const same=String(message.mes||'')===reply.text;
         if(same)delete current.xldbSwipe;
         else current.xldbSwipe={scope:{...scope},id:reply.id,text:reply.text};
@@ -1832,10 +2369,11 @@
         if(state.native.regeneration&&!state.native.active)state.native.regeneration=null;
         delete current.xldbHydrate;
         await saveNativeMetadata();
-        setStatus(same?'已回到已接受的回复版本；记忆与情绪保持不变。':SWIPE_ADOPT_HINT);
+        assertOrigin(origin);
+        setStatus(same?'已回到已接受的回复版本；记忆与情绪保持不变。':SWIPE_ADOPT_HINT,undefined,origin);
       }catch(error){
-        if(epoch!==state.epoch||!sameScope(scope,state.scope))throw error;
-        setStatus(`切换后的回复版本暂时无法与核心核对（${friendlyError(error.message)}）；XLDB 已暂停同步，已接受正文和状态未改变。请在“资料与恢复”中预览并恢复核心正文。`);
+        if(!originValid(origin))throw error;
+        setStatus(`切换后的回复版本暂时无法与核心核对（${friendlyError(error.message)}）；XLDB 已暂停同步，已接受正文和状态未改变。请在“资料与恢复”中预览并恢复核心正文。`,undefined,origin);
       }
     });
     const done=()=>{state.native.swipeChecks=Math.max(0,state.native.swipeChecks-1);};
@@ -1843,10 +2381,26 @@
     return work;
   }
 
-  async function adoptSwipe() {
+  // Adopts the reply version the host shows instead of the accepted one. originToken: a caller's started token; a
+  // direct call starts its own token here, before any await. After the wait for queued native work the token moves
+  // along with a settings change in the same chat. metadata is this chat's own metadata object: every marker change
+  // below acts on it, and every save runs right after a check of the token, so a save never saves the chat open later.
+  // Like the workbench's confirmed correction, the source correction is the one request sent without the token: the
+  // user confirmed this version for this chat, the request is fixed (this chat's scope, the shown text, the authority
+  // version shown at the start) and its recovery marker is saved before it is sent, so it may complete for this chat
+  // after the user left; everything after it checks the token, and a stale adoption leaves the saved marker, so its
+  // chat stays blocked for a reload of the core's prose.
+  async function adoptSwipe(originToken = {}) {
+    const origin = captureOrigin(originToken);
     return withBusy(async()=>{
-      assertBound();await state.native.queue.catch(()=>{});assertBound();
-      const scope={...state.scope},epoch=state.epoch,marker=swipeMarker(scope),metadata=nativeHost().chatMetadata||={};
+      assertOrigin(origin);
+      assertBound();
+      await state.native.queue.catch(()=>{});
+      if (!refreshOriginEpoch(origin)) throw new Error(ORIGIN_STALE_MESSAGE);
+      assertBound();
+      const scope = origin.scope;
+      const marker = swipeMarker(scope);
+      const metadata = nativeHost().chatMetadata ||= {};
       if(!marker)throw new Error('当前没有待采用的回复版本');
       if(sameScope(metadata.xldbHydrate,scope)||sameScope(metadata.xldbRecoveryConflict,scope)||recoverySafetyPending(scope))
         throw new Error('当前聊天待恢复，请先在“资料与恢复”中预览并恢复核心正文');
@@ -1855,26 +2409,50 @@
       if(!text.trim())throw new Error('当前回复版本为空，不能采用');
       if(!Number.isSafeInteger(state.scene.version))throw new Error('缺少同步基准，请核对当前分支并恢复权威正文后重试');
       if(text!==marker.text){
-        metadata.xldbHydrate={...scope};await saveNativeMetadata();
-        let result;
+        // The correction the user confirmed, fixed before the wait for the marker save.
+        const correction={
+          scope,
+          sourceId:marker.id,
+          revision:message.extra.xldbScene.revision,
+          text,
+          expectedVersion:state.scene.version,
+          operationId:newId('swipe'),
+        };
+        let result=null;
+        metadata.xldbHydrate={...scope};
+        await saveNativeMetadata();
         try{
-          result=await request('/v1/scene/source-correct','POST',{scope,sourceId:marker.id,revision:message.extra.xldbScene.revision,text,
-            expectedVersion:state.scene.version,operationId:newId('swipe')});
+          result=await request('/v1/scene/source-correct','POST',correction);
+          assertOrigin(origin,'采用期间聊天已切换');
         }catch(error){
+          // A failure after the user left this chat keeps this chat's recovery gate and writes nothing into, and saves
+          // nothing of, the chat open now.
+          if(!originValid(origin))throw error;
           // A refusal from the core wrote nothing; an unknown outcome keeps the recovery gate.
-          if(/^XLDB：[a-z_0-9]+$/.test(error.message)&&sameScope(metadata.xldbHydrate,scope)){delete metadata.xldbHydrate;await saveNativeMetadata().catch(()=>{});}
-          setStatus(`未采用此版本：${friendlyError(error.message)}`);
+          if(/^XLDB：[a-z_0-9]+$/.test(error.message)&&sameScope(metadata.xldbHydrate,scope)){
+            delete metadata.xldbHydrate;
+            await saveNativeMetadata().catch(()=>{});
+            if(!originValid(origin))throw error;
+          }
+          setStatus(`未采用此版本：${friendlyError(error.message)}`,undefined,origin);
           throw error;
         }
-        assertHostScope(scope,epoch,'采用期间聊天已切换');
         if(String(message.mes||'')!==text)throw new Error('回复已在采用期间变化，请先在“资料与恢复”中预览并恢复核心正文');
         delete metadata.xldbSwipe;
-        await recordSceneReceipt(result,scope,epoch);
+        await recordSceneReceipt(origin, result);
+        assertOrigin(origin);
         delete metadata.xldbHydrate;
-        if(result.status==='failed'){await saveNativeMetadata();throw new Error(`已采用此版本，后台整理失败：${result.error||'未知错误'}`);}
-      }else delete metadata.xldbSwipe;
+        if(result.status==='failed'){
+          await saveNativeMetadata();
+          assertOrigin(origin);
+          throw new Error(`已采用此版本，后台整理失败：${result.error||'未知错误'}`);
+        }
+      }else{
+        delete metadata.xldbSwipe;
+      }
       await saveNativeMetadata();
-      setStatus('已采用当前回复版本；记忆与情绪按此版本更新。');
+      assertOrigin(origin);
+      setStatus('已采用当前回复版本；记忆与情绪按此版本更新。',undefined,origin);
       return true;
     });
   }
@@ -1884,19 +2462,21 @@
   function recoverUnacceptedRegeneration() {
     const regeneration=state.native.regeneration;
     if(!regeneration)return Promise.resolve();
-    return queueNative(async()=>{
+    return queueNative(async origin=>{
+      assertOrigin(origin);
       const scope={...regeneration.scope},metadata=nativeHost().chatMetadata||{};
       if(state.native.regeneration!==regeneration||regeneration.epoch!==state.epoch||!sameScope(scope,state.scope)||
         !sameScope(metadata.xldbHydrate,scope)||sameScope(metadata.xldbRecoveryConflict,scope)||recoverySafetyPending(scope))return;
       state.native.regeneration=null;
-      const data=await request('/v1/scene/inspect','POST',{scope});
-      assertHostScope(scope,regeneration.epoch);
+      const data=await request('/v1/scene/inspect','POST',{scope},origin);
+      assertOrigin(origin);
       if(!regenerationUnchanged(regeneration,data,scope)){
-        setStatus('重生成未被接受，且聊天或核心正文已变化；请在“资料与恢复”中预览并恢复核心正文。');
+        setStatus('重生成未被接受，且聊天或核心正文已变化；请在“资料与恢复”中预览并恢复核心正文。',undefined,origin);
         return;
       }
-      await materializeScene(scope,data);
-      setStatus('重生成未被接受，已自动恢复原已接受的回复；记忆与情绪未改变。');
+      await materializeScene(origin,data);
+      assertOrigin(origin);
+      setStatus('重生成未被接受，已自动恢复原已接受的回复；记忆与情绪未改变。',undefined,origin);
     });
   }
 
@@ -2063,12 +2643,35 @@
     turn.toolContinuation=true;
   }
 
+  // Runs action as the next native job, one job at a time. The job's token is started when it is queued (the host
+  // chat, the bound scope and the epoch then). Right before the body runs, native chat must be on and the token still
+  // current; otherwise the job does nothing (its body never runs, so it starts no request and writes nothing) and
+  // resolves. The body is async origin => { ... }: it gets the token, hands it to every helper and checks it after each
+  // of its own awaits. Its outcome (the native error cleared, or the failure, its status and badge) is written only while
+  // the token is valid; a job whose token went stale while it ran rejects with its error and writes nothing.
   function queueNative(action) {
-    const epoch = state.epoch;
+    // The chat this job is queued for (host chat, bound scope, epoch).
+    const origin = captureOrigin({});
     const work = state.native.queue.catch(() => {}).then(async () => {
-      if (!state.native.enabled || epoch !== state.epoch) return;
-      try { await action(); state.native.error = ''; }
-      catch (error) { state.native.error = error.message; setStatus(`原生聊天处理失败：${error.message}。下次正常生成会尝试可恢复的同步；若需人工恢复请按界面提示操作。`); renderSkippedStages(state.dashboard.data?.skippedStages||[]); throw error; }
+      // A chat switch (even before its CHAT_CHANGED), a disable, a settings change or another world bound in the same
+      // epoch while earlier jobs ran: this job belongs to no open binding, so its body never runs. This check comes
+      // first, before anything else runs after the wait for the earlier jobs.
+      if (!originIsCurrent(origin)) return;
+      if (!state.native.enabled) return;
+      try {
+        await action(origin);
+        assertOrigin(origin);
+        state.native.error = '';
+      } catch (error) {
+        // A job whose chat is no longer open (the chat switched, another world was bound in the same epoch, or the
+        // script was destroyed while it ran) must not write its error, status or badge into the current chat; the
+        // rejection still reaches its own queue.
+        if (!originValid(origin)) throw error;
+        state.native.error = error.message;
+        setStatus(`原生聊天处理失败：${error.message}。下次正常生成会尝试可恢复的同步；若需人工恢复请按界面提示操作。`, undefined, origin);
+        renderSkippedStages(state.dashboard.data?.skippedStages||[]);
+        throw error;
+      }
     });
     state.native.queue = work;
     // Host event emitters may ignore rejected handlers; retain the failure for the generation gate.
@@ -2078,6 +2681,24 @@
 
   // SPDB presentation -> service -> gateway. Kept in one directly loadable JS.
   function createMaterialGateway(api,getHost) {
+    // Converts modern getWorldbook, legacy getLorebookEntries and loadWorldInfo entries into the one shape the service reads.
+    function normalizeEntry(entry) {
+      const normalized = {
+        uid: entry.uid ?? entry.id,
+        name: entry.name ?? entry.comment ?? '',
+        keys: entry.strategy?.keys ?? entry.keys ?? entry.key ?? [],
+        content: entry.content,
+        enabled: entry.enabled,
+      };
+      // Without a uid the source id is derived from the content. Keep the gateway's
+      // original name and comment so that filling the name from the comment during
+      // normalisation cannot change an id that was already content-derived.
+      Object.defineProperty(normalized, 'sourceIdFields', {
+        value: [entry.name || '', entry.comment || '', entry.content || ''],
+        enumerable: false,
+      });
+      return normalized;
+    }
     return {
       readPlayerName() { return String(getHost().name1||''); },
       async readCard() {
@@ -2096,13 +2717,16 @@
       async readEntries(name) {
         const read=typeof api.getWorldbook==='function'?api.getWorldbook:api.getLorebookEntries;
         if(typeof read==='function'){
-          const entries=await read(name);if(!Array.isArray(entries))throw new Error('世界书“'+name+'”返回了无效条目');return entries;
+          const entries=await read(name);
+          if(!Array.isArray(entries))throw new Error('世界书“'+name+'”返回了无效条目');
+          return entries.map(normalizeEntry);
         }
         const context=getHost();
         if(typeof context.loadWorldInfo!=='function')throw new Error('酒馆缺少世界书条目读取接口');
         const book=await context.loadWorldInfo(name);
         if(!book?.entries || typeof book.entries!=='object')throw new Error('世界书“'+name+'”返回了无效条目');
-        return Object.values(book.entries).map(entry=>({...entry,enabled:entry.disable!==true}));
+        const entries = Object.values(book.entries);
+        return entries.map(entry => normalizeEntry({...entry, enabled: entry.disable !== true}));
       },
     };
   }
@@ -2146,12 +2770,37 @@
     async function readIdentity() {
       const current = await readCurrent();
       const { raw, card, books, playerName } = current;
-      const cardText = [card.name || raw.name, card.description || raw.description, card.personality || raw.personality, card.scenario || raw.scenario].filter(Boolean).join('\n');
+      const cardText = [
+        card.name || raw.name,
+        card.description || raw.description,
+        card.personality || raw.personality,
+        card.scenario || raw.scenario,
+      ]
+        .filter(Boolean)
+        .join('\n');
       const documents = [{ id: 'card', name: String(card.name || raw.name || ''), keys: [], text: cardText.slice(0, 20000) }];
       const embedded = Object.values(card.character_book?.entries || {});
-      for (const [index, entry] of embedded.entries()) if (entry.enabled === true && entry.content) documents.push({ id: `embedded:${entry.id ?? index}`, name: String(entry.comment || ''), keys: entry.keys || [], text: String(entry.content).slice(0, 20000) });
+      for (const [index, entry] of embedded.entries()) {
+        if (entry.enabled === true && entry.content) {
+          documents.push({
+            id: `embedded:${entry.id ?? index}`,
+            name: String(entry.comment || ''),
+            keys: entry.keys || [],
+            text: String(entry.content).slice(0, 20000),
+          });
+        }
+      }
       for (const { name, entries } of books) {
-        for (const entry of entries) if (entry.enabled === true && entry.content) documents.push({ id: `book:${name}:${entry.uid}`, name: String(entry.name || ''), keys: entry.strategy?.keys || [], text: String(entry.content).slice(0, 20000) });
+        for (const entry of entries) {
+          if (entry.enabled === true && entry.content) {
+            documents.push({
+              id: `book:${name}:${entry.uid}`,
+              name: String(entry.name || ''),
+              keys: entry.keys,
+              text: String(entry.content).slice(0, 20000),
+            });
+          }
+        }
       }
       if (documents.length > 1001) throw new Error('关联世界书条目过多，请缩小当前角色卡范围');
       const provenanceDocuments=catalogFromCurrent(current).sources.map(({id,text})=>({id,text}));
@@ -2225,9 +2874,16 @@
       if (uid == null || uid === '') {
         // A card-embedded entry may have no UID. Its content identity survives
         // unrelated insertions; editing that content is a source replacement.
-        const text = JSON.stringify([entry?.name || '', entry?.comment || '', entry?.content || '']);
+        // Normalised entries carry the gateway's original fields; embedded entries are still raw.
+        const sourceIdFields = Array.isArray(entry?.sourceIdFields)
+          ? entry.sourceIdFields
+          : [entry?.name || '', entry?.comment || '', entry?.content || ''];
+        const text = JSON.stringify(sourceIdFields);
         let hash = 14695981039346656037n;
-        for (let offset = 0; offset < text.length; offset++) hash = BigInt.asUintN(64, (hash ^ BigInt(text.charCodeAt(offset))) * 1099511628211n);
+        for (let offset = 0; offset < text.length; offset++) {
+          const mixed = BigInt.asUintN(64, (hash ^ BigInt(text.charCodeAt(offset))) * 1099511628211n);
+          hash = mixed;
+        }
         base = `content:${hash.toString(16)}`;
       } else base = `uid:${initializationSourceIdPart(uid)}`;
       const count = occurrences.get(base) || 0;
@@ -2237,20 +2893,27 @@
   }
 
   function initializationEntryText(bookName, entry) {
-    const keys = Array.isArray(entry.keys) ? entry.keys : Array.isArray(entry.strategy?.keys) ? entry.strategy.keys : [];
+    const keys = Array.isArray(entry.keys) ? entry.keys : [];
+    const title = entry.name || entry.comment;
     return initializationSourceText([
       `世界书：${bookName}`,
-      entry.name || entry.comment ? `条目：${entry.name || entry.comment}` : '',
+      title ? `条目：${title}` : '',
       keys.length ? `关键词：${keys.filter(key => typeof key === 'string').join('、')}` : '',
       `内容：${String(entry.content)}`,
     ]);
   }
 
-  async function collectInitializationSources() {
-    const context=JSON.stringify([state.epoch,currentScope(state.scope?.worldId)]);
+  // Reads the selectable initialization sources (the character card and its world-book entries) for the chat the token
+  // names, keeping the ids an older initialization stored. origin: the token of the calling action; a read that outlasts
+  // that chat fails with the text a test pins for it.
+  async function collectInitializationSources(origin) {
+    assertStarted(origin);
+    const switchedMessage = '读取资料期间聊天已切换，请在当前聊天重新读取。';
+    assertOrigin(origin, switchedMessage);
     const {sources,identities}=await materialService.readCatalog();
-    if(state.initialization.hasInitialized&&!state.initialization.provenance)await fetchInitializationProvenance();
-    if(context!==JSON.stringify([state.epoch,currentScope(state.scope?.worldId)]))throw new Error('读取资料期间聊天已切换，请在当前聊天重新读取。');
+    assertOrigin(origin, switchedMessage);
+    if(state.initialization.hasInitialized&&!state.initialization.provenance)await fetchInitializationProvenance(origin);
+    assertOrigin(origin, switchedMessage);
     return preserveLegacyInitializationIds(sources,identities,state.initialization.provenance);
   }
 
@@ -2304,10 +2967,13 @@
     }
   }
 
-  async function fetchInitializationProvenance() {
-    const scope = { ...state.scope }, epoch = state.epoch;
-    const provenance = await request('/v1/scene/initialization-provenance', 'POST', { scope });
-    assertHostScope(scope, epoch, '读取初始化来源期间聊天已切换');
+  // Reads which sources and artifacts the saved initialization of the token's binding came from, and shows them.
+  // origin: the token of the calling action.
+  async function fetchInitializationProvenance(origin) {
+    assertStarted(origin);
+    assertOrigin(origin);
+    const provenance = await request('/v1/scene/initialization-provenance', 'POST', { scope: origin.scope }, origin);
+    assertOrigin(origin);
     if (!provenance || !Array.isArray(provenance.sources) || !Array.isArray(provenance.artifacts)) throw new Error('核心未返回有效初始化来源血缘');
     state.initialization.provenance = provenance;
     state.initialization.hasInitialized = hasInitializationProvenance(provenance);
@@ -2316,58 +2982,79 @@
   }
 
   async function readInitializationProvenance() {
+    // The token of this read, started before its first await.
+    const origin = captureOrigin({});
     return withBusy(async () => {
       assertBound();
-      const provenance = await fetchInitializationProvenance();
+      const provenance = await fetchInitializationProvenance(origin);
       setStatus(state.initialization.hasInitialized ? '已读取初始化来源与产物血缘。' : '当前场景尚未应用初始化。');
       return provenance;
     });
   }
 
-  async function previewInitializationRefreshInternal() {
-    const scope = { ...state.scope }, epoch = state.epoch;
-    const sources = await collectInitializationSources();
-    assertHostScope(scope, epoch, '核对初始化来源期间聊天已切换');
-    const result = await request('/v1/scene/initialization-refresh-preview', 'POST', { scope, sources });
-    assertHostScope(scope, epoch, '核对初始化来源期间聊天已切换');
+  // Compares the enabled initialization sources of the token's binding with the saved initialization and keeps the core's
+  // preview of the changes (state.initialization.refresh) for its confirmation. origin: the token of the calling action.
+  async function previewInitializationRefreshInternal(origin) {
+    assertStarted(origin);
+    assertOrigin(origin);
+    const scope = origin.scope;
+    const sources = await collectInitializationSources(origin);
+    assertOrigin(origin);
+    const result = await request('/v1/scene/initialization-refresh-preview', 'POST', { scope, sources }, origin);
+    assertOrigin(origin);
     if (!result || typeof result.previewId !== 'string' || !Number.isSafeInteger(result.expectedVersion) ||
       !Array.isArray(result.sourceChanges) || !Array.isArray(result.referenceActions) || !Array.isArray(result.characterConflicts) || !Array.isArray(result.referenceConflicts)) {
       throw new Error('核心未返回有效初始化来源变更预览');
     }
-    state.initialization.refresh = { ...result, sources, scope, epoch, operationId: newId('initialization-refresh') };
+    state.initialization.refresh = {
+      ...result,
+      sources,
+      scope,
+      epoch: origin.epoch,
+      operationId: newId('initialization-refresh'),
+    };
     renderInitializationMaintenance();
     return state.initialization.refresh;
   }
 
   async function previewInitializationRefresh() {
+    // The token of this check, started before its first await.
+    const origin = captureOrigin({});
     return withBusy(async () => {
       assertBound();
-      if (!state.initialization.hasInitialized) await fetchInitializationProvenance();
+      if (!state.initialization.hasInitialized) await fetchInitializationProvenance(origin);
       if (!state.initialization.hasInitialized) {
         setStatus('当前场景尚未应用初始化，无需刷新来源。');
         return null;
       }
-      const result = await previewInitializationRefreshInternal();
+      const result = await previewInitializationRefreshInternal(origin);
       setStatus((result.referenceActions.length || result.characterConflicts.length) ? '发现会影响初始化产物的来源变更，请先核对。' : '已核对当前启用的初始化来源。');
       return result;
     });
   }
 
-  async function ensureInitializationFreshForGeneration() {
+  // Before a generation: when the scene was initialized, checks that the enabled sources still match the saved
+  // initialization, and stops the generation (with a status for its chat) when a source change needs review first.
+  // origin: the token of the generation's context build.
+  async function ensureInitializationFreshForGeneration(origin) {
+    assertStarted(origin);
     if (!state.initialization.hasInitialized) return null;
-    const result = await previewInitializationRefreshInternal();
+    const result = await previewInitializationRefreshInternal(origin);
+    assertOrigin(origin);
     if (!(result.referenceActions.length || result.characterConflicts.length)) return result;
     if (state.panel?.initializationSection) state.panel.initializationSection.open = true;
-    setStatus('初始化来源已变更；已暂停生成，请在初始化面板核对撤销／恢复与 NPC 设定冲突。');
+    setStatus('初始化来源已变更；已暂停生成，请在初始化面板核对撤销／恢复与 NPC 设定冲突。', undefined, origin);
     throw new Error('初始化来源已变更，请先核对并确认来源刷新');
   }
 
   async function applyInitializationRefresh() {
+    // The token of this confirmation, started before its first await; the preview's own chat is checked against it.
+    const origin = captureOrigin({});
     return withBusy(async () => {
       const pending = state.initialization.refresh;
       if (!pending) throw new Error('初始化来源变更预览已失效，请重新核对');
       assertHostScope(pending.scope, pending.epoch, '来源变更预览所属聊天已切换');
-      const sources = await collectInitializationSources();
+      const sources = await collectInitializationSources(origin);
       assertHostScope(pending.scope, pending.epoch, '应用初始化来源刷新期间聊天已切换');
       if (!sameInitializationSources(pending.sources, sources)) {
         state.initialization.refresh = null;
@@ -2379,9 +3066,9 @@
         expectedVersion: pending.expectedVersion, previewId: pending.previewId, operationId: pending.operationId,
       });
       assertHostScope(pending.scope, pending.epoch, '应用初始化来源刷新期间聊天已切换');
-      await recordSceneReceipt(receipt, pending.scope, pending.epoch);
+      await recordSceneReceipt(origin, receipt);
       state.initialization.hasInitialized = true;
-      await fetchInitializationProvenance();
+      await fetchInitializationProvenance(origin);
       state.initialization.refresh = {
         ...pending, expectedVersion: receipt.version, sourceChanges: [], referenceActions: [],
         characterConflicts: Array.isArray(receipt.characterConflicts) ? receipt.characterConflicts : [],
@@ -2437,9 +3124,11 @@
   }
 
   async function loadInitializationSources() {
+    // The token of this read, started before its first await.
+    const origin = captureOrigin({});
     return withBusy(async () => {
       assertBound(); const scope = { ...state.scope }, epoch = state.epoch;
-      const sources = await collectInitializationSources();
+      const sources = await collectInitializationSources(origin);
       assertHostScope(scope, epoch, '读取初始化来源期间聊天已切换');
       setInitializationCatalog(sources);
       setStatus(`已读取 ${sources.length} 项可选来源；世界书条目需明确勾选后才会发送。`);
@@ -2472,6 +3161,8 @@
   }
 
   async function previewInitialization() {
+    // The token of this preview, started before its first await.
+    const origin = captureOrigin({});
     return withBusy(async () => {
       assertBound();
       if (!state.initialization.catalog.length) throw new Error('请先读取角色卡与世界书来源');
@@ -2480,7 +3171,7 @@
       if (!selectedBefore.length) throw new Error('请至少选择一项初始化来源');
       if (selectedBefore.length > 128) throw new Error('一次最多选择 128 项初始化来源');
       if (selectedBefore.reduce((total, source) => total + source.text.length, 0) > 1000000) throw new Error('所选初始化来源正文过长，请减少选择');
-      const freshCatalog = await collectInitializationSources();
+      const freshCatalog = await collectInitializationSources(origin);
       assertHostScope(scope, epoch, '预览初始化期间聊天已切换');
       const selectedIds = new Set(state.initialization.selectedIds);
       const freshSelected = freshCatalog.filter(source => selectedIds.has(source.id));
@@ -2499,11 +3190,13 @@
   }
 
   async function applyInitialization() {
+    // The token of this confirmation, started before its first await; the preview's own chat is checked against it.
+    const origin = captureOrigin({});
     return withBusy(async () => {
       const pending = state.initialization.preview;
       if (!pending) throw new Error('初始化预览已失效，请重新预览');
       assertHostScope(pending.scope, pending.epoch, '初始化预览所属聊天已切换');
-      const freshCatalog = await collectInitializationSources();
+      const freshCatalog = await collectInitializationSources(origin);
       assertHostScope(pending.scope, pending.epoch, '应用初始化期间聊天已切换');
       const selectedIds = new Set(state.initialization.selectedIds);
       const freshSelected = freshCatalog.filter(source => selectedIds.has(source.id));
@@ -2516,7 +3209,7 @@
         expectedVersion: pending.preview.expectedVersion, previewId: pending.preview.previewId, operationId: pending.operationId,
       });
       assertHostScope(pending.scope, pending.epoch, '应用初始化期间聊天已切换');
-      await recordSceneReceipt(receipt, pending.scope, pending.epoch);
+      await recordSceneReceipt(origin, receipt);
       state.initialization.hasInitialized = true;
       state.initialization.provenance = null;
       state.initialization.refresh = null;
@@ -2526,7 +3219,7 @@
       if (!data?.roster) throw new Error('核心未返回初始化后的 NPC 名单');
       setSceneRoster(data.roster); renderSceneControls();
       state.candidate = null; setPreview('');
-      await syncInternal();
+      await syncInternal(origin);
       invalidateInitializationPreview(`初始化已应用${receipt.duplicate ? '（重复请求已安全复用）' : ''}。`);
       setStatus('初始化已应用并同步当前聊天；NPC 名单已刷新。');
       return receipt;
@@ -2577,19 +3270,24 @@
     });
   }
 
-  async function refreshNativeIdentities(force = false,refreshDisplay = true) {
-    const epoch = state.epoch;
-    const scope = { ...state.scope };
-    assertHostScope(scope, epoch);
+  // Recognizes the people of the token's binding from the recent chat text, the character card and its linked world
+  // books: the core plans which documents to read, then extracts the roster, whose receipt is recorded. force runs the
+  // recognition even when the materials and the roster are unchanged; refreshDisplay=false leaves the display refresh to
+  // the caller. Returns { rosterChanged, pending }. origin: the token of the calling action; every await is followed by
+  // its check, so a recognition that outlasts its chat writes nothing.
+  async function refreshNativeIdentities(origin, force = false, refreshDisplay = true) {
+    assertStarted(origin);
+    assertOrigin(origin);
+    const scope = origin.scope;
     const body = nativeHost().chat.filter(message => !message.is_system && !message.is_hidden && !nativeToolMessage(message) && !message.extra?.xldbCandidate && message.mes
-      && (!message.extra?.xldbScene || sameScope(message.extra.xldbScene.scope, state.scope))).slice(-6).map(message => String(message.mes)).join('\n').slice(-20000);
+      && (!message.extra?.xldbScene || sameScope(message.extra.xldbScene.scope, scope))).slice(-6).map(message => String(message.mes)).join('\n').slice(-20000);
     if (!body.trim() && !state.scene.roster.length) {
       state.native.pendingReason = 'first_input';
       return { rosterChanged: false, pending: true };
     }
     if (!body.trim() && state.scene.roster.length) return { rosterChanged: false, pending: false };
     const freshMaterials = await materialService.readIdentity();
-    assertHostScope(scope, epoch, '读取角色卡或世界书期间聊天已切换');
+    assertOrigin(origin);
     const unchanged = JSON.stringify(freshMaterials) === JSON.stringify(state.native.materials);
     const materials = { ...freshMaterials, documents: [...freshMaterials.documents] };
     // User-confirmed identities are valid fallback sources, never chat knowledge.
@@ -2608,14 +3306,15 @@
       if (item.id === 'card') return false;
       const key = JSON.stringify([item.name, item.keys, item.text]);
       if (indexed.has(key)) return false;
-      indexed.add(key); return true;
+      indexed.add(key);
+      return true;
     });
-    setStatus('正在从当前角色卡和关联世界书识别正文中的人物……');
+    setStatus('正在从当前角色卡和关联世界书识别正文中的人物……', undefined, origin);
     const plan = await request('/v1/scene/identity-plan', 'POST', { scope, materials: {
       playerName: materials.playerName, card: materials.card, body,
       index: identityIndex.map(item => ({ id: item.id, name: item.name.slice(0, 200), keys: Array.isArray(item.keys) ? item.keys.filter(key => typeof key === 'string').slice(0, 16) : [], preview: item.text.slice(0, 160) })),
-    } });
-    assertHostScope(scope, epoch, '识别期间聊天已切换');
+    } }, origin);
+    assertOrigin(origin);
     if (plan.missing?.length) throw new Error(`资料不足，请补充独立身份：${plan.missing.join('；')}`);
     const unknown = plan.characters?.some(character => !state.scene.roster.some(existing => [existing.name, ...existing.aliases].includes(character.name) || character.aliases?.some(alias => [existing.name, ...existing.aliases].includes(alias))));
     if (!unknown && state.scene.roster.length && unchanged) {
@@ -2627,10 +3326,11 @@
     const result = await request('/v1/scene/identity-extract', 'POST', { scope, expectedVersion:state.scene.version, materials: {
       playerName: materials.playerName, plan, documents: [...materials.documents,...materials.provenanceDocuments]
         .filter(item => selected.has(item.id)).map(({ id, text }) => ({ id, text })),
-    } });
-    assertHostScope(scope, epoch, '识别期间聊天已切换');
+    } }, origin);
+    assertOrigin(origin);
     setSceneRoster(result.roster);
-    await recordSceneReceipt(result,scope,epoch,refreshDisplay);
+    await recordSceneReceipt(origin, result, refreshDisplay);
+    assertOrigin(origin);
     renderSceneControls();
     if (result.missing?.length) throw new Error(`资料不足，请补充独立身份：${result.missing.join('；')}`);
     if (!state.scene.roster.length) throw new Error('当前角色卡和世界书没有足够身份资料，请补充独立身份');
@@ -2668,64 +3368,122 @@
     return true;
   }
 
+  // options.origin: the started token of the action that enables (a recovery that turns native chat back on); without
+  // one, enableNative starts its own token here, before any await. Native chat is turned on only through rebaseOrigin,
+  // every await is followed by a check of that token, and the chat is tagged, its attachment saved and the outcome shown
+  // only while the host still shows the token's binding: a chat switch (even one whose CHAT_CHANGED has not arrived
+  // yet), a disable or a settings change during the identity read or the startup sync never turns native chat on for,
+  // or reports into, another chat or binding.
   async function enableNative(options = {}) {
+    const origin = captureOrigin(options.origin);
     return withBusy(async () => {
+      assertOrigin(origin);
+      // Enabling tags the chat as accepted history and clears the current turn; a reply still being generated would be
+      // imported half-written and its own acceptance lost.
+      const generationRunning = '酒馆正在生成回复；请等本轮结束后再启用原生聊天';
+      if (state.native.active) throw new Error(generationRunning);
+      // The identity read below waits on the host. A generation that starts meanwhile is active or owns a new turn
+      // with its own ticket; enabling after the wait would clear that ticket and lose the reply, so it refuses the
+      // same way as at the start.
+      const turnAtEntry = state.native.turn;
+      const assertNoGenerationSinceEntry = () => {
+        if (state.native.active || state.native.turn !== turnAtEntry) throw new Error(generationRunning);
+      };
       assertBound();
-      const enableScope={...state.scope},enableEpoch=state.epoch;
       if (typeof nativeHost().stopGeneration !== 'function' || !host.eventTypes?.CHAT_COMPLETION_SETTINGS_READY) throw new Error('当前宿主不支持原生聊天接入');
       if (nativeHost().mainApi !== 'openai') throw new Error('原生接入需要酒馆对话补全模式');
       state.native.automatic = options.automatic !== false;
       let identity = { pending: false };
+      // Why the identity read is still pending (its failure); recorded with the gate below, for this chat only.
+      let pendingReason = null;
       if (state.native.automatic) {
         state.native.materials = null;
-        try { identity = await refreshNativeIdentities(); }
-        catch (error) {
+        try {
+          identity = await refreshNativeIdentities(origin);
+          assertOrigin(origin);
+        } catch (error) {
+          if (!originValid(origin)) throw error;
           if (!options.allowPending || state.scene.roster.length) {
             if(options.allowPending&&state.scene.enabled&&state.scene.roster.length){
-              assertHostScope(enableScope,enableEpoch);
-              state.native.enabled=true;state.native.error=error.message;state.native.turn=null;
-              state.native.queue=Promise.reject(error);state.native.queue.catch(()=>{});
+              assertNoGenerationSinceEntry();
+              // A failed identity read keeps native chat on for a retry, only for the chat this enable started in.
+              const kept = rebaseOrigin([origin], () => {
+                state.native.enabled=true;
+                state.native.error=error.message;
+                state.native.turn=null;
+                state.native.queue=Promise.reject(error);
+                state.native.queue.catch(()=>{});
+              });
+              if (!kept) throw new Error(ORIGIN_STALE_MESSAGE);
             }
             throw error;
           }
           identity = { pending: true };
-          state.native.pendingReason = error.message;
+          pendingReason = error.message;
         }
+        assertNoGenerationSinceEntry();
         if (!identity.pending) {
+          // The identity read waited on the host: the messages below are tagged only in the chat this enable started in.
+          // A chat switch, a disable or a settings change meanwhile ends the enable here.
+          if (!originIsCurrent(origin)) throw new Error(ORIGIN_STALE_MESSAGE);
+          // The host's message that is still streaming (a generation outside the gate) is not finished text.
+          const stream = nativeHost().streamingProcessor;
+          const streamingMessage = stream && !stream.isFinished ? nativeHost().chat[stream.messageId] : null;
           for (const message of nativeHost().chat) {
+            if (streamingMessage && message === streamingMessage) continue;
             if (message.is_system || message.is_hidden || nativeToolMessage(message) || message.extra?.xldbCandidate || !String(message.mes || '').trim()) continue;
             if (message.extra?.xldbScene && !sameScope(message.extra.xldbScene.scope, state.scope)) continue;
             if (message.extra?.xldb && !sameScope(message.extra.xldb.scope,state.scope))continue;
             tagNativeMessage(message);
           }
-          const scope={...state.scope},epoch=state.epoch;
-          state.native.enabled=true;
-          state.native.error='';
-          state.native.turn=null;
-          const startup=Promise.resolve().then(async()=>{
+          const opened = rebaseOrigin([origin], () => {
+            state.native.enabled=true;
+            state.native.error='';
+            state.native.turn=null;
+          });
+          if (!opened) throw new Error(ORIGIN_STALE_MESSAGE);
+          // The first native job: the tagged chat is saved and synced, checked against the enable's token after each wait.
+          // It runs after a scheduling point, where another action may switch or disable the chat, so it checks the token
+          // before it touches the host.
+          const startup = Promise.resolve().then(async () => {
+            assertOrigin(origin);
             await saveNativeMetadata();
-            assertHostScope(scope,epoch);
-            await syncInternal();
+            assertOrigin(origin);
+            await syncInternal(origin);
+            assertOrigin(origin);
           });
           state.native.queue=startup;
           startup.catch(()=>{});
-          try { await startup; }
-          catch(error){
-            if(state.epoch===epoch&&sameScope(state.scope,scope)){
-              state.native.error=error.message;
-              setStatus(`原生聊天处理失败：${error.message}。下次正常生成会尝试可恢复的同步；若需人工恢复请按界面提示操作。`);
-            }
+          try {
+            await startup;
+            assertOrigin(origin);
+          } catch (error) {
+            // The startup's failure is recorded and shown only in the chat this enable started in.
+            if (!originValid(origin)) throw error;
+            state.native.error = error.message;
+            setStatus(`原生聊天处理失败：${error.message}。下次正常生成会尝试可恢复的同步；若需人工恢复请按界面提示操作。`, undefined, origin);
             throw error;
           }
         }
       }
       if (!state.scene.enabled && !identity.pending) throw new Error('资料不足，请补充独立身份后再继续');
       if (!state.scene.enabled && !options.allowPending) throw new Error('资料不足，请补充独立身份后再继续');
-      if(!state.native.automatic||identity.pending){state.native.enabled=true;state.native.error='';state.native.turn=null;}
-      await persistAttachment(state.scope, false, true);
+      if(!state.native.automatic||identity.pending){
+        const opened = rebaseOrigin([origin], () => {
+          if (pendingReason !== null) state.native.pendingReason = pendingReason;
+          state.native.enabled=true;
+          state.native.error='';
+          state.native.turn=null;
+        });
+        if (!opened) throw new Error(ORIGIN_STALE_MESSAGE);
+      }
+      // The attachment saved below and the outcome shown after it belong to the chat this enable started in.
+      if (!originIsCurrent(origin)) throw new Error(ORIGIN_STALE_MESSAGE);
+      await persistAttachment(origin, origin.scope, false, true);
+      assertOrigin(origin);
       setStatus(identity.pending
         ? `已接入当前聊天；${state.native.pendingReason && state.native.pendingReason !== 'first_input' ? `${state.native.pendingReason}。` : ''}等待本聊天首条有效正文后识别人物，不会导入其它范围的旧消息。`
-        : state.native.automatic ? '身份已从角色卡和世界书识别；知识仅按正文视角更新。原生聊天自动同步已启用。' : '使用已补充身份的原生聊天已启用。');
+        : state.native.automatic ? '身份已从角色卡和世界书识别；知识仅按正文视角更新。原生聊天自动同步已启用。' : '使用已补充身份的原生聊天已启用。', undefined, origin);
       return identity;
     });
   }
@@ -2749,27 +3507,33 @@
     }
     const message = nativeHost().chat?.[index];
     if (!message?.is_user || message.is_system) return;
-    return queueNative(async () => {
-      const scope={...state.scope},epoch=state.epoch;
+    return queueNative(async origin => {
+      assertOrigin(origin);
       if (state.native.automatic) {
-        const identity = await refreshNativeIdentities(false,false);
-        if (identity.pending) { setStatus('等待当前聊天的首条有效正文后识别人物。'); return; }
+        const identity = await refreshNativeIdentities(origin, false, false);
+        assertOrigin(origin);
+        if (identity.pending) {
+          setStatus('等待当前聊天的首条有效正文后识别人物。', undefined, origin);
+          return;
+        }
       }
       tagNativeMessage(message);
       await saveNativeMetadata();
-      await syncInternal(false);
-      assertHostScope(scope,epoch);
-      refreshSceneDisplayInBackground(scope,epoch);
+      assertOrigin(origin);
+      await syncInternal(origin, false);
+      assertOrigin(origin);
+      refreshSceneDisplayInBackground(origin);
     });
   }
 
-  async function onNativePrompt(event) {
-    if (!state.native.enabled || !state.native.active || event?.dryRun) return;
-    // Clear before waiting: a failing/cancelled background job must not fall through to raw history.
-    const chat = event?.chat;
-    if (!Array.isArray(chat)) { nativeHost().stopGeneration(); throw new Error('原生提示词格式不支持'); }
-    chat.splice(0, chat.length);
+  // Builds the armed main request's restricted context and ticket (state.native.turn) and returns that turn. It reads and
+  // syncs the chat, so it runs once per armed request (ensureMainContext). It never edits a host prompt and never stops
+  // the host: the typed settings hook serves or refuses the request. A failure is the main turn's own and is reported
+  // here; a build that a newer start overtook installs nothing and reports nothing.
+  async function buildMainContext(armed) {
     const epoch = state.epoch;
+    // The chat this build runs for; its failure status is dropped once the user has left that chat.
+    const origin = captureOrigin({});
     try {
       assertBound();
       const scope={...state.scope};
@@ -2783,13 +3547,15 @@
       assertPromptScope();
       if (!['', 'normal', 'regenerate', 'swipe'].includes(state.native.generationType) || state.native.generationType==='swipe'&&!regeneration) throw new Error('酒馆续写或历史滑动无法安全替换 XLDB 已接受回复；原正文和状态未改变。请发送新的用户正文，或使用“资料与恢复”核对当前聊天');
       if(state.native.turn?.resumingTool){
-        const turn=state.native.turn;assertToolTurn(turn);
-        await ensureInitializationFreshForGeneration();
+        const turn=state.native.turn;
+        assertToolTurn(turn);
+        await ensureInitializationFreshForGeneration(origin);
         if(state.native.automatic && JSON.stringify(await materialService.readIdentity())!==JSON.stringify(state.native.materials))
           throw new Error('角色卡或世界书已变化，请核对当前资料后重新生成');
-        assertToolTurn(turn);turn.resumingTool=false;
-        chat.push(...turn.messages.map(item=>({...item})));
-        return;
+        assertToolTurn(turn);
+        assertArmedRequestCurrent(armed);
+        turn.resumingTool=false;
+        return turn;
       }
       const queued=state.native.queue;
       let recoverQueue=false;
@@ -2806,10 +3572,10 @@
         recoverQueue=true;
       }
       if (!recoverQueue&&state.native.error) throw new Error(state.native.error);
-      await ensureInitializationFreshForGeneration();
+      await ensureInitializationFreshForGeneration(origin);
       assertPromptScope();
       if(recoverQueue&&state.native.automatic&&state.native.materials===null){
-        const identity=await refreshNativeIdentities(false,false);
+        const identity=await refreshNativeIdentities(origin,false,false);
         assertPromptScope();
         if(identity.pending)throw new Error('独立身份尚未识别，请先补充当前角色卡或世界书资料');
       }
@@ -2825,8 +3591,13 @@
           regeneration.type==='regenerate'&&original.text!==regeneration.reply.text||original.processing!=='ready'||user?.id!==regeneration.user.id||
           user.revision!==regeneration.user.revision||user.text!==regeneration.user.text)
           throw new Error('权威正文已变化，请恢复当前聊天后重试');
-        const result=await request('/v1/scene/native-context','POST',{scope:state.scope,expectedVersion:regeneration.version,
-          envelope:regeneration.reply.envelope,sourceId:regeneration.user.id,regenerateId:regeneration.reply.id});
+        const result = await request('/v1/scene/native-context', 'POST', {
+          scope: state.scope,
+          expectedVersion: regeneration.version,
+          envelope: regeneration.reply.envelope,
+          sourceId: regeneration.user.id,
+          regenerateId: regeneration.reply.id,
+        }, origin);
         assertBound();
         if(epoch!==state.epoch||state.native.stopped||regeneration.selectionVersion!==state.scene.selectionVersion||
           nativeFingerprint(regeneration.reply.id)!==regeneration.afterDeletionFingerprint||result.replaces?.id!==regeneration.reply.id||
@@ -2834,18 +3605,28 @@
           result.messages.some(item=>!['system','user','assistant'].includes(item.role)||typeof item.content!=='string')||
           typeof result.contextTicket!=='string'||!Number.isSafeInteger(result.version))
           throw new Error('重生成票据或聊天已变化，请恢复权威正文');
-        chat.push(...result.messages);
-        await recordSceneReceipt(result,state.scope,epoch,false);
-        state.native.turn={epoch,selectionVersion:regeneration.selectionVersion,contextTicket:result.contextTicket,version:result.version,
-          scope:{...state.scope},fingerprint:regeneration.afterDeletionFingerprint,automatic:Boolean(result.automatic),
-          envelope:result.envelope,dependencies:result.dependencies,targetId:result.speakerId||state.scene.targetId,
-          replaces:regeneration.reply,messages:result.messages.map(item=>({...item}))};
+        await recordSceneReceipt(origin,result,false);
+        assertArmedRequestCurrent(armed);
+        state.native.turn = {
+          epoch,
+          selectionVersion: regeneration.selectionVersion,
+          contextTicket: result.contextTicket,
+          version: result.version,
+          scope: { ...state.scope },
+          fingerprint: regeneration.afterDeletionFingerprint,
+          automatic: Boolean(result.automatic),
+          envelope: result.envelope,
+          dependencies: result.dependencies,
+          targetId: result.speakerId || state.scene.targetId,
+          replaces: regeneration.reply,
+          messages: result.messages.map(item => ({ ...item })),
+        };
         setStatus('正在重生成当前回复；原已接受正文由 XLDB 保留，完成后按原身份更新。');
-        refreshSceneDisplayInBackground(state.scope,epoch);
-        return;
+        refreshSceneDisplayInBackground(origin);
+        return state.native.turn;
       }
       if(recoverQueue)await saveNativeMetadata();
-      await syncInternal(false);
+      await syncInternal(origin,false);
       assertPromptScope();
       if(recoverQueue){
         if(state.native.queue!==queued)throw new Error('同步期间聊天又有变化，请等待自动同步后重新生成');
@@ -2862,19 +3643,24 @@
       let selectionVersion = state.scene.selectionVersion;
       let result;
       try {
-        result = await request('/v1/scene/native-context', 'POST', { scope: state.scope, expectedVersion:state.scene.version, envelope: nativeEnvelope(), sourceId: last.id });
+        result = await request('/v1/scene/native-context', 'POST', {
+          scope: state.scope,
+          expectedVersion: state.scene.version,
+          envelope: nativeEnvelope(),
+          sourceId: last.id,
+        }, origin);
       } catch (error) {
         if (!state.native.automatic || error?.message !== 'XLDB：invalid_scene_unresolved') throw error;
         if (epoch !== state.epoch || !state.native.enabled || state.native.stopped || selectionVersion !== state.scene.selectionVersion || fingerprint !== nativeFingerprint()) throw new Error('生成期间聊天或角色范围已变更');
         const current = nativeHost().chat.filter(message => message?.extra?.xldbScene?.id === last.id && message.is_user && !message.is_system);
         if (current.length !== 1) throw new Error('生成期间聊天或角色范围已变更');
         const beforeRefresh = state.scene.selectionVersion;
-        const refreshed = await refreshNativeIdentities(true,false);
+        const refreshed = await refreshNativeIdentities(origin,true,false);
         const expectedSelection = beforeRefresh + (refreshed.rosterChanged ? 1 : 0);
         if (epoch !== state.epoch || !state.native.enabled || state.native.stopped || state.scene.selectionVersion !== expectedSelection || fingerprint !== nativeFingerprint()) throw new Error('生成期间聊天或角色范围已变更');
         if (!refreshed.rosterChanged || !refreshCurrentNativeBinding(current[0])) throw error;
         await saveNativeMetadata();
-        await syncInternal(false);
+        await syncInternal(origin,false);
         assertBound();
         if (epoch !== state.epoch || !state.native.enabled || state.native.stopped || state.scene.selectionVersion !== expectedSelection || fingerprint !== nativeFingerprint()) throw new Error('生成期间聊天或角色范围已变更');
         if (state.scene.needsReview.length) throw new Error('存在待复核的依赖消息，请先处理');
@@ -2883,76 +3669,149 @@
         selectionVersion = state.scene.selectionVersion;
         fingerprint = nativeFingerprint();
         if (epoch !== state.epoch || !state.native.enabled || state.native.stopped) throw new Error('生成期间聊天或角色范围已变更');
-        result = await request('/v1/scene/native-context', 'POST', { scope: state.scope, expectedVersion:state.scene.version, envelope: nativeEnvelope(), sourceId: retried.id });
+        result = await request('/v1/scene/native-context', 'POST', {
+          scope: state.scope,
+          expectedVersion: state.scene.version,
+          envelope: nativeEnvelope(),
+          sourceId: retried.id,
+        }, origin);
       }
       assertBound();
       if (epoch !== state.epoch || !state.native.enabled || state.native.stopped || selectionVersion !== state.scene.selectionVersion || fingerprint !== nativeFingerprint()) throw new Error('生成期间聊天或角色范围已变更');
       if (!Array.isArray(result.messages) || !result.messages.length || result.messages.some(item => !['system', 'user', 'assistant'].includes(item.role) || typeof item.content !== 'string')) throw new Error('核心未返回有效的受限上下文');
-      chat.push(...result.messages);
       if(typeof result.contextTicket!=='string'||!Number.isSafeInteger(result.version))throw new Error('核心未返回生成版本票据');
-      await recordSceneReceipt(result,state.scope,epoch,false);
-      state.native.turn = { epoch, selectionVersion, contextTicket:result.contextTicket, version:result.version, scope: { ...state.scope }, fingerprint, automatic: Boolean(result.automatic), envelope: result.envelope, dependencies: result.dependencies, targetId: result.speakerId || state.scene.targetId, messages: result.messages.map(item => ({ ...item })) };
+      await recordSceneReceipt(origin,result,false);
+      assertArmedRequestCurrent(armed);
+      state.native.turn = {
+        epoch,
+        selectionVersion,
+        contextTicket: result.contextTicket,
+        version: result.version,
+        scope: { ...state.scope },
+        fingerprint,
+        automatic: Boolean(result.automatic),
+        envelope: result.envelope,
+        dependencies: result.dependencies,
+        targetId: result.speakerId || state.scene.targetId,
+        messages: result.messages.map(item => ({ ...item })),
+      };
       setStatus(result.skippedStages?.length ? '本轮部分后台环节未完成，已跳过并继续正文；详情见工作台提示。' : Array.isArray(result.retrievalModes) && result.retrievalModes.some(mode=>mode==='bm25-fallback'||mode==='hybrid-fallback')
         ? (retrievalNotice(state.retrieval)?.text || RETRIEVAL_TEXT[playerLanguage()].turnFallback)
         : '受限记忆与情绪已交给酒馆前台模型，等待完整回复。');
-      refreshSceneDisplayInBackground(state.scope,epoch);
+      refreshSceneDisplayInBackground(origin);
+      return state.native.turn;
     } catch (error) {
-      state.native.turn = null;
-      state.native.stopped = true;
-      chat.splice(0, chat.length);
-      nativeHost().stopGeneration();
-      setStatus(`已停止本轮生成：${error.message}`);
-      renderSkippedStages(state.dashboard.data?.skippedStages||[]);
-      if(state.native.regeneration)void recoverUnacceptedRegeneration().catch(()=>{});
+      // Only the request still armed in the open chat records the failure; the settings hook then refuses the request.
+      if (currentArmedRequest() === armed) {
+        state.native.turn = null;
+        state.native.stopped = true;
+        setStatus(`已停止本轮生成：${error.message}`, undefined, origin);
+        renderSkippedStages(state.dashboard.data?.skippedStages||[]);
+        if(state.native.regeneration)void recoverUnacceptedRegeneration().catch(()=>{});
+      }
       throw error;
     }
   }
 
   async function onNativeReceived(index, toolFinal = false) {
     // Tavern's second event argument is a generation type string, not our finalization flag.
+    const hostType = typeof toolFinal === 'string' ? toolFinal : '';
     toolFinal=toolFinal===true;
     if (!state.native.enabled || state.selfInserting || !state.native.turn) return;
+    // Only this turn's own generation may answer the ticket. Tavern also emits MESSAGE_RECEIVED for messages other
+    // origins insert ('command' for /sendas, 'extension', 'first_message'); those are not the reply and leave the turn
+    // waiting. Tavern files a regenerate or swipe reply that becomes a new message as 'normal'. A host event without a
+    // type string (older hosts) is not filtered here.
+    const ownGeneration = hostType === 'normal' || hostType === state.native.generationType;
+    if (hostType && !ownGeneration) return;
+    const stream = nativeHost().streamingProcessor;
+    // A streaming reply is the message its processor fills: Tavern emits MESSAGE_RECEIVED with the processor's
+    // messageId. Any other message, even one of the same generation type, is not this turn's reply and leaves the
+    // ticket waiting. A messageId below 0 means the processor has not created its message yet, and the tool
+    // finalization from onNativeEnded passes a message this check already admitted when it first arrived.
+    const streamMessageId = stream?.messageId;
+    const streamOwnsAMessage = Number.isSafeInteger(streamMessageId) && streamMessageId >= 0;
+    if (!toolFinal && streamOwnsAMessage && Number(index) !== streamMessageId) return;
     const turn = state.native.turn;
-    const incoming=nativeHost().chat?.[index],stream=nativeHost().streamingProcessor;
+    // onNativeEnded closed this ticket: the generation ended without a reply, so no later message answers it.
+    if (turn.endedWithoutReply) return;
+    // A source change rejects the reply outside the accept queue, so it reports itself the way a failed accept in
+    // queueNative does: state.native.error marks the turn as needing repair (header badge, journey card), and the
+    // status says that the shown reply is not in the character's memory and how to bring chat and memory back together.
+    // A turn from an older epoch (the chat was switched while its candidate was being saved) still rejects its own
+    // promise, but it leaves the error, status and badges of the chat that is current now alone.
+    // origin: the turn's origin token, for a rejection after an await. Then a bind of another world in the same epoch
+    // also leaves the new world's error and status alone. Without a token only the epoch is compared, as before.
+    const rejectChangedSource = (origin = null) => {
+      const reason = '原生回复来源已变更，未提交';
+      const reportHere = origin ? originIsCurrent(origin) : turn.epoch === state.epoch;
+      if (reportHere) {
+        state.native.error = reason;
+        setStatus(`${reason}：生成期间聊天、角色或较早的正文有变化，这条回复没有写入 XLDB 记忆与情绪，角色不会记得它。请在“资料与恢复”中预览并恢复核心正文，让聊天与记忆重新一致。`, 'error');
+        renderSkippedStages(state.dashboard.data?.skippedStages||[]);
+      }
+      return new Error(reason);
+    };
+    const incoming=nativeHost().chat?.[index];
     if(turn.toolsStartedAt && incoming && !incoming.is_system && !incoming.is_user){
-      incoming.extra||={};incoming.extra.xldbToolIntermediate=true;
-      if(!toolFinal&&(stream?.toolCalls?.length||!stream&&state.native.active)){turn.pendingToolMessage=incoming;return;}
+      incoming.extra||={};
+      incoming.extra.xldbToolIntermediate=true;
+      const toolRoundOpen=stream?.toolCalls?.length||!stream&&state.native.active;
+      if(!toolFinal&&toolRoundOpen){
+        turn.pendingToolMessage=incoming;
+        return;
+      }
       assertToolTurn(turn);
     }
     state.native.turn = null;
+    // The turn's own reply is taken (accepted below or rejected), so the main generation is over: Tavern may never
+    // report its end, because overlapping generations share one GENERATION_ENDED. A stream still filling keeps the turn
+    // until its own end.
+    const streamUnfinished = Boolean(stream && !stream.isFinished);
+    if (!streamUnfinished) releaseMainTurn();
     assertBound();
-    if(turn.epoch!==state.epoch||!sameScope(turn.scope,state.scope))throw new Error('原生回复来源已变更，未提交');
+    if(turn.epoch!==state.epoch||!sameScope(turn.scope,state.scope))throw rejectChangedSource();
     const message=nativeHost().chat?.[index];
     if(turn.toolsStartedAt&&message?.extra)delete message.extra.xldbToolIntermediate;
     if(!message||message.is_user||message.is_system||nativeToolMessage(message)||!String(message.mes||'').trim())return;
     const candidateId=turn.replaces?.id||newId('native');
-    message.extra||={};message.extra.xldbCandidate={id:candidateId,scope:{...turn.scope}};
+    message.extra||={};
+    message.extra.xldbCandidate={id:candidateId,scope:{...turn.scope}};
+    // The turn's chat, which the scope check above found open; the save below may outlast it.
+    const turnOrigin = captureOrigin({});
     await saveNativeMetadata();
     const processor = nativeHost().streamingProcessor;
     if (state.native.stopped || (processor && (!processor.isFinished || processor.isStopped || processor.abortController?.signal?.aborted || processor.toolCalls?.length))) {
-      setStatus('生成已中止或失败，半截回复未写入 XLDB。');
+      setStatus('生成已中止或失败，半截回复未写入 XLDB。', undefined, turnOrigin);
       if (turn.replaces) void recoverUnacceptedRegeneration().catch(() => {});
       return;
     }
     assertBound();
-    if (turn.epoch !== state.epoch || turn.selectionVersion!==state.scene.selectionVersion || !sameScope(turn.scope, state.scope) || turn.fingerprint !== nativeFingerprint(turn.replaces?.id)) throw new Error('原生回复来源已变更，未提交');
+    if (turn.epoch !== state.epoch || turn.selectionVersion!==state.scene.selectionVersion || !sameScope(turn.scope, state.scope) || turn.fingerprint !== nativeFingerprint(turn.replaces?.id)) throw rejectChangedSource(turnOrigin);
     const binding = { id: candidateId, revision: turn.replaces?turn.replaces.revision+1:1, scope: turn.scope, acceptedAtMs: turn.replaces?.acceptedAtMs||Date.now(),
       envelope: turn.envelope, ...(turn.automatic ? { automatic: true } : { speakerId: turn.targetId }), dependencies: turn.dependencies };
     const acceptedMessage={...binding,role:'assistant',text:String(message.mes)},receivedSwipe=message.swipe_id;
-    void queueNative(async () => {
+    void queueNative(async origin => {
+      assertOrigin(origin);
       if(turn.selectionVersion!==state.scene.selectionVersion||turn.fingerprint!==nativeFingerprint(turn.replaces?.id))throw new Error('原生回复来源已变更，未提交');
-      const receipt=await request('/v1/scene/native-accept','POST',{scope:turn.scope,contextTicket:turn.contextTicket,message:acceptedMessage});
-      assertHostScope(turn.scope,turn.epoch,'接受回复期间聊天已切换');
+      const receipt=await request('/v1/scene/native-accept','POST',{scope:turn.scope,contextTicket:turn.contextTicket,message:acceptedMessage},origin);
+      assertOrigin(origin,'接受回复期间聊天已切换');
       // A plain swipe during the accept shows another stored version; the accepted one is still kept at its own index,
       // and the queued swipe comparison decides whether the shown version waits for adoption.
       const swipedAway=String(message.mes)!==acceptedMessage.text&&Number.isInteger(receivedSwipe)&&message.swipe_id!==receivedSwipe&&
         message.swipes?.[receivedSwipe]===acceptedMessage.text&&state.native.swipeChecks>0;
       if(String(message.mes)!==acceptedMessage.text&&!swipedAway)throw new Error('回复已在接受期间编辑，请先恢复权威正文');
-      message.extra={...message.extra,xldbScene:binding};delete message.extra.xldbCandidate;
-      const swipe=message.swipe_info?.[message.swipe_id];if(swipe)swipe.extra={...message.extra};
+      message.extra={...message.extra,xldbScene:binding};
+      delete message.extra.xldbCandidate;
+      const swipe=message.swipe_info?.[message.swipe_id];
+      if(swipe)swipe.extra={...message.extra};
       const kept=swipedAway?message.swipe_info?.[receivedSwipe]:null;
-      if(kept){kept.extra={...kept.extra,xldbScene:binding};delete kept.extra.xldbCandidate;}
-      await recordSceneReceipt(receipt,turn.scope,turn.epoch);
+      if(kept){
+        kept.extra={...kept.extra,xldbScene:binding};
+        delete kept.extra.xldbCandidate;
+      }
+      await recordSceneReceipt(origin,receipt);
+      assertOrigin(origin);
       if(turn.replaces){
         const metadata=nativeHost().chatMetadata;
         // A pending swipe comparison owns the gate it set and clears it itself.
@@ -2960,38 +3819,208 @@
         if(sameScope(metadata?.xldbSwipe?.scope,turn.scope)&&metadata.xldbSwipe.id===turn.replaces.id)delete metadata.xldbSwipe;
         state.native.regeneration=null;
         await saveNativeMetadata();
+        assertOrigin(origin);
       }
       if(receipt.status==='failed')throw new Error(`正文已接受，后台整理失败：${receipt.error}`);
-      renderSceneMaterials(await inspectInternal());
-      setStatus(turn.replaces?'已按原回复身份接受重生成正文，记忆与情绪已更新。':'原生回复已同步，记忆与情绪已更新。');
+      const inspected=await inspectInternal(origin);
+      assertOrigin(origin);
+      renderSceneMaterials(inspected);
+      setStatus(turn.replaces?'已按原回复身份接受重生成正文，记忆与情绪已更新。':'原生回复已同步，记忆与情绪已更新。',undefined,origin);
     });
     setStatus('正文已完成，后台正在整理记忆与情绪。');
   }
 
+  // ---- Generation attribution: the type-keyed contract (GENERATION-ATTRIBUTION-STUDY section 3) ----
+  // SillyTavern names a generation's type only in GENERATION_STARTED, CHAT_COMPLETION_SETTINGS_READY (generate_data.type)
+  // and MESSAGE_RECEIVED. CHAT_COMPLETION_PROMPT_READY and GENERATION_ENDED carry no identity, other extensions run
+  // background ('quiet') generations at any time, and generateRaw requests emit no start and no end at all. So:
+  // - a main-type GENERATION_STARTED arms one main request (state.native.armed);
+  // - the armed request is served exactly once, at its own typed CHAT_COMPLETION_SETTINGS_READY, the host's last hook
+  //   before the request body is serialised; every other main-type request there leaves with no messages and is stopped;
+  // - CHAT_COMPLETION_PROMPT_READY is left alone: it cannot tell the main prompt from a background or generateRaw
+  //   prompt, so it never edits a prompt, never starts, waits for or fails a context and never stops the host. The
+  //   armed request's context is built by its own typed settings hook;
+  // - the main turn ends on its own typed MESSAGE_RECEIVED, or on a GENERATION_ENDED that is provably the main's. An end
+  //   that may belong to a background generation changes nothing but the status: it delays recovery, never opens the gate.
+  // Background prompts of other extensions pass through untouched, during an XLDB turn and outside one.
+
+  // The generation type of a host request or start; SillyTavern leaves it undefined for an ordinary send.
+  function generationTypeOf(type) {
+    if (typeof type === 'string' && type) return type;
+    return 'normal';
+  }
+
+  // Arms the main request this GENERATION_STARTED begins. A later start replaces it: a new send or regeneration
+  // supersedes an older request, and a late settings hook of the older one is then served from the new turn once.
+  function armMainRequest(type) {
+    state.native.armed = {
+      type: generationTypeOf(type),
+      epoch: state.epoch,
+      // True once a settings hook has claimed this request; a second main-type settings hook is refused.
+      sealed: false,
+      // The context build, started once by the request's typed settings hook (ensureMainContext).
+      contextPromise: null,
+      contextFailed: false,
+      // The ticketed turn the build produced; the settings hook serves only this turn.
+      turn: null,
+    };
+    state.native.replyWaitEpoch = null;
+    renderReplyWaitControl();
+  }
+
+  // The armed main request while it still belongs to the open chat; a chat switch or a disable moves the epoch on.
+  function currentArmedRequest() {
+    const armed = state.native.armed;
+    if (!armed || armed.epoch !== state.epoch) return null;
+    return armed;
+  }
+
+  // Throws when a newer start or a chat change replaced this armed request, so that its context never becomes the ticket
+  // of the turn that replaced it.
+  function assertArmedRequestCurrent(armed) {
+    if (currentArmedRequest() !== armed) throw new Error('本轮生成已被新的生成取代');
+  }
+
+  // Starts the armed request's context once; every later caller shares the same promise.
+  function ensureMainContext(armed) {
+    if (armed.contextPromise) return armed.contextPromise;
+    const markBuilt = turn => {
+      armed.turn = turn;
+      return turn;
+    };
+    const markFailed = error => {
+      armed.contextFailed = true;
+      throw error;
+    };
+    armed.contextPromise = buildMainContext(armed).then(markBuilt, markFailed);
+    // A superseded request's failure may have no listener left; it was already reported by buildMainContext.
+    armed.contextPromise.catch(() => {});
+    return armed.contextPromise;
+  }
+
+  // True for the two barrier handlers that keepBarrierHandlersLast moves behind every other extension's handler.
+  function isBarrierHandler(handler) {
+    return handler === onNativeSettings || handler === onNativeData;
+  }
+
+  // Moves the barrier handlers behind every other extension's handler (makeLast), so the settings hook sees each request
+  // after every other change. Hosts without makeLast keep the subscription order. SillyTavern's makeLast also subscribes
+  // a handler that is not subscribed, so only a subscription the script still lists (state.listeners) is moved, with
+  // the event and on the source it was made with: whatever makeLast (re)adds is listed, and destroy removes it. After
+  // destroy the script is unloaded for good: nothing is moved, and so nothing is subscribed again, however late the
+  // start that calls this resumes.
+  function keepBarrierHandlersLast() {
+    if (state.native.unloaded) return;
+    for (const [source, event, handler] of state.listeners) {
+      if (!isBarrierHandler(handler)) continue;
+      if (typeof source.makeLast !== 'function') continue;
+      source.makeLast(event, handler);
+    }
+  }
+
+  // Ends the main turn: no main generation is in flight any more, so enabling, binding and recovery may run again, and a
+  // late main-type settings hook finds nothing armed and is refused.
+  function releaseMainTurn() {
+    state.native.active = false;
+    state.native.armed = null;
+    state.native.replyWaitEpoch = null;
+    renderReplyWaitControl();
+    renderSkippedStages(state.dashboard.data?.skippedStages||[]);
+  }
+
+  // The label of the manual way out of a turn that waits after an ambiguous end (product choice, study section 4).
+  const REPLY_WAIT_LABEL = '放弃等待本轮回复';
+
+  // True while the main turn of the open chat waits after an end that may have been a background generation's.
+  function replyWaitIsOpen() {
+    return state.native.enabled && state.native.active && state.native.replyWaitEpoch === state.epoch;
+  }
+
+  // Shows the give-up control next to the status line while replyWaitIsOpen, and hides it otherwise. The control is
+  // created on first use, so a panel that never needs it never shows it.
+  function renderReplyWaitControl() {
+    const panel = state.panel;
+    if (!panel?.status) return;
+    const waiting = replyWaitIsOpen();
+    if (!panel.replyWaitButton) {
+      if (!waiting) return;
+      const control = button(REPLY_WAIT_LABEL, giveUpWaitingForReply);
+      control.className = 'xldb-reply-wait';
+      if (typeof panel.status.after === 'function') panel.status.after(control);
+      else (panel.status.parentNode || panel.root)?.append?.(control);
+      panel.replyWaitButton = control;
+    }
+    panel.replyWaitButton.hidden = !waiting;
+  }
+
+  // The give-up control: closes the waiting turn's ticket the way an unanswered end does, so a late reply is no longer
+  // accepted, and ends the turn so that a new generation, enabling and binding are free again. The host is not stopped:
+  // the end may have been the reply's own failure, and a background generation may still be running.
+  function giveUpWaitingForReply() {
+    if (!replyWaitIsOpen()) {
+      renderReplyWaitControl();
+      return;
+    }
+    const turn = state.native.turn;
+    if (turn) turn.endedWithoutReply = true;
+    releaseMainTurn();
+    setStatus('已放弃等待本轮回复；你发送的消息已记录，本轮回复不会写入 XLDB。可以重新生成回复。', 'info');
+  }
+
+  // A GENERATION_ENDED that may belong to a background generation: Tavern reports one end for overlapping generations,
+  // and a failed main request ends exactly like a finished background one. The main turn keeps waiting; the player is
+  // told how to continue.
+  function noteAmbiguousEnd() {
+    if (!state.native.enabled || !state.native.active) return;
+    state.native.replyWaitEpoch = state.epoch;
+    setStatus(`本轮尚未收到回复；若酒馆已提示错误，可以直接重新生成，或点击“${REPLY_WAIT_LABEL}”。`, 'info');
+    renderReplyWaitControl();
+  }
+
   async function onNativeStart(type, _options, dryRun) {
-    if (!state.native.enabled || dryRun) return;
-    if (type === 'quiet') return;
+    // A token-count run sends nothing to the model.
+    if (dryRun) return;
+    // After destroy the script is unloaded for good: a start that still reaches a handler the host failed to remove
+    // registers no tool, arms no request and moves no listener, also when native chat was enabled again since.
+    if (state.native.unloaded) return;
+    // A background generation (another extension's 'quiet' prompt) is counted, also while native chat is off, so that
+    // onNativeEnded knows an untyped end may be its. Nothing else changes: its prompt and settings pass untouched.
+    if (type === 'quiet') {
+      state.native.quietCount = (state.native.quietCount || 0) + 1;
+      return;
+    }
+    if (!state.native.enabled) return;
     registerContextTool();
     const continuation=state.native.turn?.toolContinuation&&type==='normal';
     if(continuation){
-      try{assertToolTurn(state.native.turn);}catch(error){state.native.turn=null;nativeHost().stopGeneration();throw error;}
-      state.native.turn.toolContinuation=false;state.native.turn.resumingTool=true;
-      state.native.active=true;state.native.generationType='normal';
-      if(typeof host.eventSource.makeLast==='function'){
-        host.eventSource.makeLast(host.eventTypes.CHAT_COMPLETION_PROMPT_READY,onNativePrompt);
-        host.eventSource.makeLast(host.eventTypes.CHAT_COMPLETION_SETTINGS_READY,onNativeSettings);
-        host.eventSource.makeLast(host.eventTypes.GENERATE_AFTER_DATA,onNativeData);
+      try {
+        assertToolTurn(state.native.turn);
+      } catch (error) {
+        state.native.turn = null;
+        nativeHost().stopGeneration();
+        throw error;
       }
+      state.native.turn.toolContinuation = false;
+      state.native.turn.resumingTool = true;
+      state.native.active = true;
+      state.native.generationType = 'normal';
+      armMainRequest('normal');
+      keepBarrierHandlersLast();
       return;
     }
     // A new generation means the previous one is over, also when its prompt was ready and no reply ever arrived (model
     // error, abort, stop before any token); an unaccepted regeneration is restored before this one reads the chat.
     if(state.native.regeneration)await recoverUnacceptedRegeneration().catch(()=>{});
+    // destroy may have run while the recovery waited: this start then ends here, so it arms nothing, marks no main
+    // generation in progress (a later destroy would stop the host for it), writes nothing into the host chat and moves
+    // no listener.
+    if (state.native.unloaded) return;
     state.native.active = true;
     state.native.stopped = false;
     state.native.generationType = type || 'normal';
     state.native.turn = null;
     state.native.regeneration=null;
+    armMainRequest(type);
     // 'regenerate' deletes the reply before the prompt; 'swipe' keeps the message and fills a new version of it.
     // Both replace the last accepted reply at its next revision.
     if((type==='regenerate'||type==='swipe')&&!sameScope(nativeHost().chatMetadata?.xldbHydrate,state.scope)){
@@ -3009,63 +4038,224 @@
             selectionVersion:state.scene.selectionVersion,user,reply,afterDeletionFingerprint:nativeFingerprint(reply.id)};
         }
         await saveNativeMetadata();
+        // destroy may have run while the host saved the chat: this start then ends here and moves or subscribes no
+        // listener again.
+        if (state.native.unloaded) return;
       }
     }
     setStatus('正在处理本轮消息，等待受限上下文准备。');
     renderSkippedStages(state.dashboard.data?.skippedStages||[]);
-    if (typeof host.eventSource.makeLast === 'function') host.eventSource.makeLast(host.eventTypes.CHAT_COMPLETION_PROMPT_READY, onNativePrompt);
-    if (typeof host.eventSource.makeLast === 'function') host.eventSource.makeLast(host.eventTypes.CHAT_COMPLETION_SETTINGS_READY, onNativeSettings);
-    if (typeof host.eventSource.makeLast === 'function') host.eventSource.makeLast(host.eventTypes.GENERATE_AFTER_DATA, onNativeData);
+    keepBarrierHandlersLast();
   }
 
-  function onNativeSettings(data) {
-    if (!state.native.enabled || !state.native.active) return;
-    const turn = state.native.turn;
-    if (!turn || state.native.stopped || turn.epoch !== state.epoch || turn.selectionVersion !== state.scene.selectionVersion || turn.fingerprint !== nativeFingerprint(turn.replaces?.id)) {
+  // CHAT_COMPLETION_PROMPT_READY has no generation identity: the main request's prompt, a background prompt and a
+  // generateRaw call (which emits no start of its own and may arrive before the main turn's MESSAGE_SENT) look the same.
+  // So this hook does nothing at all: it never edits the prompt array, never starts, waits for or fails the main
+  // context, never creates or closes a turn and never stops the host. Its promise is already settled when it returns
+  // (the shape every other hook handler of the script has), so no other extension's generation waits for XLDB here.
+  // The armed request's context is built by its own typed settings hook.
+  async function onNativePrompt() {}
+
+  // The refusal wording for a continuation or impersonation, which cannot safely replace an accepted reply.
+  const CONTINUATION_REFUSAL = '酒馆续写或历史滑动无法安全替换 XLDB 已接受回复；原正文和状态未改变。请发送新的用户正文，或使用“资料与恢复”核对当前聊天';
+
+  // The refusal wording for a main-type request that is not the armed one (none armed, already served, or another type).
+  const UNARMED_REQUEST_REFUSAL = '这次生成请求不属于 XLDB 正在处理的回合，聊天记录没有发送。请重新发送消息或重新生成';
+
+  // The refusal wording when reading the request or a host callback failed while XLDB was preparing it.
+  const HOST_REQUEST_FAILURE = '酒馆在发送本轮请求前出错，聊天记录没有发送。请重新生成';
+
+  // The generation type a host request names. A request whose type cannot be read is not 'quiet', so the caller treats
+  // it as a main request and refuses it rather than letting the host's history through.
+  function readRequestType(data) {
+    try {
+      return generationTypeOf(data.type);
+    } catch {
+      return 'unreadable';
+    }
+  }
+
+  // Empties a main-type request: no history, no tools. It returns the tool list the host had offered, which only the
+  // serve step reads, or null when the request could not be emptied. It never throws.
+  function emptyMainRequest(data) {
+    try {
       data.messages = [];
+      const offeredTools = data.tools;
+      delete data.tools;
+      delete data.tool_choice;
+      return { offeredTools };
+    } catch {
+      return null;
+    }
+  }
+
+  // Asks the host to stop the current generation. A host whose stop throws has no other way to stop; the request was
+  // already emptied, so the failure is not passed on. It never throws. After destroy it asks nothing: a request claimed
+  // before the unload whose context settles later is refused without stopping a generation the host started since
+  // (destroy already stopped the one that was running).
+  function stopHostGeneration() {
+    if (state.native.unloaded) return;
+    try {
       nativeHost().stopGeneration();
+    } catch {
+      // Nothing else can stop the host; the emptied request is the barrier.
+    }
+  }
+
+  // Sends a main-type request away empty: no history, no tools, and the host is asked to stop. reason, when given, is
+  // shown as the status; without it the status that explains the failure is already shown.
+  function refuseMainRequest(data, reason) {
+    emptyMainRequest(data);
+    stopHostGeneration();
+    if (reason) setStatus(`已停止本轮生成：${reason}`);
+  }
+
+  // Refuses a main-type request after a read or a host callback threw while XLDB prepared it, and stops the turn, so
+  // that no later request of it is served either.
+  function failMainRequest(data) {
+    state.native.stopped = true;
+    refuseMainRequest(data, HOST_REQUEST_FAILURE);
+  }
+
+  // Fills the claimed (already emptied) request from the armed turn's context, or refuses it when that context failed
+  // or went stale. Every read and host callback comes first; the request is written only at the end, so a throw on the
+  // way leaves it empty. offeredTools: the tool list the host had put on the request before it was emptied.
+  function serveMainRequest(data, armed, offeredTools) {
+    const turn = state.native.turn;
+    const contextReady = !armed.contextFailed && turn && turn === armed.turn && currentArmedRequest() === armed;
+    const turnCurrent = contextReady && turn.epoch === state.epoch && turn.selectionVersion === state.scene.selectionVersion;
+    const sourceUnchanged = turnCurrent && turn.fingerprint === nativeFingerprint(turn.replaces?.id);
+    if (!sourceUnchanged || state.native.stopped) {
+      refuseMainRequest(data, null);
       return;
     }
-    const toolsEnabled=Boolean(contextToolRegistered&&state.native.generationType==='normal'&&nativeHost().isToolCallingSupported?.()&&
-      Array.isArray(data.tools)&&data.tools.some(tool=>tool?.type==='function'&&tool.function?.name===CONTEXT_TOOL));
-    if(turn.toolsStartedAt||toolsEnabled){
-      turn.toolsStartedAt||=Date.now();
-      try{assertToolTurn(turn);}catch(error){
-        data.messages=[];delete data.tools;delete data.tool_choice;state.native.stopped=true;
-        nativeHost().stopGeneration();setStatus(error.message);return;
+    const normalGeneration = state.native.generationType === 'normal';
+    const hostCallsTools = contextToolRegistered && normalGeneration && Boolean(nativeHost().isToolCallingSupported?.());
+    const offersContextTool = Array.isArray(offeredTools) &&
+      offeredTools.some(tool => tool?.type === 'function' && tool.function?.name === CONTEXT_TOOL);
+    const toolsEnabled = hostCallsTools && offersContextTool;
+    if (turn.toolsStartedAt || toolsEnabled) {
+      turn.toolsStartedAt ||= Date.now();
+      try {
+        assertToolTurn(turn);
+      } catch (error) {
+        state.native.stopped = true;
+        refuseMainRequest(data, null);
+        setStatus(error.message);
+        return;
       }
     }
+    const messages = turn.messages.map(item => ({ ...item }));
+    turn.toolsEnabled = toolsEnabled;
     // This is the host's final awaited hook, immediately before JSON.stringify/fetch.
-    data.messages = turn.messages.map(item => ({ ...item }));
-    turn.toolsEnabled=toolsEnabled;
-    if(turn.toolsEnabled){
-      turn.toolsStartedAt||=Date.now();
-      data.tools=[{type:'function',function:{name:CONTEXT_TOOL,description:CONTEXT_TOOL_DESCRIPTION,parameters:CONTEXT_TOOL_PARAMETERS}}];
-      data.tool_choice='auto';
-    }else{delete data.tools;delete data.tool_choice;}
+    data.messages = messages;
+    if (!toolsEnabled) return;
+    const contextTool = {
+      name: CONTEXT_TOOL,
+      description: CONTEXT_TOOL_DESCRIPTION,
+      parameters: CONTEXT_TOOL_PARAMETERS,
+    };
+    data.tools = [{ type: 'function', function: contextTool }];
+    data.tool_choice = 'auto';
+  }
+
+  // Claims or refuses an emptied main-type request (onNativeSettings). Only the armed, not yet claimed request of the same
+  // type is served, once: its claim starts its context build, and the returned promise settles after the request was
+  // served or refused. A refused request returns nothing.
+  function claimMainRequest(data, requestType, offeredTools) {
+    if (requestType === 'continue' || requestType === 'impersonate') {
+      refuseMainRequest(data, CONTINUATION_REFUSAL);
+      return;
+    }
+    if (state.native.stopped) {
+      refuseMainRequest(data, null);
+      return;
+    }
+    const armed = currentArmedRequest();
+    if (!armed || armed.sealed || armed.type !== requestType) {
+      refuseMainRequest(data, UNARMED_REQUEST_REFUSAL);
+      return;
+    }
+    armed.sealed = true;
+    const serve = () => serveMainRequest(data, armed, offeredTools);
+    const refuse = () => refuseMainRequest(data, null);
+    const fail = () => failMainRequest(data);
+    return ensureMainContext(armed).then(serve, refuse).then(undefined, fail);
+  }
+
+  // CHAT_COMPLETION_SETTINGS_READY carries the request's own type and is the host's last awaited hook before the body is
+  // serialised: the main barrier lives here. A 'quiet' request (an extension's background prompt or a generateRaw call)
+  // passes untouched. Every other request is a main-type request and is emptied first, before any other read or host
+  // callback (rule C): it leaves either with the restricted context of the armed turn or empty with the host stopped,
+  // also when a read or a host callback throws on the way. A continuation or impersonation is refused. The handler
+  // returns a promise when it serves the armed request; the host awaits it. The request is emptied and the host stopped
+  // before any status is written, so even a rejected promise leaves nothing of the host's history. After destroy native
+  // chat is off, so a request that still reaches this handler (its removal failed) passes untouched.
+  function onNativeSettings(data) {
+    if (!data || typeof data !== 'object') return;
+    if (!state.native.enabled) return;
+    const requestType = readRequestType(data);
+    if (requestType === 'quiet') return;
+    const emptied = emptyMainRequest(data);
+    if (!emptied) {
+      failMainRequest(data);
+      return;
+    }
+    try {
+      return claimMainRequest(data, requestType, emptied.offeredTools);
+    } catch {
+      failMainRequest(data);
+    }
   }
 
   function onNativeStopped() { state.native.stopped = true;renderSkippedStages(state.dashboard.data?.skippedStages||[]); }
-  // Streaming hides its stop button before it emits the completed message.
+
+  // GENERATION_ENDED carries no identity (only the chat length), and Tavern emits it only when its stop button was
+  // visible, so overlapping generations report one end between them. Three cases:
+  // - a streaming processor exists: a background generation never ends while a main stream is unfinished, and the
+  //   processor is cleared only after its own end, so this is the main generation's end;
+  // - no processor and a background generation was counted: the end may be that generation's or the main request's
+  //   failure, which look the same. The count drops by one and nothing else changes; the main turn keeps waiting for its
+  //   typed reply, the next start or the give-up control. The count only ever drops by one, so any miscount errs
+  //   towards waiting, never towards opening the gate;
+  // - no processor and nothing counted: the main generation's own end.
   async function onNativeEnded() {
-    state.native.active = false;
+    const processor = nativeHost().streamingProcessor;
+    const backgroundCounted = (state.native.quietCount || 0) > 0;
+    if (!processor && backgroundCounted) {
+      state.native.quietCount -= 1;
+      noteAmbiguousEnd();
+      return;
+    }
     const turn=state.native.turn;
+    releaseMainTurn();
     if(turn?.toolsStartedAt&&turn.pendingToolMessage&&!turn.toolContinuation&&!state.native.stopped){
-      const index=nativeHost().chat.indexOf(turn.pendingToolMessage);turn.pendingToolMessage=null;
+      const index=nativeHost().chat.indexOf(turn.pendingToolMessage);
+      turn.pendingToolMessage=null;
       if(index>=0)await onNativeReceived(index,true);
+    }
+    // Without streaming, Tavern emits MESSAGE_RECEIVED before GENERATION_ENDED, so a turn still waiting here got no
+    // reply (model or API error, abort). Its ticket is closed so that no later message of another origin can answer
+    // it; the turn itself stays until the next generation or swipe, which read it as a regeneration that never got its
+    // reply. Streaming emits GENERATION_ENDED before the completed message, and a tool round continues the same turn.
+    // The turn has a ticket only after its user message was committed, so the notice speaks of the reply alone.
+    const unanswered = state.native.turn;
+    if (unanswered && !unanswered.toolContinuation && !nativeHost().streamingProcessor) {
+      unanswered.endedWithoutReply = true;
+      if (!state.native.stopped) setStatus('本轮生成已结束，但没有收到模型回复；你发送的消息已记录，本轮回复未写入 XLDB。可以重新生成回复。');
     }
     renderSkippedStages(state.dashboard.data?.skippedStages||[]);
   }
 
+  // GENERATE_AFTER_DATA has no generation type. For chat completion the typed settings hook later in the same request is
+  // the barrier, so this hook leaves the request alone. Native chat cannot run on any other API: there every request is
+  // stopped, background ones included.
   function onNativeData(data, dryRun) {
-    if (dryRun || !state.native.enabled || !state.native.active) return;
-    if (nativeHost().mainApi === 'openai' && state.native.turn && !state.native.stopped) {
-      data.prompt = state.native.turn.messages.map(item => ({ ...item }));
-      return;
-    }
+    if (dryRun || !state.native.enabled) return;
+    if (nativeHost().mainApi === 'openai') return;
     data.prompt = '';
     state.native.stopped = true;
-    nativeHost().stopGeneration();
+    stopHostGeneration();
     setStatus('已停止生成：原生接入需要酒馆对话补全模式。');
   }
 
@@ -3094,22 +4284,136 @@
     }
   }
 
-  function destroy() {
-    if(contextToolRegistered){nativeHost().unregisterFunctionTool(CONTEXT_TOOL);contextToolRegistered=false;}
-    for(const dialog of todoDialogs)dialog.remove();todoDialogs.clear();
-    if(state.panel?.progressTimer)globalThis.clearInterval(state.panel.progressTimer);
-    if(state.panel?.clockTimer)globalThis.clearInterval(state.panel.clockTimer);
-    if(state.panel?.dashboardTimer)globalThis.clearInterval(state.panel.dashboardTimer);
-    state.panel?.variableRoot?.remove();state.panel?.dashboardStyle?.remove();
-    for (const [source, event, handler] of state.listeners.splice(0)) {
-      if (source && typeof source.removeListener === 'function') source.removeListener(event, handler);
-    }
-    if (state.panel && state.panel.root && typeof state.panel.root.remove === 'function') state.panel.root.remove();
-    if (state.panel && state.panel.toggle && typeof state.panel.toggle.remove === 'function') state.panel.toggle.remove();
+  // True while XLDB's own main generation may still be running in the host: a main turn started in the open chat
+  // (state.native.active), or a tool round whose continuation the host has yet to start. destroy then stops the host
+  // once. A request armed before a disable or a chat switch does not count: clearBinding already stopped that
+  // generation, and the host may be running an ordinary one by now.
+  function mainGenerationInProgress() {
+    if (state.native.active) return true;
+    return Boolean(state.native.turn?.toolContinuation);
+  }
+
+  // Closes the native gate for good: no turn and no armed request, and a new epoch, so that every queued native job
+  // returns without running and a context build still under way serves nothing.
+  function closeNativeGate() {
+    state.native.enabled = false;
+    state.native.active = false;
+    state.native.turn = null;
+    state.native.armed = null;
+    state.epoch += 1;
+    // The script is unloaded for good: stopHostGeneration never stops the host again.
+    state.native.unloaded = true;
+  }
+
+  // Unregisters the context tool. When the host throws, the tool stays marked as registered, so a later destroy tries
+  // again.
+  function unregisterContextTool() {
+    nativeHost().unregisterFunctionTool(CONTEXT_TOOL);
+    contextToolRegistered = false;
+  }
+
+  // Removes one host listener this script subscribed ([source, event, handler] from state.listeners).
+  function removeHostListener([source, event, handler]) {
+    if (source && typeof source.removeListener === 'function') source.removeListener(event, handler);
+  }
+
+  // Removes one host listener of the script and drops it from state.listeners. When the host throws, the listener
+  // stays listed, so a later destroy tries again.
+  function removeScriptListener(listener) {
+    removeHostListener(listener);
+    const index = state.listeners.indexOf(listener);
+    if (index >= 0) state.listeners.splice(index, 1);
+  }
+
+  // Removes the pagehide subscription the script made at load, so that an extension turned off by hand leaves no XLDB
+  // listener on the page either. A page without removeEventListener has nothing to remove.
+  function removePageHideListener() {
+    if (typeof globalThis.removeEventListener !== 'function') return;
+    globalThis.removeEventListener('pagehide', destroy);
+  }
+
+  // Asks the host to stop its current generation; destroy runs this once, and only while XLDB's main generation was in
+  // progress (mainGenerationInProgress). A host without stopGeneration has nothing to stop.
+  function stopGenerationForUnload() {
+    nativeHost().stopGeneration?.();
+  }
+
+  // Removes one open to-do dialog from the page and forgets it. When the removal throws, the dialog stays listed.
+  function removeTodoDialog(dialog) {
+    dialog.remove();
+    todoDialogs.delete(dialog);
+  }
+
+  // Removes one node the panel added to the page (the variable bar, the dashboard style, the panel or its toggle).
+  function removePanelNode(node) {
+    if (typeof node.remove === 'function') node.remove();
+  }
+
+  // Forgets the panel and the connection: no panel to render into, no candidate, no pairing token, not connected.
+  function forgetSession() {
     state.panel = null;
     state.candidate = null;
     state.token = '';
     state.connected = false;
+  }
+
+  // The cleanup steps of one destroy, in order, each a function that does one thing. The gate closes first, so that
+  // queued native jobs and any host event during the later steps find native chat off. The script's host listeners go
+  // before the stop, so that the GENERATION_ENDED and GENERATION_STOPPED the stop emits reach no XLDB handler. The stop
+  // is a step only when XLDB's main generation was in progress (read here, before the gate closes).
+  function destroyCleanupSteps() {
+    const steps = [closeNativeGate];
+    if (contextToolRegistered) steps.push(unregisterContextTool);
+    for (const listener of [...state.listeners]) {
+      steps.push(() => removeScriptListener(listener));
+    }
+    steps.push(removePageHideListener);
+    if (mainGenerationInProgress()) steps.push(stopGenerationForUnload);
+    for (const dialog of [...todoDialogs]) {
+      steps.push(() => removeTodoDialog(dialog));
+    }
+    const panel = state.panel;
+    // The three interval timers the panel may hold: progress polling, the story clock and the dashboard refresh.
+    const timers = [panel?.progressTimer, panel?.clockTimer, panel?.dashboardTimer];
+    for (const timer of timers) {
+      if (timer) steps.push(() => globalThis.clearInterval(timer));
+    }
+    const nodes = [panel?.variableRoot, panel?.dashboardStyle, panel?.root, panel?.toggle];
+    for (const node of nodes) {
+      if (node) steps.push(() => removePanelNode(node));
+    }
+    steps.push(forgetSession);
+    return steps;
+  }
+
+  // Runs every step in order, each in its own try, so that a step that throws never skips a later one. Returns the
+  // first failure as { failed, error }: a host may throw null, undefined, 0 or '', so failed says whether any step
+  // threw at all.
+  function runCleanupSteps(steps) {
+    const failure = { failed: false, error: undefined };
+    for (const step of steps) {
+      try {
+        step();
+      } catch (error) {
+        if (!failure.failed) {
+          failure.failed = true;
+          failure.error = error;
+        }
+      }
+    }
+    return failure;
+  }
+
+  // Unloads the script (pagehide, or the extension turned off or reloaded); afterwards XLDB is off for this page. It
+  // keeps no barrier for a request still in flight: it stops the host's current generation once (best effort) when
+  // XLDB's main generation was in progress, and removes every XLDB listener, the settings subscription included. A
+  // request that reaches the host later is an ordinary SillyTavern request and passes untouched, and no reply is
+  // accepted any more. Every cleanup step is one entry of destroyCleanupSteps and runs in its own try; after all of
+  // them ran, the first error is thrown again, whatever its value, so the caller can attribute it. A listener or the
+  // context tool whose removal threw stays listed, so a later destroy tries it again.
+  function destroy() {
+    const failure = runCleanupSteps(destroyCleanupSteps());
+    if (failure.failed) throw failure.error;
   }
 
   function element(tag, text) {
@@ -3118,7 +4422,12 @@
     return node;
   }
 
-  function button(label, handler) {
+  // options.origin: the click starts an origin token (captureOrigin) with the chat open at the click, before the handler
+  // runs, and hands it to the handler; an error that comes back after the user has left that chat is not shown in the
+  // chat open now. Without the option the handler gets no argument and every error is shown, as before. The token is
+  // started inside the try: a host callback that throws while it is read fails only this click (its error is shown, the
+  // handler does not run) and the finally still restores the button, so the next click runs.
+  function button(label, handler, options = {}) {
     const node = element('button', label);
     node.type = 'button';
     let pending = false;
@@ -3135,8 +4444,15 @@
       node.style.opacity = '0.55';
       node.style.cursor = 'wait';
       node.setAttribute('aria-busy', 'true');
-      try { await handler(); } catch (error) { setStatus(error && error.message ? error.message : '操作失败','error'); }
-      finally {
+      // The click's token; it stays null when the click takes none or when starting it failed.
+      let origin = null;
+      try {
+        if (options.origin) origin = captureOrigin({});
+        if (origin) await handler(origin);
+        else await handler();
+      } catch (error) {
+        setStatus(error && error.message ? error.message : '操作失败', 'error', origin);
+      } finally {
         pending = false;
         if (node.textContent === pendingText) node.textContent = previousText;
         if (node.style.pointerEvents === 'none') node.style.pointerEvents = previousPointerEvents;
@@ -3381,7 +4697,10 @@
     const review = Array.isArray(data && data.needsReview) ? data.needsReview : state.scene.needsReview;
     if (review.length) {
       area.append(element('p', '以下记录因来源变更已暂停使用。核对正文后可按当前来源重新确认；来源已删除时请编辑或删除相关正文。'));
-      for(const id of review)area.append(button(`按当前来源重新确认：${id}`,()=>reconfirmSceneSource(id)));
+      for(const id of review){
+        const reviewButton=button(`按当前来源重新确认：${id}`,origin=>reconfirmSceneSource(id,origin),{origin:true});
+        area.append(reviewButton);
+      }
     }
   }
 
@@ -3401,7 +4720,7 @@
     const token = field('XLDB 访问令牌', 'password');
     token.input.autocomplete = 'off';
     token.input.addEventListener('input', () => { state.token = token.input.value; });
-    const bindButton = button('启用／重试当前聊天', enableCurrentChat);
+    const bindButton = button('启用／重试当前聊天', enableCurrentChat, { origin: true });
     const recoveryPreview=element('div');
     const recoverButton=button('预览用核心正文恢复',()=>withBusy(async()=>{
       assertToken();requireSceneRestoreHost();
@@ -3421,15 +4740,15 @@
       }
       for(const item of changes.removed.slice(0,5))details.append(element('p',`移除：${item.text.slice(0,300)}`));
       recoveryPreview.append(element('p',`目标：${scope.worldId} / ${scope.sessionId} / ${scope.branchId} · 核心修订 ${data.version}。将用核心中已接受的正文重建本聊天受管消息；当前本地受管改动会被覆盖。`),details,
-        button('确认用核心正文覆盖',async()=>{
+        button('确认用核心正文覆盖',async origin=>{
           clearElement(recoveryPreview);
-          await recoverScene(scope.worldId,preview);
-        }));
+          await recoverScene(scope.worldId,preview,origin);
+        },{origin:true}));
     }));
     const disableButton = button('禁用本聊天', disable);
-    const syncButton = button('同步更改', sync);
-    const inspectButton = button('查看当前状态', inspect);
-    const nativeButton = button('启用原生聊天', enableNative);
+    const syncButton = button('同步更改', sync, { origin: true });
+    const inspectButton = button('查看当前状态', inspect, { origin: true });
+    const nativeButton = button('启用原生聊天', origin => enableNative({ origin }), { origin: true });
     const interactionSection=element('section');
     interactionSection.append(element('h4','模式与时钟'));
     const timeZone=field('显示时区（留空跟随系统，如 Asia/Shanghai）');
@@ -3448,7 +4767,8 @@
       button('读取保存点列表', () => withBusy(async () => { assertBound(); const rows = await request('/v1/scene/checkpoints', 'POST', { scope: state.scope }); while (checkpointSelect.firstChild) checkpointSelect.removeChild(checkpointSelect.firstChild); for (const row of rows) { const option = element('option', `${row.createdAt} · ${row.reason}`); option.value = row.id; checkpointSelect.append(option); } })), checkpointSelect,
       button('预览恢复所选保存点', () => { if (!checkpointSelect.value) throw new Error('请先选择保存点'); return previewLifecycle('restore', checkpointSelect.value); }),
       button('预览撤销最近操作', () => previewLifecycle('undo')), branchName.wrap,
-      button('从当前状态创建分支', () => switchSceneBranch(branchName.input.value, true)), button('切换已有分支', () => switchSceneBranch(branchName.input.value)));
+      button('从当前状态创建分支', origin => switchSceneBranch(branchName.input.value, true, origin), { origin: true }),
+      button('切换已有分支', origin => switchSceneBranch(branchName.input.value, false, origin), { origin: true }));
     const worldSection = element('details');
     worldSection.append(element('summary', '世界时间与账本'));
     const worldMode = element('select');
@@ -3486,8 +4806,10 @@
       const entry = { kind, row, owner, name, amount, checks }; ledgerEntries.push(entry);
       row.append(owner, name.wrap, amount.wrap, element('p', '可以知道这项完整余额或库存的角色'), readers, button('移除此项', () => { row.remove(); ledgerEntries.splice(ledgerEntries.indexOf(entry), 1); })); ledgerRows.append(row);
     };
-    const loadWorld = button('读取世界设置', () => withBusy(async () => {
-      assertBound(); const epoch = state.epoch; const data = await inspectInternal();
+    const loadWorld = button('读取世界设置', origin => withBusy(async () => {
+      assertBound();
+      const epoch = state.epoch;
+      const data = await inspectInternal(origin);
       if (state.epoch !== epoch) throw new Error('聊天已切换，请重新读取世界设置');
       assertBound(); const settings = data.worldSettings;
       if (!settings) { setLegacyWorld(false); worldLoaded = true; setStatus('此聊天尚未启用世界时钟与账本。'); return; }
@@ -3495,8 +4817,8 @@
       ledgerEntries.splice(0); while (ledgerRows.firstChild) ledgerRows.removeChild(ledgerRows.firstChild);
       for (const row of settings.balances) addLedgerRow('balance', row);
       for (const row of settings.inventory) addLedgerRow('inventory', row);
-    }));
-    const saveWorld = button('保存并重算世界状态', () => withBusy(async () => {
+    }), { origin: true });
+    const saveWorld = button('保存并重算世界状态', origin => withBusy(async () => {
       assertBound();
       if (!worldLoaded) throw new Error('请先点击“读取世界设置”，确认当前设置后再保存');
       if (legacyCompanionWorld && !legacyWorldConfirm.checked) throw new Error('此世界设置来自旧版现实陪伴时间；请先勾选“确认改为剧情时间”再保存');
@@ -3509,10 +4831,13 @@
       const receipt=await request('/v1/scene/world-configure', 'POST', { scope: state.scope, expectedVersion:state.scene.version, settings });
       if (state.epoch !== epoch) throw new Error('聊天已切换，原聊天设置已提交');
       assertBound();
-      await recordSceneReceipt(receipt);
+      await recordSceneReceipt(origin, receipt);
       setLegacyWorld(false);
-      await syncInternal(); renderSceneMaterials(await inspectInternal()); setStatus('世界状态已保存并重算。');
-    }));
+      await syncInternal(origin);
+      const data = await inspectInternal(origin);
+      renderSceneMaterials(data);
+      setStatus('世界状态已保存并重算。');
+    }), { origin: true });
     worldSection.append(element('p', '先配置一套 XLDB 后台处理模型。金额与数量由脚本计算；修改初始值会重算当前有效历史。支持明确购买、引用原购买的部分退款、消耗和时间线索。'), worldMode, legacyWorldNotice, legacyWorldLabel, worldStart.wrap, playerName.wrap, timeLabel, ledgerRows,
       button('添加初始余额', () => addLedgerRow('balance')), button('添加初始物品', () => addLedgerRow('inventory')), loadWorld, saveWorld,
       element('p','世界状态随当前聊天接入启用。初始资料未知时保持未知，可随剧情逐步补全。'));
@@ -3660,6 +4985,7 @@
     renderInteraction();
     state.panel.branchInput = branchName.input;
     buildWorkbench(root,lifecycleSection);
+    buildPresetSection(root);
     for(const node of [title,closeButton,status,bindButton,disableButton,syncButton,inspectButton,nativeButton])node._xldbGroup='chat';
     for(const node of [interactionSection,sceneSection,worldSection])node._xldbGroup='world';
     for(const node of [configTitle,configArea,loadConfigButton,configActions])node._xldbGroup='models';
@@ -3678,25 +5004,48 @@
     return new Intl.DateTimeFormat('zh-CN',{timeZone:clock.timeZone,year:'numeric',month:'2-digit',day:'2-digit',weekday:'long',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(clock.timeMs);
   }
 
-  async function refreshDashboard() {
+  // Reads the story state of the token's binding (clock, characters, calendar, map, reminders) into the dashboard; only the
+  // latest read is shown. A character the core no longer knows falls back to the player's view once, and any other error
+  // stays in the dashboard area. origin: the token of the calling action; a read that outlasts its chat shows nothing and
+  // ends with the stale error.
+  async function refreshDashboard(origin) {
+    assertStarted(origin);
     if(!state.scene.enabled||!state.scope)throw new Error(state.enabled?'请先在酒馆发送第一条正文，故事状态会随本轮处理自动建立。':'请先接入当前聊天，再查看故事状态。');
-    const scope={...state.scope},epoch=state.epoch;
-    const requestId=(state.dashboard.requestId||0)+1;state.dashboard.requestId=requestId;
-    state.dashboard.loading=true;
+    assertOrigin(origin);
+    const requestId = (state.dashboard.requestId || 0) + 1;
+    state.dashboard.requestId = requestId;
+    state.dashboard.loading = true;
     try {
-      const data=await request('/v1/scene/dashboard','POST',{scope,characterId:state.dashboard.characterId||'player',...(state.dashboard.month||{})});
-      assertHostScope(scope,epoch);
-      if(requestId!==state.dashboard.requestId)return;
-      state.dashboard.data={...data,sampledAt:Date.now()};state.dashboard.error='';
-      if(data.emotionRanker){state.emotionRanker=data.emotionRanker;renderRankerBadge();}
-      renderDashboard();showTodoReminders(data);return data;
-    } catch(error) {
-      if(error.message==='XLDB：invalid_dashboard_character'&&requestId===state.dashboard.requestId&&sameScope(scope,state.scope)&&epoch===state.epoch&&state.dashboard.characterId!=='player'){
-        state.dashboard.characterId='player';return await refreshDashboard();
+      const body = { scope: origin.scope, characterId: state.dashboard.characterId || 'player', ...(state.dashboard.month || {}) };
+      const data = await request('/v1/scene/dashboard', 'POST', body, origin);
+      assertOrigin(origin);
+      if (requestId !== state.dashboard.requestId) return;
+      state.dashboard.data = { ...data, sampledAt: Date.now() };
+      state.dashboard.error = '';
+      if (data.emotionRanker) {
+        state.emotionRanker = data.emotionRanker;
+        renderRankerBadge();
       }
-      if(requestId===state.dashboard.requestId&&sameScope(scope,state.scope)&&epoch===state.epoch){state.dashboard.data=null;state.dashboard.error=error.message;renderDashboard();}
+      renderDashboard();
+      showTodoReminders(data);
+      return data;
+    } catch (error) {
+      if (!originValid(origin)) throw error;
+      // Only the latest read writes its outcome.
+      const latest = requestId === state.dashboard.requestId;
+      if (error.message === 'XLDB：invalid_dashboard_character' && latest && state.dashboard.characterId !== 'player') {
+        state.dashboard.characterId = 'player';
+        return await refreshDashboard(origin);
+      }
+      if (latest) {
+        state.dashboard.data = null;
+        state.dashboard.error = error.message;
+        renderDashboard();
+      }
       throw error;
-    } finally { if(requestId===state.dashboard.requestId)state.dashboard.loading=false; }
+    } finally {
+      if (requestId === state.dashboard.requestId) state.dashboard.loading = false;
+    }
   }
 
   function displayCard(label,value) {
@@ -3712,8 +5061,14 @@
     }
     select.value=state.dashboard.characterId||'player';
     select.addEventListener('change',async()=>{
+      // The token of this change, started before its first await.
+      const origin = captureOrigin({});
       state.dashboard.characterId=select.value;state.dashboard.data=null;renderDashboard();
-      try{await refreshDashboard();}catch(error){setStatus(error.message,'error');}
+      try {
+        await refreshDashboard(origin);
+      } catch (error) {
+        setStatus(error.message, 'error', origin);
+      }
     });
     label.append(select);row.append(label,element('small',data.view==='inspection'?'NPC 查看 · 仅供你查看，不改变角色知情范围':'默认显示你可知的状态'));
     return row;
@@ -3737,36 +5092,121 @@
     const scope={...state.scope},epoch=state.epoch,dialog=todoDialog(todo?'编辑我的待办':'添加我的待办');
     const fields={};
     for(const [key,label,type,value] of [['title','事项','text',todo?.title||''],['date','剧情日期','date',todo?.date||''],['time','剧情时间','time',todo?.time||'09:00']]){
-      const row=element('label',label),input=element('input');input.type=type;input.value=value;input.required=true;
-      input.setAttribute('aria-label',label);row.append(input);dialog.append(row);fields[key]=input;
+      const row=element('label',label);
+      const input=element('input');
+      input.type=type;
+      input.value=value;
+      input.required=true;
+      input.setAttribute('aria-label',label);
+      row.append(input);
+      dialog.append(row);
+      fields[key]=input;
     }
-    const feedback=element('p');feedback.setAttribute('role','alert');dialog.append(feedback);
+    const feedback=element('p');
+    feedback.setAttribute('role','alert');
+    dialog.append(feedback);
     dialog.append(button('保存待办',async()=>{
+      // The token of this save, started at the click; the dialog's chat is checked right below.
+      const origin = captureOrigin({});
       try{
         assertHostScope(scope,epoch);
         if(Object.values(fields).some(input=>!input.reportValidity()))return;
-        await request('/v1/scene/todo-save','POST',{scope,...(todo?{id:todo.id,revision:todo.revision}:{}),title:fields.title.value,date:fields.date.value,time:fields.time.value});
-        assertHostScope(scope,epoch);dialog.close();await refreshDashboard();setStatus('待办已保存。','success');
+        const payload = {
+          scope,
+          ...(todo ? { id: todo.id, revision: todo.revision } : {}),
+          title: fields.title.value,
+          date: fields.date.value,
+          time: fields.time.value,
+        };
+        await request('/v1/scene/todo-save','POST',payload);
+        assertHostScope(scope,epoch);
+        dialog.close();
+        try{
+          await refreshDashboard(origin);
+        }catch(error){
+          setStatus(error.message,'error');
+          return;
+        }
+        setStatus('待办已保存。','success');
       }catch(error){
         const errors={'XLDB：calendar_todo_not_future':'请选择剧情当前时间之后的日期和时间。','XLDB：calendar_story_clock_unknown':'请先在设置中补全剧情起始日期。','XLDB：invalid_calendar_todo_time':'日期或时间无效，请重新选择。','XLDB：invalid_calendar_todo':'请填写不超过 300 字的待办事项。'};
         feedback.textContent=errors[error.message]||friendlyError(error.message);
       }
-    }),button('取消',()=>dialog.close()));dialog.showModal();
+    }),button('取消',()=>dialog.close()));
+    dialog.showModal();
   }
 
   function showTodoReminders(data) {
     if(!(data.reminders||[]).length||[...todoDialogs].some(dialog=>dialog.isTodoReminder))return;
-    const scope={...state.scope},epoch=state.epoch,dialog=todoDialog('剧情待办提醒');dialog.classList.add('xldb-todo-reminder');dialog.isTodoReminder=true;
+    const scope={...state.scope},epoch=state.epoch;
+    const scopeKey=JSON.stringify([scope.worldId,scope.sessionId,scope.branchId,scope.characterId]);
+    const savedDismissals=state.dashboard.todoReminderDismissals;
+    if(!savedDismissals||savedDismissals.scopeKey!==scopeKey||savedDismissals.epoch!==epoch){
+      state.dashboard.todoReminderDismissals={scopeKey,epoch,dismissed:new Set()};
+    }
+    const dismissed=state.dashboard.todoReminderDismissals.dismissed;
+    // A reminder is identified by its id and revision; a changed revision is a new reminder.
+    const reminderKey=item=>`${String(item.id)}\u0000${String(item.revision)}`;
+    const pending=(data.reminders||[]).filter(item=>!dismissed.has(reminderKey(item)));
+    if(!pending.length)return;
+    const dialog=todoDialog('剧情待办提醒');
+    dialog.classList.add('xldb-todo-reminder');
+    dialog.isTodoReminder=true;
     dialog.append(element('p','剧情时间已进入待办前一天或当天。'));
-    for(const item of data.reminders)dialog.append(element('p',`${item.date} ${item.time} · ${item.title}`));
-    const feedback=element('p');feedback.setAttribute('role','alert');dialog.append(feedback);
-    dialog.append(button('知道了',async()=>{
+    for(const item of pending)dialog.append(element('p',`${item.date} ${item.time} · ${item.title}`));
+    const feedback=element('p');
+    feedback.setAttribute('role','alert');
+    dialog.append(feedback);
+    // Closing without acknowledging keeps these reminders quiet for this chat scope and epoch.
+    let acknowledged=false;
+    // Marks every reminder currently in the dialog as dismissed for this session.
+    const dismissShown=()=>{
+      for(const item of pending)dismissed.add(reminderKey(item));
+    };
+    dialog.addEventListener('cancel',dismissShown);
+    dialog.addEventListener('close',()=>{
+      if(!acknowledged)dismissShown();
+    });
+    // Acknowledges each reminder on its own: a stale one is skipped, and other failures keep the dialog open.
+    const acknowledge=async()=>{
+      // The token of this acknowledgement, started at the click; the dialog's chat is checked right below.
+      const origin = captureOrigin({});
       try{
         assertHostScope(scope,epoch);
-        for(const item of data.reminders)await request('/v1/scene/todo-ack','POST',{scope,id:item.id,revision:item.revision});
-        assertHostScope(scope,epoch);dialog.close();await refreshDashboard();
-      }catch(error){feedback.textContent=friendlyError(error.message);}
-    }));dialog.showModal();
+        const failures=[];
+        for(const item of pending){
+          try{
+            await request('/v1/scene/todo-ack','POST',{scope,id:item.id,revision:item.revision});
+            dismissed.add(reminderKey(item));
+          }catch(error){
+            // A todo the server no longer knows is stale; it must not block the acknowledgements after it.
+            if(error.message!=='XLDB：calendar_todo_not_found'){
+              failures.push(error);
+              continue;
+            }
+            dismissed.add(reminderKey(item));
+          }
+        }
+        if(failures.length)throw failures[0];
+        assertHostScope(scope,epoch);
+        acknowledged=true;
+        dialog.close();
+        try{
+          await refreshDashboard(origin);
+        }catch(error){
+          setStatus(error.message,'error');
+        }
+      }catch(error){
+        feedback.textContent=friendlyError(error.message);
+      }
+    };
+    // Hides the reminders until the chat scope or epoch changes.
+    const remindLater=()=>{
+      dismissShown();
+      dialog.close();
+    };
+    dialog.append(button('知道了',acknowledge),button('稍后提醒',remindLater));
+    dialog.showModal();
   }
 
   function calendarContent(data,compact) {
@@ -3775,19 +5215,28 @@
     if(!calendar){area.append(element('p','剧情日期尚未设置。设置故事的起始日期后，月历会跟随剧情时钟显示。'));if(!compact)area.append(button('设置剧情日期',()=>navigateWorkbench('settings','world')));return area;}
     const {year,month}=calendar,tools=element('div');tools.className='xldb-calendar-tools';
     const changeMonth=async(delta)=>{
+      // The token of this month change, started before its first await.
+      const origin = captureOrigin({});
       const index=year*12+month-1+delta,newYear=Math.floor(index/12);if(newYear<1||newYear>9999)return;
-      state.dashboard.month={year:newYear,month:index%12+1};await refreshDashboard();
+      state.dashboard.month={year:newYear,month:index%12+1};
+      await refreshDashboard(origin);
     };
-    tools.append(button('上个月',()=>changeMonth(-1)),element('strong',`${year} 年 ${month} 月`),button('下个月',()=>changeMonth(1)),button(data.mode==='roleplay'?'回到剧情当前月':'回到当前月',async()=>{state.dashboard.month=null;await refreshDashboard();}));
+    tools.append(button('上个月',()=>changeMonth(-1)),element('strong',`${year} 年 ${month} 月`),button('下个月',()=>changeMonth(1)),button(data.mode==='roleplay'?'回到剧情当前月':'回到当前月',async origin=>{
+      state.dashboard.month=null;
+      await refreshDashboard(origin);
+    },{origin:true}));
     area.append(tools);
     if(!compact&&data.selectedCharacterId==='player'){
       area.append(button('添加我的待办',()=>editTodo()));
       for(const todo of data.todos||[])if(todo.status==='active'){
         const row=element('div');row.className='xldb-card';row.append(element('span',`${todo.date} ${todo.time} · ${todo.title}`),button('编辑',()=>editTodo(todo)));
-        for(const [label,path] of [['标记完成','todo-complete'],['删除待办','todo-delete']])row.append(button(label,async()=>{
+        for(const [label,path] of [['标记完成','todo-complete'],['删除待办','todo-delete']])row.append(button(label,async origin=>{
           const scope={...state.scope},epoch=state.epoch;
-          await request(`/v1/scene/${path}`,'POST',{scope,id:todo.id,revision:todo.revision});assertHostScope(scope,epoch);await refreshDashboard();
-        }));area.append(row);
+          await request(`/v1/scene/${path}`,'POST',{scope,id:todo.id,revision:todo.revision});
+          assertHostScope(scope,epoch);
+          await refreshDashboard(origin);
+        },{origin:true}));
+        area.append(row);
       }
     }
     const directorTodos=(data.directorTodos||[]).filter(item=>item.date.startsWith(`${String(year).padStart(4,'0')}-${String(month).padStart(2,'0')}-`));
@@ -3841,11 +5290,15 @@
           card.append(element('strong',item.title),element('p',`${owners} · ${when}${schedule.startTime?' '+schedule.startTime:''}${schedule.endTime?'–'+schedule.endTime:''}${schedule.startDate?' · 从 '+schedule.startDate:''}${schedule.endDate?' 至 '+schedule.endDate:''}`),element('p',`依据：${item.quote}`));box.append(card);
         }
         if(!preview.candidate?.items?.length)box.append(element('p','没有发现可确认的课程或待办。'));
-        box.append(button('确认加入月历',async()=>{
+        box.append(button('确认加入月历',async origin=>{
           const scope={...state.scope},epoch=state.epoch;
           await request('/v1/scene/calendar-apply','POST',{scope,candidate:preview.candidate,expectedVersion:preview.expectedVersion,previewId:preview.previewId});
-          assertHostScope(scope,epoch);state.dashboard.calendarPreview=null;await refreshDashboard();setStatus('课程与待办已加入月历。','success');
-        }),button('放弃本次整理',()=>{state.dashboard.calendarPreview=null;renderDashboard();}));area.append(box);
+          assertHostScope(scope,epoch);
+          state.dashboard.calendarPreview=null;
+          await refreshDashboard(origin);
+          setStatus('课程与待办已加入月历。','success');
+        },{origin:true}),button('放弃本次整理',()=>{state.dashboard.calendarPreview=null;renderDashboard();}));
+        area.append(box);
       }
     }
     return area;
@@ -3876,7 +5329,7 @@
 
   function dashboardContent(tab,compact=false) {
     const area=element('div'),data=state.dashboard.data;
-    if(!data){const empty=element('div');empty.className='xldb-empty';empty.append(element('p',state.dashboard.error?friendlyError(state.dashboard.error):state.enabled?(state.scene.enabled?'还没有读取到这段故事的状态。':'在酒馆发送第一条正文后，世界时间、物品和已确认的变化会出现在这里。'):'接入聊天后，世界时间、物品和已确认的变化会出现在这里。'));if(state.scene.enabled&&!compact)empty.append(button('读取故事状态',refreshDashboard));area.append(empty);return area;}
+    if(!data){const empty=element('div');empty.className='xldb-empty';empty.append(element('p',state.dashboard.error?friendlyError(state.dashboard.error):state.enabled?(state.scene.enabled?'还没有读取到这段故事的状态。':'在酒馆发送第一条正文后，世界时间、物品和已确认的变化会出现在这里。'):'接入聊天后，世界时间、物品和已确认的变化会出现在这里。'));if(state.scene.enabled&&!compact)empty.append(button('读取故事状态',refreshDashboard,{origin:true}));area.append(empty);return area;}
     area.append(dashboardViewer(data,compact));
     const balances=data.balances||[],inventory=data.inventory||[],transactions=data.transactions||[];
     const grid=element('div');grid.className='xldb-grid';
@@ -3988,10 +5441,17 @@
         group.append(make('title',{},`${place.name} · ${id} · ${place.basis==='map_report'?'地图／传闻':'有来源记录'}`));
         if(!compact)group.addEventListener('pointerdown',event=>{
           if(state.busy)return;event.preventDefault();const scope={...state.scope},epoch=state.epoch,revision=map.layout.revision;
+          // The token of this drag, started with its scope and epoch.
+          const origin=captureOrigin({});
           state.dashboard.mapDragging=true;group.setPointerCapture?.(event.pointerId);let position={...nodes[id]},moved=false;
           const move=event=>{const rect=svg.getBoundingClientRect();position={...position,x:Math.max(0,Math.min(100,((event.clientX-rect.left)/rect.width*700-35)/6.3)),y:Math.max(0,Math.min(100,((event.clientY-rect.top)/rect.height*460-30)/3.8))};moved=true;group.setAttribute('transform',`translate(${35+position.x*6.3} ${30+position.y*3.8})`);};
           const finish=event=>{group.removeEventListener('pointermove',move);group.removeEventListener('pointerup',finish);group.removeEventListener('pointercancel',cancel);state.dashboard.mapDragging=false;
-            if(moved)void withBusy(async()=>{assertHostScope(scope,epoch);await request('/v1/scene/geography/layout','POST',{scope,readerId:'player',expectedRevision:revision,operationId:newId('map-layout'),layout:{axes:map.layout.axes,nodes:{...nodes,[id]:position}}});assertHostScope(scope,epoch);await refreshDashboard();});};
+            if(moved)void withBusy(async()=>{
+              assertHostScope(scope,epoch);
+              await request('/v1/scene/geography/layout','POST',{scope,readerId:'player',expectedRevision:revision,operationId:newId('map-layout'),layout:{axes:map.layout.axes,nodes:{...nodes,[id]:position}}});
+              assertHostScope(scope,epoch);
+              await refreshDashboard(origin);
+            });};
           const cancel=()=>{group.removeEventListener('pointermove',move);group.removeEventListener('pointerup',finish);group.removeEventListener('pointercancel',cancel);state.dashboard.mapDragging=false;renderDashboard();};
           group.addEventListener('pointermove',move);group.addEventListener('pointerup',finish);group.addEventListener('pointercancel',cancel);
         });
@@ -4189,7 +5649,7 @@
     `;viewDocument.body.append(style);
     const header=element('header');header.className='xldb-header';const revision=element('small');revision.className='xldb-revision';
     const headerClock=element('time','剧情时间 · 尚未读取');headerClock.className='xldb-header-clock';panel.headerClock=headerClock;
-    header.append(element('strong','XLDB'),element('span','世界工作台'),headerClock,button('刷新状态',refreshDashboard),button('关闭工作台',()=>setPanelOpen(false)));
+    header.append(element('strong','XLDB'),element('span','世界工作台'),headerClock,button('刷新状态',refreshDashboard,{origin:true}),button('关闭工作台',()=>setPanelOpen(false)));
     header.children[0].className='xldb-brand';header.children[1].className='xldb-brand-sub';
     const layout=element('div');layout.className='xldb-layout';const rail=element('aside');rail.className='xldb-rail';
     const tabs=element('nav');tabs.className='xldb-tabs';tabs.setAttribute('aria-label','工作台栏目');tabs.setAttribute('role','tablist');
@@ -4204,7 +5664,16 @@
     const headerBadges={core:element('span'),chat:element('span'),mode:element('span'),turn:element('span'),ranker:element('span'),retrieval:element('span')};headerBadges.ranker.hidden=true;headerBadges.retrieval.hidden=true;headerBadges.retrieval.setAttribute('role','status');badgeRow.append(...Object.values(headerBadges));panel.headerBadges=headerBadges;
     contextbar.append(badgeRow,revision);panel.status.className='xldb-status';
     const journey=element('section');journey.className='xldb-journey';journey.setAttribute('aria-label','开始使用');
-    const journeyLabel=element('div');journeyLabel.className='xldb-eyebrow';const journeyTitle=element('h2'),journeyText=element('p'),journeyAction=button('',()=>currentJourney().run());journeyAction.className='xldb-primary';
+    const journeyLabel=element('div');
+    journeyLabel.className='xldb-eyebrow';
+    const journeyTitle=element('h2');
+    const journeyText=element('p');
+    // The card runs the step shown at the click and hands it the click's token. The adoption and the sync retry take
+    // it as their own token. The enable step starts while no chat is bound, so its token is an unbound one:
+    // enableCurrentChat uses it only for its attachment save, and the attachment it then asks for reports its own
+    // failures in the chat it attaches, as before. The other steps only navigate and ignore it.
+    const journeyAction=button('',origin=>currentJourney().run(origin),{origin:true});
+    journeyAction.className='xldb-primary';
     const steps=element('ol');steps.className='xldb-steps';const journeySteps=['连接核心','后台模型','当前聊天'].map((label,index)=>{const item=element('li',label);item.setAttribute('data-number',String(index+1));steps.append(item);return item;});
     journey.append(journeyLabel,journeyTitle,journeyText,journeyAction,steps);Object.assign(panel,{journey,journeyLabel,journeyTitle,journeyText,journeyAction,journeySteps});
     const area=element('div');area.id='xldb-dashboard-area';area.className='xldb-content';area.setAttribute('role','tabpanel');settings.id='xldb-settings-area';
@@ -4217,7 +5686,7 @@
     const variableArea=element('div');variableArea.className='xldb-content';const tools=element('div');tools.className='xldb-tools';
     let light=safeStorageGet('xldb.ui.theme')==='paper',left=safeStorageGet('xldb.ui.side')==='left',large=safeStorageGet('xldb.ui.large')==='true';
     const preference=()=>{variableRoot.className=light?'xldb-paper':'';variableRoot.style.left=left?'12px':'';variableRoot.style.right=left?'':'12px';variableRoot.style.fontSize=large?'16px':'14px';};
-    tools.append(button('刷新变量',refreshDashboard),button('主题',()=>{light=!light;safeStorageSet('xldb.ui.theme',light?'paper':'dark');preference();}),button('左右位置',()=>{left=!left;safeStorageSet('xldb.ui.side',left?'left':'right');preference();}),button('字号',()=>{large=!large;safeStorageSet('xldb.ui.large',String(large));preference();}));
+    tools.append(button('刷新变量',refreshDashboard,{origin:true}),button('主题',()=>{light=!light;safeStorageSet('xldb.ui.theme',light?'paper':'dark');preference();}),button('左右位置',()=>{left=!left;safeStorageSet('xldb.ui.side',left?'left':'right');preference();}),button('字号',()=>{large=!large;safeStorageSet('xldb.ui.large',String(large));preference();}));
     variableRoot.append(mini,variableTabs,variableArea,tools);viewDocument.body.append(variableRoot);
     panel.toggle.style.left='12px';panel.toggle.style.right='auto';panel.toggle.style.top='calc(100vh - 74px)';panel.toggle.style.bottom='auto';
     Object.assign(panel,{settingsArea:settings,settingsPanels,settingsButtons,dashboardArea:area,dashboardTabs,dashboardRevision:revision,variableRoot,variableToggle,variableArea,variableTabs,variableTools:tools,dashboardStyle:style});
@@ -4226,19 +5695,26 @@
     root.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();setPanelOpen(false);}});
     buildPhysiologyPanel(settingsPanels.get('world'));buildGeographyPanel(settingsPanels.get('world'));
     preference();renderDashboard();
-    panel.dashboardTimer=globalThis.setInterval(()=>{if(state.scene.enabled&&!state.busy&&!state.dashboard.loading&&!state.dashboard.mapDragging)void refreshDashboard().catch(()=>{});},15000);
+    panel.dashboardTimer=globalThis.setInterval(()=>{if(state.scene.enabled&&!state.busy&&!state.dashboard.loading&&!state.dashboard.mapDragging)void refreshDashboard(captureOrigin({})).catch(()=>{});},15000);
   }
 
   async function previewLifecycle(operation,checkpointId) {
     return withBusy(async()=>{
-      assertBound();const scope={...state.scope},epoch=state.epoch;
+      assertBound();
+      const scope={...state.scope};
+      const epoch=state.epoch;
       const result=await request('/v1/scene/restore-preview','POST',{scope,operation,checkpointId});
-      assertHostScope(scope,epoch);const area=state.panel.lifecyclePreview;clearElement(area);
+      assertHostScope(scope,epoch);
+      const area=state.panel.lifecyclePreview;
+      clearElement(area);
       area.append(element('pre',JSON.stringify(result,null,2)));
-      if(result.checkpointId)area.append(button('确认以上恢复',async()=>{
+      // The confirm click's token goes to the restore, and the preview is cleared only while its chat is still open.
+      if(result.checkpointId)area.append(button('确认以上恢复',async origin=>{
         assertHostScope(scope,epoch);
-        await restoreScene(operation,result.checkpointId,result.version);clearElement(area);
-      }));
+        await restoreScene(operation,result.checkpointId,result.version,origin);
+        assertOrigin(origin);
+        clearElement(area);
+      },{origin:true}));
       return result;
     });
   }
@@ -4248,16 +5724,80 @@
     const result=await request('/v1/scene/workbench','POST',{scope,...options});assertHostScope(scope,epoch);return result;
   }
 
-  async function correctWorkbenchSource(row,replacement,version) {
+  // Corrects one accepted source from the admin workbench (replacement text), or deletes it (replacement null), at the
+  // authority version the workbench query showed. A definite refusal from the core wrote nothing, so the recovery marker
+  // set before the request is taken back and the chat stays attached. Any other failure may have written, so the marker
+  // stays and this tab unbinds without saving an explicit disable into the chat that is open now.
+  // originToken: the confirm button's started token; a direct call starts its own token here, before any await. The
+  // correction's status, its disable and the error the button shows are all dropped after the user has left the chat
+  // the correction started in.
+  // One exception to the origin rule: once the recovery marker is written, the core write the user confirmed for this
+  // chat is sent even if the user leaves the chat while the marker is saved. It carries this chat's own scope, so it
+  // can only change this chat's history in the core, and silently dropping an edit the user confirmed would be worse.
+  // Everything after it still follows the rule: the token is checked after every later await, and the reload, the
+  // status, the disable and the error are dropped once it is stale, so the chat open now (its binding, status, badges,
+  // metadata and panel) is never touched; the marker this correction wrote into this chat's metadata before the request
+  // makes the next bind of this chat reload the core's prose. A correction whose token went stale also leaves that marker
+  // in place after a refusal, so its chat stays blocked for a reload, the safe state. Before the marker is written (while
+  // queued native work drains) a switch or an unbinding still cancels the correction: nothing is marked or sent.
+  async function correctWorkbenchSource(row,replacement,version,originToken={}) {
+    const origin=captureOrigin(originToken);
     return withBusy(async()=>{
-      assertBound();requireSceneRestoreHost();const scope={...state.scope},epoch=state.epoch;
-      const metadata=nativeHost().chatMetadata||={};metadata.xldbHydrate=scope;await saveNativeMetadata();
+      assertOrigin(origin);
+      assertBound();
+      requireSceneRestoreHost();
+      // A reply still streaming, or its queued acceptance, would be redrawn under the correction: stop it, let the
+      // queued native work finish, and only then read the scope and epoch this correction runs under.
+      if(state.native.active)nativeHost().stopGeneration?.();
+      await state.native.queue.catch(()=>{});
+      // The row belongs to the chat and binding the correction started in; after a switch or an unbinding nothing is
+      // marked or sent. A settings change in the same chat only moves the token's epoch along.
+      if(!refreshOriginEpoch(origin))throw new Error('聊天已切换或已停用，正文未纠正。');
+      assertBound();
+      const scope=origin.scope;
+      const metadata=nativeHost().chatMetadata||={};
+      const hadMarker=Object.hasOwn(metadata,'xldbHydrate');
+      const previousMarker=metadata.xldbHydrate;
+      // Whether the confirmed core write was answered; a refusal before that wrote nothing.
+      let sent=false;
+      metadata.xldbHydrate=scope;
+      await saveNativeMetadata();
       try {
-        await request('/v1/scene/source-correct','POST',{scope,sourceId:row.sourceId,revision:row.revision,text:replacement,expectedVersion:version,operationId:newId('correction')});
-        assertHostScope(scope,epoch);state.candidate=null;state.native.turn=null;
-        await materializeScene(scope,await request('/v1/scene/inspect','POST',{scope}));
-        setStatus('正文已纠正；相关资料按新来源重算。');
-      } catch(error) { disable('正文纠正结果待载入，请重新绑定当前聊天。');throw error; }
+        // The confirmed core write is the one request sent without the token (the exception described above).
+        await request('/v1/scene/source-correct','POST',{
+          scope,
+          sourceId:row.sourceId,
+          revision:row.revision,
+          text:replacement,
+          expectedVersion:version,
+          operationId:newId('correction'),
+        });
+        assertOrigin(origin);
+        sent=true;
+        state.candidate=null;
+        state.native.turn=null;
+        const inspected=await request('/v1/scene/inspect','POST',{scope},origin);
+        assertOrigin(origin);
+        await materializeScene(origin,inspected);
+        assertOrigin(origin);
+        setStatus('正文已纠正；相关资料按新来源重算。',undefined,origin);
+      } catch(error) {
+        if(!originValid(origin))throw error;
+        const refused=!sent&&/^XLDB：[a-z_0-9]+$/.test(error.message);
+        if(!refused) {
+          disable('正文纠正结果待载入，请重新绑定当前聊天。',false,origin);
+          throw error;
+        }
+        // Take the marker back only while the same chat is still open; another chat's metadata is never touched.
+        if(nativeHost().chatMetadata===metadata&&sameScope(metadata.xldbHydrate,scope)) {
+          if(hadMarker)metadata.xldbHydrate=previousMarker;
+          else delete metadata.xldbHydrate;
+          await saveNativeMetadata().catch(()=>{});
+          assertOrigin(origin);
+        }
+        if(error.message==='XLDB：context_changed_retry')throw new Error('资料已变化，正文未纠正。请重新查询资料后再预览。');
+        throw error;
+      }
     });
   }
 
@@ -4287,8 +5827,20 @@
           const edit=element('textarea');edit.value=String(row.value);edit.setAttribute('aria-label','纠正正文');
           const correction=element('details');correction.append(element('summary','查看与纠正'));actions.append(correction);
           correction.append(edit,button('预览纠正',()=>{
-            const proposed=edit.value;clearElement(content);content.append(element('pre',`原文：${row.value}\n新文：${proposed}`),button('确认纠正正文',async()=>{assertHostScope(scope,epoch);await correctWorkbenchSource(row,proposed,result.version);await refresh();}));
-          }),button('预览删除',()=>{clearElement(content);content.append(element('p','确认后删除正文及其派生影响。'),button('确认删除正文',async()=>{assertHostScope(scope,epoch);await correctWorkbenchSource(row,null,result.version);await refresh();}));}));
+            const proposed=edit.value;clearElement(content);content.append(element('pre',`原文：${row.value}\n新文：${proposed}`),button('确认纠正正文',async origin=>{
+              assertHostScope(scope,epoch);
+              // A sync after the query moved the authority on; the preview is stale, so nothing is sent or marked.
+              if(state.scene.version!==result.version)throw new Error('资料已变化，请重新查询');
+              await correctWorkbenchSource(row,proposed,result.version,origin);
+              await refresh();
+            },{origin:true}));
+          }),button('预览删除',()=>{clearElement(content);content.append(element('p','确认后删除正文及其派生影响。'),button('确认删除正文',async origin=>{
+            assertHostScope(scope,epoch);
+            // Same stale-preview check as the correction above.
+            if(state.scene.version!==result.version)throw new Error('资料已变化，请重新查询');
+            await correctWorkbenchSource(row,null,result.version,origin);
+            await refresh();
+          },{origin:true}));}));
         }
         if(result.view==='admin'&&row.type==='memory') {
           const access=element('select');for(const level of ACCESS_LEVELS){const option=element('option',level);option.value=level;access.append(option);}access.value=row.access;
@@ -4299,7 +5851,13 @@
           actions.append(edit,enabled,button('保存偏好',async()=>{assertHostScope(scope,epoch);if(state.scene.version!==result.version)throw new Error('资料已变化，请重新查询');await setPreference(row.id,enabled.checked,edit.value,row.characterId);await refresh();}));
         }
         if(result.view==='admin'&&row.type==='reference')actions.append(button('预览删除资料',()=>{
-          content.append(button('确认删除参考资料',()=>withBusy(async()=>{assertHostScope(scope,epoch);const receipt=await request('/v1/scene/reference-delete','POST',{scope,id:row.id,expectedVersion:result.version,operationId:newId('reference-delete')});assertHostScope(scope,epoch);await recordSceneReceipt(receipt);await refresh();})));
+          content.append(button('确认删除参考资料',origin=>withBusy(async()=>{
+            assertHostScope(scope,epoch);
+            const receipt=await request('/v1/scene/reference-delete','POST',{scope,id:row.id,expectedVersion:result.version,operationId:newId('reference-delete')});
+            assertHostScope(scope,epoch);
+            await recordSceneReceipt(origin,receipt);
+            await refresh();
+          }),{origin:true}));
         }));
         tr.append(actions);table.append(tr);
       }
@@ -4332,10 +5890,14 @@
           if(stage.status==='skipped'&&Number.isSafeInteger(stage.attempts))samples.push(`共尝试 ${stage.attempts} 次`);
           line.append(element('p',`${STAGE_LABELS[stage.stage]||stage.stage} ${stage.characterId||''}：${stage.status==='skipped'?'未完成，已跳过':stage.status}${stage.failure?`（${stage.failure.kind}）`:''}${samples.length?` · ${samples.join(' · ')}`:''}`));
         }
-        if(['failed','pending','degraded'].includes(source.status))line.append(button('重试该来源未完成阶段',()=>withBusy(async()=>{
-          try{assertHostScope(scope,epoch);const receipt=await request('/v1/scene/retry','POST',{scope,sourceId:source.sourceId,revision:source.revision});await recordSceneReceipt(receipt);}
+        if(['failed','pending','degraded'].includes(source.status))line.append(button('重试该来源未完成阶段',origin=>withBusy(async()=>{
+          try{
+            assertHostScope(scope,epoch);
+            const receipt=await request('/v1/scene/retry','POST',{scope,sourceId:source.sourceId,revision:source.revision});
+            await recordSceneReceipt(origin,receipt);
+          }
           finally{await refreshProgress(true).catch(()=>{});}
-        })));
+        }),{origin:true}));
         progress.append(line);
       }
       return result;
@@ -4431,7 +5993,8 @@
         const preview=await request('/v1/scene/transfer-preview','POST',{scope,document});assertHostScope(scope,epoch);
         clearElement(transferPreview);transferPreview.append(element('pre',JSON.stringify(preview,null,2)));
         if(preview.valid) {
-          const operationId=newId('transfer');transferPreview.append(button('确认以上迁入',()=>withBusy(async()=>{
+          const operationId=newId('transfer');
+          transferPreview.append(button('确认以上迁入',origin=>withBusy(async()=>{
             assertHostScope(scope, epoch);
             if (document.format === 'xldb-scene-template-v1') {
               const inspection = await readSceneEmotionRoster(scope, epoch);
@@ -4442,7 +6005,7 @@
               scope, document, expectedVersion: preview.expectedVersion, previewId: preview.previewId, operationId,
             });
             assertHostScope(scope, epoch);
-            await recordSceneReceipt(receipt);
+            await recordSceneReceipt(origin, receipt);
             state.candidate = null;
             const data = await request('/v1/scene/inspect', 'POST', {scope});
             assertHostScope(scope, epoch);
@@ -4450,7 +6013,7 @@
             renderSceneControls();
             clearElement(transferPreview);
             transferPreview.append(element('p', `迁入完成：新增 ${receipt.imported}，跳过 ${receipt.skipped}。`));
-          })));
+          }),{origin:true}));
         }
       })),transferPreview);root.append(transfer);
 
@@ -4570,6 +6133,1117 @@
     renderConfigSummary();
     panel.saveSceneButton.disabled = state.busy || !state.enabled;
     for (const input of panel.sceneSelectionInputs || []) input.disabled = state.busy || !state.scene.enabled;
+    // The give-up control belongs to the waiting turn of the open chat; a chat change or a disable hides it.
+    renderReplyWaitControl();
+  }
+
+  // ---- Tavern preset import ----
+  // The settings panel imports, shows, corrects and stores a SillyTavern chat-completion preset. Generation does not
+  // use it yet. Preset text is rendered with textContent only, never logged and never put in localStorage.
+
+  // Union of the host's settingsToUpdate isConnection keys and its sensitiveFields: 56 keys that may hold credentials.
+  // The panel drops them by name before their values are read, so they are never kept or sent.
+  const PRESET_CONNECTION_FIELDS = new Set([
+    'chat_completion_source', 'group_models', 'sort_models', 'openai_model', 'claude_model',
+    'openrouter_model', 'openrouter_use_fallback', 'openrouter_providers', 'openrouter_quantizations',
+    'openrouter_allow_fallbacks', 'openrouter_middleout', 'ai21_model', 'mistralai_model', 'cohere_model',
+    'perplexity_model', 'groq_model', 'chutes_model', 'siliconflow_model', 'siliconflow_endpoint',
+    'minimax_model', 'minimax_endpoint', 'electronhub_model', 'nanogpt_model', 'nanogpt_provider',
+    'nanogpt_payg_override', 'deepseek_model', 'aimlapi_model', 'xai_model', 'pollinations_model',
+    'pollinations_endpoint', 'moonshot_model', 'fireworks_model', 'cometapi_model', 'custom_model',
+    'custom_url', 'custom_include_body', 'custom_exclude_body', 'custom_include_headers',
+    'custom_prompt_post_processing', 'google_model', 'vertexai_model', 'zai_model', 'zai_endpoint',
+    'workers_ai_model', 'workers_ai_account_id', 'reverse_proxy', 'show_external_models', 'proxy_password',
+    'vertexai_auth_mode', 'vertexai_region', 'vertexai_express_project_id', 'bypass_status_check',
+    'azure_base_url', 'azure_deployment_name', 'azure_api_version', 'azure_openai_model',
+  ]);
+
+  // Export-named settings the core accepts next to prompts and prompt_order (the backend's preset contract).
+  const PRESET_SETTING_KEYS = [
+    'temperature', 'frequency_penalty', 'presence_penalty', 'top_p', 'top_k', 'top_a', 'min_p',
+    'repetition_penalty', 'openai_max_context', 'openai_max_tokens', 'seed', 'n', 'names_behavior',
+    'tool_call_recurse_limit',
+    'max_context_unlocked', 'stream_openai', 'use_sysprompt', 'squash_system_messages', 'media_inlining',
+    'continue_prefill', 'function_calling', 'show_thoughts', 'enable_web_search', 'request_images',
+    'send_if_empty', 'impersonation_prompt', 'new_chat_prompt', 'new_group_chat_prompt',
+    'new_example_chat_prompt', 'continue_nudge_prompt', 'bias_preset_selected', 'wi_format',
+    'scenario_format', 'personality_format', 'group_nudge_prompt', 'assistant_prefill',
+    'assistant_impersonation', 'continue_postfix', 'reasoning_effort', 'verbosity', 'tool_reasoning_mode',
+    'inline_image_quality', 'request_image_aspect_ratio', 'request_image_resolution', 'preset_settings_openai',
+  ];
+
+  // The live host settings (getContext().chatCompletionSettings) keep these samplers under other names
+  // (the host's settingsToUpdate: export key -> live key). An active-preset import reads the live name and sends the
+  // export name.
+  const PRESET_LIVE_ALIASES = {
+    temperature: 'temp_openai',
+    frequency_penalty: 'freq_pen_openai',
+    presence_penalty: 'pres_pen_openai',
+    top_p: 'top_p_openai',
+    top_k: 'top_k_openai',
+    top_a: 'top_a_openai',
+    min_p: 'min_p_openai',
+    repetition_penalty: 'repetition_penalty_openai',
+  };
+
+  // The core's closed label set, with the words the player sees.
+  const PRESET_LABELS = {
+    prose_style: '文风',
+    content_permissions: '内容尺度',
+    character_voice: '角色语气',
+    world_lore: '世界设定',
+    player_proxy: '代写玩家',
+    format_addon: '格式附加',
+    reasoning_scaffold: '思考步骤',
+    unknown: '无法判断',
+  };
+
+  // Labels whose rows carry a short explanation.
+  const PRESET_LABEL_EXPLANATIONS = {
+    player_proxy: '这条提示会替玩家说话或做决定；XLDB 不把它交给角色言行。',
+    format_addon: '状态栏、卡片之类的格式附加；只用于酒馆正文，会占用上下文长度。',
+    reasoning_scaffold: '思考步骤或思维链要求；只用于酒馆正文，不交给 XLDB 的结构化环节。',
+  };
+
+  const PRESET_SOURCE_TEXT = { identifier: '按提示标识', model: '模型归类', player: '你的更正' };
+  const PRESET_DESTINATION_TEXT = { B: '酒馆正文', M1: '理解环节', M2: '角色言行' };
+  const PRESET_FLAG_TEXT = {
+    unclassified: '尚未归类',
+    player_proxy: '代写玩家',
+    costs_context: '占用上下文',
+    unknown: '无法判断',
+    facts_conflict: '可能与 XLDB 的事实冲突',
+  };
+  const PRESET_ORIGIN_TEXT = { file: '预设文件', active: '当前酒馆预设', pinned: '本聊天固定的预设' };
+
+  // The closed error codes each preset route of the core can answer with: the host and origin checks, the token check
+  // and an invalid preset; classification adds a pending prompt, a missing model and a failed run. Any other `error`
+  // value in a reply is not taken as a code.
+  const PRESET_COMMON_CODES = ['invalid_host', 'origin_not_allowed', 'unauthorized', 'invalid_tavern_preset'];
+  const PRESET_ROUTE_CODES = {
+    '/v1/scene/preset-inspect': new Set(PRESET_COMMON_CODES),
+    '/v1/scene/preset-classify': new Set([
+      ...PRESET_COMMON_CODES,
+      'classification_prompt_pending',
+      'classification_model_not_configured',
+      'classification_failed',
+    ]),
+  };
+
+  const PRESET_CLASSIFY_PENDING = '自动归类还没有准备好（归类提示词尚未提供）。现有对照按提示标识保留；你可以在下表为每条提示手动选择标签，更正会被保存。';
+  // One line for both host-check codes: the core refused this page's address.
+  const PRESET_PAGE_NOT_ALLOWED = 'XLDB 核心拒绝了这个页面的请求。请重新运行启动器，并重新加载酒馆中的 XLDB 脚本。';
+
+  // Every line a failed preset action can show, keyed by failure kind: each route code above, 'core_unreachable' when
+  // no reply arrived, 'unexpected' for anything else (a host getter, a file read, an unknown core reply), and the
+  // section's own checks. A failed action shows exactly one of these lines and never the text of a thrown error.
+  const PRESET_FAILURE_TEXT = {
+    invalid_host: PRESET_PAGE_NOT_ALLOWED,
+    origin_not_allowed: PRESET_PAGE_NOT_ALLOWED,
+    unauthorized: '连接认证已失效。请重新运行启动器，并重新加载酒馆中的 XLDB 脚本。',
+    invalid_tavern_preset: '这不是可识别的酒馆预设，或超出了大小限制；没有导入，也没有保存任何内容。',
+    classification_prompt_pending: PRESET_CLASSIFY_PENDING,
+    classification_model_not_configured: '自动归类需要先在“后台模型”中配置模型。现有对照保留，可以手动选择标签。',
+    classification_failed: '模型归类没有成功，现有对照保留；可以稍后重试，或手动选择标签。',
+    core_unreachable: '无法连接 XLDB 核心：请确认启动器正在运行、本页已连接核心，然后重试。',
+    unexpected: '预设操作没有完成：酒馆、浏览器或 XLDB 核心报告了错误。',
+    invalid_reply: 'XLDB 核心返回的预设对照无效。',
+    invalid_json: '无法读取：所选文件不是有效的 JSON，没有导入，也没有保存任何内容。',
+    file_too_large: '预设文件超过 2 MiB，没有导入，也没有保存任何内容。',
+    no_active_preset: '此酒馆没有提供当前预设，请改用文件导入。',
+    no_pin: '本聊天没有固定的预设；默认跟随当前酒馆预设。',
+    nothing_loaded: '请先导入预设。',
+    nothing_to_pin: '请先导入或读取一份预设，再固定。',
+    no_chat: '请先打开一个聊天，再固定预设。',
+    prompt_not_correctable: '这条提示无法更正。',
+    unknown_label: '未知的标签。',
+    no_label_store: '此酒馆没有提供扩展设置，当前也没有打开的聊天；更正无法保存。',
+    not_saved: '酒馆没有保存成功：这次更改已在本页生效，但还没有保存。请点“重试保存”；酒馆下次自己保存时也会一并保存。',
+  };
+  // Shown when the open chat changed while a preset action ran, or before an action on a panel drawn for another chat.
+  const PRESET_CHAT_SWITCHED = '聊天已切换；上一个聊天的预设内容不再显示，这次操作没有执行或其结果已丢弃。请在当前聊天重新读取。';
+  // The section's mark while a store holds a panel change whose save failed; the retry button stands next to it.
+  const PRESET_UNSAVED_TEXT = '未保存：本页的预设更改还没有保存到酒馆。';
+  // The notices after a successful panel write. A save the host confirmed says "saved"; a save the host took without
+  // anything to wait for (presetPersist: 'requested') says it was asked for, never that it was written.
+  const PRESET_CORRECTION_SAVED = '更正已保存，会优先于模型的归类。';
+  const PRESET_CORRECTION_REQUESTED = '更正已生效，会优先于模型的归类；已请酒馆保存，酒馆不回报是否保存成功。';
+  const PRESET_CORRECTION_CLEARED = '已撤销这条更正。';
+  const PRESET_RETRY_SAVED = '预设更改已保存。';
+  const PRESET_RETRY_REQUESTED = '已再次请酒馆保存预设更改；酒馆不回报是否保存成功。';
+  // The notice of a retry that found nothing unsaved when its turn came: a write queued before it saved the store.
+  const PRESET_RETRY_NOTHING = '没有未保存的预设更改。';
+  // The notices after a correction whose table could not be read again: its row shows the new label from the label
+  // store, and its destinations wait for the next read.
+  const PRESET_SAVED_NOT_REFRESHED = '这次更改已保存，但这条提示的去向没能刷新；请重新读取预设查看。';
+  const PRESET_REQUESTED_NOT_REFRESHED = '这次更改已生效，已请酒馆保存（酒馆不回报是否保存成功），但这条提示的去向没能刷新；请重新读取预设查看。';
+  // The notice of a load whose stored labels the core could not apply: the table still shows them from the store.
+  const PRESET_LABELS_NOT_APPLIED = '你的更正和模型标签暂时没能交给 XLDB 核心套用；下表照常显示它们，去向待刷新，请稍后重新读取。';
+  // The destinations of a row whose shown label is not the one the last inspection was made with.
+  const PRESET_DESTINATIONS_PENDING = '待刷新';
+
+  // A preset file above the core's 2 MiB request-body limit is refused before it is read.
+  const PRESET_FILE_MAX_BYTES = 2 * 1024 * 1024;
+  // Nesting deeper than 32 levels is not a preset (a full export is about 5 deep); the copy stops there.
+  const PRESET_MAX_DEPTH = 32;
+  // A SHA-256 hex digest, the form of the core's preset and prompt hashes.
+  const PRESET_HASH_PATTERN = /^[a-f0-9]{64}$/;
+
+  // Panel state of the preset section.
+  // - current: the last successful load: the sanitized request preset, the number of connection fields the browser
+  //   dropped, where it came from, the core's inspection and the chat key it was loaded in.
+  // - activeHash: the hash of the last read of SillyTavern's active preset ('' when unknown).
+  // - generation: counts loads; a newer load (or a chat switch) makes every older one stale.
+  // - activeRead: counts active-preset hash reads, so a slower older read never overwrites a newer one.
+  // - chatEpoch: counts chat switches seen by presetOnChatChanged; part of the chat key.
+  // - renderedChatKey: the chat key the whole section was last drawn for (renderPresetSection).
+  const presetView = {
+    generation: 0,
+    current: null,
+    activeHash: '',
+    activeRead: 0,
+    chatEpoch: 0,
+    renderedChatKey: '',
+    notice: '',
+    panel: null,
+  };
+
+  // The panel's write queue and what is not saved yet. Every panel write (pin, unpin, a correction, model labels, a
+  // retry) waits for the one before it, so writes run one at a time; a host save that hands back a promise is awaited
+  // inside its write. A write changes memory once and is never rolled back; a failed save only marks its store.
+  // - tail: settles when the last queued write has finished.
+  // - unsavedChatKey: the chat key of the open chat when a save of its metadata failed ('' when nothing is pending).
+  // - unsavedSettings: true while a save of the extension settings failed and no later panel save of them was
+  //   confirmed or taken by the host.
+  const presetWrites = {
+    tail: Promise.resolve(),
+    unsavedChatKey: '',
+    unsavedSettings: false,
+  };
+
+  // A failure the preset section reports: `key` names its line in PRESET_FAILURE_TEXT. It carries no text of its own.
+  class PresetFailure {
+    constructor(key) {
+      this.key = key;
+    }
+  }
+
+  // The line a failed preset action shows: the line of a PresetFailure's key, or the 'unexpected' line for any other
+  // exception, whatever it is or says. Nothing of another exception is read.
+  function presetFailureText(error) {
+    let key = 'unexpected';
+    try {
+      if (error instanceof PresetFailure) key = error.key;
+    } catch {
+      key = 'unexpected';
+    }
+    return Object.hasOwn(PRESET_FAILURE_TEXT, key) ? PRESET_FAILURE_TEXT[key] : PRESET_FAILURE_TEXT.unexpected;
+  }
+
+  // POSTs `body` to one preset route with the page's core address and token and reads the reply itself; it does not go
+  // through request(), so no host or connector callback runs. `body` is serialized before anything is sent (a toJSON a
+  // live host value carries runs here and may throw). Returns { ok, status, code, data }:
+  // - ok: the reply said ok.
+  // - status: the reply's HTTP status, 0 when no reply with a status arrived (not connected, no fetch, request failed).
+  // - code: the reply's JSON `error` when it is one of the route's closed codes, otherwise ''.
+  // - data: the parsed reply of an ok reply (null when it could not be read).
+  async function presetFetch(path, body) {
+    const routeCodes = PRESET_ROUTE_CODES[path];
+    const payload = JSON.stringify(body);
+    const noReply = { ok: false, status: 0, code: '', data: null };
+    if (!state.token) return noReply;
+    if (typeof helpers.fetch !== 'function') return noReply;
+    const headers = {
+      Authorization: `Bearer ${state.token}`,
+      'Content-Type': 'application/json',
+    };
+    let response;
+    try {
+      response = await helpers.fetch(`${CORE_ORIGIN}${path}`, { method: 'POST', headers, body: payload });
+    } catch {
+      return noReply;
+    }
+    if (!response || typeof response !== 'object') return noReply;
+    const status = Number.isInteger(response.status) ? response.status : 0;
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    if (response.ok === true) return { ok: true, status, code: '', data };
+    const error = data && typeof data === 'object' ? data.error : undefined;
+    const code = typeof error === 'string' && routeCodes.has(error) ? error : '';
+    return { ok: false, status, code, data: null };
+  }
+
+  // The failure of a reply that was not ok: its closed code, 'core_unreachable' without a status, else 'unexpected'.
+  function presetReplyFailure(reply) {
+    if (reply.code) return new PresetFailure(reply.code);
+    if (reply.status === 0) return new PresetFailure('core_unreachable');
+    return new PresetFailure('unexpected');
+  }
+
+  // Calls one preset route and returns its parsed reply, or throws the reply's PresetFailure.
+  async function presetCall(path, body) {
+    const reply = await presetFetch(path, body);
+    if (!reply.ok) throw presetReplyFailure(reply);
+    return reply.data;
+  }
+
+  // The open chat as the preset section sees it: the chat switches it has seen plus the host's chat id. A preset
+  // action keeps the key it started with and drops its results and writes when the key has changed.
+  function presetChatKey() {
+    const context = nativeHost();
+    const chatId = typeof context.getCurrentChatId === 'function' ? context.getCurrentChatId() : context.chatId;
+    return `${presetView.chatEpoch}\u0000${chatId ?? ''}`;
+  }
+
+  // Starts a load. Every load started earlier becomes stale, and so does this one if the chat changes.
+  function presetBeginLoad() {
+    presetView.generation += 1;
+    return { generation: presetView.generation, chatKey: presetChatKey() };
+  }
+
+  // True while the ticket's load is still the newest one and the chat it started in is still open.
+  function presetTicketCurrent(ticket) {
+    return ticket.generation === presetView.generation && ticket.chatKey === presetChatKey();
+  }
+
+  // Forgets a shown preset that was loaded in another chat (its text, pin button and labels belong to that chat).
+  function presetForgetOtherChat() {
+    if (presetView.current && presetView.current.chatKey !== presetChatKey()) {
+      presetView.current = null;
+      presetView.notice = '';
+    }
+  }
+
+  // Queues one panel write behind every earlier one. When its turn comes, a write whose chat (`chatKey`) is no longer
+  // open is dropped untouched; otherwise `apply` changes memory once and returns the stores to save ('chat',
+  // 'settings'), and each of them is saved. Resolves to { ran, saved, confirmed, stores }: stores counts the stores it
+  // asked the host to save, saved is false when a save failed, and confirmed is true only when the host confirmed every
+  // save (presetPersist); a caller checks stores before it reads confirmed as "saved". Rejects when `apply` throws. A
+  // failed or rejected write never holds up the next one.
+  function presetQueueWrite(chatKey, apply) {
+    const run = () => presetRunWrite(chatKey, apply);
+    const job = presetWrites.tail.then(run);
+    presetWrites.tail = job.then(presetIgnoreResult, presetIgnoreResult);
+    return job;
+  }
+
+  // Lets the queue go on after a write, whatever its result.
+  function presetIgnoreResult() {}
+
+  // One queued write at its turn (see presetQueueWrite). Memory is never put back: a failed save leaves the intended
+  // value in memory and marks its store unsaved. Each save is awaited here, inside the queue.
+  async function presetRunWrite(chatKey, apply) {
+    if (chatKey !== presetChatKey()) return { ran: false, saved: false, confirmed: false, stores: 0 };
+    const kinds = apply();
+    let saved = true;
+    let confirmed = true;
+    for (const kind of kinds) {
+      const answer = await presetSave(kind, chatKey);
+      if (answer === 'failed') saved = false;
+      if (answer !== 'confirmed') confirmed = false;
+    }
+    return { ran: true, saved, confirmed, stores: kinds.length };
+  }
+
+  // Asks the host to save one store as it is in memory ('chat': the open chat with its whole metadata, through
+  // saveChat; 'settings': the extension settings, through saveSettingsDebounced) and returns how the host answered:
+  // - 'confirmed': the save handed back a promise or another thenable, and it fulfilled. The write waits for it, so a
+  //   later queued write starts only after it settled.
+  // - 'requested': the save returned no thenable. It was asked for, but nothing confirms that it was written.
+  // SillyTavern's saveSettingsDebounced returns nothing (it only schedules one later write of all settings), so its
+  // saves are 'requested'; its saveChat returns a promise that also fulfils when the host caught its own write error or
+  // gave up waiting for an earlier chat save, so there 'confirmed' means the host finished its save, not that it wrote.
+  // Throws when the host has no such save function, when the save throws, or when its thenable rejects.
+  async function presetPersist(kind) {
+    const context = nativeHost();
+    const save = kind === 'chat' ? context.saveChat : context.saveSettingsDebounced;
+    if (typeof save !== 'function') throw new PresetFailure('not_saved');
+    const returned = save.call(context);
+    const then = presetThenOf(returned);
+    if (!then) return 'requested';
+    await new Promise((resolve, reject) => {
+      then.call(returned, resolve, reject);
+    });
+    return 'confirmed';
+  }
+
+  // The `then` method of `value` when `value` is a thenable (an object or a function with a callable `then`, such as a
+  // promise of any window), read once; otherwise null.
+  function presetThenOf(value) {
+    if (value === null) return null;
+    if (typeof value !== 'object' && typeof value !== 'function') return null;
+    const then = value.then;
+    if (typeof then !== 'function') return null;
+    return then;
+  }
+
+  // Saves one store for a write made in `chatKey` and returns the host's answer: 'confirmed' or 'requested'
+  // (presetPersist), or 'failed'. A failed save marks the store unsaved. A confirmed or requested save clears the mark:
+  // the host writes the whole store as the panel shows it, an earlier failed change included.
+  async function presetSave(kind, chatKey) {
+    let answer;
+    try {
+      answer = await presetPersist(kind);
+    } catch {
+      presetMarkUnsaved(kind, chatKey);
+      return 'failed';
+    }
+    presetMarkSaved(kind, chatKey);
+    return answer;
+  }
+
+  // Marks a store unsaved. The chat mark belongs to the chat it was made in; a failure that comes back after a chat
+  // switch is dropped with that chat.
+  function presetMarkUnsaved(kind, chatKey) {
+    if (kind === 'settings') {
+      presetWrites.unsavedSettings = true;
+      return;
+    }
+    if (chatKey === presetChatKey()) presetWrites.unsavedChatKey = chatKey;
+  }
+
+  // Clears a store's unsaved mark after a panel save of that store that the host confirmed or took (presetSave).
+  function presetMarkSaved(kind, chatKey) {
+    if (kind === 'settings') {
+      presetWrites.unsavedSettings = false;
+      return;
+    }
+    if (presetWrites.unsavedChatKey === chatKey) presetWrites.unsavedChatKey = '';
+  }
+
+  // The stores that hold an unsaved panel change for the chat `chatKey`.
+  function presetUnsavedKinds(chatKey) {
+    const kinds = [];
+    if (presetWrites.unsavedChatKey && presetWrites.unsavedChatKey === chatKey) kinds.push('chat');
+    if (presetWrites.unsavedSettings) kinds.push('settings');
+    return kinds;
+  }
+
+  // Copies parsed JSON without any key of PRESET_CONNECTION_FIELDS at any depth; counter.stripped counts the drops.
+  // Keys are checked before their values are read; own "__proto__" keys stay plain data.
+  function presetSanitizedCopy(value, counter, depth = 0) {
+    if (depth > PRESET_MAX_DEPTH) throw new PresetFailure('invalid_tavern_preset');
+    if (value === null || typeof value !== 'object') return value;
+    if (Array.isArray(value)) return value.map(item => presetSanitizedCopy(item, counter, depth + 1));
+    const copy = {};
+    for (const key of Object.keys(value)) {
+      if (PRESET_CONNECTION_FIELDS.has(key)) {
+        counter.stripped += 1;
+        continue;
+      }
+      const item = presetSanitizedCopy(value[key], counter, depth + 1);
+      Object.defineProperty(copy, key, { value: item, enumerable: true, writable: true, configurable: true });
+    }
+    return copy;
+  }
+
+  // Reads a picked preset file (the full preset export or the prompt-manager export) and inspects the parsed object.
+  // The load starts when the file is picked, so a slow read of an earlier pick never replaces a later one.
+  async function loadPresetFromFile(file) {
+    if (!file) return;
+    const ticket = presetBeginLoad();
+    if (typeof file.size === 'number' && file.size > PRESET_FILE_MAX_BYTES) {
+      throw new PresetFailure('file_too_large');
+    }
+    const text = await file.text();
+    if (!presetTicketCurrent(ticket)) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new PresetFailure('invalid_json');
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new PresetFailure('invalid_tavern_preset');
+    }
+    const counter = { stripped: 0 };
+    const preset = presetSanitizedCopy(parsed, counter);
+    // Other extensions' data is not part of the split and can be large.
+    delete preset.extensions;
+    await inspectPreset({ preset, stripped: counter.stripped, origin: 'file' }, ticket);
+  }
+
+  // Builds the request preset from the live host settings: prompts, prompt_order and the export-named settings only.
+  // Connection fields are never read; the live sampler aliases are sent under their export names.
+  function activePresetPayload() {
+    const settings = nativeHost().chatCompletionSettings;
+    if (!settings || typeof settings !== 'object') throw new PresetFailure('no_active_preset');
+    const counter = { stripped: 0 };
+    const preset = {
+      prompts: presetSanitizedCopy(settings.prompts, counter),
+      prompt_order: presetSanitizedCopy(settings.prompt_order, counter),
+    };
+    for (const key of PRESET_SETTING_KEYS) {
+      const liveKey = Object.hasOwn(PRESET_LIVE_ALIASES, key) ? PRESET_LIVE_ALIASES[key] : key;
+      const value = settings[liveKey];
+      if (value === undefined || value === null) continue;
+      preset[key] = presetSanitizedCopy(value, counter);
+    }
+    return { preset, stripped: counter.stripped };
+  }
+
+  // Reads the preset SillyTavern uses right now and remembers its hash for the pin comparison.
+  async function loadActivePreset() {
+    const ticket = presetBeginLoad();
+    presetView.activeRead += 1;
+    const activeRead = presetView.activeRead;
+    const inspection = await inspectPreset({ ...activePresetPayload(), origin: 'active' }, ticket);
+    if (inspection && activeRead === presetView.activeRead) presetView.activeHash = inspection.hash;
+  }
+
+  // Shows the mapping of the preset pinned to the open chat.
+  async function loadPinnedPreset() {
+    const ticket = presetBeginLoad();
+    const pin = presetPin();
+    if (!pin) throw new PresetFailure('no_pin');
+    await inspectPreset({ preset: pin.snapshot, stripped: 0, origin: 'pinned' }, ticket);
+  }
+
+  // Reads the hash of SillyTavern's active preset after the host switched presets, so the differs notice follows
+  // without another manual read. Only activeHash changes: the shown mapping and every pin stay as they are. When the
+  // read fails (no core, no token, a host getter throws) the hash is unknown and no notice is shown.
+  async function refreshActivePresetHash() {
+    presetView.activeRead += 1;
+    const activeRead = presetView.activeRead;
+    presetView.activeHash = '';
+    let hash = '';
+    try {
+      const { preset } = activePresetPayload();
+      const reply = await presetCall('/v1/scene/preset-inspect', { preset });
+      hash = presetInspection(reply).hash;
+    } catch {
+      hash = '';
+    }
+    if (activeRead !== presetView.activeRead) return;
+    presetView.activeHash = hash;
+    renderPresetSection();
+  }
+
+  // Host event OAI_PRESET_CHANGED_AFTER. The host awaits its listeners, so the read runs on without holding it up.
+  function presetOnHostPresetChanged() {
+    void refreshActivePresetHash();
+  }
+
+  // Host event CHAT_CHANGED: the shown preset, its notice and its status belong to the previous chat. Loads and writes
+  // still waiting for that chat become stale, its unsaved mark no longer matches the chat key, and the pin state is
+  // drawn for the chat now open.
+  function presetOnChatChanged() {
+    presetView.chatEpoch += 1;
+    presetView.generation += 1;
+    presetView.current = null;
+    presetView.notice = '';
+    if (presetView.panel) presetView.panel.status.textContent = '';
+    renderPresetSection();
+  }
+
+  // Subscribes the preset section to the two host events above; destroy() removes them with the other listeners.
+  // OAI_PRESET_CHANGED_AFTER falls back to the host's own value (SillyTavern events.js) when eventTypes lacks it.
+  function presetSubscribeHostEvents() {
+    const source = host.eventSource;
+    if (!source || typeof source.on !== 'function') return;
+    const types = host.eventTypes || {};
+    const subscriptions = [
+      [types.CHAT_CHANGED, presetOnChatChanged],
+      [types.OAI_PRESET_CHANGED_AFTER || 'oai_preset_changed_after', presetOnHostPresetChanged],
+    ];
+    for (const [event, handler] of subscriptions) {
+      if (event === undefined || event === null) continue;
+      source.on(event, handler);
+      state.listeners.push([source, event, handler]);
+    }
+  }
+
+  // The pin of the open chat (chatMetadata.xldbPreset with pinned: true), or null when the chat follows the active preset.
+  function presetPin() {
+    const saved = nativeHost().chatMetadata?.xldbPreset;
+    if (!saved || typeof saved !== 'object' || saved.version !== 1 || saved.pinned !== true) return null;
+    if (typeof saved.hash !== 'string' || !PRESET_HASH_PATTERN.test(saved.hash)) return null;
+    if (!saved.snapshot || typeof saved.snapshot !== 'object') return null;
+    return saved;
+  }
+
+  // True when the host offers extensionSettings, where label rows are shared by every chat on the same preset.
+  function presetSharedStorage() {
+    const settings = nativeHost().extensionSettings;
+    return Boolean(settings && typeof settings === 'object');
+  }
+
+  // Puts `empty` at target[key] unless an object is already there, and returns the object at target[key].
+  function presetEnsureObject(target, key, empty) {
+    const existing = target[key];
+    if (existing && typeof existing === 'object') return existing;
+    target[key] = empty;
+    return empty;
+  }
+
+  // The label store and the store it is saved with: extensionSettings.xldb.presetMappings ('settings'), or, without
+  // extensionSettings, this chat's chatMetadata.xldbPreset.presetMappings ('chat'). Shape:
+  // { [presetHash]: { [promptHash]: { model?, player? } } }. With `create`, missing containers are made; without it,
+  // nothing is created and mappings may be null.
+  function presetMappingStore(create) {
+    const context = nativeHost();
+    if (presetSharedStorage()) {
+      const settings = context.extensionSettings;
+      if (create) presetEnsureObject(settings, 'xldb', {});
+      if (create) presetEnsureObject(settings.xldb, 'presetMappings', {});
+      const mappings = settings.xldb?.presetMappings;
+      return { kind: 'settings', mappings: mappings && typeof mappings === 'object' ? mappings : null };
+    }
+    if (create && (!context.chatMetadata || typeof context.chatMetadata !== 'object')) {
+      throw new PresetFailure('no_label_store');
+    }
+    const metadata = context.chatMetadata;
+    if (create) presetEnsureObject(metadata, 'xldbPreset', { version: 1, pinned: false });
+    if (create) presetEnsureObject(metadata.xldbPreset, 'presetMappings', {});
+    const mappings = metadata?.xldbPreset?.presetMappings;
+    return { kind: 'chat', mappings: mappings && typeof mappings === 'object' ? mappings : null };
+  }
+
+  // `value` when it is one of the closed labels, otherwise ''.
+  function presetClosedLabel(value) {
+    if (typeof value !== 'string') return '';
+    return Object.hasOwn(PRESET_LABELS, value) ? value : '';
+  }
+
+  // The labels the label store holds for one preset hash: a Map from prompt hash to { player, model }, each a closed
+  // label or ''. The core requests (presetStoredRows) and the table (presetShownRow) both read the store through here.
+  function presetStoredLabels(presetHash) {
+    const labels = new Map();
+    const { mappings } = presetMappingStore(false);
+    if (!mappings || !Object.hasOwn(mappings, presetHash)) return labels;
+    const entries = mappings[presetHash];
+    if (!entries || typeof entries !== 'object') return labels;
+    for (const promptHash of Object.keys(entries)) {
+      if (!PRESET_HASH_PATTERN.test(promptHash)) continue;
+      const entry = entries[promptHash];
+      if (!entry || typeof entry !== 'object') continue;
+      const player = presetClosedLabel(entry.player);
+      const model = presetClosedLabel(entry.model);
+      if (player || model) labels.set(promptHash, { player, model });
+    }
+    return labels;
+  }
+
+  // The stored model labels and player corrections of one preset hash, as core request rows.
+  function presetStoredRows(presetHash) {
+    const rows = { classifications: [], corrections: [] };
+    for (const [promptHash, labels] of presetStoredLabels(presetHash)) {
+      if (labels.model) rows.classifications.push({ promptHash, label: labels.model });
+      if (labels.player) rows.corrections.push({ promptHash, label: labels.player });
+    }
+    return rows;
+  }
+
+  // The body of both preset routes; empty row lists are left out.
+  function presetRequestBody(preset, rows) {
+    const body = { preset };
+    if (rows.classifications.length) body.classifications = rows.classifications;
+    if (rows.corrections.length) body.corrections = rows.corrections;
+    return body;
+  }
+
+  // Checks the inspection shape the panel relies on and returns it.
+  function presetInspection(value) {
+    const valid = Boolean(value && typeof value === 'object'
+      && typeof value.hash === 'string' && PRESET_HASH_PATTERN.test(value.hash)
+      && value.snapshot && typeof value.snapshot === 'object'
+      && value.mapping && Array.isArray(value.mapping.prompts) && Array.isArray(value.mapping.settings)
+      && value.diagnostics && typeof value.diagnostics === 'object');
+    if (!valid) throw new PresetFailure('invalid_reply');
+    return value;
+  }
+
+  // Inspects one preset, then again with the labels stored for its hash (labels are bound to the preset hash and the
+  // prompt hash together). If the core cannot apply the stored labels, the first inspection is kept and the panel says
+  // so; the table still shows the stored labels (presetShownRow), with their destinations pending.
+  // `ticket` comes from presetBeginLoad when the action started. Returns null when a newer load or a chat switch made
+  // this one stale; then nothing is shown or kept.
+  async function inspectPreset(entry, ticket) {
+    const source = { preset: entry.preset, stripped: entry.stripped, origin: entry.origin };
+    const firstReply = await presetCall('/v1/scene/preset-inspect', { preset: source.preset });
+    let inspection = presetInspection(firstReply);
+    if (!presetTicketCurrent(ticket)) return null;
+    let notice = '';
+    const rows = presetStoredRows(inspection.hash);
+    if (rows.classifications.length || rows.corrections.length) {
+      try {
+        const labelledReply = await presetCall('/v1/scene/preset-inspect', presetRequestBody(source.preset, rows));
+        inspection = presetInspection(labelledReply);
+      } catch {
+        notice = PRESET_LABELS_NOT_APPLIED;
+      }
+    }
+    if (!presetTicketCurrent(ticket)) return null;
+    presetView.current = { ...source, inspection, chatKey: ticket.chatKey };
+    if (notice) presetView.notice = notice;
+    return inspection;
+  }
+
+  // Sets (or, with an empty label, removes) the player's label of one prompt in the label store and returns the store
+  // to save. An entry left without labels is removed, and so is a preset hash left without entries.
+  function presetApplyCorrection(presetHash, promptHash, label) {
+    const store = presetMappingStore(true);
+    const entries = presetEnsureObject(store.mappings, presetHash, {});
+    const entry = presetEnsureObject(entries, promptHash, {});
+    if (label) entry.player = label;
+    else delete entry.player;
+    if (!entry.model && !entry.player) delete entries[promptHash];
+    if (!Object.keys(entries).length) delete store.mappings[presetHash];
+    return [store.kind];
+  }
+
+  // Stores the model labels of one preset hash in the label store and returns the store to save.
+  function presetApplyModelLabels(presetHash, rows) {
+    const store = presetMappingStore(true);
+    const entries = presetEnsureObject(store.mappings, presetHash, {});
+    for (const row of rows) {
+      const entry = presetEnsureObject(entries, row.promptHash, {});
+      entry.model = row.label;
+    }
+    return [store.kind];
+  }
+
+  // Pins a preset (its hash and normalized snapshot) to the open chat's metadata, keeping the chat's labels.
+  function presetApplyPin(hash, snapshot) {
+    const metadata = presetEnsureObject(nativeHost(), 'chatMetadata', {});
+    const saved = metadata.xldbPreset;
+    const mappings = saved && typeof saved === 'object' ? saved.presetMappings : undefined;
+    metadata.xldbPreset = {
+      version: 1,
+      pinned: true,
+      hash,
+      snapshot,
+      ...(mappings ? { presetMappings: mappings } : {}),
+    };
+    return ['chat'];
+  }
+
+  // Removes the open chat's pin, keeping the chat's labels; nothing to save when the chat has no preset entry.
+  function presetApplyUnpin() {
+    const metadata = nativeHost().chatMetadata;
+    const saved = metadata?.xldbPreset;
+    if (!saved || typeof saved !== 'object') return [];
+    if (saved.presetMappings) {
+      metadata.xldbPreset = { version: 1, pinned: false, presetMappings: saved.presetMappings };
+    } else {
+      delete metadata.xldbPreset;
+    }
+    return ['chat'];
+  }
+
+  // Stores (or, with an empty label, removes) the player's label for one prompt of the shown preset, keyed by the
+  // preset hash and the prompt hash, then inspects again so the destinations follow the label. The label stays in
+  // memory whether or not the save succeeds; a failed save reports not_saved. The table shows the stored label even
+  // when the new inspection fails (presetShownRow); only the destinations then wait for the next read.
+  async function savePresetCorrection(promptHash, label) {
+    const current = presetView.current;
+    if (!current) throw new PresetFailure('nothing_loaded');
+    if (typeof promptHash !== 'string' || !PRESET_HASH_PATTERN.test(promptHash)) {
+      throw new PresetFailure('prompt_not_correctable');
+    }
+    if (label && !Object.hasOwn(PRESET_LABELS, label)) throw new PresetFailure('unknown_label');
+    const ticket = presetBeginLoad();
+    const presetHash = current.inspection.hash;
+    const applyCorrection = () => presetApplyCorrection(presetHash, promptHash, label);
+    const outcome = await presetQueueWrite(current.chatKey, applyCorrection);
+    if (!outcome.ran) return;
+    let inspection = null;
+    let refreshed = true;
+    try {
+      inspection = await inspectPreset(current, ticket);
+    } catch {
+      refreshed = false;
+    }
+    if (!outcome.saved) throw new PresetFailure('not_saved');
+    if (!refreshed) {
+      presetView.notice = outcome.confirmed ? PRESET_SAVED_NOT_REFRESHED : PRESET_REQUESTED_NOT_REFRESHED;
+      return;
+    }
+    if (!inspection) return;
+    if (!label) {
+      presetView.notice = PRESET_CORRECTION_CLEARED;
+      return;
+    }
+    presetView.notice = outcome.confirmed ? PRESET_CORRECTION_SAVED : PRESET_CORRECTION_REQUESTED;
+  }
+
+  // Asks the core to classify the shown preset. While the classification prompt is pending (409), the identifier
+  // mapping stays and the panel points to the manual labels. Model labels are stored under the preset hash through the
+  // write queue; they are dropped when a newer load or a chat switch happened while the core worked.
+  async function classifyPreset() {
+    const current = presetView.current;
+    if (!current) throw new PresetFailure('nothing_loaded');
+    const ticket = { generation: presetView.generation, chatKey: current.chatKey };
+    const rows = presetStoredRows(current.inspection.hash);
+    const reply = await presetFetch('/v1/scene/preset-classify', presetRequestBody(current.preset, rows));
+    if (!reply.ok && reply.code === 'classification_prompt_pending') {
+      if (presetTicketCurrent(ticket)) presetView.notice = PRESET_CLASSIFY_PENDING;
+      return;
+    }
+    if (!reply.ok) throw presetReplyFailure(reply);
+    const inspection = presetInspection(reply.data);
+    if (!presetTicketCurrent(ticket)) return;
+    if (inspection.hash !== current.inspection.hash) return;
+    const labels = Array.isArray(reply.data.classifications) ? reply.data.classifications : [];
+    const valid = labels.filter(row => row
+      && typeof row.promptHash === 'string'
+      && PRESET_HASH_PATTERN.test(row.promptHash)
+      && Object.hasOwn(PRESET_LABELS, row.label));
+    let saved = true;
+    if (valid.length) {
+      const applyLabels = () => presetApplyModelLabels(inspection.hash, valid);
+      const outcome = await presetQueueWrite(ticket.chatKey, applyLabels);
+      if (!outcome.ran) return;
+      saved = outcome.saved;
+    }
+    if (presetTicketCurrent(ticket)) {
+      presetView.current = { ...current, inspection };
+      presetView.notice = '模型归类已完成；你的更正仍然优先。';
+    }
+    if (!saved) throw new PresetFailure('not_saved');
+  }
+
+  // Pins the shown preset to the open chat: its normalized snapshot and hash go to chatMetadata.xldbPreset. The pin
+  // stays in memory whether or not the save succeeds; a failed save reports not_saved.
+  async function pinPreset() {
+    const current = presetView.current;
+    if (!current) throw new PresetFailure('nothing_to_pin');
+    const context = nativeHost();
+    const chatId = typeof context.getCurrentChatId === 'function' ? context.getCurrentChatId() : context.chatId;
+    if (!chatId) throw new PresetFailure('no_chat');
+    const hash = current.inspection.hash;
+    const snapshot = JSON.parse(JSON.stringify(current.inspection.snapshot));
+    const outcome = await presetQueueWrite(current.chatKey, () => presetApplyPin(hash, snapshot));
+    if (!outcome.ran) return;
+    if (!outcome.saved) throw new PresetFailure('not_saved');
+    presetView.notice = '已为本聊天固定这份预设；之后更换酒馆预设不会改变本聊天。';
+  }
+
+  // Returns the open chat to following the active preset; corrections kept in this chat stay. The change stays in
+  // memory whether or not the save succeeds; a failed save reports not_saved.
+  async function unpinPreset() {
+    const outcome = await presetQueueWrite(presetChatKey(), presetApplyUnpin);
+    if (!outcome.ran) return;
+    if (!outcome.saved) throw new PresetFailure('not_saved');
+    presetView.notice = '本聊天已改为跟随当前酒馆预设。';
+  }
+
+  // Saves again every store that holds an unsaved panel change of the open chat (the retry control). The notice says
+  // "saved" only when the host confirmed every save, and says nothing was unsaved when the retry had no store to save.
+  async function retryPresetSaves() {
+    const chatKey = presetChatKey();
+    const outcome = await presetQueueWrite(chatKey, () => presetUnsavedKinds(chatKey));
+    if (!outcome.ran) return;
+    if (!outcome.saved) throw new PresetFailure('not_saved');
+    if (!outcome.stores) {
+      presetView.notice = PRESET_RETRY_NOTHING;
+      return;
+    }
+    presetView.notice = outcome.confirmed ? PRESET_RETRY_SAVED : PRESET_RETRY_REQUESTED;
+  }
+
+  // Runs one preset action and redraws the section. A failure shows one fixed line (presetFailureText).
+  // A panel drawn for another chat runs nothing: it is redrawn for the open chat first. When the chat changes while
+  // the action runs, its notice and failure belong to the previous chat and are replaced by PRESET_CHAT_SWITCHED.
+  async function runPresetAction(action) {
+    presetView.notice = '';
+    const chatKey = presetChatKey();
+    let failure = '';
+    if (presetView.renderedChatKey !== chatKey) {
+      failure = PRESET_CHAT_SWITCHED;
+    } else {
+      try {
+        await action();
+      } catch (error) {
+        failure = presetFailureText(error);
+      }
+    }
+    if (chatKey !== presetChatKey()) {
+      presetView.notice = '';
+      failure = PRESET_CHAT_SWITCHED;
+    }
+    renderPresetSection();
+    const panel = presetView.panel;
+    if (!panel) return;
+    panel.status.textContent = failure || presetView.notice;
+    panel.status.setAttribute('data-level', failure ? 'error' : 'info');
+  }
+
+  // True when a mapping row is part of this generation: its order entry is enabled and its trigger includes normal.
+  // The core keeps an empty "main" anchor for a disabled main; it is not listed as active.
+  function presetRowActive(row, snapshot, promptsById) {
+    const group = Array.isArray(snapshot.prompt_order) ? snapshot.prompt_order[0] : null;
+    const order = group && Array.isArray(group.order) ? group.order : [];
+    const entry = order.find(item => item && item.identifier === row.identifier);
+    if (entry && entry.enabled === false) return false;
+    const prompt = promptsById.get(row.identifier);
+    const triggers = prompt && Array.isArray(prompt.injection_trigger) ? prompt.injection_trigger : [];
+    return !triggers.length || triggers.includes('normal');
+  }
+
+  // Diagnostics as counts only; connection fields dropped in the browser and by the core are added up.
+  function presetDiagnosticsText(diagnostics, strippedInBrowser) {
+    const count = value => (Number.isSafeInteger(value) && value >= 0 ? value : 0);
+    const stripped = count(strippedInBrowser) + count(diagnostics.strippedFields);
+    const unknown = count(diagnostics.unknownFields) + count(diagnostics.ignoredFields);
+    return `已移除连接字段 ${stripped} 个 · 忽略未知字段 ${unknown} 个 · 停用的提示 ${count(diagnostics.disabledPrompts)} 条 · `
+      + `本次不触发的提示 ${count(diagnostics.triggerExcludedPrompts)} 条 · 找不到的提示 ${count(diagnostics.missingPrompts)} 条`;
+  }
+
+  // What one mapping row shows: { label, source, player, correctable, known, destinations, flags }.
+  // A prompt the core classifies (the row has a label or the 'unclassified' flag, and a prompt hash) is correctable and
+  // shows the label store's labels for its prompt hash: the player's correction, else the model's label, else none
+  // (source 'identifier'), whatever label the inspection carried. The table therefore always shows what the store
+  // holds, which is what the next save writes and what a reload reads. The inspection's destinations and flags belong
+  // to the label it was made with: they are shown only when that label and source are the shown ones (`known`);
+  // otherwise, as after a correction whose new inspection failed, the destinations are pending and no flag is shown.
+  // `storedLabels` comes from presetStoredLabels for the shown preset hash.
+  function presetShownRow(row, storedLabels) {
+    const flags = Array.isArray(row.flags) ? row.flags : [];
+    const destinations = Array.isArray(row.destinations) ? row.destinations : [];
+    const classified = row.label !== null || flags.includes('unclassified');
+    const hashed = typeof row.promptHash === 'string' && PRESET_HASH_PATTERN.test(row.promptHash);
+    if (!classified || !hashed) {
+      return {
+        label: row.label,
+        source: row.source,
+        player: '',
+        correctable: false,
+        known: true,
+        destinations,
+        flags,
+      };
+    }
+    const stored = storedLabels.get(row.promptHash);
+    const player = stored ? stored.player : '';
+    const model = stored ? stored.model : '';
+    let label = null;
+    let source = 'identifier';
+    if (model) {
+      label = model;
+      source = 'model';
+    }
+    if (player) {
+      label = player;
+      source = 'player';
+    }
+    const known = label === row.label && source === row.source;
+    return {
+      label,
+      source,
+      player,
+      correctable: true,
+      known,
+      destinations: known ? destinations : [],
+      flags: known ? flags : [],
+    };
+  }
+
+  // One mapping row: name, label, source, destinations, flags, an explanation for three labels, a correction select for
+  // classifiable prompts, and the prompt text collapsed. Label, source, destinations, flags and the selected value come
+  // from `shown` (presetShownRow). Everything is textContent.
+  function presetMappingRow(row, prompt, shown) {
+    const item = element('div');
+    item.className = 'xldb-preset-row';
+    item.setAttribute('role', 'listitem');
+    const name = typeof row.name === 'string' && row.name.trim() ? row.name : String(row.identifier);
+    const labelText = shown.label ? (PRESET_LABELS[shown.label] || String(shown.label)) : '未归类';
+    const sourceText = PRESET_SOURCE_TEXT[shown.source] || String(shown.source || '');
+    const destinationNames = shown.destinations.map(value => PRESET_DESTINATION_TEXT[value] || String(value));
+    let destinationText = destinationNames.length ? destinationNames.join('、') : '不使用';
+    if (!shown.known) destinationText = PRESET_DESTINATIONS_PENDING;
+    item.append(element('strong', name));
+    item.append(element('p', `标识：${row.identifier} · 标签：${labelText}（${sourceText}） · 去向：${destinationText}`));
+    const flagNames = shown.flags.map(flag => PRESET_FLAG_TEXT[flag] || String(flag));
+    if (flagNames.length) item.append(element('p', `提示：${flagNames.join('、')}`));
+    if (Object.hasOwn(PRESET_LABEL_EXPLANATIONS, shown.label)) {
+      item.append(element('p', PRESET_LABEL_EXPLANATIONS[shown.label]));
+    }
+    if (shown.correctable) {
+      const select = element('select');
+      select.setAttribute('aria-label', `更正“${name}”的标签`);
+      const automatic = element('option', '不更正（使用模型或标识）');
+      automatic.value = '';
+      select.append(automatic);
+      for (const [value, text] of Object.entries(PRESET_LABELS)) {
+        const option = element('option', text);
+        option.value = value;
+        select.append(option);
+      }
+      select.value = shown.player;
+      const saveSelected = () => savePresetCorrection(row.promptHash, select.value);
+      select.addEventListener('change', () => runPresetAction(saveSelected));
+      item.append(select);
+    }
+    const content = prompt && typeof prompt.content === 'string' ? prompt.content : '';
+    if (content) {
+      const details = element('details');
+      details.append(element('summary', `查看提示内容（${content.length} 字）`));
+      const body = element('pre', content);
+      body.style.whiteSpace = 'pre-wrap';
+      details.append(body);
+      item.append(details);
+    }
+    return item;
+  }
+
+  // The stored labels the table shows for one preset hash (presetStoredLabels). A store the host does not let the
+  // panel read shows no labels (a row the inspection labelled then shows pending destinations), so drawing the section
+  // never fails on it.
+  function presetLabelsForTable(presetHash) {
+    try {
+      return presetStoredLabels(presetHash);
+    } catch {
+      return new Map();
+    }
+  }
+
+  // Draws the shown preset: origin, diagnostics counts, the active prompt rows and the settings summary. Each row's
+  // label comes from the label store as it is now (presetShownRow).
+  function renderPresetMapping() {
+    const panel = presetView.panel;
+    if (!panel) return;
+    clearElement(panel.mapping);
+    const current = presetView.current;
+    if (!current) {
+      panel.mapping.append(element('p', '尚未导入预设。'));
+      return;
+    }
+    const { snapshot, mapping, diagnostics } = current.inspection;
+    const storedLabels = presetLabelsForTable(current.inspection.hash);
+    const promptsById = new Map();
+    for (const prompt of Array.isArray(snapshot.prompts) ? snapshot.prompts : []) {
+      if (prompt && typeof prompt.identifier === 'string') promptsById.set(prompt.identifier, prompt);
+    }
+    panel.mapping.append(element('p', `已读取：${PRESET_ORIGIN_TEXT[current.origin] || ''}`));
+    panel.mapping.append(element('p', presetDiagnosticsText(diagnostics, current.stripped)));
+    const list = element('div');
+    list.className = 'xldb-preset-mapping';
+    list.setAttribute('role', 'list');
+    list.setAttribute('aria-label', '预设拆分对照');
+    for (const row of mapping.prompts) {
+      if (!row || typeof row.identifier !== 'string') continue;
+      if (!presetRowActive(row, snapshot, promptsById)) continue;
+      const shown = presetShownRow(row, storedLabels);
+      list.append(presetMappingRow(row, promptsById.get(row.identifier), shown));
+    }
+    panel.mapping.append(list);
+    const isUnused = setting => !Array.isArray(setting?.destinations) || !setting.destinations.length;
+    const unused = mapping.settings.filter(isUnused).length;
+    const used = mapping.settings.length - unused;
+    const total = mapping.settings.length;
+    panel.mapping.append(element('p', `取样与格式设置 ${total} 项：${used} 项只用于酒馆正文，${unused} 项 XLDB 不使用。`));
+  }
+
+  // Draws whether the open chat follows the active preset or keeps a pin, the differs notice and the storage note.
+  function renderPresetPinState() {
+    const panel = presetView.panel;
+    if (!panel) return;
+    const pin = presetPin();
+    panel.pinState.textContent = pin
+      ? `本聊天：已固定预设（标识 ${pin.hash.slice(0, 8)}）。`
+      : '本聊天：跟随当前酒馆预设（默认）。';
+    const differs = Boolean(pin && presetView.activeHash && presetView.activeHash !== pin.hash);
+    panel.differs.hidden = !differs;
+    panel.differs.textContent = differs ? '当前酒馆预设与本聊天固定的预设不同；本聊天仍使用固定的预设。' : '';
+    panel.storageNote.hidden = presetSharedStorage();
+    panel.storageNote.textContent = presetSharedStorage() ? '' : '此酒馆没有提供扩展设置存储；标签更正只保存在本聊天。';
+    panel.pinnedButton.hidden = !pin;
+    panel.unpinButton.hidden = !pin;
+    panel.pinButton.disabled = !presetView.current;
+    panel.classifyButton.disabled = !presetView.current;
+  }
+
+  // Draws the unsaved mark and its retry button while a store holds an unsaved panel change of the open chat.
+  function renderPresetUnsaved() {
+    const panel = presetView.panel;
+    if (!panel) return;
+    const unsaved = presetUnsavedKinds(presetChatKey()).length > 0;
+    panel.unsavedNote.hidden = !unsaved;
+    panel.unsavedNote.textContent = unsaved ? PRESET_UNSAVED_TEXT : '';
+    panel.retryButton.hidden = !unsaved;
+  }
+
+  // Draws the whole section for the chat that is open now; a preset shown for another chat is forgotten first.
+  function renderPresetSection() {
+    presetForgetOtherChat();
+    renderPresetPinState();
+    renderPresetUnsaved();
+    renderPresetMapping();
+    presetView.renderedChatKey = presetChatKey();
+  }
+
+  // The preset section of the settings panel ("后台模型" page): two ways to load, pin controls, classification and the
+  // mapping table.
+  function buildPresetSection(root) {
+    const section = element('details');
+    section._xldbGroup = 'models';
+    section.className = 'xldb-disclosure xldb-preset';
+    section.append(element('summary', '酒馆预设：导入与标签'));
+    section.append(element('p', '读取你的酒馆对话补全预设，查看 XLDB 如何拆分每条提示，并可更正标签。默认跟随当前酒馆预设，也可以为本聊天固定一份。目前只导入、显示和保存，生成暂不使用。连接地址、密钥等连接字段不会读取或发送。'));
+    const fileInput = element('input');
+    fileInput.type = 'file';
+    fileInput.accept = '.json,application/json';
+    fileInput.setAttribute('aria-label', '选择导出的预设 JSON 文件');
+    fileInput.addEventListener('change', () => runPresetAction(async () => {
+      const file = fileInput.files && fileInput.files[0];
+      fileInput.value = '';
+      await loadPresetFromFile(file);
+    }));
+    const fileLabel = element('label');
+    fileLabel.append(element('span', '从文件导入预设 JSON'), fileInput);
+    const activeButton = button('读取当前酒馆预设', () => runPresetAction(loadActivePreset));
+    const pinnedButton = button('显示本聊天固定的预设', () => runPresetAction(loadPinnedPreset));
+    const pinButton = button('为本聊天固定这份预设', () => runPresetAction(pinPreset));
+    const unpinButton = button('取消固定，跟随当前预设', () => runPresetAction(unpinPreset));
+    const classifyButton = button('用模型自动归类', () => runPresetAction(classifyPreset));
+    const retryButton = button('重试保存', () => runPresetAction(retryPresetSaves));
+    const pinState = element('p');
+    const differs = element('p');
+    differs.setAttribute('role', 'alert');
+    const storageNote = element('p');
+    const unsavedNote = element('p');
+    unsavedNote.className = 'xldb-preset-unsaved';
+    const status = element('p');
+    status.setAttribute('role', 'status');
+    const mapping = element('div');
+    section.append(
+      fileLabel,
+      activeButton,
+      pinState,
+      differs,
+      storageNote,
+      pinButton,
+      pinnedButton,
+      unpinButton,
+      classifyButton,
+      unsavedNote,
+      retryButton,
+      status,
+      mapping,
+    );
+    section.addEventListener('toggle', renderPresetSection);
+    presetView.panel = {
+      section,
+      status,
+      pinState,
+      differs,
+      storageNote,
+      unsavedNote,
+      retryButton,
+      mapping,
+      pinButton,
+      pinnedButton,
+      unpinButton,
+      classifyButton,
+    };
+    root.append(section);
+    renderPresetSection();
+    presetSubscribeHostEvents();
   }
 
   function renderInspect(data) {
@@ -4601,8 +7275,8 @@
     area.append(emotion);
   }
 
-  const api = { connect,switchMode,setTimeZone,setDirectorEnabled,refreshClock,sceneCheckpoint, restoreScene, recoverScene, adoptSwipe, switchSceneBranch, enableNative, bind, disable, sync, configureScene, loadInitializationSources, previewInitialization, applyInitialization, readInitializationProvenance, previewInitializationRefresh, applyInitializationRefresh, readNpcResources, configureNpcResources, loadConfig, saveConfig, inspect, setAccess, setPreference, destroy, getState: () => ({ interaction:state.interaction,clock:state.clock,enabled: state.enabled, nativeEnabled: state.native.enabled, busy: state.busy, scope: state.scope, hasCandidate: Boolean(state.candidate), resources:state.resources ? { ...state.resources, priorityIds:[...state.resources.priorityIds], selectedIds:[...state.resources.selectedIds], activeIds:[...state.resources.activeIds], pausedIds:[...state.resources.pausedIds] } : null, scene: { enabled: state.scene.enabled, targetId: state.scene.targetId, presentIds: [...state.scene.presentIds], mode: state.scene.mode, roster: state.scene.roster.map(character => ({ ...character })) } }), setToken: token => { state.token = String(token || ''); } };
-  api.refreshDashboard=refreshDashboard;
+  const api = { connect,switchMode,setTimeZone,setDirectorEnabled,refreshClock:()=>refreshClock(captureOrigin({})),sceneCheckpoint, restoreScene, recoverScene, adoptSwipe, switchSceneBranch, enableNative, bind, disable, sync, configureScene, loadInitializationSources, previewInitialization, applyInitialization, readInitializationProvenance, previewInitializationRefresh, applyInitializationRefresh, readNpcResources, configureNpcResources, loadConfig, saveConfig, inspect, setAccess, setPreference, destroy, getState: () => ({ interaction:state.interaction,clock:state.clock,enabled: state.enabled, nativeEnabled: state.native.enabled, busy: state.busy, scope: state.scope, hasCandidate: Boolean(state.candidate), resources:state.resources ? { ...state.resources, priorityIds:[...state.resources.priorityIds], selectedIds:[...state.resources.selectedIds], activeIds:[...state.resources.activeIds], pausedIds:[...state.resources.pausedIds] } : null, scene: { enabled: state.scene.enabled, targetId: state.scene.targetId, presentIds: [...state.scene.presentIds], mode: state.scene.mode, roster: state.scene.roster.map(character => ({ ...character })) } }), setToken: token => { state.token = String(token || ''); } };
+  api.refreshDashboard=()=>refreshDashboard(captureOrigin({}));
   globalThis.XLDBTavernMvp = api;
   buildPanel();
   subscribeEvents();

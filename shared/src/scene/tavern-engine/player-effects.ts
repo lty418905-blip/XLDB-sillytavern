@@ -1,4 +1,5 @@
 import type { Scope } from '../../memory/access.ts';
+import { checkTavernPossessionEffect, snapshotTavernPossessionWorld } from './projection.ts';
 import type { TavernWorldSnapshot } from './projection.ts';
 import type { DecodeIssue, EngineEvent, EventPayload } from './types.ts';
 
@@ -98,6 +99,11 @@ export function checkTavernPlayerWorld(
       requireShape(object(entry) && identity(entry.itemId) && !items.has(entry.itemId));
       items.add(entry.itemId);
       checkBasis(entry.basis, scope);
+      requireShape(entry.consumed == null || typeof entry.consumed === 'boolean');
+      requireShape(entry.consumed !== true || entry.holderId === null);
+      if (entry.readers != null) {
+        for (const reader of identities(entry.readers)) requireShape(entities.has(reader));
+      }
     }
     const holders = new Set([...entities, ...places, ...items]);
     for (const entry of world.possessions) {
@@ -129,7 +135,8 @@ export function checkTavernPlayerWorld(
 }
 
 function hardEffect(payload: EventPayload): boolean {
-  return payload.kind === 'Enter' || payload.kind === 'Exit' || payload.kind === 'Transfer';
+  return payload.kind === 'Enter' || payload.kind === 'Exit' || payload.kind === 'Transfer'
+    || payload.kind === 'ConsumeItem';
 }
 
 function downgraded(event: EngineEvent, reason: DecodeIssue): EngineEvent {
@@ -147,9 +154,10 @@ function downgraded(event: EngineEvent, reason: DecodeIssue): EngineEvent {
 /**
  * Checks decoded M1 spatial/ownership effects in ledger order without mutating events or the snapshot.
  * Only the player may author effects or move themselves; firstTurn also permits an NPC Enter destination.
- * Transfers must give a currently player-held item. Rejected effects retain their envelope/origin as Unknown.
+ * Transfers may give player-held items or take items from an accessible place/container.
+ * Consumption uses the same control. Rejected effects retain their envelope/origin as Unknown.
  * Null world rejects every hard effect as world_unavailable; other payloads and old Unknown records survive.
- * Work is O(snapshot entries + events); Maps/Sets avoid prototype-key lookup and repeated snapshot scans.
+ * Work is O(snapshot entries * (events + 1)); M1 has at most 12 events, with no chat-wide cap.
  */
 export function checkTavernPlayerEffects(
   events: readonly EngineEvent[],
@@ -160,13 +168,14 @@ export function checkTavernPlayerEffects(
     return events.map(event => hardEffect(event.payload) ? downgraded(event, 'world_unavailable') : event);
   }
 
-  const { world, firstTurn } = state;
+  const { firstTurn } = state;
+  const world = snapshotTavernPossessionWorld(state.world);
   const entities = new Set(world.entityIds);
   const places = new Set(world.placeIds);
   const present = new Set(world.presentIds);
   const positions = new Map(world.positions.map(entry => [entry.entityId, entry.position]));
-  const possessions = new Map(world.possessions.map(entry => [entry.itemId, entry.holderId]));
-  const holders = new Set([...entities, ...places, ...possessions.keys()]);
+  const possessions = new Map(world.possessions.map(entry => [entry.itemId, entry]));
+  const scope = world.scope;
 
   return events.map(event => {
     const payload = event.payload;
@@ -194,13 +203,30 @@ export function checkTavernPlayerEffects(
         present.delete(payload.entityId);
         positions.set(payload.entityId, { state: 'unknown' });
       }
-    } else if (payload.kind === 'Transfer') {
-      if (payload.fromId !== playerId) return downgraded(event, 'effect_actor_not_allowed');
-      if (!possessions.has(payload.itemId) || possessions.get(payload.itemId) !== payload.fromId
-        || !holders.has(payload.toId)) {
-        return downgraded(event, 'effect_world_mismatch');
+    } else if (payload.kind === 'Transfer' || payload.kind === 'ConsumeItem') {
+      const reason = checkTavernPossessionEffect({
+        scope,
+        entityIds: [...entities],
+        placeIds: [...places],
+        presenceKnown: true,
+        presenceSeeds: [],
+        applied: [],
+        presentIds: [...present],
+        positions: [...positions].map(([entityId, position]) => ({
+          entityId,
+          position,
+          basis: { kind: 'existing', scope, sourceId: 'player-check', sourceRevision: 1 },
+        })),
+        possessions: [...possessions.values()],
+      }, payload);
+      if (reason !== null) {
+        return downgraded(event, reason === 'projection_actor_not_allowed' || reason === 'projection_item_not_visible'
+          ? 'effect_actor_not_allowed' : 'effect_world_mismatch');
       }
-      possessions.set(payload.itemId, payload.toId);
+      const item = possessions.get(payload.itemId)!;
+      possessions.set(payload.itemId, payload.kind === 'Transfer'
+        ? { ...item, holderId: payload.toId }
+        : { ...item, holderId: null, consumed: true });
     }
     return event;
   });

@@ -268,13 +268,14 @@ export class SceneLifecycle {
 
   /**
    * Removes checkpoints that could replay erased sources or revisions. A supplied read-only invalidation
-   * leaves live rows untouched; otherwise erasure retains its existing behavior. Database errors propagate.
+   * leaves live rows untouched; otherwise erasure retains its existing behavior. Returns that invalidation,
+   * including actual live status changes, or undefined when there is nothing to redact. Database errors propagate.
    */
   redactUnsafeCheckpoints(
     scope: SceneScope,
     sourceIds: Iterable<string>,
     checkpointInvalidation?: ReturnType<typeof eraseTavernEngineSources>,
-  ): void {
+  ): ReturnType<typeof eraseTavernEngineSources> | undefined {
     const deleted = new Set(sourceIds);
 
     if (!deleted.size
@@ -301,6 +302,8 @@ export class SceneLifecycle {
         continue;
       this.db.prepare('DELETE FROM scene_checkpoints WHERE id=?').run(checkpoint.id);
     }
+
+    return invalidated;
   }
 
   private capture(scope: SceneScope): SceneCheckpointSnapshot {

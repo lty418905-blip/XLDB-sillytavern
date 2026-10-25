@@ -742,8 +742,14 @@ export class TavernLedgerStore implements TavernEngineLedgerPort {
  * Captures only this scope's accepted ledger rows, including embedded private plans and durable receipts.
  * Returns undefined without creating tables when the scope has no rows. SQL errors propagate unchanged.
  * Work is O(rows + stored bytes); raw JSON is retained so capture does not normalize accepted history.
+ * With includeReferencedEmptyScope, explicit memory event references retain an empty snapshot for erasure.
+ * The eligibility probe returns only a scope flag, never source rows; unrelated ledger tables do not qualify.
  */
-export function captureTavernEngineRows(database: DatabaseSync, scope: Scope): {
+export function captureTavernEngineRows(
+  database: DatabaseSync,
+  scope: Scope,
+  includeReferencedEmptyScope = false,
+): {
   turns: { turn_id: string; turn_revision: number; kind: string; body: string }[];
   receipts: { ticket_id: string; body_hash: string; receipt: string }[];
 } | undefined {
@@ -770,7 +776,30 @@ export function captureTavernEngineRows(database: DatabaseSync, scope: Scope): {
     { ticket_id: string; body_hash: string; receipt: string }[]
     : [];
 
-  return turns.length || receipts.length ? { turns, receipts } : undefined;
+  if (turns.length || receipts.length) {
+    return { turns, receipts };
+  }
+
+  // No accepted event reference can originate without ledger tables. Keep that legacy path free of source reads.
+  // Existing tables can be empty after deletion, so check this scope's references before discarding the snapshot.
+  if (includeReferencedEmptyScope && tables.size > 0) {
+    const references = database.prepare(`SELECT 1 AS scope_event_references
+      FROM scene_sources AS source,
+        json_each(CASE
+          WHEN instr(source.analysis, '"knowledge') > 0 OR instr(source.analysis, '\\u') > 0
+          THEN source.analysis ELSE NULL END, '$.characters') AS character,
+        json_each(character.value, '$.memories') AS memory
+      WHERE source.scope=? AND (
+        json_type(memory.value, '$.source.knowledge') NOT IN ('null')
+        OR json_array_length(memory.value, '$.source.knowledgeSet') > 0
+      ) LIMIT 1`).get(key);
+
+    if (references) {
+      return { turns, receipts };
+    }
+  }
+
+  return undefined;
 }
 
 /**
@@ -1104,29 +1133,43 @@ export function filterTavernEngineSnapshot(
  * Returns whole deleted/missing source IDs and invalid revisions keyed by JSON [sourceId, revision].
  * Checkpoints must match that pair; a removed historical revision does not erase its valid replacement.
  * Later causal analyses are queued for rebuild.
- * Source/turn queues and one ordered suffix pass cost O(sources + rows + references + serialized bytes).
+ * A memory whose explicit event reference (its knowledge, or any knowledgeSet entry) is no longer current is erased
+ * whole. Commit records every event a memory depends on, so memories without an explicit reference are never erased
+ * here; an analysis keeps its stored bytes unless one of its memories is erased, and legacy analyses never change.
+ * Source/turn queues and address lookups cost O(sources + rows + references + serialized bytes); an analysis text
+ * that cannot hold a reference key is skipped without parsing.
  * Explicit IDs include deletions/corrections; current source status/revision also invalidates stale entries.
+ * Reports changedSourceRevisions only for accepted rows whose status this call actually changed; historical
+ * invalid revisions stay separate. The optional field is absent on read-only checkpoint filter accumulators.
  * Missing tables/data are a no-op. Writes share the caller transaction; any SQL/JSON/getter failure rolls back.
  */
 export function eraseTavernEngineSources(
   database: DatabaseSync,
   scope: Scope,
   sourceIds: Iterable<string>,
-): { deletedSourceIds: Set<string>; sourceRevisions: Set<string> } {
+): { deletedSourceIds: Set<string>; sourceRevisions: Set<string>; changedSourceRevisions?: Set<string> } {
   const key = checkedScope(scope);
-  const invalidated = { deletedSourceIds: new Set(sourceIds), sourceRevisions: new Set<string>() };
+  const invalidated = {
+    deletedSourceIds: new Set(sourceIds),
+    sourceRevisions: new Set<string>(),
+    changedSourceRevisions: new Set<string>(),
+  };
 
   return inTransaction(
     database,
     () => {
-      const snapshot = captureTavernEngineRows(database, scope);
+      const snapshot = captureTavernEngineRows(database, scope, true);
 
-      if (!snapshot)
+      // Only this scope's ledger rows or explicit memory event references authorize erasure. Empty shared
+      // tables do not. The reference probe still finds stale memories after every ledger row was deleted.
+      if (!snapshot) {
         return invalidated;
+      }
 
       const sources = database.prepare(
         'SELECT id,revision,status,message,analysis FROM scene_sources WHERE scope=? ORDER BY rowid',
       ).all(key) as { id: string; revision: number; status: string; message: string; analysis: string | null }[];
+      // Eligible event scopes retain the existing transitive invalidation of event and message dependencies.
       const filtered = filterTavernEngineSnapshot(snapshot, sources, invalidated.deletedSourceIds, invalidated)!;
       const retained = new Set(filtered.turns);
       const retainedReceipts = new Set(filtered.receipts);
@@ -1158,17 +1201,134 @@ export function eraseTavernEngineSources(
           erased.set(sourceIdentity(source), source);
       }
 
-      if (!erased.size)
-        return invalidated;
-
-      const invalidateAnalysis = database.prepare(
-        "UPDATE scene_sources SET status='needs_review',processing='failed',analysis=NULL WHERE scope=? AND id=? AND revision=? AND status='accepted'",
-      );
       const clearStages = database.prepare(
         "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='scene_processing_stages'",
       ).get()
         ? database.prepare('DELETE FROM scene_processing_stages WHERE scope=? AND source=? AND revision=?')
         : undefined;
+      const currentSources = new Map(sources.map(source => [source.id, source]));
+      const sourceValid = (source: TavernSourceReference): boolean => {
+        const current = currentSources.get(source.id);
+
+        return current?.status === 'accepted' && current.revision === source.revision
+          && !invalidated.deletedSourceIds.has(source.id)
+          && !invalidated.sourceRevisions.has(sourceIdentity(source));
+      };
+      type MemoryReference = import('./types.ts').TavernEventAddress;
+      const addressIdentity = (reference: MemoryReference): string => JSON.stringify([
+        reference.turnId,
+        reference.turnRevision,
+        reference.eventId,
+        reference.phase,
+        reference.itemRef ?? null,
+        reference.effectIndex ?? null,
+      ]);
+      const latestRevisions = new Map<string, number>();
+
+      for (const row of snapshot.turns) {
+        latestRevisions.set(row.turn_id, Math.max(latestRevisions.get(row.turn_id) ?? 0, row.turn_revision));
+      }
+
+      const availableAddresses = new Set<string>();
+
+      for (const row of filtered.turns) {
+        const turn = JSON.parse(row.body) as AcceptedTavernTurn;
+
+        if (turn.turnId !== row.turn_id || turn.turnRevision !== row.turn_revision || turn.kind !== row.kind
+          || latestRevisions.get(turn.turnId) !== turn.turnRevision || scopeKey(turn.scope) !== key
+          || !sourceValid(turn.source)) {
+          continue;
+        }
+
+        for (const event of turn.kind === 'interpret' ? turn.events : turn.beats) {
+          if (event.envelope.status !== 'accepted' || event.envelope.turnId !== turn.turnId
+            || event.origin.turnRevision !== turn.turnRevision || scopeKey(event.origin.scope) !== key
+            || !sourceValid({id: event.origin.sourceId, revision: event.origin.sourceRevision})) {
+            continue;
+          }
+
+          const addAddress = (phase: MemoryReference['phase'], itemRef?: number, effectIndex?: number): void => {
+            availableAddresses.add(addressIdentity({
+              turnId: turn.turnId,
+              turnRevision: turn.turnRevision,
+              eventId: event.envelope.id,
+              phase,
+              ...(itemRef == null ? {} : {itemRef}),
+              ...(effectIndex == null ? {} : {effectIndex}),
+            }));
+          };
+
+          if ('payload' in event) {
+            if (event.payload.kind !== 'Unknown') {
+              addAddress('event');
+            }
+          } else {
+            const itemIndices = new Set(event.items.map(item => item.itemIndex));
+
+            for (const item of event.items) {
+              addAddress('item', item.itemIndex);
+            }
+
+            for (const effect of event.effects) {
+              if (itemIndices.has(effect.itemRef)) {
+                addAddress(effect.phase, effect.itemRef, effect.effectIndex);
+              }
+            }
+          }
+        }
+      }
+
+      for (const source of sources) {
+        if (source.status !== 'accepted' || source.analysis === null || erased.has(sourceIdentity(source))) {
+          continue;
+        }
+
+        // Only a knowledge or knowledgeSet key can name an event, so a text with neither is skipped unparsed. The test
+        // is exact for any JSON text: a key's letters appear literally or as \u escapes, so a text holding neither
+        // the literal key prefix nor any \u escape has no such key, and parsing it could not erase a memory.
+        if (!source.analysis.includes('"knowledge') && !source.analysis.includes('\\u')) {
+          continue;
+        }
+
+        const analysis = JSON.parse(source.analysis) as import('../types.ts').StoredSceneAnalysis;
+        let memoriesErased = false;
+
+        for (const character of Object.values(analysis.characters ?? {})) {
+          if (character.memories == null) {
+            continue;
+          }
+
+          character.memories = character.memories.filter(memory => {
+            const metadata = memory.source;
+            // A memory without an explicit reference depends on no event, so it is never erased here.
+            const memoryReferences = metadata?.knowledgeSet
+              ?? (metadata?.knowledge == null ? [] : [metadata.knowledge]);
+            const missingEvent = memoryReferences.some(reference => !availableAddresses.has(addressIdentity(reference)));
+
+            if (missingEvent) {
+              memoriesErased = true;
+            }
+
+            return !missingEvent;
+          });
+        }
+
+        if (memoriesErased) {
+          // Update the in-memory row too: the causal suffix below must not write erased candidates back.
+          source.analysis = JSON.stringify(analysis);
+          database.prepare('UPDATE scene_sources SET analysis=? WHERE scope=? AND id=? AND revision=?')
+            .run(source.analysis, key, source.id, source.revision);
+          clearStages?.run(key, source.id, source.revision);
+        }
+      }
+
+      if (!erased.size) {
+        return invalidated;
+      }
+
+      const invalidateAnalysis = database.prepare(
+        "UPDATE scene_sources SET status='needs_review',processing='failed',analysis=NULL WHERE scope=? AND id=? AND revision=? AND status='accepted'",
+      );
       const hasWorld = Boolean(database.prepare('SELECT 1 FROM scene_world_settings WHERE scope=?').get(key));
       const affectedCharacters = new Set<string>();
       let changed = false;
@@ -1176,7 +1336,11 @@ export function eraseTavernEngineSources(
       // Removed historical revisions can still have staged work, even when the current source has advanced.
       // Match both writes to the removed revision so its replacement keeps its analysis and staged learning.
       for (const source of erased.values()) {
-        invalidateAnalysis.run(key, source.id, source.revision);
+        const update = invalidateAnalysis.run(key, source.id, source.revision);
+
+        if (update.changes > 0) {
+          invalidated.changedSourceRevisions.add(sourceIdentity(source));
+        }
         clearStages?.run(key, source.id, source.revision);
       }
 

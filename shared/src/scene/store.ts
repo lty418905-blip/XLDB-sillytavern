@@ -62,36 +62,44 @@ import {commitmentStoryClock,storyNow} from './story-clock-consumers.ts';
 import {storyLanguageOf} from '../memory/text-units.ts';
 import type {StoryLanguage} from '../memory/text-units.ts';
 import {defaultSceneHooks} from './extension.ts';
-import type { EventSourceObservation, Observation } from './types.ts';
+import type { EventSourceObservation, LegacyObservation, Observation } from './types.ts';
 import type { AcceptedTavernTurn } from './tavern-engine/store.ts';
 import { TavernPerception } from './tavern-engine/perception.ts';
 import type {ContactEmotionProjection,SceneAuthorityExtensionFactory,SceneAuthorityHooks,SceneSubjectBinding} from './extension.ts';
 
 export type {SceneSubjectBinding} from './extension.ts';
 
+/** Final reader routes indexed once per commit; coverage uses both turn identity and revision. */
+type EventReaderRoutes = {
+  readers: ReadonlyMap<string, ReturnType<TavernPerception['memoryReaders']>[number]>;
+  turns: ReadonlySet<string>;
+};
+
 /**
  * Resolves event observations against current ledger content and independently authorized readers.
  * Private content is bounded by its author/whisperTo; public readers use saved final perception results.
  * An optional fresh route is saved in the caller's commit transaction, never on the read path.
  * Each referenced turn is indexed once: O(observations + event bytes + routed reader entries).
+ * Returns resolved observations and whether any event was rebuilt, without rereading caller array slots.
  * Malformed imported references return no observation; legacy entries retain their original representation.
  */
 function currentEventObservations(
   database: DatabaseSync,
   scope: SceneScope,
-  source: SceneSource,
+  source: Pick<SceneSource, 'id' | 'revision' | 'role'>,
   observations: Observation[],
-  routedReaders?: ReadonlyMap<string, ReturnType<TavernPerception['memoryReaders']>[number]>,
-): Observation[] {
+  routedReaders?: EventReaderRoutes,
+): {observations: Observation[]; hasEventObservations: boolean} {
   const key = scopeKey(scope);
   const turns = new Map<string, Map<string, {actorId: string; quote: string; readers: Set<string>}>>();
   const references = new Set<string>();
   let hasLedger: boolean | undefined;
+  let hasEventObservations = false;
   const sourceCurrent = (id: string, revision: number) => Boolean(database.prepare(
     "SELECT 1 FROM scene_sources WHERE scope=? AND id=? AND revision=? AND status='accepted'",
   ).get(key, id, revision));
 
-  return observations.flatMap<Observation>(observation => {
+  const currentObservations = observations.flatMap<Observation>(observation => {
     if (!Object.hasOwn(observation, 'ref')) return [observation];
 
     // Only the address and permission-neutral labels come from the caller. Read errors escape unchanged.
@@ -140,6 +148,9 @@ function currentEventObservations(
         if (turn.turnId !== turnId || turn.turnRevision !== turnRevision
           || scopeKey(turn.scope) !== key || turn.kind !== kind
           || turn.source.id !== source.id || turn.source.revision !== source.revision) return [];
+        // One fresh entry covers the entire turn revision, including absent or explicitly empty readers.
+        // A batch that only routes other turns must neither replace nor write this turn's saved permissions.
+        const covered = routedReaders?.turns.has(JSON.stringify([turnId, turnRevision])) === true;
         const savedRoutes = new Map((turn.memoryReaders ?? []).map(route => [route.address, route]));
         const nextRoutes: NonNullable<typeof turn.memoryReaders> = [];
 
@@ -156,7 +167,7 @@ function currentEventObservations(
             if (content.kind === 'Unknown') return;
             const address = JSON.stringify([event.envelope.id, phase, itemRef, effectIndex]);
             const routeKey = JSON.stringify([turnId, turnRevision, event.envelope.id, phase, itemRef, effectIndex]);
-            const route = routedReaders === undefined ? savedRoutes.get(address) : routedReaders.get(routeKey);
+            const route = covered ? routedReaders!.readers.get(routeKey) : savedRoutes.get(address);
             const quote = content.text ?? '';
             const whisperTo = content.whisperTo ?? [];
             const authorized = whisperTo.length > 0
@@ -176,7 +187,7 @@ function currentEventObservations(
             }
           }
         }
-        if (routedReaders !== undefined) {
+        if (covered) {
           // The enclosing analysis transaction rolls this back if any observation or candidate is rejected.
           turn.memoryReaders = nextRoutes;
           database.prepare('UPDATE scene_tavern_turns SET body=? WHERE scope=? AND turn_id=? '
@@ -185,6 +196,8 @@ function currentEventObservations(
       }
       const event = events.get(JSON.stringify([eventId, phase, itemRef ?? null, effectIndex ?? null]));
       if (!event || event.readers.size === 0) return [];
+
+      hasEventObservations = true;
 
       return [{
         channel: 'event' as const,
@@ -209,6 +222,214 @@ function currentEventObservations(
       return [];
     }
   });
+
+  return {observations: currentObservations, hasEventObservations};
+}
+
+
+/**
+ * Creates a transaction/read-local resolver for explicit memory references. Each ledger turn is indexed once.
+ * Work is O(references + indexed ledger bytes + reader entries); sorting is bounded by sixteen unique addresses.
+ * Returns undefined for omitted/null metadata, and throws for an invalid or inaccessible complete set.
+ * Getters on caller addresses are read once and their exceptions propagate unchanged.
+ */
+function createEventMemoryResolver(
+  database: DatabaseSync,
+  scope: SceneScope,
+  routedReaders?: EventReaderRoutes,
+) {
+  type Entry = {
+    observation: EventSourceObservation;
+    order: number[];
+    source: {id: string; revision: number};
+    authorRole: SceneMessage['role'];
+  };
+  const turns = new Map<string, Map<string, Entry>>();
+  const observationLabels = new WeakMap<Observation[], Map<string, EventSourceObservation>>();
+  const key = scopeKey(scope);
+  const addressKey = (reference: EventSourceObservation['ref']) => JSON.stringify([
+    reference.turnId, reference.turnRevision, reference.eventId, reference.phase,
+    reference.itemRef ?? null, reference.effectIndex ?? null,
+  ]);
+
+  return (
+    metadata: import('./types.ts').SceneCharacterAnalysis['memories'][number]['source'],
+    carrier: SceneSource,
+    observations: Observation[],
+    characterId: string,
+  ) => {
+    const inputSet = metadata?.knowledgeSet;
+    const inputSingle = inputSet == null ? metadata?.knowledge : undefined;
+    if (inputSet == null && inputSingle == null) return undefined;
+    const input = inputSet ?? [inputSingle!];
+    if (!Array.isArray(input) || input.length === 0) throw new Error('invalid_scene_memory_source');
+    const unique = new Map<string, EventSourceObservation['ref']>();
+    for (const reference of input) {
+      const {turnId, turnRevision, eventId, phase, itemRef, effectIndex} = reference ?? {};
+      if (typeof turnId !== 'string' || turnId.length === 0
+        || !Number.isSafeInteger(turnRevision) || turnRevision < 1
+        || typeof eventId !== 'string' || eventId.length === 0
+        || !['event', 'item', 'beforeItem', 'afterItem'].includes(phase)
+        || (phase === 'event' ? itemRef != null : !Number.isSafeInteger(itemRef) || itemRef! < 0)
+        || (phase === 'beforeItem' || phase === 'afterItem'
+          ? !Number.isSafeInteger(effectIndex) || effectIndex! < 0 : effectIndex != null)) {
+        throw new Error('invalid_scene_memory_source');
+      }
+      const address = {
+        turnId, turnRevision, eventId, phase,
+        ...(itemRef == null ? {} : {itemRef}),
+        ...(effectIndex == null ? {} : {effectIndex}),
+      };
+      unique.set(addressKey(address), address);
+      // Product limit applies after deduplication to one memory, never to the chat or raw input count.
+      if (unique.size > 16) {
+        recordStage('memory_source_set_contract_gap', {
+          stage: 'memory', sourceId: carrier.id, revision: carrier.revision, characterId,
+        });
+        throw new Error('invalid_scene_memory_source_set_limit');
+      }
+    }
+    // Multiple memories can share a plan; index its labels once rather than scanning it per memory.
+    let labels = observationLabels.get(observations);
+    if (!labels) {
+      labels = new Map();
+      for (const observation of observations) {
+        if (observation.channel === 'event') labels.set(addressKey(observation.ref), observation);
+      }
+      observationLabels.set(observations, labels);
+    }
+    const entries: Entry[] = [];
+    for (const [identity, reference] of unique) {
+      const kind = reference.phase === 'event' ? 'interpret' : 'npc';
+      const turnKey = JSON.stringify([reference.turnId, reference.turnRevision, kind]);
+      let indexed = turns.get(turnKey);
+      if (!indexed) {
+        indexed = new Map();
+        turns.set(turnKey, indexed);
+        if (!database.prepare(
+          "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='scene_tavern_turns'",
+        ).get()) throw new Error('invalid_scene_memory_source');
+        const row = database.prepare(
+          'SELECT rowid,body FROM scene_tavern_turns WHERE scope=? AND turn_id=? AND turn_revision=? AND kind=?',
+        ).get(key, reference.turnId, reference.turnRevision, kind) as {rowid: number; body: string} | undefined;
+        if (!row) throw new Error('invalid_scene_memory_source');
+        const turn = JSON.parse(row.body) as AcceptedTavernTurn;
+        const origin = database.prepare('SELECT message FROM scene_sources WHERE scope=? AND id=? '
+          + "AND revision=? AND status='accepted'").get(key, turn.source.id, turn.source.revision) as
+          {message: string} | undefined;
+        if (!origin) throw new Error('invalid_scene_memory_source');
+        const message = JSON.parse(origin.message) as SceneMessage;
+        const addresses: EventSourceObservation[] = [];
+        const add = (eventId: string, phase: EventSourceObservation['ref']['phase'],
+          itemRef?: number, effectIndex?: number) => {
+          const ref = {
+            turnId: turn.turnId, turnRevision: turn.turnRevision, eventId, phase,
+            ...(itemRef == null ? {} : {itemRef}),
+            ...(effectIndex == null ? {} : {effectIndex}),
+          };
+          // Labels are permission-neutral; only these labels are retained from a matching plan observation.
+          const label = labels.get(addressKey(ref));
+          addresses.push({
+            channel: 'event', ref, id: label?.id ?? addressKey(ref), kind: label?.kind ?? 'observed',
+            sequence: addresses.length + 1, actorId: '', quote: '', evidence: '', readers: [],
+          });
+        };
+        for (const event of turn.kind === 'interpret' ? turn.events : turn.beats) {
+          if ('payload' in event) {
+            add(event.envelope.id, 'event');
+          } else {
+            const effectsBySlot = new Map<string, typeof event.effects[number][]>();
+            for (const effect of event.effects) {
+              const slot = JSON.stringify([effect.itemRef, effect.phase]);
+              const effects = effectsBySlot.get(slot) ?? [];
+              effects.push(effect);
+              effectsBySlot.set(slot, effects);
+            }
+            for (const item of event.items) {
+              for (const effect of effectsBySlot.get(JSON.stringify([item.itemIndex, 'beforeItem'])) ?? []) {
+                add(event.envelope.id, effect.phase, effect.itemRef, effect.effectIndex);
+              }
+              add(event.envelope.id, 'item', item.itemIndex);
+              for (const effect of effectsBySlot.get(JSON.stringify([item.itemIndex, 'afterItem'])) ?? []) {
+                add(event.envelope.id, effect.phase, effect.itemRef, effect.effectIndex);
+              }
+            }
+          }
+        }
+        // Resolve explicit memory references with the same turn coverage used for plan observations.
+        const {observations: resolved} = currentEventObservations(database, scope, message, addresses, routedReaders);
+        for (const observation of resolved) {
+          if (observation.channel !== 'event') continue;
+          indexed.set(addressKey(observation.ref), {
+            observation, order: [row.rowid, observation.sequence], source: turn.source, authorRole: message.role,
+          });
+        }
+      }
+      const entry = indexed.get(identity);
+      if (!entry) throw new Error('invalid_scene_memory_source');
+      entries.push(entry);
+    }
+    entries.sort((left, right) => left.order[0]! - right.order[0]! || left.order[1]! - right.order[1]!);
+    const readerSets = entries.map(entry => new Set(entry.observation.readers));
+    const readers = entries[0]!.observation.readers.filter(reader => readerSets.every(set => set.has(reader)));
+    if (readers.length === 0 || !readers.includes(characterId)) throw new Error('invalid_scene_memory_source');
+    const knowledge = entries.map(({observation}) => ({
+      kind: observation.kind,
+      actorId: observation.actorId,
+      observationId: observation.id,
+      channel: 'event' as const,
+      turnId: observation.ref.turnId,
+      turnRevision: observation.ref.turnRevision,
+      eventId: observation.ref.eventId,
+      phase: observation.ref.phase,
+      ...(observation.ref.itemRef == null ? {} : {itemRef: observation.ref.itemRef}),
+      ...(observation.ref.effectIndex == null ? {} : {effectIndex: observation.ref.effectIndex}),
+    }));
+    return {
+      entries,
+      readers,
+      knowledge: knowledge.length === 1 ? {knowledge: knowledge[0]!} : {knowledgeSet: knowledge},
+    };
+  };
+}
+
+/** Checks complete literal fragments independently; at most sixteen quoted events are compared per fragment. */
+function eventMemoryTextMatches(
+  candidate: import('./types.ts').SceneCharacterAnalysis['memories'][number],
+  entries: NonNullable<ReturnType<ReturnType<typeof createEventMemoryResolver>>>['entries'],
+): boolean {
+  const quotes = entries.map(entry => entry.observation.quote);
+  return [candidate.detail, ...candidate.protectedFacts, ...(candidate.episode?.evidenceQuotes ?? [])]
+    .every(fragment => quotes.some(quote => quote.includes(fragment)));
+}
+
+/**
+ * Returns the first observation, in the given plan order, that supports a memory saved without a usable source.
+ * This is verbatim the predicate the memory read path used before commit recorded event sources: a legacy
+ * observation needs only the detail, while an event observation must also contain every protected fact and episode
+ * evidence quote, because the memory then depends on that single event. Returns undefined when none qualifies.
+ * Work is O(observations x fragments) literal comparisons, each bounded by the observation's quote length.
+ */
+function firstSupportingObservation(
+  observations: readonly Observation[],
+  candidate: import('./types.ts').SceneCharacterAnalysis['memories'][number],
+): Observation | undefined {
+  return observations.find(observation => observation.quote.includes(candidate.detail) && (
+    observation.channel !== 'event' || (
+      candidate.protectedFacts.every(fact => observation.quote.includes(fact))
+      && (candidate.episode?.evidenceQuotes ?? []).every(quote => observation.quote.includes(quote))
+    )));
+}
+
+/**
+ * Returns the first legacy message observation, in plan order, whose quote contains a memory detail.
+ * A memory that depends on an event records it at commit, so a memory read without an explicit source is
+ * supported only by legacy observations; for plans without event observations this is the former read predicate.
+ * Returns undefined when none qualifies. Work is O(observations) literal comparisons, each bounded by a quote.
+ */
+function firstLegacySupport(observations: readonly Observation[], detail: string): LegacyObservation | undefined {
+  return observations.find((observation): observation is LegacyObservation =>
+    observation.channel !== 'event' && observation.quote.includes(detail));
 }
 
 /** Read-only terminal-skip test; work is O(P + R + K) in this source's pending, ready and skipped entries. */
@@ -1109,7 +1330,12 @@ export class SceneAuthority {
             changed = true;
             removed++;
           }
-        this.lifecycle.redactUnsafeCheckpoints(scope, deletedSourceIds);
+        const erasure = this.lifecycle.redactUnsafeCheckpoints(scope, deletedSourceIds);
+        const erasedSourcesChanged = (erasure?.changedSourceRevisions?.size ?? 0) > 0;
+
+        if (erasedSourcesChanged) {
+          changed = true;
+        }
         if (changed) {
           const dependentChanges = this.invalidateDependents(scope);
           this.invalidateCausalSuffix(scope, [...causalChanges, ...dependentChanges]);
@@ -1117,7 +1343,7 @@ export class SceneAuthority {
           // Then the OpenHer snapshots, only when this call edited, reconfirmed, deleted or invalidated a source or re-queued
           // the opening: a call whose new sources all stay valid only adds pending sources, which change no snapshot.
           const openingRequeued = this.requeueOpening(scope);
-          if (causalChanges.length > 0 || dependentChanges.length > 0 || openingRequeued)
+          if (causalChanges.length > 0 || dependentChanges.length > 0 || erasedSourcesChanged || openingRequeued)
             this.rebuildEmotionStatesGuarded(scope);
           this.bump(scope);
           if (userActivityChanged)
@@ -1269,14 +1495,19 @@ export class SceneAuthority {
       const routes = eventPerception == null
         ? undefined : TavernPerception.prototype.memoryReaders.call(eventPerception, scope);
       // Index the full route once for the whole batch, rather than once for each source analysis.
-      const routedReaders = routes === undefined ? undefined : new Map(routes.map(route => [JSON.stringify([
-        route.source.turnId,
-        route.source.turnRevision,
-        route.source.eventId,
-        route.source.phase,
-        route.source.itemRef ?? null,
-        route.source.effectIndex ?? null,
-      ]), route]));
+      const routedReaders: EventReaderRoutes | undefined = routes === undefined ? undefined : {
+        readers: new Map(routes.map(route => [JSON.stringify([
+          route.source.turnId,
+          route.source.turnRevision,
+          route.source.eventId,
+          route.source.phase,
+          route.source.itemRef ?? null,
+          route.source.effectIndex ?? null,
+        ]), route])),
+        turns: new Set(routes.map(route => JSON.stringify([route.source.turnId, route.source.turnRevision]))),
+      };
+      const resolveMemoryEvents = createEventMemoryResolver(this.db, scope, routedReaders);
+      const memoryDependencies = new Map<string, Map<string, {id: string; revision: number}>>();
       const prepared = results.map(result => {
         const {id, revision, analysis} = result;
         const source = state.sources.find(item => item.id === id);
@@ -1287,9 +1518,67 @@ export class SceneAuthority {
         const plan = normalized.plan;
         const observations = plan.observations;
         // Every downstream validator consumes ledger-derived event facts; legacy entries pass through unchanged.
-        const currentObservations = currentEventObservations(this.db, scope, source, observations, routedReaders);
+        const {observations: currentObservations, hasEventObservations} = currentEventObservations(
+          this.db, scope, source, observations, routedReaders,
+        );
         if (currentObservations.length !== observations.length) throw new Error('invalid_scene_memory_source');
         normalized.plan = {...plan, observations: currentObservations};
+        // The first resolution records whether it rebuilt an event. A legacy-only plan skips conversion without
+        // reading candidate text or caller observation slots again; downstream work uses the resolved array.
+        for (const [characterId, character] of Object.entries(normalized.characters)) {
+          const referencedQuotes: string[] = [];
+          let hasExplicitSources = false;
+          // Plan order is kept, so the first supporting observation is the one the read path used to derive.
+          // Conversion costs O(memories x visible observations x fragments) literal comparisons per character: the
+          // predicate work every read used to repeat, now paid once here. Plan and memory counts are not capped.
+          const visible = hasEventObservations
+            ? currentObservations.filter(observation => observation.readers.includes(characterId))
+            : [];
+          character.memories = character.memories.map(candidate => {
+            let fields = candidate;
+            let resolved: ReturnType<typeof resolveMemoryEvents>;
+            let suppliedByCaller = false;
+
+            if (Object.hasOwn(candidate, 'source')) {
+              const {source: metadata, ...rest} = candidate;
+              fields = rest;
+              // An unusable caller reference throws here and rejects the commit; it never falls back to the plan.
+              resolved = resolveMemoryEvents(metadata, source, currentObservations, characterId);
+              suppliedByCaller = resolved !== undefined;
+            }
+
+            if (!resolved) {
+              // No caller reference: record the event the read path used to derive from the saved plan. The address
+              // is the authority's own ledger-resolved observation, never a caller value; a resolver error rolls back.
+              const first = firstSupportingObservation(visible, fields);
+
+              if (first?.channel === 'event') {
+                // Check and store one snapshot, so a caller getter cannot change the text after the check.
+                fields = {...fields};
+                resolved = resolveMemoryEvents({knowledge: first.ref}, source, currentObservations, characterId);
+              }
+            }
+
+            // Without event support the candidate keeps its exact stored shape, as legacy rows always have.
+            if (!resolved) return fields;
+            if (!eventMemoryTextMatches(fields, resolved.entries)) throw new Error('invalid_scene_memory_source');
+            // Only caller-supplied references restrict relationship evidence; converted quotes still count as cited.
+            if (suppliedByCaller) hasExplicitSources = true;
+            referencedQuotes.push(...resolved.entries.map(entry => entry.observation.quote));
+            const dependencies = memoryDependencies.get(source.id) ?? new Map();
+            for (const entry of resolved.entries) {
+              if (entry.source.id !== source.id) {
+                dependencies.set(JSON.stringify([entry.source.id, entry.source.revision]), entry.source);
+              }
+            }
+            memoryDependencies.set(source.id, dependencies);
+            return {...fields, source: resolved.knowledge};
+          });
+          if (hasExplicitSources && character.relationships?.some(relationship =>
+            relationship.evidenceQuotes.some(quote => !referencedQuotes.some(text => text.includes(quote))))) {
+            throw new Error('invalid_scene_memory_source');
+          }
+        }
         return {id, revision, analysis: normalized};
       });
       if (prepared.some(result => Object.values(result.analysis.characters)
@@ -1383,10 +1672,10 @@ export class SceneAuthority {
           }
           const quotes = result.analysis.plan.observations
             .filter(observation => observation.readers.includes(characterId)).map(observation => observation.quote);
-          if (analysis.memories.some(memory => !quotes.some(quote => quote.includes(memory.detail))
+          if (analysis.memories.some(memory => !memory.source && (!quotes.some(quote => quote.includes(memory.detail))
             || memory.protectedFacts.some(fact => !quotes.some(quote => quote.includes(fact)))
             || (memory.episode?.evidenceQuotes ?? []).some(evidence =>
-              !quotes.some(quote => quote.includes(evidence))))) {
+              !quotes.some(quote => quote.includes(evidence)))))) {
             throw new Error('invalid_scene_memory_source');
           }
           if (analysis.relationships !== undefined) {
@@ -1397,6 +1686,14 @@ export class SceneAuthority {
 
         this.migrateControls(scope, source, result.analysis);
         const dependencies = [...(source.dependencies ?? [])];
+        const dependencyKeys = new Set(dependencies.map(dependency =>
+          JSON.stringify([dependency.id, dependency.revision])));
+        for (const [identity, dependency] of memoryDependencies.get(source.id) ?? []) {
+          if (!dependencyKeys.has(identity)) {
+            dependencies.push(dependency);
+            dependencyKeys.add(identity);
+          }
+        }
         for (const observation of result.analysis.plan.observations) {
           for (const reference of observation.identityEvidence ?? []) {
             const origin = state.sources.find(item => item.id === reference.sourceId
@@ -1545,9 +1842,10 @@ export class SceneAuthority {
     // Each visible excerpt and each candidate cue is folded once per snapshot. Matching uses those cached strings.
     // Sources are visited once for the lookup; each memory matches only its cues and its own recorded entries.
     const foldedSources = new Map<number, string[]>();
+    const resolveMemoryEvents = createEventMemoryResolver(this.db, scope);
     const currentObservations = new Map(sources.map(source => [
       source,
-      currentEventObservations(this.db, scope, source, source.analysis!.plan?.observations ?? []),
+      currentEventObservations(this.db, scope, source, source.analysis!.plan?.observations ?? []).observations,
     ]));
     const records = new Map<string, Map<number, {
       weak: boolean;
@@ -1640,13 +1938,51 @@ export class SceneAuthority {
       if (!analysis)
         continue;
       for (const [index, candidate] of analysis.memories.entries()) {
-        const observation = observations.find(item => item.quote.includes(candidate.detail)
-          && (item.channel !== 'event' || (
-            candidate.protectedFacts.every(fact => item.quote.includes(fact))
-            && (candidate.episode?.evidenceQuotes ?? []).every(quote => item.quote.includes(quote))
-          )));
-        if (!observation)
-          continue;
+        let explicit: ReturnType<typeof resolveMemoryEvents>;
+        let memoryCandidate = candidate;
+        if (Object.hasOwn(candidate, 'source')) {
+          const {source: metadata, ...fields} = candidate;
+          memoryCandidate = fields;
+          // Read caller-owned getters before the stale-ledger guard, so their errors are never swallowed.
+          const knowledgeSet = metadata?.knowledgeSet;
+          const knowledge = knowledgeSet == null ? metadata?.knowledge : undefined;
+          try {
+            explicit = resolveMemoryEvents({knowledgeSet, knowledge}, source, observations, characterId);
+            if (explicit && !eventMemoryTextMatches(fields, explicit.entries)) continue;
+          } catch (error) {
+            if (error instanceof Error && (error.message === 'invalid_scene_memory_source'
+              || error.message === 'invalid_scene_memory_source_set_limit')) continue;
+            throw error;
+          }
+        }
+        // Commit records every event a memory depends on. A memory without an explicit source is read only through
+        // a legacy message observation; one that only event observations support stays stored but inert.
+        let knowledgeSource: Pick<Memory['source'], 'author' | 'knowledge' | 'knowledgeSet'>;
+        if (explicit) {
+          const [entry] = explicit.entries;
+          knowledgeSource = explicit.entries.length > 1 ? explicit.knowledge : {
+            author: {role: entry.authorRole, actorId: entry.observation.actorId},
+            ...explicit.knowledge,
+          };
+        } else {
+          const observation = firstLegacySupport(observations, candidate.detail);
+          if (!observation)
+            continue;
+          knowledgeSource = {
+            author: {
+              role: source.role,
+              actorId: source.role === 'user' ? 'player' : source.automatic ? 'narrator' : source.speakerId!,
+            },
+            knowledge: {
+              kind: observation.kind,
+              ...(source.role === 'user' && source.envelope.mode === 'direct'
+                ? {actorId: 'player'} : observation.actorId ? {actorId: observation.actorId} : {}),
+              observationId: observation.id,
+              start: observation.start,
+              end: observation.end,
+            },
+          };
+        }
         const id = `${source.id}:${characterId}#${index}`;
         const controlId = memoryControlId(source.id, characterId, candidate);
         const control = controls.find(control => control.id === controlId && control.revision === 0) ??
@@ -1711,7 +2047,7 @@ export class SceneAuthority {
         memories.set(
           id,
           {
-            ...candidate,
+            ...memoryCandidate,
             id,
             scope: roleScope,
             status: 'accepted',
@@ -1728,30 +2064,7 @@ export class SceneAuthority {
               revision: source.revision,
               occurredAtMs: source.acceptedAtMs,
               knownAtMs: Math.max(source.acceptedAtMs, source.observedAtMs),
-              author: {
-                role: source.role,
-                actorId: observation.channel === 'event' ? observation.actorId
-                  : source.role === 'user' ? 'player' : source.automatic ? 'narrator' : source.speakerId!,
-              },
-              knowledge: observation.channel === 'event' ? {
-                kind: observation.kind,
-                actorId: observation.actorId,
-                observationId: observation.id,
-                channel: 'event',
-                turnId: observation.ref.turnId,
-                turnRevision: observation.ref.turnRevision,
-                eventId: observation.ref.eventId,
-                phase: observation.ref.phase,
-                ...(observation.ref.itemRef == null ? {} : {itemRef: observation.ref.itemRef}),
-                ...(observation.ref.effectIndex == null ? {} : {effectIndex: observation.ref.effectIndex}),
-              } : {
-                kind: observation.kind,
-                ...(source.role === 'user' && source.envelope.mode === 'direct'
-                  ? {actorId: 'player'} : observation.actorId ? {actorId: observation.actorId} : {}),
-                observationId: observation.id,
-                start: observation.start,
-                end: observation.end,
-              },
+              ...knowledgeSource,
             },
           }
         );

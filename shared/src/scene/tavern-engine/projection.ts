@@ -33,11 +33,15 @@ export interface TavernPresenceSeed {
   positions?: readonly { entityId: string; position: GeographyPosition }[] | null;
 }
 
-/** A unique existing item's holder; null means unknown, never an inferred owner or a counted asset balance. */
+/** Unique-item state; null holder means unknown or, with consumed=true, a sourced consumption tombstone. */
 export interface TavernProjectedPossession {
   itemId: string;
   holderId: string | null;
   basis: TavernProjectionBasis;
+  /** True is a consumed tombstone with a null holder; null/omission means not consumed. */
+  consumed?: boolean | null;
+  /** Optional locally sourced visibility restriction; null/omission adds no restriction. */
+  readers?: readonly string[] | null;
 }
 
 /** One sourced location using the existing geography union; unknown and transit do not imply presence. */
@@ -182,6 +186,354 @@ function normalizePosition(position: GeographyPosition, places: ReadonlySet<stri
   return result;
 }
 
+
+interface ProjectionState {
+  world: TavernWorldSnapshot;
+  entities: ReadonlySet<string>;
+  places: ReadonlySet<string>;
+  present: Set<string>;
+  positions: Map<string, TavernProjectedPosition>;
+  possessions: Map<string, TavernProjectedPossession>;
+  holders: ReadonlySet<string>;
+}
+
+// A holder graph has at most one outgoing edge per unique item. Each node is visited once, O(items).
+function requireAcyclicPossessions(
+  possessions: ReadonlyMap<string, TavernProjectedPossession>,
+  terminals: ReadonlySet<string>,
+): void {
+  const complete = new Set<string>();
+  for (const itemId of possessions.keys()) {
+    const visiting = new Set<string>();
+    let current: string | null = itemId;
+    while (current !== null && possessions.has(current) && !complete.has(current)) {
+      if (visiting.has(current)) throw new Error('projection_container_cycle');
+      visiting.add(current);
+      current = possessions.get(current)!.holderId;
+      // Existing catalogs permit the same spelling for actor/item IDs; actors and places are terminal holders.
+      if (current !== null && terminals.has(current)) break;
+    }
+    for (const visited of visiting) complete.add(visited);
+  }
+}
+
+function readable(item: TavernProjectedPossession, actorId: string): boolean {
+  return item.readers == null || item.readers.includes(actorId);
+}
+
+function requireItemControl(state: ProjectionState, item: TavernProjectedPossession, actorId: string): void {
+  requireMember(actorId, state.entities);
+  let current = item;
+  const visited = new Set<string>();
+  while (true) {
+    requireScope(current.basis.scope, state.world.scope);
+    if (current.consumed === true) throw new Error('projection_item_consumed');
+    if (!readable(current, actorId)) throw new Error('projection_item_not_visible');
+    if (visited.has(current.itemId)) throw new Error('projection_container_cycle');
+    visited.add(current.itemId);
+    const holderId = current.holderId;
+    if (holderId === actorId) return;
+    if (holderId !== null && state.places.has(holderId)) {
+      const position = state.positions.get(actorId)?.position;
+      if (state.present.has(actorId) && position != null
+        && (position.state === 'at' || position.state === 'within') && position.placeId === holderId) return;
+      throw new Error('projection_actor_not_allowed');
+    }
+    if (holderId !== null && state.entities.has(holderId)) throw new Error('projection_actor_not_allowed');
+    const container = holderId === null ? undefined : state.possessions.get(holderId);
+    if (container == null) throw new Error('projection_actor_not_allowed');
+    current = container;
+  }
+}
+
+function applyWorldPayload(state: ProjectionState, payload: EventPayload, basis: TavernProjectionBasis): void {
+  const { world, entities, places, present, positions, possessions, holders } = state;
+  requireScope(basis.scope, world.scope);
+  if (payload.kind === 'Enter' || payload.kind === 'Exit') {
+    requireMember(payload.entityId, entities);
+    requireMember(payload.placeId, places);
+    const previous = positions.get(payload.entityId)?.position;
+    // Arrivals set destinations; departures must match the location being left.
+    if (payload.kind === 'Exit' && previous && (previous.state === 'at' || previous.state === 'within')
+      && previous.placeId !== payload.placeId) throw new Error('projection_location_mismatch');
+    if (payload.kind === 'Enter') {
+      present.add(payload.entityId);
+      positions.set(payload.entityId, {
+        entityId: payload.entityId,
+        position: { state: 'at', placeId: payload.placeId },
+        basis,
+      });
+    } else {
+      if (!present.has(payload.entityId)) throw new Error('projection_absent_entity');
+      present.delete(payload.entityId);
+      positions.set(payload.entityId, { entityId: payload.entityId, position: { state: 'unknown' }, basis });
+    }
+    world.presenceKnown = true;
+    return;
+  }
+  if (payload.kind !== 'Transfer' && payload.kind !== 'ConsumeItem') return;
+  const item = possessions.get(payload.itemId);
+  if (item == null) throw new Error('projection_holder_mismatch');
+  if (item.consumed === true) throw new Error('projection_item_consumed');
+  if (payload.kind === 'Transfer' && item.holderId !== payload.fromId) {
+    throw new Error('projection_holder_mismatch');
+  }
+  requireItemControl(state, item, payload.actorId);
+  if (payload.kind === 'ConsumeItem') {
+    possessions.set(payload.itemId, { ...item, holderId: null, consumed: true, basis });
+    return;
+  }
+  requireMember(payload.toId, holders);
+  const actorPosition = positions.get(payload.actorId)?.position;
+  const actorPlaceId = present.has(payload.actorId) && actorPosition != null
+    && (actorPosition.state === 'at' || actorPosition.state === 'within')
+    ? actorPosition.placeId : null;
+  let destination: string | null = payload.toId;
+  // A move can create a cycle only on the new destination's ancestor chain, O(container depth).
+  while (destination !== null) {
+    if (entities.has(destination)) {
+      const recipientPosition = positions.get(destination)?.position;
+      if (actorPlaceId === null || !present.has(destination) || recipientPosition == null
+        || (recipientPosition.state !== 'at' && recipientPosition.state !== 'within')
+        || recipientPosition.placeId !== actorPlaceId) {
+        throw new Error('projection_destination_not_accessible');
+      }
+      break;
+    }
+    if (places.has(destination)) {
+      if (actorPlaceId !== destination) throw new Error('projection_destination_not_accessible');
+      break;
+    }
+    if (destination === payload.itemId) throw new Error('projection_container_cycle');
+    const container = possessions.get(destination);
+    if (container == null) break;
+    requireScope(container.basis.scope, world.scope);
+    if (container.consumed === true) throw new Error('projection_item_consumed');
+    if (!readable(container, payload.actorId)) throw new Error('projection_item_not_visible');
+    destination = container.holderId;
+  }
+  // A known container with an unknown ultimate holder does not establish physical reachability.
+  if (destination === null) throw new Error('projection_destination_not_accessible');
+  possessions.set(payload.itemId, { ...item, holderId: payload.toId, basis });
+}
+
+function projectionState(world: TavernWorldSnapshot): ProjectionState {
+  const entities = new Set(world.entityIds);
+  const places = new Set(world.placeIds);
+  const possessions = new Map<string, TavernProjectedPossession>();
+  for (const entry of world.possessions) {
+    if (possessions.has(entry.itemId)) throw new Error('projection_duplicate_item');
+    requireScope(entry.basis.scope, world.scope);
+    if (entry.consumed != null && typeof entry.consumed !== 'boolean') {
+      throw new TypeError('invalid_projection_consumed');
+    }
+    if (entry.consumed === true && entry.holderId !== null) throw new Error('projection_consumed_holder');
+    if (entry.readers != null && !Array.isArray(entry.readers)) throw new TypeError('invalid_projection_readers');
+    for (const reader of entry.readers ?? []) requireMember(reader, entities);
+    possessions.set(entry.itemId, entry);
+  }
+  return {
+    world,
+    entities,
+    places,
+    present: new Set(world.presentIds),
+    positions: new Map(world.positions.map(entry => [entry.entityId, entry])),
+    possessions,
+    holders: new Set([...entities, ...places, ...possessions.keys()]),
+  };
+}
+
+/**
+ * Detaches only ownership inputs, reading each needed caller field once; live Proxy arrays are supported.
+ * Scope, presence, location and possession data are retained. Replay history and source metadata are not read.
+ * Work/memory are O(catalog + positions + possessions + reader entries), with no chat-length limit.
+ * Getter failures propagate unchanged; this helper performs no authority writes or full-world clone.
+ */
+export function snapshotTavernPossessionWorld(world: TavernWorldSnapshot): TavernWorldSnapshot {
+  const scopes = new Map<Scope, Scope>();
+  const basisScopes = new Map<TavernProjectionBasis, Scope>();
+  const readerLists = new Map<readonly string[], readonly string[]>();
+  const positionValues = new Map<GeographyPosition, GeographyPosition>();
+
+  function snapshotScope(value: Scope): Scope {
+    let snapshot = scopes.get(value);
+    if (snapshot === undefined) {
+      const { worldId, sessionId, branchId, characterId } = value;
+      snapshot = { worldId, sessionId, branchId, characterId };
+      scopes.set(value, snapshot);
+    }
+    return snapshot;
+  }
+
+  const scope = snapshotScope(world.scope);
+  const entityIds = [...world.entityIds];
+  const placeIds = [...world.placeIds];
+  const presentIds = [...world.presentIds];
+  const positions = world.positions.map(entry => {
+    const { entityId, position } = entry;
+    let snapshot = positionValues.get(position);
+    if (snapshot === undefined) {
+      const positionState = position.state;
+      const positionSnapshot: GeographyPosition = positionState === 'at' || positionState === 'within'
+        ? { state: positionState, placeId: position.placeId }
+        : { state: positionState };
+      positionValues.set(position, positionSnapshot);
+      snapshot = positionSnapshot;
+    }
+    return {
+      entityId,
+      position: snapshot,
+      basis: { kind: 'existing' as const, scope, sourceId: 'ownership-check', sourceRevision: 1 },
+    };
+  });
+  const possessions = world.possessions.map(entry => {
+    const { itemId, holderId, basis, consumed, readers } = entry;
+    let itemScope = basisScopes.get(basis);
+    if (itemScope === undefined) {
+      itemScope = snapshotScope(basis.scope);
+      basisScopes.set(basis, itemScope);
+    }
+    let readerSnapshot: readonly string[] | undefined;
+    if (readers != null) {
+      if (!Array.isArray(readers)) throw new TypeError('invalid_projection_readers');
+      readerSnapshot = readerLists.get(readers);
+      if (readerSnapshot === undefined) {
+        readerSnapshot = [...readers];
+        readerLists.set(readers, readerSnapshot);
+      }
+    }
+    return {
+      itemId,
+      holderId,
+      basis: { kind: 'existing' as const, scope: itemScope, sourceId: 'ownership-check', sourceRevision: 1 },
+      ...(consumed == null ? {} : { consumed }),
+      ...(readerSnapshot === undefined ? {} : { readers: readerSnapshot }),
+    };
+  });
+
+  // Presence provenance and replay fingerprints do not participate in an ownership precheck.
+  return {
+    scope,
+    entityIds,
+    placeIds,
+    presenceKnown: true,
+    presenceSeeds: [],
+    presentIds,
+    positions,
+    possessions,
+    applied: [],
+  };
+}
+
+/**
+ * Checks one decoded ownership effect against the exact sourced snapshot without writes.
+ * Null means valid; failures return a content-free projection reason. Getter/payload-clone failures propagate.
+ * O(ownership input bytes + container depth); no source-text scan or chat-length limit is introduced.
+ */
+export function checkTavernPossessionEffect(world: TavernWorldSnapshot, payload: EventPayload): string | null {
+  const copied = { world: snapshotTavernPossessionWorld(world), payload: structuredClone(payload) };
+  const state = projectionState(copied.world);
+  requireAcyclicPossessions(state.possessions, new Set([...state.entities, ...state.places]));
+  try {
+    applyWorldPayload(state, copied.payload, {
+      kind: 'existing',
+      scope: copied.world.scope,
+      sourceId: 'ownership-check',
+      sourceRevision: 1,
+    });
+    return null;
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.startsWith('projection_')) throw error;
+    return error.message;
+  }
+}
+
+/** Local checkBeat result, using original item/effect indices and content-free reasons; no renderable text. */
+export type TavernPossessionBeatCheck =
+  | { kind: 'valid' }
+  | { kind: 'invalid_actions'; actions: readonly { itemRef: number; reason: string }[] }
+  | {
+    kind: 'invalid_effects';
+    effects: readonly { effectIndex: number; reason: string }[];
+    actions: readonly { itemRef: number; reason: string }[];
+  };
+
+/** Already validated engine exclusions, using original zero-based indices and content-free reason codes. */
+export interface TavernPossessionExclusions {
+  actions: readonly { itemRef: number; reason: string }[];
+  effects: readonly { effectIndex: number; reason: string }[];
+}
+
+/**
+ * Checks a decoded beat in item/phase order, including dependencies lost when an action is excluded.
+ * Null exclusions mean none; supplied exclusions must already be validated against this beat.
+ * The existing engine owns the single retry and Unknown diagnostics. No prompts or model calls occur.
+ * At most six items/effects enter from the codec: O(snapshot bytes * 7 + 42 * container depth).
+ * Scope/clone errors propagate. Invalid effects return their original indices without private state values.
+ */
+export function checkTavernPossessionBeat(
+  world: TavernWorldSnapshot,
+  beat: DecodedBeat,
+  excluded: TavernPossessionExclusions | null = null,
+): TavernPossessionBeatCheck {
+  const input = { world: snapshotTavernPossessionWorld(world), beat: structuredClone(beat) };
+  requireScope(input.beat.origin.scope, input.world.scope);
+  const actions = new Map((excluded?.actions ?? []).map(entry => [entry.itemRef, entry.reason]));
+  const effects = new Map((excluded?.effects ?? []).map(entry => [entry.effectIndex, entry.reason]));
+  // Unknown invalidates its action before any earlier link can supply a prerequisite to another item.
+  // Engine exclusions also include non-ownership checks; each pass must start from the same removed set.
+  for (const link of input.beat.effects) {
+    if (link.effect.kind !== 'Unknown') continue;
+    const item = input.beat.items.find(entry => entry.itemIndex === link.itemRef);
+    if (item?.kind === 'action') {
+      if (!actions.has(link.itemRef)) actions.set(link.itemRef, link.effect.reason);
+    } else {
+      effects.set(link.effectIndex, link.effect.reason);
+    }
+  }
+  let changed: boolean;
+  do {
+    changed = false;
+    const state = projectionState(structuredClone(input.world));
+    requireAcyclicPossessions(state.possessions, new Set([...state.entities, ...state.places]));
+    const selected = projectBeatItems(input.beat, input.beat.items
+      .filter(item => !actions.has(item.itemIndex)).map(item => item.itemIndex));
+    if (!selected.ok) throw new Error(selected.reason);
+    for (const entry of selected.value) {
+      for (const link of [...entry.beforeItem, ...entry.afterItem]) {
+        if (effects.has(link.effectIndex)) continue;
+        try {
+          if (link.effect.actorId !== input.beat.actorId) throw new Error('projection_actor_not_allowed');
+          applyWorldPayload(state, link.effect, {
+            kind: 'event',
+            scope: input.beat.origin.scope,
+            sourceId: input.beat.origin.sourceId,
+            sourceRevision: input.beat.origin.sourceRevision,
+          });
+        } catch (error) {
+          if (!(error instanceof Error) || !error.message.startsWith('projection_')) throw error;
+          effects.set(link.effectIndex, error.message);
+          if (entry.item.kind === 'action' && !actions.has(entry.item.itemIndex)) {
+            actions.set(entry.item.itemIndex, error.message);
+            changed = true;
+          }
+        }
+      }
+    }
+  } while (changed);
+  if (effects.size === 0) {
+    return actions.size === 0 ? { kind: 'valid' } : {
+      kind: 'invalid_actions',
+      actions: [...actions].map(([itemRef, reason]) => ({ itemRef, reason })),
+    };
+  }
+  return {
+    kind: 'invalid_effects',
+    effects: [...effects].map(([effectIndex, reason]) => ({ effectIndex, reason })),
+    actions: [...actions].map(([itemRef, reason]) => ({ itemRef, reason })),
+  };
+}
+
 /**
  * Builds a detached baseline from locally verified sources in O(catalog + seed + possession bytes).
  * Existing presence, including an explicitly empty set, takes precedence over all opening settings.
@@ -246,16 +598,32 @@ export function bootstrapTavernWorld(input: TavernWorldBootstrap): TavernWorldSn
   }
 
   for (const entry of copied.possessions ?? []) {
+    // Counted inventory belongs to the ledger and never acquires a second unique-item authority.
+    if (Object.hasOwn(entry, 'count')) continue;
     requireIdentity(entry.itemId);
     const basis = normalizeBasis(entry.basis, copied.scope);
     if (possessions.has(entry.itemId)) throw new Error('projection_duplicate_item');
     // Holders may be actors, places, or another catalogued unique item; null remains unknown.
-    possessions.set(entry.itemId, { itemId: entry.itemId, holderId: entry.holderId, basis });
+    if (entry.consumed != null && typeof entry.consumed !== 'boolean') {
+      throw new TypeError('invalid_projection_consumed');
+    }
+    if (entry.consumed === true && entry.holderId !== null) throw new Error('projection_consumed_holder');
+    if (entry.readers != null && !Array.isArray(entry.readers)) throw new TypeError('invalid_projection_readers');
+    for (const reader of entry.readers ?? []) requireMember(reader, entities);
+    possessions.set(entry.itemId, {
+      itemId: entry.itemId,
+      holderId: entry.holderId,
+      basis,
+      ...(entry.consumed == null ? {} : { consumed: entry.consumed }),
+      ...(entry.readers == null ? {} : { readers: [...new Set(entry.readers)] }),
+    });
   }
   const holders = new Set([...entities, ...places, ...possessions.keys()]);
   for (const entry of possessions.values()) {
     if (entry.holderId !== null) requireMember(entry.holderId, holders);
   }
+
+  requireAcyclicPossessions(possessions, new Set([...entities, ...places]));
 
   return {
     scope: copied.scope,
@@ -273,7 +641,7 @@ export function bootstrapTavernWorld(input: TavernWorldBootstrap): TavernWorldSn
 /**
  * Folds ordered, already locally validated ledger/emission/correction records into an isolated overlay.
  * Supply the event suffix after the baseline; continuing from a returned snapshot retains replay identities.
- * Work is O(input bytes + events + items + effects + output snapshot bytes); there is no chat-wide cap.
+ * Work is O(input/output bytes + events + items + effects * container depth); there is no chat-wide cap.
  * No text, model, director switch, database, clock or callback is consulted. Non-position components remain
  * owned by their existing consumers. Invalid provenance, replay conflicts or state preconditions throw;
  * the baseline and all inputs remain unchanged, including when getters throw during the initial copy.
@@ -285,12 +653,9 @@ export function projectTavernWorld(
   const world = structuredClone(baseline);
   const copiedSteps = structuredClone(steps);
   scopeIdentity(world.scope);
-  const entities = new Set(world.entityIds);
-  const places = new Set(world.placeIds);
-  const present = new Set(world.presentIds);
-  const positions = new Map(world.positions.map(entry => [entry.entityId, entry]));
-  const possessions = new Map(world.possessions.map(entry => [entry.itemId, entry]));
-  const holders = new Set([...entities, ...places, ...possessions.keys()]);
+  const state = projectionState(world);
+  const { entities, places, present, positions, possessions } = state;
+  requireAcyclicPossessions(possessions, new Set([...entities, ...places]));
   const applied = new Map(world.applied.map(entry => [entry.key, entry.fingerprint]));
   const phases: TavernProjectionPhase[] = [];
 
@@ -352,34 +717,7 @@ export function projectTavernWorld(
   }
 
   function applyPayload(payload: EventPayload, basis: TavernProjectionBasis): void {
-    if (payload.kind === 'Enter' || payload.kind === 'Exit') {
-      requireMember(payload.entityId, entities);
-      requireMember(payload.placeId, places);
-      const previous = positions.get(payload.entityId)?.position;
-      // An accepted arrival sets its destination; only a departure must match the location it leaves.
-      if (payload.kind === 'Exit' && previous && (previous.state === 'at' || previous.state === 'within')
-        && previous.placeId !== payload.placeId) {
-        throw new Error('projection_location_mismatch');
-      }
-      if (payload.kind === 'Enter') {
-        present.add(payload.entityId);
-        positions.set(payload.entityId, {
-          entityId: payload.entityId,
-          position: { state: 'at', placeId: payload.placeId },
-          basis,
-        });
-      } else {
-        if (!present.has(payload.entityId)) throw new Error('projection_absent_entity');
-        present.delete(payload.entityId);
-        positions.set(payload.entityId, { entityId: payload.entityId, position: { state: 'unknown' }, basis });
-      }
-      world.presenceKnown = true;
-    } else if (payload.kind === 'Transfer') {
-      const item = possessions.get(payload.itemId);
-      if (!item || item.holderId !== payload.fromId) throw new Error('projection_holder_mismatch');
-      requireMember(payload.toId, holders);
-      possessions.set(payload.itemId, { itemId: payload.itemId, holderId: payload.toId, basis });
-    }
+    applyWorldPayload(state, payload, basis);
   }
 
   function applyBeat(beat: DecodedBeat, emittedItemRefs: readonly number[]): void {
@@ -530,6 +868,8 @@ export function projectTavernActorWorld(
         : { state: 'unknown' }));
     } else if (content.kind === 'Transfer') {
       knownHolders.add(key(event.source, content.itemId, content.toId));
+    } else if (content.kind === 'ConsumeItem') {
+      knownHolders.add(key(event.source, content.itemId, null));
     }
   }
 
@@ -547,6 +887,7 @@ export function projectTavernActorWorld(
     }),
     possessions: world.possessions.filter(entry => {
       sourced(entry.basis);
+      if (!readable(entry, view.actorId)) return false;
       if (entry.basis.kind !== 'event') return entry.holderId === view.actorId;
       return entry.basis.event != null
         && knownHolders.has(key(entry.basis.event, entry.itemId, entry.holderId));
