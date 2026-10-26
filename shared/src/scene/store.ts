@@ -13,7 +13,7 @@ import type {EmotionRelationInput} from '../emotion/openher.ts';
 import type {OmittedEmotionJump} from '../emotion/clock.ts';
 import {createEmotionEngineKey, emotionEngineRuleOf, recognizesEmotionSnapshot} from '../emotion/engine.ts';
 import type {EmotionEngineKey, EmotionEngineRule} from '../emotion/engine.ts';
-import { CURRENT_STORE_FORMAT, STORE_WRITER_VERSION, stampStoreFormat } from '../core/store-format.ts';
+import { APPRAISAL_STORE_FORMAT, STORE_WRITER_VERSION, stampStoreFormat } from '../core/store-format.ts';
 import {limitWorldBlock,worldBlockOmissionLines} from './world-block-limit.ts';
 import type {WorldBlockOmissions,WorldBlockCoordinate,WorldBlockLink} from './world-block-limit.ts';
 import type { DatabaseSync } from 'node:sqlite';
@@ -677,6 +677,9 @@ function replaceObjectMember(objectText: string, members: readonly string[], bod
   return spliceObjectMember(objectText, offset, offset, insertion);
 }
 
+/** Approved user-visible checkpoint reason for explicitly removing a card identity grant. */
+const CARD_CHARACTER_CLEAR_REASON = '取消角色卡本人标记';
+
 /** World sources and all NPC projections share the existing SQLite transaction. */
 export class SceneAuthority {
   private db: DatabaseSync;
@@ -1045,13 +1048,52 @@ export class SceneAuthority {
   /** Needed after interaction inheritance, which occurs after lifecycle fork materialization. */
   refreshDerived(scope:SceneScope,nowMs=Date.now()):void {this.transaction(()=>this.rebuildDerived(scope,nowMs));}
 
-  /** Saves a roster atomically; accepted emotion records replay locally under changed settings or identity. */
+  /**
+   * Saves a roster atomically; now is Unix milliseconds and caller card flags are ignored.
+   * Returns version, retained roster and processing status. Validation and beforeWrite errors propagate before writes.
+   */
   configure(
     scope: SceneScope,
     roster: SceneRoster,
     now = Date.now(),
     captureCheckpoint = true,
     beforeWrite?: (state: SceneState, roster: SceneRoster) => void,
+  ) {
+    return this.configureRoster(scope, roster, now, captureCheckpoint, beforeWrite);
+  }
+
+  /**
+   * Commits reverified extraction profiles and an optional card identity id in one transaction.
+   * Returns version, retained roster and processing status, using the current Unix time in milliseconds.
+   * Without an id this is exactly configure. Invalid grants throw invalid_scene_card_character before any write.
+   */
+  applyIdentityExtraction(scope: SceneScope, roster: SceneRoster, cardCharacterId?: string) {
+    return this.configureRoster(scope, roster, Date.now(), true, undefined,
+      cardCharacterId === undefined ? undefined : {grant: cardCharacterId});
+  }
+
+  /**
+   * Clears the scope's sole card flag and records refusal without deleting its identity or experiences.
+   * now is Unix milliseconds. Returns version and roster; a nonmatching id throws invalid_scene_card_character.
+   */
+  clearCardCharacter(scope: SceneScope, characterId: string, now = Date.now()) {
+    return this.transaction(() => {
+      const state = this.state(scope);
+      const flagged = state.roster.characters.filter(character =>
+        Object.hasOwn(character, 'cardCharacter') && character.cardCharacter === true);
+      if (flagged.length !== 1 || flagged[0]!.id !== characterId) throw new Error('invalid_scene_card_character');
+      const result = this.configureRoster(scope, state.roster, now, true, undefined, {clear: characterId});
+      return {version: result.version, roster: result.roster};
+    });
+  }
+
+  private configureRoster(
+    scope: SceneScope,
+    roster: SceneRoster,
+    now: number,
+    captureCheckpoint: boolean,
+    beforeWrite?: (state: SceneState, roster: SceneRoster) => void,
+    cardChange?: {grant: string} | {clear: string},
   ) {
     return this.transaction(() => {
       const state = this.state(scope);
@@ -1075,9 +1117,33 @@ export class SceneAuthority {
       const characters = roster.characters.map(character => retainReserved(
         character,
         storedCharacters.get(character.id),
-        ['calibration', 'emotionProvenance'],
+        ['calibration', 'emotionProvenance', 'cardCharacter'],
       ));
-      roster = retainReserved({...roster, characters}, state.roster, ['emotionControls']);
+      roster = retainReserved({...roster, characters}, state.roster, ['emotionControls', 'cardCharacterDeclined']);
+      if (cardChange && 'grant' in cardChange) {
+        if (state.roster.cardCharacterDeclined === true
+          || !roster.characters.some(character => character.id === cardChange.grant)
+          || state.roster.characters.some(character =>
+            character.cardCharacter === true && character.id !== cardChange.grant)) {
+          throw new Error('invalid_scene_card_character');
+        }
+        roster = {...roster, characters: roster.characters.map(character =>
+          character.id === cardChange.grant ? {...character, cardCharacter: true} : character)};
+      } else if (cardChange && 'clear' in cardChange) {
+        roster = {
+          ...roster,
+          characters: roster.characters.map(character => {
+            if (character.id !== cardChange.clear) return character;
+            const {cardCharacter: _cardCharacter, ...retained} = character;
+            return retained;
+          }),
+          cardCharacterDeclined: true,
+        };
+      }
+      if (roster.characters.filter(character =>
+        Object.hasOwn(character, 'cardCharacter') && character.cardCharacter === true).length > 1) {
+        throw new Error('invalid_scene_card_character');
+      }
       if (state.version && JSON.stringify(state.roster) === JSON.stringify(roster)) {
         return {
           version: state.version,
@@ -1105,7 +1171,10 @@ export class SceneAuthority {
       // The guard observes the validated pre-write state before checkpoints or cache invalidation.
       beforeWrite?.(state, roster);
 
-      if (state.version && captureCheckpoint) this.lifecycle.checkpoint(scope, '角色配置变更', {automatic: true});
+      if (state.version && captureCheckpoint) {
+        const reason = cardChange && 'clear' in cardChange ? CARD_CHARACTER_CLEAR_REASON : '角色配置变更';
+        this.lifecycle.checkpoint(scope, reason, {automatic: true});
+      }
       if (state.version) this.processing.clearScope(scope);
       this.db.prepare('INSERT INTO scene_worlds VALUES(?,?,?,1,?) '
         + 'ON CONFLICT(key) DO UPDATE SET roster=excluded.roster,version=scene_worlds.version+1')
@@ -1462,7 +1531,7 @@ export class SceneAuthority {
       const relationships=validateRelationships(result.relationships,
         relationshipValidationContext(source,source.analysis.plan,state.roster,characterId));
       if (Object.hasOwn(result.emotion, 'appraisalRule')) {
-        stampStoreFormat(this.db, CURRENT_STORE_FORMAT, STORE_WRITER_VERSION);
+        stampStoreFormat(this.db, APPRAISAL_STORE_FORMAT, STORE_WRITER_VERSION);
       }
       const prior=source.analysis.characters[characterId]!;
       const counterpartId = selectEmotionCounterpart(
@@ -1583,7 +1652,7 @@ export class SceneAuthority {
       });
       if (prepared.some(result => Object.values(result.analysis.characters)
         .some(analysis => analysis.emotion && Object.hasOwn(analysis.emotion, 'appraisalRule')))) {
-        stampStoreFormat(this.db, CURRENT_STORE_FORMAT, STORE_WRITER_VERSION);
+        stampStoreFormat(this.db, APPRAISAL_STORE_FORMAT, STORE_WRITER_VERSION);
       }
 
       const settings = this.worldSettings(scope);

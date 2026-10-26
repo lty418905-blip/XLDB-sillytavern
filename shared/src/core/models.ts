@@ -24,6 +24,12 @@ import { buildWorldExtractionPrompts, decodeWorldExtraction } from '../scene/wor
 import { recordModelDispatch,recordModelResponse,recordModelUsage,traceModel,withModelAddress } from './runtime-log.ts';
 import { activePairCapture, capturingRunner } from './pair-capture.ts';
 
+const CARD_CHARACTER_VIEWS_PROMPT = "characters中带cardCharacter:true的角色是这个一对一聊天的角色卡本人，默认与玩家在同一处：玩家以正常音量说的话和公开的外在动作都给它（public=true），不需要正文写出它的名字；只有当前正文或history的连续场景写明它已离开、不在、睡着、听不见，或玩家只对别人耳语、背着它时才不给。其他角色仍按上面的在场依据处理。玩家没写主语、而上文也没有可承接主语的外在动作和外在状态，是玩家本人做的，by标\"player\"；上一句主语是某个NPC时，省略主语的后续句仍是那个NPC做的；纯环境与场景描写（天气、光线、物件、声响）不是玩家的动作，by为null；玩家的内心活动仍不是外在动作。";
+
+const CARD_CHARACTER_COMPACT_PROMPT = "present为null时，characters中带cardCharacter:true的角色默认与玩家同处在场，无论作为actor还是recipients都不需要姓名依据，identityRefs可以不包含它的姓名。当前自动生成的assistant正文里，没有写明说话或行动的人、而上下文（包括前一句的主语）也指不出别人时，就是这个角色说的或做的；前一句主语是别的NPC或“你”时，省略主语的句子仍归那个人；环境描写归为这个角色observed到的场景，不是它的行动。";
+
+const CARD_CHARACTER_IDENTITY_RETRY = "上份候选被本地身份校验拒绝：invalid_scene_identity。请逐项核对identityRefs引用的原文。present为null时，原文必须出现actor及recipients的姓名/别名；带cardCharacter:true的角色例外，不需要姓名依据。present非null时：heard或observed的读者是present全体时无需姓名；排除了present中某人时，要么每个读者都有姓名依据（knownSpeaker回复的听者或观察者姓名放在audienceQuote），要么identityRefs引用写明每个被排除者排除理由的原文。耳语、低声、只对某人说、背着某人等限制情况，不得为通过校验而把被排除者补回读者；只有不属于限制情况而被漏掉的在场NPC才按在场默认补回。private、内心与推测仍须actor及recipients都有姓名依据，带cardCharacter:true的角色同样例外。仅有“她/他”的sourceRef不是姓名依据；请引用本条连续场景中实际包含姓名的前文ref（例如s0有甲姓名、s1只有她，s1应引用s0）。不得改变正文或角色名单；present为null时不得扩大读者，present非null时读者不得超出present；只修正有实际原文支持的身份引用，既无姓名依据也无排除理由可引的项目标unresolved。返回完整JSON。";
+
 export type Prompt = { role: 'system' | 'user' | 'assistant'; content: string };
 export type ModelRunner = (config: ModelConfig, prompts: Prompt[], json: boolean) => Promise<string>;
 
@@ -219,7 +225,9 @@ public表示玩家也能感知这段经历。玩家亲自对NPC说的话，即�
 by为views里用到的每个ref标明这个片段是谁说出或做出的，每个ref一项：玩家本人的台词、外在动作和外在状态为"player"；用户替在场NPC写的台词、动作和内心为该NPC的c key；叙述玩家看见或听见别人说话做事时（例如我看见乙推开门、我听见乙说快走），算说话做事的那个人；环境与场景叙述、不在characters里的人、几人一起说出或做出、一个片段里有不同人的话，或无法确定时为null。用户正文里NPC说的话不是玩家说的，即使其中有“我”“你”。玩家对别人转述的话为"player"，NPC转述玩家的话为该NPC。玩家的内心独白不是台词或可见动作，不给任何NPC。by只标说话做事的人，不改变views的分配、public和合并规则。
 当前正文明确的地点、时间、物品和在场情况也是必要内容，不能只抽台词。所有确定处于连续同场景的观察者都可以获得同一公开环境片段。只向某人耳语仅该听者得知；后来入场的人不能得知此前内容。被提到姓名不等于听到话。
 每项refs只能引用fragments中的连续ref，按原文顺序排列，勿抄写正文。同一个NPC的各项不可重叠；相同种类和可见范围的相邻片段可合成一项，不得跨过隐藏内容。每人最多8项，合计最多64项。history只作身份与连续在场消歧，不抽取旧事作为当前新经历；当前离场、转场或更正优先。用户在叙述中明确纠正当前场景（例如一直在休息室、没有去餐厅、桌上没有餐具）属于有在场依据的observed，不能因它否定history就标为角色inferred；只有角色自己的推测才用inferred。
-unresolved只能是简短字符串数组，不能放对象，用用户正文的语言和字形（繁体或简体）书写；仅在必要角色身份无法确定时填写。玩家以正常音量说话或做公开动作时，所有在场NPC都获得heard或observed（public=true），未指定听众也一样；只在耳语、只对某人说、背着某人、对方不在同一处、睡着或正文写明没听见时限制范围。是否在场无法判断的角色不给片段，也不追问；不相关角色不需要更新，也不需要追问。`},
+unresolved只能是简短字符串数组，不能放对象，用用户正文的语言和字形（繁体或简体）书写；仅在必要角色身份无法确定时填写。玩家以正常音量说话或做公开动作时，所有在场NPC都获得heard或observed（public=true），未指定听众也一样；只在耳语、只对某人说、背着某人、对方不在同一处、睡着或正文写明没听见时限制范围。是否在场无法判断的角色不给片段，也不追问；不相关角色不需要更新，也不需要追问。
+
+${CARD_CHARACTER_VIEWS_PROMPT}`},
         {role:'user',content:JSON.stringify(codec.input)}],true));
       return codec.decode(candidate);
     }
@@ -237,7 +245,9 @@ playerRef仅在这条quote确实为玩家能听见或看见时，填写sourceRef
 例：current=[{ref:"s0",text:"甲只向你低声说：钥匙在盒里。乙随后进门，未听到前面的谈话。"}]，characters=[{key:"c0",name:"甲"},{key:"c1",name:"乙"}]：钥匙句actor=c0、recipients=[]、identityRefs=["s0"]、playerRef="s0"，不能给c1。乙的进门若玩家可见可单列observed，不给乙补上钥匙知识。
 例：present=null，history有“h0p0:老周在茶馆柜台后算账。”，current=[{ref:"s0",text:"李三一拍桌子：“这茶里掺了水！”"}]：台词heard的actor为李三的c key、recipients含老周的c key，identityRefs含"s0"与"h0p0"；拍桌子的observed给李三和老周。
 仅在automatic=false且knownSpeaker的台词/动作确实传给其他NPC、而quote未包含其身份依据时，另给audienceQuote：覆盖quote并指认真实NPC听者/观察者的一段连续current原文。不要用场边出现姓名替代实际听闻证据。其他情况省略此字段。knownSpeaker非空的assistant是该角色对玩家的回复：present中其他NPC按在场默认听见和看见；只对玩家低声说或背着他人时recipients=[]；玩家不需要characters条目或c数字key，绝不能因为玩家不在characters中标unresolved。quote没有玩家字面锚点时playerRef仍为null，不影响确定已知角色的发言归属。
-unresolved仅记录必要发言者/直接受众身份不明或无法分开的秘密，用current原文的语言和字形（繁体或简体）书写；是否在场无法从present、current或history判断的NPC不加入recipients，也不写入unresolved；在场且不属于上述限制的NPC必须加入，不能因正文没写他的反应就省略。不相关角色无需更新，玩家无NPC ID、研究内容未知或角色未察觉秘密不是unresolved。未知必要NPC应注明，不能按常识补造。`},
+unresolved仅记录必要发言者/直接受众身份不明或无法分开的秘密，用current原文的语言和字形（繁体或简体）书写；是否在场无法从present、current或history判断的NPC不加入recipients，也不写入unresolved；在场且不属于上述限制的NPC必须加入，不能因正文没写他的反应就省略。不相关角色无需更新，玩家无NPC ID、研究内容未知或角色未察觉秘密不是unresolved。未知必要NPC应注明，不能按常识补造。
+
+${CARD_CHARACTER_COMPACT_PROMPT}`},
       {role:'user',content:JSON.stringify(codec.input)}];
     const candidate=parseJson(await run(config,prompts,true));
     if(Array.isArray(candidate.observations) && candidate.observations.every(value=>typeof value==='object' && value!==null && 'sourceRef' in value)) {
@@ -247,7 +257,7 @@ unresolved仅记录必要发言者/直接受众身份不明或无法分开的秘
         if(run!==this.run)throw new Error('model_invalid_response');
         const corrected=parseJson(await run(config,[...prompts,
           {role:'assistant',content:JSON.stringify(candidate)},
-          {role:'user',content:'上份候选被本地身份校验拒绝：invalid_scene_identity。请逐项核对identityRefs引用的原文。present为null时，原文必须出现actor及recipients的姓名/别名。present非null时：heard或observed的读者是present全体时无需姓名；排除了present中某人时，要么每个读者都有姓名依据（knownSpeaker回复的听者或观察者姓名放在audienceQuote），要么identityRefs引用写明每个被排除者排除理由的原文。耳语、低声、只对某人说、背着某人等限制情况，不得为通过校验而把被排除者补回读者；只有不属于限制情况而被漏掉的在场NPC才按在场默认补回。private、内心与推测仍须actor及recipients都有姓名依据。仅有“她/他”的sourceRef不是姓名依据；请引用本条连续场景中实际包含姓名的前文ref（例如s0有甲姓名、s1只有她，s1应引用s0）。不得改变正文或角色名单；present为null时不得扩大读者，present非null时读者不得超出present；只修正有实际原文支持的身份引用，既无姓名依据也无排除理由可引的项目标unresolved。返回完整JSON。'},
+          {role:'user',content:CARD_CHARACTER_IDENTITY_RETRY},
         ],true));
         return codec.decode(corrected);
       }

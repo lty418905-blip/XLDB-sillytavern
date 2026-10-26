@@ -2,8 +2,24 @@ import fs from 'node:fs';
 import {DatabaseSync} from 'node:sqlite';
 import {pathToFileURL} from 'node:url';
 
-/** Highest authority-store format understood by this release; unmarked stores are format 1 by contract. */
-export const CURRENT_STORE_FORMAT = 2;
+/**
+ * Highest authority-store format readable by this release; unmarked stores remain format 1.
+ * The next unissued format, 3, is allocated to ledger writes after checking the issued formats.
+ */
+export const CURRENT_STORE_FORMAT = 3;
+
+/** Existing issued format required by readable appraisal records and processing candidates; remains 2. */
+export const APPRAISAL_STORE_FORMAT = 2;
+
+/**
+ * Allocated ledger write format, 3, the next unissued number above the existing appraisal format.
+ * Keep it equal to CURRENT_STORE_FORMAT: the ledger refuses writes to any higher format.
+ * Raising the readable limit again therefore also requires a decision about the ledger write guard.
+ */
+export const TAVERN_LEDGER_STORE_FORMAT = 3;
+
+/** Opaque writer identity for the allocated ledger format; distinct from the existing appraisal writer. */
+export const TAVERN_LEDGER_WRITER_VERSION = 'tavern-ledger-1';
 
 /** Opaque writer identifier stored with the first readable-appraisal record; no ordering semantics. */
 export const STORE_WRITER_VERSION = 'readable-appraisal-1';
@@ -30,7 +46,7 @@ export function readStoreFormat(database: DatabaseSync): number {
 /**
  * Stamps a positive safe-integer format inside the caller's transaction. Equal or higher markers are unchanged.
  * writerVersion is opaque nonempty release text. Invalid arguments or a missing transaction throw without writing.
- * New readable appraisals and their processing candidates stamp this marker in their writing transaction.
+ * Readable appraisals and processing candidates require APPRAISAL_STORE_FORMAT in their writing transaction.
  */
 export function stampStoreFormat(database: DatabaseSync, format: number, writerVersion: string): void {
   if (!Number.isSafeInteger(format) || format < 1 || typeof writerVersion !== 'string' || !writerVersion) {

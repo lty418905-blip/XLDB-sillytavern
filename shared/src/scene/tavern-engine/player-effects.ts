@@ -1,3 +1,4 @@
+import type { AcceptedMessage } from '../../core/types.ts';
 import type { Scope } from '../../memory/access.ts';
 import { checkTavernPossessionEffect, snapshotTavernPossessionWorld } from './projection.ts';
 import type { TavernWorldSnapshot } from './projection.ts';
@@ -139,13 +140,34 @@ function hardEffect(payload: EventPayload): boolean {
     || payload.kind === 'ConsumeItem';
 }
 
-function downgraded(event: EngineEvent, reason: DecodeIssue): EngineEvent {
+function effectEvidenceText(payload: EventPayload, message: AcceptedMessage): string {
+  // Consumption keeps its existing diagnostic text; only spatial and transfer effects quote the player.
+  if (payload.kind !== 'Enter' && payload.kind !== 'Exit' && payload.kind !== 'Transfer') {
+    return 'text' in payload ? payload.text : '';
+  }
+
+  const segments: string[] = [];
+  // One pass over evidence, plus the UTF-16 units copied: O(evidence slots + quoted units).
+  for (const span of payload.evidence ?? []) {
+    if (span.channel !== 'message' || span.sourceId !== message.id || span.revision !== message.revision) continue;
+    // The checker also accepts direct callers, so malformed offsets must not be clamped by String.slice.
+    if (!Number.isInteger(span.start) || !Number.isInteger(span.end)
+      || span.start < 0 || span.end <= span.start || span.end > message.text.length) {
+      continue;
+    }
+    segments.push(message.text.slice(span.start, span.end));
+  }
+
+  return segments.join('\n');
+}
+
+function downgraded(event: EngineEvent, reason: DecodeIssue, message: AcceptedMessage): EngineEvent {
   return {
     ...event,
     payload: {
       kind: 'Unknown',
       actorId: event.payload.actorId,
-      text: 'text' in event.payload ? event.payload.text : '',
+      text: effectEvidenceText(event.payload, message),
       reason,
     },
   };
@@ -157,15 +179,19 @@ function downgraded(event: EngineEvent, reason: DecodeIssue): EngineEvent {
  * Transfers may give player-held items or take items from an accessible place/container.
  * Consumption uses the same control. Rejected effects retain their envelope/origin as Unknown.
  * Null world rejects every hard effect as world_unavailable; other payloads and old Unknown records survive.
- * Work is O(snapshot entries * (events + 1)); M1 has at most 12 events, with no chat-wide cap.
+ * Message is the current accepted player source. Rejected Enter/Exit/Transfer quote only its matching
+ * evidence spans, in evidence order, joined by a newline; invalid spans are skipped and no spans yield empty text.
+ * Offsets are UTF-16 units. Work is O(snapshot entries * (events + 1) + evidence slots + quoted units);
+ * M1 has at most 12 events, with no chat-wide cap or additional diagnostic text limit.
  */
 export function checkTavernPlayerEffects(
   events: readonly EngineEvent[],
   playerId: string,
   state: TavernPlayerWorld | null,
+  message: AcceptedMessage,
 ): readonly EngineEvent[] {
   if (state === null) {
-    return events.map(event => hardEffect(event.payload) ? downgraded(event, 'world_unavailable') : event);
+    return events.map(event => hardEffect(event.payload) ? downgraded(event, 'world_unavailable', message) : event);
   }
 
   const { firstTurn } = state;
@@ -180,20 +206,20 @@ export function checkTavernPlayerEffects(
   return events.map(event => {
     const payload = event.payload;
     if (!hardEffect(payload)) return event;
-    if (payload.actorId !== playerId) return downgraded(event, 'effect_actor_not_allowed');
+    if (payload.actorId !== playerId) return downgraded(event, 'effect_actor_not_allowed', message);
 
     if (payload.kind === 'Enter' || payload.kind === 'Exit') {
       if (payload.entityId !== playerId && !(firstTurn && payload.kind === 'Enter')) {
-        return downgraded(event, 'effect_actor_not_allowed');
+        return downgraded(event, 'effect_actor_not_allowed', message);
       }
       if (!entities.has(payload.entityId) || !places.has(payload.placeId)) {
-        return downgraded(event, 'effect_world_mismatch');
+        return downgraded(event, 'effect_world_mismatch', message);
       }
       const previous = positions.get(payload.entityId);
       if (payload.kind === 'Exit' && (!present.has(payload.entityId)
         || (previous && (previous.state === 'at' || previous.state === 'within')
           && previous.placeId !== payload.placeId))) {
-        return downgraded(event, 'effect_world_mismatch');
+        return downgraded(event, 'effect_world_mismatch', message);
       }
 
       if (payload.kind === 'Enter') {
@@ -221,7 +247,7 @@ export function checkTavernPlayerEffects(
       }, payload);
       if (reason !== null) {
         return downgraded(event, reason === 'projection_actor_not_allowed' || reason === 'projection_item_not_visible'
-          ? 'effect_actor_not_allowed' : 'effect_world_mismatch');
+          ? 'effect_actor_not_allowed' : 'effect_world_mismatch', message);
       }
       const item = possessions.get(payload.itemId)!;
       possessions.set(payload.itemId, payload.kind === 'Transfer'

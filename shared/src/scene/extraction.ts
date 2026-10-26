@@ -1,4 +1,4 @@
-import { MAX_IDENTITY_REFERENCES, perspectiveOf } from './perspective.ts';
+import { cardCharacterIdOf, isNarratorSource, MAX_IDENTITY_REFERENCES, perspectiveOf } from './perspective.ts';
 import type { KnowledgeKind, PerspectivePlan, SceneCharacter, SceneMessage, SceneRoster } from './types.ts';
 
 const MAX_OBSERVATIONS = 12;
@@ -66,7 +66,11 @@ export function buildPerspectiveInput(messageValue: SceneMessage, rosterValue: S
     knownSpeaker: knownSpeaker ?? null,
     playerName: message.envelope.playerName ?? null,
     characters: characterEntries.map(([key, character]) => ({
-      key, name: character.name, aliases: [...character.aliases],
+      key,
+      name: character.name,
+      aliases: [...character.aliases],
+      ...(message.automatic === true && message.envelope.mode === 'scene' && !isNarratorSource(message)
+        && character.id === cardCharacterIdOf(roster) ? { cardCharacter: true } : {}),
       ...([character.name, ...character.aliases].some(label => labels.filter(candidate => candidate === label).length > 1)
         ? { identityId: character.id } : {}),
     })),

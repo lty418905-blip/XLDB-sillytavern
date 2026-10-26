@@ -528,6 +528,10 @@
     if (!state.token) throw new Error('请填写 XLDB 访问令牌');
   }
 
+  // The error of a core reply the adapter cannot use: a body that is not JSON (request below), or a reply that lacks a
+  // member its caller needs (the card character clear's roster).
+  const CORE_RESPONSE_INVALID_MESSAGE = 'XLDB 核心响应无效';
+
   // origin: optional origin token of the calling action. A token that is no longer valid (originValid: an ordinary
   // token whose chat or binding the host no longer shows, a binding-replacing token whose chat, binding or epoch moved)
   // is refused here with the fixed ORIGIN_STALE_MESSAGE, before the fetch and before any host or connector callback, so
@@ -563,7 +567,7 @@
     try {
       result = await response.json();
     } catch {
-      throw new Error('XLDB 核心响应无效');
+      throw new Error(CORE_RESPONSE_INVALID_MESSAGE);
     }
     // A turn response carries the core's retrieval health; the status line follows it. The reply of an action whose
     // token is no longer valid (the user left its chat while it was answered) shows nothing: the badge belongs to the
@@ -2090,6 +2094,63 @@
     });
   }
 
+  // The card character row's button: its click asks before the flag is cleared (openCardCharacterClearDialog).
+  // character: the stored roster entry; its id and stored name are the ones the dialog names and clears.
+  function cardCharacterClearButton(character) {
+    const characterId = String(character.id || '');
+    const characterName = String(character.name || '');
+    return button(CARD_CHARACTER_CLEAR_BUTTON_TEXT, origin => openCardCharacterClearDialog(origin, characterId, characterName), { origin: true });
+  }
+
+  // Opens the blocking dialog that asks before the card character's flag is cleared. Only its confirm button clears
+  // (clearCardCharacter, with the confirm click's own token); keeping the flag, closing the dialog, a chat switch (the
+  // workbench reset) and destroy remove the dialog without a request, so it is registered with the to-do dialogs, which
+  // both of them remove. origin: the token of the click that opens it. Throws the fixed
+  // CARD_CHARACTER_CLEAR_UNCONFIRMED when the dialog cannot be shown; nothing is cleared then.
+  function openCardCharacterClearDialog(origin, characterId, characterName) {
+    assertOrigin(origin);
+    if (!state.panel) throw new Error(CARD_CHARACTER_CLEAR_UNCONFIRMED);
+    const dialog = todoDialog(CARD_CHARACTER_CLEAR_TITLE_TEXT);
+    dialog.append(element('p', withCharacterName(CARD_CHARACTER_CLEAR_BODY_TEXT, characterName)));
+    const confirmButton = button(CARD_CHARACTER_CLEAR_CONFIRM_TEXT, origin => clearCardCharacter(dialog, characterId, characterName, origin), { origin: true });
+    const keepButton = button(CARD_CHARACTER_CLEAR_KEEP_TEXT, () => dialog.close());
+    dialog.append(confirmButton, keepButton);
+    try {
+      dialog.showModal();
+    } catch {
+      removeTodoDialog(dialog);
+      throw new Error(CARD_CHARACTER_CLEAR_UNCONFIRMED);
+    }
+  }
+
+  // The clear dialog's confirm action: the core removes the card character's flag (the character stays on the roster
+  // with its memories, and the chat is recorded as having declined the card character), and the roster it returns is
+  // shown. originToken: the confirm click's started token. A dialog no longer registered (kept, closed, removed by the
+  // workbench reset or by destroy) sends nothing; the dialog is closed before the request, and every await is followed
+  // by a check of the token. A reply whose roster has no character list is not an empty roster: the roster shown stays,
+  // the fixed CORE_RESPONSE_INVALID_MESSAGE is thrown, and no success is reported.
+  async function clearCardCharacter(dialog, characterId, characterName, originToken = {}) {
+    const origin = captureOrigin(originToken);
+    return withBusy(async () => {
+      assertOrigin(origin);
+      if (!todoDialogs.has(dialog)) return null;
+      dialog.close();
+      removeTodoDialog(dialog);
+      assertBound();
+      const body = { scope: origin.scope, expectedVersion: state.scene.version, characterId };
+      const result = await request('/v1/scene/card-character-clear', 'POST', body, origin);
+      assertOrigin(origin);
+      const returnedCharacters = result?.roster?.characters;
+      if (!Array.isArray(returnedCharacters)) throw new Error(CORE_RESPONSE_INVALID_MESSAGE);
+      setSceneRoster(result.roster);
+      await recordSceneReceipt(origin, result);
+      assertOrigin(origin);
+      renderSceneControls();
+      setStatus(withCharacterName(CARD_CHARACTER_CLEARED_TEXT, characterName), undefined, origin);
+      return state.scene.roster;
+    });
+  }
+
   // Changes how much of one memory a character may recall (access) and shows the result. The receipt and the reload take
   // the token this change starts at its call.
   async function setAccess(memoryId, access, characterId) {
@@ -2804,7 +2865,11 @@
       }
       if (documents.length > 1001) throw new Error('关联世界书条目过多，请缩小当前角色卡范围');
       const provenanceDocuments=catalogFromCurrent(current).sources.map(({id,text})=>({id,text}));
-      return { playerName, card: { id: 'card', text: cardText.slice(0, 20000) }, documents, provenanceDocuments };
+      // The card's own name, trimmed and cut to the core's 200-unit name limit: the core checks the card character's
+      // name against it.
+      const cardName = String(card.name || raw.name || '').trim().slice(0, 200);
+      const cardMaterial = { id: 'card', text: cardText.slice(0, 20000), name: cardName };
+      return { playerName, card: cardMaterial, documents, provenanceDocuments };
     }
 
 
@@ -3270,11 +3335,118 @@
     });
   }
 
+  // The card character ("角色卡本人") is the one roster entry the core flags with cardCharacter: true. Only the core's
+  // identity extraction grants the flag, and only the user removes it (the clear dialog below); the panel never sends
+  // it. The texts below are the approved wording, used verbatim; {name} is the only slot.
+
+  // Why the card character was not set this time, by the core's cardIssue code. Shown as a status when the roster is
+  // not empty (enabling goes on), and thrown when the roster is still empty after the identity read.
+  const CARD_ISSUE_TEXT = Object.freeze({
+    card_player: '识别出的角色卡本人“{name}”与玩家名字相同，没有启用为角色卡本人。若这不是误判，请修改玩家名或角色卡名称，然后重新启用本聊天。',
+    card_name: '角色卡本人“{name}”与卡名对不上，没有启用为角色卡本人。卡名需要就是角色名（括号、标签和版本号会自动忽略）；如果卡名还带着其他说明文字（例如“小雪 - 傲娇青梅”），请把卡名改成角色名本身，再重新启用本聊天。',
+    card_source: '角色卡本人“{name}”缺少来自角色卡的身份依据，没有启用为角色卡本人。可以重新启用本聊天再试一次。',
+    card_alias: '角色卡本人“{name}”有找不到逐字依据的别名，没有启用为角色卡本人。可以重新启用本聊天再试一次。',
+    card_conflict: '这次识别出的角色卡本人“{name}”与名单上已标记的角色卡本人不一致，本次没有更改。若名单上的标记是错的，可以在「人物与世界」的名单中取消该标记；取消后，本聊天不会再自动标记任何角色卡本人。',
+    card_ambiguous: '名单上不止一个角色可能是角色卡本人“{name}”，本次没有标记。请在「人物与世界」把对应角色的姓名改成与卡名一致，或修改重名的角色，再重新启用本聊天。',
+  });
+
+  // The card issue text for a code the adapter does not know.
+  const CARD_ISSUE_UNKNOWN_TEXT = '角色卡本人“{name}”这次没有启用。可以重新启用本聊天再试一次。';
+
+  // The refusals of an identity read that leaves the roster empty, each with its fixed code (the thrown error's code).
+  const NATIVE_IDENTITY_ENSEMBLE_NO_NAMED_NPC = 'NATIVE_IDENTITY_ENSEMBLE_NO_NAMED_NPC';
+  const NATIVE_IDENTITY_ENSEMBLE_NO_NAMED_NPC_TEXT = '这是主持或多角色剧场卡，最近的正文里没有点名任何有身份资料的角色，暂时无法启用。请在正文里写出要互动的角色名字后再启用；修改角色卡描述不会改变这个结果。';
+  const NATIVE_IDENTITY_ROSTER_EMPTY = 'NATIVE_IDENTITY_ROSTER_EMPTY';
+  const NATIVE_IDENTITY_ROSTER_EMPTY_TEXT = '没能识别出可以互动的角色，暂时无法启用。可以稍后重新启用；如果一直失败，请在「人物与世界」手动添加角色。';
+  const NATIVE_IDENTITY_CARD_DECLINED = 'NATIVE_IDENTITY_CARD_DECLINED';
+  const NATIVE_IDENTITY_CARD_DECLINED_TEXT = '本聊天取消过角色卡本人标记，因此不会再自动标记。请在正文里点名要互动的角色后再启用。如果那次取消是误操作，可以在「资料与恢复」还原到取消之前的保存点；这会同时撤回之后的剧情，而且只有最近的保存点可用。';
+
+  // The fixed code of the refusal by a card issue (its text is the card issue text); the error's cardIssue member
+  // carries the core's cardIssue code as it came, an unknown code included.
+  const NATIVE_IDENTITY_CARD_ISSUE = 'NATIVE_IDENTITY_CARD_ISSUE';
+
+  // The roster row's mark of the card character.
+  const CARD_CHARACTER_ROW_TEXT = '角色卡本人（一对一聊天中默认在场，无需点名）';
+
+  // The automatic enable's success status when the roster has a card character.
+  const CARD_CHARACTER_ENABLED_TEXT = '已启用：角色卡本人会感知你在本聊天里的每一条消息，其他角色按正文点名与在场情况更新。原生聊天自动同步已启用。';
+
+  // The automatic enable's success status without a card character (the text before the card character existed).
+  const NATIVE_IDENTITY_ENABLED_TEXT = '身份已从角色卡和世界书识别；知识仅按正文视角更新。原生聊天自动同步已启用。';
+
+  // The status of a turn the core prepared for the narrator because no character perceives the player's text.
+  const NO_LISTENER_TURN_TEXT = '本轮没有角色感知到你的内容（角色不在、睡着，或你只写了心声与环境），由旁白延续场景。';
+
+  // The clear control of the card character: the row's button, the dialog's title, body and two buttons, and the
+  // status after the clear.
+  const CARD_CHARACTER_CLEAR_BUTTON_TEXT = '取消角色卡本人标记';
+  const CARD_CHARACTER_CLEAR_TITLE_TEXT = '取消角色卡本人标记？';
+  const CARD_CHARACTER_CLEAR_BODY_TEXT = '取消后，“{name}”会变回一般角色：之后只有正文点名或有在场依据时，它才会感知你的消息。它已有的记忆与经历全部保留。本聊天之后不会再自动标记任何角色卡本人。如需撤销，只能在「资料与恢复」还原到取消之前的保存点；这会同时撤回之后的剧情，而且只有最近的保存点可用。';
+  const CARD_CHARACTER_CLEAR_CONFIRM_TEXT = '确认取消标记';
+  const CARD_CHARACTER_CLEAR_KEEP_TEXT = '保留标记';
+  const CARD_CHARACTER_CLEARED_TEXT = '已取消角色卡本人标记；“{name}”现在按一般角色处理。';
+
+  // The fixed error when the clear dialog cannot be shown: nothing is cleared without the user's confirmation.
+  const CARD_CHARACTER_CLEAR_UNCONFIRMED = 'XLDB：scene_card_character_clear_unconfirmed';
+
+  // Fills the {name} slot of an approved text. A replacer function keeps a name's "$" characters literal.
+  function withCharacterName(text, name) {
+    return text.replace('{name}', () => String(name ?? ''));
+  }
+
+  // A sentence ended with exactly one full stop: a text that already ends with "。" (the approved card issue and
+  // refusal texts do) is returned as it is, any other text gets one.
+  function withFullStop(sentence) {
+    return sentence.endsWith('。') ? sentence : `${sentence}。`;
+  }
+
+  // The text that explains a card issue ({ code, name }) from the core: the text of its code, or the text for an
+  // unknown code.
+  function cardIssueText(cardIssue) {
+    const code = cardIssue?.code;
+    const known = typeof code === 'string' && Object.hasOwn(CARD_ISSUE_TEXT, code);
+    const text = known ? CARD_ISSUE_TEXT[code] : CARD_ISSUE_UNKNOWN_TEXT;
+    return withCharacterName(text, cardIssue?.name);
+  }
+
+  // An error with a fixed code for the refusal of an identity read: message is the approved text, code the fixed code.
+  function nativeIdentityError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  }
+
+  // The error of an identity read that leaves the roster empty, in this order: the scope declined the card character
+  // (extraction's cardCharacterDeclined), the card character had an issue (cardIssue: extraction's over the plan's), the
+  // card is a host or ensemble card (the plan's cardKind), or nothing usable was recognized.
+  function emptyRosterError(plan, result, cardIssue) {
+    if (result?.cardCharacterDeclined === true) {
+      return nativeIdentityError(NATIVE_IDENTITY_CARD_DECLINED, NATIVE_IDENTITY_CARD_DECLINED_TEXT);
+    }
+    if (cardIssue) {
+      const issueError = nativeIdentityError(NATIVE_IDENTITY_CARD_ISSUE, cardIssueText(cardIssue));
+      issueError.cardIssue = cardIssue.code;
+      return issueError;
+    }
+    if (plan?.cardKind === 'ensemble') {
+      return nativeIdentityError(NATIVE_IDENTITY_ENSEMBLE_NO_NAMED_NPC, NATIVE_IDENTITY_ENSEMBLE_NO_NAMED_NPC_TEXT);
+    }
+    return nativeIdentityError(NATIVE_IDENTITY_ROSTER_EMPTY, NATIVE_IDENTITY_ROSTER_EMPTY_TEXT);
+  }
+
+  // True when the roster held now has a card character.
+  function rosterHasCardCharacter() {
+    return state.scene.roster.some(character => character.cardCharacter === true);
+  }
+
   // Recognizes the people of the token's binding from the recent chat text, the character card and its linked world
   // books: the core plans which documents to read, then extracts the roster, whose receipt is recorded. force runs the
   // recognition even when the materials and the roster are unchanged; refreshDisplay=false leaves the display refresh to
-  // the caller. Returns { rosterChanged, pending }. origin: the token of the calling action; every await is followed by
-  // its check, so a recognition that outlasts its chat writes nothing.
+  // the caller. Returns { rosterChanged, pending, cardIssueText }: cardIssueText is the explanation of this read's card
+  // issue ('' without one), already shown as the status, for a caller whose own status follows. A card issue fails the
+  // read only when the roster is still empty; otherwise the read goes on and the stored flag stays as it was. origin:
+  // the token of the calling action; every await is followed by its check, so a recognition that outlasts its chat
+  // writes nothing.
   async function refreshNativeIdentities(origin, force = false, refreshDisplay = true) {
     assertStarted(origin);
     assertOrigin(origin);
@@ -3315,17 +3487,26 @@
       index: identityIndex.map(item => ({ id: item.id, name: item.name.slice(0, 200), keys: Array.isArray(item.keys) ? item.keys.filter(key => typeof key === 'string').slice(0, 16) : [], preview: item.text.slice(0, 160) })),
     } }, origin);
     assertOrigin(origin);
+    // The plan's card issue is reported apart from missing, so the wrapper below is for ordinary missing names only.
     if (plan.missing?.length) throw new Error(`资料不足，请补充独立身份：${plan.missing.join('；')}`);
     const unknown = plan.characters?.some(character => !state.scene.roster.some(existing => [existing.name, ...existing.aliases].includes(character.name) || character.aliases?.some(alias => [existing.name, ...existing.aliases].includes(alias))));
+    // This early return needs a roster, so a plan's card issue here never fails the read: it is shown as the status.
     if (!unknown && state.scene.roster.length && unchanged) {
       state.native.identityBody = body;
-      return { rosterChanged: false };
+      const planIssueText = plan.cardIssue ? cardIssueText(plan.cardIssue) : '';
+      if (planIssueText) setStatus(planIssueText, undefined, origin);
+      return { rosterChanged: false, cardIssueText: planIssueText };
     }
     const selected = new Set((plan.characters || []).flatMap(character => character.documentIds));
     for (const character of state.scene.roster) for (const evidence of character.identitySource?.evidence || []) selected.add(evidence.sourceId);
+    // The card ({ id, name }) lets the core check the card character against the card document again. The core
+    // refuses an empty name, and a card without a name never has a card character in its plan, so it is sent only
+    // with a name.
+    const extractionCard = materials.card.name ? { card: { id: materials.card.id, name: materials.card.name } } : {};
     const result = await request('/v1/scene/identity-extract', 'POST', { scope, expectedVersion:state.scene.version, materials: {
       playerName: materials.playerName, plan, documents: [...materials.documents,...materials.provenanceDocuments]
         .filter(item => selected.has(item.id)).map(({ id, text }) => ({ id, text })),
+      ...extractionCard,
     } }, origin);
     assertOrigin(origin);
     setSceneRoster(result.roster);
@@ -3333,11 +3514,15 @@
     assertOrigin(origin);
     renderSceneControls();
     if (result.missing?.length) throw new Error(`资料不足，请补充独立身份：${result.missing.join('；')}`);
-    if (!state.scene.roster.length) throw new Error('当前角色卡和世界书没有足够身份资料，请补充独立身份');
+    // When both report a card issue, the extraction's is the later and more exact one.
+    const cardIssue = result.cardIssue || plan.cardIssue;
+    if (!state.scene.roster.length) throw emptyRosterError(plan, result, cardIssue);
     state.native.materials = freshMaterials;
     state.native.identityBody = body;
     state.native.pendingReason = '';
-    return { rosterChanged: true, pending: false };
+    const issueText = cardIssue ? cardIssueText(cardIssue) : '';
+    if (issueText) setStatus(issueText, undefined, origin);
+    return { rosterChanged: true, pending: false, cardIssueText: issueText };
   }
 
   function nativeEnvelope() {
@@ -3481,9 +3666,16 @@
       if (!originIsCurrent(origin)) throw new Error(ORIGIN_STALE_MESSAGE);
       await persistAttachment(origin, origin.scope, false, true);
       assertOrigin(origin);
+      // The automatic success names the card character when the roster has one; this read's card issue, if any,
+      // follows the success text directly.
+      const automaticEnabledText = rosterHasCardCharacter() ? CARD_CHARACTER_ENABLED_TEXT : NATIVE_IDENTITY_ENABLED_TEXT;
+      const automaticStatus = `${automaticEnabledText}${identity.cardIssueText || ''}`;
+      // The pending status quotes why the identity read is pending; an approved text there keeps its own full stop.
+      const pendingReasonShown = state.native.pendingReason && state.native.pendingReason !== 'first_input';
+      const pendingReasonText = pendingReasonShown ? withFullStop(state.native.pendingReason) : '';
       setStatus(identity.pending
-        ? `已接入当前聊天；${state.native.pendingReason && state.native.pendingReason !== 'first_input' ? `${state.native.pendingReason}。` : ''}等待本聊天首条有效正文后识别人物，不会导入其它范围的旧消息。`
-        : state.native.automatic ? '身份已从角色卡和世界书识别；知识仅按正文视角更新。原生聊天自动同步已启用。' : '使用已补充身份的原生聊天已启用。', undefined, origin);
+        ? `已接入当前聊天；${pendingReasonText}等待本聊天首条有效正文后识别人物，不会导入其它范围的旧消息。`
+        : state.native.automatic ? automaticStatus : '使用已补充身份的原生聊天已启用。', undefined, origin);
       return identity;
     });
   }
@@ -3524,6 +3716,25 @@
       assertOrigin(origin);
       refreshSceneDisplayInBackground(origin);
     });
+  }
+
+  // The status of a prepared main turn, from the core's native context reply: a turn no character perceives (noListener,
+  // written by the narrator) first, even when stages were skipped (the workbench notice still lists them); then skipped
+  // stages, a retrieval fallback, or the ordinary handover.
+  function nativeTurnStatus(result) {
+    if (result.noListener === true) return NO_LISTENER_TURN_TEXT;
+    if (result.skippedStages?.length) return '本轮部分后台环节未完成，已跳过并继续正文；详情见工作台提示。';
+    const fallbackModes = ['bm25-fallback', 'hybrid-fallback'];
+    const retrievalFellBack = Array.isArray(result.retrievalModes) && result.retrievalModes.some(mode => fallbackModes.includes(mode));
+    if (retrievalFellBack) return retrievalNotice(state.retrieval)?.text || RETRIEVAL_TEXT[playerLanguage()].turnFallback;
+    return '受限记忆与情绪已交给酒馆前台模型，等待完整回复。';
+  }
+
+  // The status of a prepared regeneration, from the core's native context reply: a turn no character perceives
+  // (noListener, written by the narrator) shows the same text as a main turn; otherwise the regeneration's own text.
+  function regenerationTurnStatus(result) {
+    if (result.noListener === true) return NO_LISTENER_TURN_TEXT;
+    return '正在重生成当前回复；原已接受正文由 XLDB 保留，完成后按原身份更新。';
   }
 
   // Builds the armed main request's restricted context and ticket (state.native.turn) and returns that turn. It reads and
@@ -3621,7 +3832,7 @@
           replaces: regeneration.reply,
           messages: result.messages.map(item => ({ ...item })),
         };
-        setStatus('正在重生成当前回复；原已接受正文由 XLDB 保留，完成后按原身份更新。');
+        setStatus(regenerationTurnStatus(result));
         refreshSceneDisplayInBackground(origin);
         return state.native.turn;
       }
@@ -3695,9 +3906,7 @@
         targetId: result.speakerId || state.scene.targetId,
         messages: result.messages.map(item => ({ ...item })),
       };
-      setStatus(result.skippedStages?.length ? '本轮部分后台环节未完成，已跳过并继续正文；详情见工作台提示。' : Array.isArray(result.retrievalModes) && result.retrievalModes.some(mode=>mode==='bm25-fallback'||mode==='hybrid-fallback')
-        ? (retrievalNotice(state.retrieval)?.text || RETRIEVAL_TEXT[playerLanguage()].turnFallback)
-        : '受限记忆与情绪已交给酒馆前台模型，等待完整回复。');
+      setStatus(nativeTurnStatus(result));
       refreshSceneDisplayInBackground(origin);
       return state.native.turn;
     } catch (error) {
@@ -4504,10 +4713,14 @@
     return { wrap, input };
   }
 
-  function sceneRosterRow(character = {}) {
+  // One editable roster row. cardControls: nodes shown after the card character's mark (only on its row).
+  function sceneRosterRow(character = {}, cardControls = []) {
     const row = element('fieldset');
     row._npcId = String(character.id || newId('npc'));
     row.append(element('legend', `NPC ${row._npcId}`));
+    // Only the card character's row carries its mark, followed by cardControls (the clear button the roster render
+    // hands in).
+    if (character.cardCharacter === true) row.append(element('p', CARD_CHARACTER_ROW_TEXT), ...cardControls);
     const id = field('稳定 ID');
     id.input.value = row._npcId;
     id.input.readOnly = true;
@@ -4601,7 +4814,10 @@
     panel.refreshWorkbenchActors?.();
     const editor = panel.sceneRosterEditor;
     while (editor.firstChild) editor.removeChild(editor.firstChild);
-    for (const character of state.scene.roster) editor.append(sceneRosterRow(character));
+    for (const character of state.scene.roster) {
+      const cardControls = character.cardCharacter === true ? [cardCharacterClearButton(character)] : [];
+      editor.append(sceneRosterRow(character, cardControls));
+    }
     const controls = panel.sceneControls;
     panel.sceneSelectionInputs = [];
     while (controls.firstChild) controls.removeChild(controls.firstChild);

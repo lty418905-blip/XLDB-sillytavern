@@ -136,7 +136,7 @@ export class SceneTransfer {
     if (typeof name !== 'string' || !name.trim() || name.length > 200) throw new Error('invalid_scene_template_name');
     return clone({
       format: 'xldb-scene-template-v1', name,
-      roster: state.roster,
+      roster: withoutCardMembers(state.roster),
       worldSettings: this.authority.worldSettings(scope),
     });
   }
@@ -186,7 +186,7 @@ export class SceneTransfer {
       if (conflicts.length)
         throw new Error(conflicts[0]!.code);
       const changed = normalized.format === 'xldb-scene-template-v1'
-        ? canonical(state.roster) !== canonical(normalized.roster) || canonical(this.authority.worldSettings(scope)) !== canonical(normalized.worldSettings)
+        ? canonical(withoutCardMembers(state.roster)) !== canonical(withoutCardMembers(normalized.roster)) || canonical(this.authority.worldSettings(scope)) !== canonical(normalized.worldSettings)
         : importDiff(scope, normalized, this.db).new > 0;
       // All input checks precede this guard, including conflicts; even unchanged transfers record an operation.
       beforeWrite?.(state, normalized.format === 'xldb-scene-template-v1' ? normalized.roster : state.roster);
@@ -194,7 +194,7 @@ export class SceneTransfer {
       let imported = 0;
       let skipped = 0;
       if (normalized.format === 'xldb-scene-template-v1') {
-        const rosterChanged = canonical(state.roster) !== canonical(normalized.roster);
+        const rosterChanged = canonical(withoutCardMembers(state.roster)) !== canonical(withoutCardMembers(normalized.roster));
         const settingsChanged = canonical(this.authority.worldSettings(scope)) !== canonical(normalized.worldSettings);
         if (rosterChanged)
           this.authority.configure(scope, normalized.roster, Date.now(), false);
@@ -448,8 +448,17 @@ function templateConflicts(state:ReturnType<SceneAuthority['state']>, current:Wo
   return [] as {code:string}[];
 }
 
+// Card identity belongs to this scope's accepted extraction, never to a portable template.
+function withoutCardMembers(roster: SceneRoster): SceneRoster {
+  const {cardCharacterDeclined: _declined, ...retained} = roster;
+  return {
+    ...retained,
+    characters: roster.characters.map(({cardCharacter: _cardCharacter, ...character}) => character),
+  };
+}
+
 function templateDiff(currentRoster:SceneRoster,currentSettings:WorldSettings|null,template:SceneTemplate) {
-  return {roster: canonical(currentRoster) === canonical(template.roster) ? 'unchanged' : 'changed',
+  return {roster: canonical(withoutCardMembers(currentRoster)) === canonical(withoutCardMembers(template.roster)) ? 'unchanged' : 'changed',
     worldSettings: canonical(currentSettings) === canonical(template.worldSettings) ? 'unchanged' : 'changed'};
 }
 

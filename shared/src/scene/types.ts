@@ -18,7 +18,7 @@ export interface SceneIdentityEvidence { sourceId: string; quote: string; docume
 export type SceneIdentitySource =
   | { kind: 'automatic'; evidence: SceneIdentityEvidence[] }
   | { kind: 'manual' };
-/** A roster identity and optional settings; reserved metadata is opaque and only retained from stored values. */
+/** A roster identity and settings; reserved metadata is retained from storage, never trusted from callers. */
 export interface SceneCharacter {
   id: string;
   name: string;
@@ -29,11 +29,15 @@ export interface SceneCharacter {
   identitySource?: SceneIdentitySource;
   calibration?: unknown;
   emotionProvenance?: unknown;
+  /** Reserved: only identity extraction grants through the authority; user clear removes it. Caller values are ignored. */
+  cardCharacter?: true;
 }
-/** The scope's ordered roster; emotionControls is opaque stored metadata, never populated from a caller. */
+/** The scope's ordered roster; emotionControls and cardCharacterDeclined are authority-owned stored metadata. */
 export interface SceneRoster {
   characters: SceneCharacter[];
   emotionControls?: unknown;
+  /** Reserved: user clear records refusal; checkpoint restore can undo it. Caller values are ignored. */
+  cardCharacterDeclined?: true;
 }
 export type SceneInputMode = 'direct' | 'scene';
 export interface SceneEnvelope {
@@ -55,11 +59,14 @@ export interface SceneRecall {
   details?: {start: number; end: number; stray?: true}[];
 }
 
+/** Accepted scene text with explicit actor scope; narrator means no default NPC speaker, not an identity grant. */
 export interface SceneMessage extends AcceptedMessage {
   /** IANA zone captured at first acceptance; legacy sources without one replay in UTC. */
   acceptedTimeZone?: string;
   /** Native theatre prose; participants must be established by body evidence. */
   automatic?: boolean;
+  /** Core-written on accepting an automatic narrator packet: this reply has no default NPC speaker. */
+  narrator?: true;
   envelope: SceneEnvelope;
   /** Accepted assistant text is spoken only by the selected NPC. */
   speakerId?: string;

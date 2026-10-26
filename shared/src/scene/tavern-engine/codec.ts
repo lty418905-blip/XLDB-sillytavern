@@ -232,7 +232,7 @@ function commitment(value: unknown, current: Context, references: References): E
   const input = record(value);
   const action = input.action;
   if (action !== 'propose' && action !== 'confirm' && action !== 'establish' && action !== 'revise'
-    && action !== 'fulfill' && action !== 'cancel' && action !== 'harden') reject('unknown_kind');
+    && action !== 'fulfill' && action !== 'cancel') reject('unknown_kind');
   const result: EventCommitment = {
     operationId: identifier(input.operationId),
     action,

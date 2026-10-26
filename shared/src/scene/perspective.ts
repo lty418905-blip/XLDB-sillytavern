@@ -27,6 +27,30 @@ const knowledgeKinds = new Set<KnowledgeKind>(['observed', 'heard', 'private', '
  */
 export const MAX_IDENTITY_REFERENCES = 8;
 
+/**
+ * Returns the id of the sole character with an own, literal-true card flag, or undefined.
+ * The roster is trusted stored data; the scan is O(character count), stopping at a second flag.
+ */
+export function cardCharacterIdOf(roster: SceneRoster): string | undefined {
+  let characterId: string | undefined;
+
+  for (const character of roster.characters) {
+    if (!Object.hasOwn(character, 'cardCharacter')
+      || (character as SceneCharacter & { cardCharacter?: unknown }).cardCharacter !== true) continue;
+
+    if (characterId !== undefined) return undefined;
+    characterId = character.id;
+  }
+
+  return characterId;
+}
+
+/** Returns whether a trusted stored message has its own literal-true narrator flag; absent/null is false. */
+export function isNarratorSource(message: SceneMessage): boolean {
+  return Object.hasOwn(message, 'narrator')
+    && (message as SceneMessage & { narrator?: unknown }).narrator === true;
+}
+
 export function rosterOf(value: unknown): SceneRoster {
   const input = record(value, 'invalid_scene_roster');
   if (!Array.isArray(input.characters) || input.characters.length < 1 || input.characters.length > MAX_CHARACTERS) {
@@ -332,13 +356,25 @@ function observationOf(value: unknown, message: SceneMessage, roster: SceneRoste
   if (readers.some(id => !allowed.has(id))) fail('invalid_scene_readers');
 
   if (message.automatic) {
-    const identityEvidence=[candidate.evidence,candidate.identityQuote??'',...(candidate.identityEvidence??[]).map(item=>item.quote)].join('\n');
-    requireIdentity(identityEvidence, candidate.actorId, roster);
+    const identityEvidence = [
+      candidate.evidence,
+      candidate.identityQuote ?? '',
+      ...(candidate.identityEvidence ?? []).map(item => item.quote),
+    ].join('\n');
+    // Product presence default applies only to the card character in automatic prose.
+    // Other readers still need literal identity evidence; narrator sources have no default speaker.
+    const cardCharacterId = isNarratorSource(message) ? undefined : cardCharacterIdOf(roster);
+    if (candidate.actorId !== cardCharacterId) requireIdentity(identityEvidence, candidate.actorId, roster);
+
     if (candidate.kind === 'private' || candidate.kind === 'heard') {
-      for (const recipient of candidate.recipients) requireIdentity(identityEvidence, recipient, roster);
+      for (const recipient of candidate.recipients) {
+        if (recipient !== cardCharacterId) requireIdentity(identityEvidence, recipient, roster);
+      }
     }
     if (candidate.kind === 'observed') {
-      for (const recipient of candidate.recipients) requireIdentity(identityEvidence, recipient, roster);
+      for (const recipient of candidate.recipients) {
+        if (recipient !== cardCharacterId) requireIdentity(identityEvidence, recipient, roster);
+      }
     }
   } else {
     // perspectiveOf rejects direct envelopes, so a message that is not automatic is a manual scene message here.

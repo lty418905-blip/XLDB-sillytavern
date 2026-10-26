@@ -484,10 +484,15 @@ export function createServer(core: Core, options: {token:string;configPath:strin
         return send(200,interactions.clock(scope));
       }
       interactions.assertActive(scope,input.interactionRevision as number|undefined);
-      if(['/v1/scene/configure','/v1/scene/world-configure','/v1/scene/access','/v1/scene/preference','/v1/scene/identity-extract','/v1/scene/native-context','/v1/scene/restore','/v1/scene/undo'].includes(request.url??'')) {
+      if(['/v1/scene/configure','/v1/scene/card-character-clear','/v1/scene/world-configure','/v1/scene/access','/v1/scene/preference','/v1/scene/identity-extract','/v1/scene/native-context','/v1/scene/restore','/v1/scene/undo'].includes(request.url??'')) {
         if(core.scene.syncState(scope).version!==integer(input.expectedVersion))throw new Error('context_changed_retry');
       }
       switch (request.url) {
+        case '/v1/scene/card-character-clear': {
+          // Character identifiers share the existing 200 UTF-16-unit HTTP label limit.
+          const result = core.authority.scene.clearCardCharacter(scope, text(input.characterId, 200));
+          return send(200, {roster: result.roster, ...core.scene.syncState(scope)});
+        }
         case '/v1/scene/resources': return send(200,core.scene.resources(scope));
         case '/v1/scene/resources-configure': return send(200,core.scene.configureResources(scope,{
           maxActive:integer(input.maxActive),priorityIds:input.priorityIds as string[],expectedRevision:integer(input.expectedRevision)}));

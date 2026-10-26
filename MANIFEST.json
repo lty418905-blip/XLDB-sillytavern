@@ -5,7 +5,7 @@
   "source": {
     "verified": false
   },
-  "sourceManifestSha256": "a61cc57dbc3461af37f3eb1758c3d28449d7f475d5623cb9ec20e27983004f66",
+  "sourceManifestSha256": "0f66f195bc54c2a946472f699cb90395dca38c85d8440b9e770797002c046be2",
   "files": [
     {
       "file": ".gitattributes",
@@ -179,8 +179,8 @@
     },
     {
       "file": "shared/src/core/models.ts",
-      "sha256": "52e230065c433506a6102bd4b3d66046be11b51f9377162c92ca9f494c7d2486",
-      "bytes": 60968
+      "sha256": "4850da92bdb04151c2800205088fab857838a0c1f21986c0d245d52c509ec397",
+      "bytes": 62616
     },
     {
       "file": "shared/src/core/pair-capture-switch.ts",
@@ -214,13 +214,13 @@
     },
     {
       "file": "shared/src/core/store-format.ts",
-      "sha256": "60ca4955d55c01fcc98857de713a171fcc8fd649d8054e899615e1d1ac5b3253",
-      "bytes": 4130
+      "sha256": "24a2764106e6394f4600f82bd70c7edf1eec7ec4702bae903bfab2d6b00172e3",
+      "bytes": 4888
     },
     {
       "file": "shared/src/core/store.ts",
-      "sha256": "1c481b66446e36c5b90b0618e8769207660751c2c31a3a3abc2a8f3bbd945c0d",
-      "bytes": 29741
+      "sha256": "09a2b6286a2baff007e2f64fad4de74e91ad8c386add97b82ddce28ae4fd34a6",
+      "bytes": 29780
     },
     {
       "file": "shared/src/core/tool-loop.ts",
@@ -489,8 +489,8 @@
     },
     {
       "file": "shared/src/scene/extraction.ts",
-      "sha256": "416c07291f8abde7e5d40762d7531ddd9ae1bf29c69d4638e233034369c1734e",
-      "bytes": 10190
+      "sha256": "993ab7bc4050d3a62d9b7947132106cff37358094eab28fd6aaaba822ed5eeeb",
+      "bytes": 10430
     },
     {
       "file": "shared/src/scene/generation-view.ts",
@@ -499,13 +499,13 @@
     },
     {
       "file": "shared/src/scene/identities.ts",
-      "sha256": "c066deb82d35821d4e9e8b74be5e883c5d7b72637469caa1a27622eb132e222f",
-      "bytes": 28127
+      "sha256": "534ebf474b93a20db954c482000689f4b408eb8e5b3811fca77bf296a88b591c",
+      "bytes": 41746
     },
     {
       "file": "shared/src/scene/initialization.ts",
-      "sha256": "c2f8385473651dee1fe3ce5b4e460ac7fd8039cee359a5e1309e4153ab70fc54",
-      "bytes": 47892
+      "sha256": "ac4092357c5b33f700de1b5905d22c53b126ab78b0f068c9eda91722342723e6",
+      "bytes": 47978
     },
     {
       "file": "shared/src/scene/interaction.ts",
@@ -544,13 +544,13 @@
     },
     {
       "file": "shared/src/scene/perspective.ts",
-      "sha256": "2f6a96e817f15ecb15010ea2d4e97e34e4aedf062baf39ac4fd36d3e1d718b6d",
-      "bytes": 23896
+      "sha256": "dc338a0755b6291a7c7190ee4de323fffeab4a1c27f54cd540c8c2bb048d87ea",
+      "bytes": 25295
     },
     {
       "file": "shared/src/scene/processing.ts",
-      "sha256": "d091c0a741a87be7b84f9d42bcb1200cd38987a360a1e33322aa9238fbea5e36",
-      "bytes": 18438
+      "sha256": "c9786f3403d1e1f922c4483fe3c4e7dae339c69332bb209e524010f761af5398",
+      "bytes": 18442
     },
     {
       "file": "shared/src/scene/provider-gate.ts",
@@ -569,13 +569,13 @@
     },
     {
       "file": "shared/src/scene/service.ts",
-      "sha256": "5a3d8bc8cd3b1f5c249e82ae546549bbbf1eb52919a78ca5d59c93fde1f44c5b",
-      "bytes": 172042
+      "sha256": "8a1437c4824fabce17b591aa66c8888996fff6d5c77a7e7b6470476c883101a3",
+      "bytes": 182901
     },
     {
       "file": "shared/src/scene/store.ts",
-      "sha256": "008dd043fabc3bf62b5ebc4430ab38c08656fa482cd778e2f3cf661e4707191c",
-      "bytes": 203256
+      "sha256": "0f5341f73ad8dd8864d1e9ce69351e1f4c2e6355684b6227a1a96f15f88f5f9a",
+      "bytes": 206712
     },
     {
       "file": "shared/src/scene/story-clock-consumers.ts",
@@ -609,18 +609,18 @@
     },
     {
       "file": "shared/src/scene/tavern-engine/codec.ts",
-      "sha256": "616d02477fc73e00799d68ad9345b5355cfc9f084adcc76efccef858544a3435",
-      "bytes": 33184
+      "sha256": "47962c4736baeed01a83406c360f4cb2280bc563a5478f93ceacbddfe4e55032",
+      "bytes": 33161
     },
     {
       "file": "shared/src/scene/tavern-engine/engine.ts",
-      "sha256": "0b5143ad9441fdd0067df91696ee9cd953a2e3b2c1fb23b32a271348e0b7e2b9",
-      "bytes": 55964
+      "sha256": "5dc88cff69897567a10c7d44c2cffacd80a276fec1a1ca254308124c9c563bfd",
+      "bytes": 59281
     },
     {
       "file": "shared/src/scene/tavern-engine/model-input.ts",
-      "sha256": "20cf376b597048e0840be84f7f63d0532f4209c5d5adc828534e7b484c592b69",
-      "bytes": 53817
+      "sha256": "ef61f3524d6947b9c90a0d9d055c4edf4818e0f1ad2a2eff46ec517c76161d3a",
+      "bytes": 57123
     },
     {
       "file": "shared/src/scene/tavern-engine/perception.ts",
@@ -629,8 +629,8 @@
     },
     {
       "file": "shared/src/scene/tavern-engine/player-effects.ts",
-      "sha256": "ef46f5e946f737644b627962dbb674fa4aa20c9f37f089596d87b6db01e6f242",
-      "bytes": 9910
+      "sha256": "4672c9d6014af4cc552735bb11c792f6569aeb0f609c22d0a6ebb86b5a8a6459",
+      "bytes": 11398
     },
     {
       "file": "shared/src/scene/tavern-engine/preset.ts",
@@ -669,18 +669,18 @@
     },
     {
       "file": "shared/src/scene/transfer.ts",
-      "sha256": "924e265b747f266821fdf59960ea4f90bd26362ff162bd490c898e0e890f6512",
-      "bytes": 29341
+      "sha256": "406958306ebdc821065ee321b0c523e89b118284ed36e9fad1214f596adc3fa5",
+      "bytes": 29840
     },
     {
       "file": "shared/src/scene/types.ts",
-      "sha256": "1dd296de6dca461d2f8ec143d5f324a304f79973c1e889e04aa6a3393d5b3958",
-      "bytes": 10075
+      "sha256": "dc83cc126a09ec7eb7341714d3ca6f932becb52a3cfe949401d0a874f53ed4b8",
+      "bytes": 10602
     },
     {
       "file": "shared/src/scene/views.ts",
-      "sha256": "54859610eb6594243af6fdf6b18e86206ac740e9309919dcac621cc9195564ac",
-      "bytes": 18015
+      "sha256": "2ab77dc563c83e6df20065057bc673fd1d5ee92b30d79e52ff9de03b01053133",
+      "bytes": 19078
     },
     {
       "file": "shared/src/scene/workbench.ts",
@@ -744,8 +744,8 @@
     },
     {
       "file": "sillytavern/adapters/xldb.js",
-      "sha256": "a7ebf52afdb602a29ffb0f6b141b137851b0bcb00cbce00aa8e1fb0e8e84c8c4",
-      "bytes": 467703
+      "sha256": "f0ce959c9a2df98025f8bdf6c6535a99911a2627f754d2feb2ce0f0a80c9120a",
+      "bytes": 483223
     },
     {
       "file": "sillytavern/src/dashboard.ts",
@@ -759,8 +759,8 @@
     },
     {
       "file": "sillytavern/src/server.ts",
-      "sha256": "14230886201fe76becc7954aa1ae2a62a6ba7f733735105cf60bd78badfb7ef5",
-      "bytes": 48398
+      "sha256": "2058820f461793de61eb23e642af4dd43134609312141d85ff3a60bfb1e7965d",
+      "bytes": 48766
     },
     {
       "file": "START-XLDB.cmd",
@@ -819,13 +819,13 @@
     },
     {
       "file": "XLDB-酒馆.js",
-      "sha256": "14355837abb594970fe313bfbe2f44570172d1192e7fbd3cfa340f5ada67c5ce",
-      "bytes": 482503
+      "sha256": "b464ba60f3edefdba10b66ea477d572bb7138932fad2d9dd93a2f027a54903ab",
+      "bytes": 498245
     },
     {
       "file": "XLDB-酒馆.json",
-      "sha256": "4ca066b7567bbad89231606974309de2a0da10a0cbc1c85d5e56303857acebae",
-      "bytes": 490397
+      "sha256": "93eaafd5ec5f08d6c4159dce48b0aa9e29503b4565ec29fe507e6b633ff70375",
+      "bytes": 506367
     }
   ]
 }

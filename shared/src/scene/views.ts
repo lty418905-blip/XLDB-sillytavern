@@ -1,6 +1,6 @@
 import {foldForMatch,includesForMatch} from '../common/script-fold.ts';
 import { segmentOutward } from './outward.ts';
-import { envelopeOf, eventObservationOf, snapshotEventObservation } from './perspective.ts';
+import { cardCharacterIdOf, envelopeOf, eventObservationOf, snapshotEventObservation } from './perspective.ts';
 import type { TavernActorEventView } from './tavern-engine/types.ts';
 import type { KnowledgeKind, Observation, PerspectivePlan, SceneCharacter, SceneMessage, SceneRoster } from './types.ts';
 
@@ -83,7 +83,12 @@ export function buildViewInput(messageValue: SceneMessage, rosterValue: SceneRos
   const input: ViewInput = {
     role: message.role,
     playerName: envelope.playerName ?? null,
-    characters: entries.map(([key, character]) => ({ key, name: character.name, aliases: [...character.aliases] })),
+    characters: entries.map(([key, character]) => ({
+      key,
+      name: character.name,
+      aliases: [...character.aliases],
+      ...(character.id === cardCharacterIdOf(roster) ? { cardCharacter: true } : {}),
+    })),
     fragments: fragments.map(({ ref, text }) => ({ ref, text })),
     history: history.map(source => ({ role: source.role, text: source.text })),
   };
@@ -183,8 +188,15 @@ export function viewsOf(
         || typeof item.public !== 'boolean') fail('invalid_scene_views');
       const kind = item.kind as KnowledgeKind;
       const quote = quoteOf(message.text, selected);
+      // Product rule for subjectless player actions changes public projection only, never readership.
+      // If the model mislabels scenery as player action, only the card character may respond to it;
+      // no other NPC gains the quote. Check all selected fragments in O(selected refs).
+      const cardPlayerAction = message.role === 'user' && message.automatic === true
+        && character.id === cardCharacterIdOf(roster)
+        && (kind === 'heard' || kind === 'observed')
+        && selected.every(fragment => attribution.get(fragment.ref) === 'player');
       const isPublic = item.public && kind !== 'private' && kind !== 'thought' && kind !== 'inferred'
-        && playerAnchored(quote, message.role, envelope.playerName);
+        && (cardPlayerAction || playerAnchored(quote, message.role, envelope.playerName));
       decoded.push({ character, kind, fragments: selected, isPublic });
     }
   }
@@ -261,7 +273,12 @@ function identityFor(
 ): { identityQuote?: string; identityEvidence: { sourceId: string; quote: string; revision: number }[] } {
   const currentMatches: BoundFragment[] = [];
   const identityEvidence: { sourceId: string; quote: string; revision: number }[] = [];
+  // Automatic player prose uses the product's presence default only for the sole card character.
+  // Other readers still need literal evidence. Narrator assistant prose uses the compact path instead.
+  const cardCharacterId = message.automatic === true ? cardCharacterIdOf(roster) : undefined;
+
   for (const readerId of new Set(readerIds)) {
+    if (readerId === cardCharacterId) continue;
     const character = roster.characters.find(item => item.id === readerId) ?? fail('invalid_scene_character');
     const local = [...current.values()].find(fragment => mentionsIdentity(fragment.text, character, roster));
     if (local) {

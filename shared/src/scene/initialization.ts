@@ -652,7 +652,8 @@ function mergeRoster(current: SceneRoster, incoming: readonly InitializationChar
     if (index < 0) {
       characters.push(character);
       added.push(item.id);
-    } else if (canonical(characters[index]) === canonical(character)) {
+    } else if (canonical(Object.fromEntries(Object.entries(characters[index]!).filter(([key]) => key !== 'cardCharacter')))
+      === canonical(character)) {
       unchanged.push(item.id);
     } else {
       conflicts.push({code: 'initialization_existing_character_conflict', id: item.id});

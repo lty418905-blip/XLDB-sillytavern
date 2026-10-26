@@ -1,4 +1,4 @@
-import { CURRENT_STORE_FORMAT, STORE_WRITER_VERSION, stampStoreFormat } from '../core/store-format.ts';
+import { APPRAISAL_STORE_FORMAT, STORE_WRITER_VERSION, stampStoreFormat } from '../core/store-format.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { scopeKey } from '../core/types.ts';
@@ -115,7 +115,7 @@ export class Processing {
           JSON.stringify(payload),
           now,
         );
-      if (newAppraisal) stampStoreFormat(this.db, CURRENT_STORE_FORMAT, STORE_WRITER_VERSION);
+      if (newAppraisal) stampStoreFormat(this.db, APPRAISAL_STORE_FORMAT, STORE_WRITER_VERSION);
       if (ownsTransaction) this.db.exec('COMMIT');
     } catch (error) {
       if (ownsTransaction) this.db.exec('ROLLBACK');

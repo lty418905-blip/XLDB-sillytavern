@@ -86,7 +86,7 @@ export interface TavernIntentInput {
   actorId: string;
   configurationId: string;
   prefix: TavernBeatPrefix;
-  tail: TavernPerceptionDispatch['input'];
+  tail: TavernBeatTail;
 }
 
 /**
@@ -101,15 +101,40 @@ export interface TavernBeatActorContract {
   frontIntent?: NonNullable<DecodedBeat['intent']> | null;
   persona?: string | null;
   history?: readonly string[] | null;
+  /** Full server recall, bound once to actor/version at turn start before any NPC call. */
+  recall?: TavernContextRecall | null;
   /** Caller-authorized IDs for this actor's beats; never replace these with the global world catalog. */
   references?: TavernInterpretationReferences | null;
   /** Display data captured at turn preparation; null/omission supplies an empty table. */
   names?: TavernNameTable | null;
 }
 
+/** Five visible recall fields, rebuilt from server recall; actor/version bindings stay outside model input. */
+export type TavernBeatRecall = Pick<
+  TavernContextRecall,
+  'memories' | 'context' | 'constraints' | 'emotion' | 'relationships'
+>;
+
+/** One-turn fallback text, with no event address or reader list; confidence is finite in [0, 1]. */
+export type TavernBeatPlayerBroadcast = Pick<
+  TavernInterpretationFallback['broadcast'],
+  'actorId' | 'text' | 'confidence'
+>;
+
+/** Current delivery followed by the actor's known world and, only for a fallback reader, original player text. */
+export type TavernBeatTail = TavernPerceptionDispatch['input'] & {
+  /** Actor-only projection computed before this beat, including observations from earlier beats. */
+  world: TavernActorWorldProjection;
+  /** Readers are fixed at turn start exclusively by buildTavernInterpretationFallback. */
+  playerBroadcast?: TavernBeatPlayerBroadcast;
+};
+
 /** Stable per-actor starting data; only the supplied, already filtered materials and history enter this prefix. */
 export interface TavernBeatPrefix {
+  /** Validated at turn start; the builder bounds these original parts and retains local diagnostics. */
   presetParts?: readonly TavernContextPresetPart[] | null;
+  /** Actor/version-checked recall; the builder reapplies visible layers for direct callers as well. */
+  recall?: TavernBeatRecall | null;
   persona: string;
   materials: TavernPerceptionDispatch['input']['materials'];
   turnWindow: TavernPerceptionDispatch['input']['turnWindow'];
@@ -128,11 +153,13 @@ export interface TavernBeatInput {
   identity: TavernInterpretationRequest['identity'];
   beatIndex: number;
   maxItems: number;
+  /** Seats left after this dispatch is recorded; nonnegative integer, fixed across its retry. */
+  remainingSlots: number;
   firstForActor: boolean;
   intentRequired: boolean;
   script: TavernBeatScript;
   prefix: TavernBeatPrefix;
-  tail: TavernPerceptionDispatch['input'];
+  tail: TavernBeatTail;
   intent?: NonNullable<DecodedBeat['intent']>;
   retryReasons: readonly string[];
   /** Non-enumerable local diagnostics; cloning for a model never sends discarded-preset metadata. */
@@ -168,6 +195,10 @@ export function buildTavernBeatInput(
     if (current.actorId !== data.contract.actorId || current.input.actorId !== current.actorId
       || typeof current.firstForActor !== 'boolean'
       || !Number.isSafeInteger(current.beatIndex) || current.beatIndex < 1
+      || !Number.isSafeInteger(current.remainingSlots) || current.remainingSlots < 0
+      || current.world == null || typeof current.world !== 'object'
+      || current.world.actorId !== current.actorId
+      || !Array.isArray(current.world.positions) || !Array.isArray(current.world.possessions)
       || (current.maxItems !== CODEC_LIMITS.items && current.maxItems !== CODEC_LIMITS.soloFirstItems)
       || ![0, 1].includes(current.attempt)) {
       throw new Error();
@@ -178,11 +209,28 @@ export function buildTavernBeatInput(
     const script = resolveTavernBeatScript(playerText, data.contract.history ?? []).script;
     const preset = boundTavernPresetParts(data.prefix.presetParts);
     const names = checkedNames(data.prefix.names, data.contract.references);
+    let recall: TavernBeatRecall | undefined;
+    if (data.prefix.recall != null) {
+      if (!Array.isArray(data.prefix.recall.memories)) throw new Error();
+      const { memories, context, constraints, emotion, relationships } = data.prefix.recall;
+      // Direct callers receive the same visible-layer whitelist; repeating it is idempotent.
+      recall = { memories: memories.map(contextMemory), context, constraints, emotion, relationships };
+    }
+    let playerBroadcast: TavernBeatPlayerBroadcast | undefined;
+    if (current.playerBroadcast != null) {
+      const { actorId, text, confidence } = current.playerBroadcast;
+      requireId(actorId);
+      if (typeof text !== 'string' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+        throw new Error();
+      }
+      playerBroadcast = { actorId, text, confidence };
+    }
     const result: TavernBeatInput = {
       identity: current.identity,
       actorId: current.actorId,
       beatIndex: current.beatIndex,
       maxItems: current.maxItems,
+      remainingSlots: current.remainingSlots,
       firstForActor: current.firstForActor,
       intentRequired: current.firstForActor
         ? data.contract.beatConfigurationId === data.contract.frontConfigurationId
@@ -191,11 +239,20 @@ export function buildTavernBeatInput(
       prefix: {
         persona: data.prefix.persona,
         ...(preset.parts.length === 0 ? {} : { presetParts: preset.parts }),
+        ...(recall == null ? {} : { recall }),
         materials: data.prefix.materials,
         turnWindow: data.prefix.turnWindow,
         names,
       },
-      tail: current.input,
+      tail: {
+        ...current.input,
+        world: {
+          actorId: current.world.actorId,
+          positions: current.world.positions,
+          possessions: current.world.possessions,
+        },
+        ...(playerBroadcast == null ? {} : { playerBroadcast }),
+      },
       ...(current.intent == null ? {} : { intent: current.intent }),
       retryReasons: current.retryReasons,
       retryInstructions: SLOT_RETRY_INSTRUCTIONS,
@@ -853,6 +910,18 @@ function contextMemory(memory: MemoryView): MemoryView {
     if (value != null) Object.assign(result, { [field]: value });
   }
   return result;
+}
+
+/**
+ * Checks full server recall against the prepared actor and authority version once at turn start.
+ * Returns only visible recall fields; propagates invalid_context_recall and other validator errors unchanged.
+ */
+export function checkTavernBeatRecall(
+  recall: TavernContextRecall,
+  actorId: string,
+  version: number,
+): TavernBeatRecall {
+  return contextRecall(recall, actorId, version);
 }
 
 function contextRecall(value: TavernContextRecall, actorId: string, version: number): TavernContextPrefix['recall'] {

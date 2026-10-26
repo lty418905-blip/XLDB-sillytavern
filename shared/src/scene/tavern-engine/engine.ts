@@ -3,11 +3,26 @@ import type { AcceptedMessage } from '../../core/types.ts';
 import type { Scope } from '../../memory/access.ts';
 import { checkTavernBeatScript, decodeBeatCandidate, MAX_TAVERN_TURN_UNITS } from './codec.ts';
 import type { TavernBeatQuotation } from './codec.ts';
-import { buildTavernBeatInput, SLOT_INTENT_INSTRUCTIONS } from './model-input.ts';
-import type { TavernBeatActorContract, TavernBeatInput, TavernBeatPrefix, TavernIntentInput } from './model-input.ts';
+import {
+  boundTavernPresetParts,
+  buildTavernBeatInput,
+  buildTavernInterpretationFallback,
+  checkTavernBeatRecall,
+  SLOT_INTENT_INSTRUCTIONS,
+} from './model-input.ts';
+import type {
+  TavernBeatActorContract,
+  TavernBeatInput,
+  TavernBeatPlayerBroadcast,
+  TavernBeatPrefix,
+  TavernBeatRecall,
+  TavernContextPresetPart,
+  TavernIntentInput,
+  TavernInterpretationFallback,
+} from './model-input.ts';
 import { TavernPerception } from './perception.ts';
-import { checkTavernPossessionBeat, projectTavernWorld } from './projection.ts';
-import type { TavernWorldSnapshot } from './projection.ts';
+import { checkTavernPossessionBeat, projectTavernActorWorld, projectTavernWorld } from './projection.ts';
+import type { TavernActorWorldProjection, TavernWorldSnapshot } from './projection.ts';
 import { checkTavernPlayerEffects, checkTavernPlayerWorld } from './player-effects.ts';
 import type { TavernPlayerWorld } from './player-effects.ts';
 import {
@@ -179,6 +194,8 @@ export interface TavernPreparedTurn {
   eventReferences?: readonly EventReference[] | null;
   /** M2 adapter preparation; omit only for a port implementing its own complete contract validation. */
   beatContracts?: readonly TavernBeatActorContract[] | null;
+  /** One turn's original preset parts: validated before NPC calls, bounded by each M2 builder. */
+  presetParts?: readonly TavernContextPresetPart[] | null;
 }
 
 /** Nonempty reason codes address original action items; speech cannot be silently removed or rewritten. */
@@ -261,6 +278,12 @@ export interface TavernEnginePorts {
     beatIndex: number;
     attempt: number;
     maxItems: number;
+    /** Seats remaining after recording this dispatch; unchanged by retries. */
+    remainingSlots: number;
+    /** Current actor-only world, using the full perception view before this dispatch. */
+    world: TavernActorWorldProjection;
+    /** Original fallback text for readers fixed once at turn start by the fallback adapter. */
+    playerBroadcast?: TavernBeatPlayerBroadcast | null;
     firstForActor: boolean;
     intent?: NonNullable<DecodedBeat['intent']>;
     modelInput?: TavernBeatInput;
@@ -274,8 +297,15 @@ export interface TavernEnginePorts {
     packet: TavernPlayerEventView;
     signal: AbortSignal;
   }): Promise<string>;
-  verifyRender(input: { packet: TavernPlayerEventView; body: string; renderer: 'A' | 'B' }): boolean;
-  renderA(packet: TavernPlayerEventView): string;
+  /** Each verification receives its own detached turn identity, including both source revisions. */
+  verifyRender(input: {
+    identity: TavernTurnIdentity;
+    packet: TavernPlayerEventView;
+    body: string;
+    renderer: 'A' | 'B';
+  }): boolean;
+  /** Local layout receives a fresh identity copy, independent of both verification calls. */
+  renderA(packet: TavernPlayerEventView, identity: TavernTurnIdentity): string;
   afterCommit(receipt: TavernCommitReceipt): void;
 }
 
@@ -700,7 +730,7 @@ export class TavernEngine {
     }
     for (const event of events) requireEventIdentity(event, turn.identity, 'tentative');
     this.#checkCancellation(turn);
-    events = checkTavernPlayerEffects(events, turn.request.playerId, playerWorld);
+    events = checkTavernPlayerEffects(events, turn.request.playerId, playerWorld, turn.request.message);
     const accepted = structuredClone(this.#ports.ledger.acceptPlayer({
       scope: structuredClone(turn.identity.scope),
       turnId: turn.identity.turnId,
@@ -753,6 +783,23 @@ export class TavernEngine {
       directorEnabled: turn.request.directorEnabled,
       ...(interpreted.fallback ? { inferredAddressees: [], perceivingActorIds: world.presentIds } : {}),
     });
+    // Reader ownership stays in the existing fallback adapter; the result is fixed for the entire turn.
+    let fallback: TavernInterpretationFallback | null = null;
+    if (interpreted.fallback) {
+      try {
+        fallback = buildTavernInterpretationFallback(
+          interpreted.accepted, turn.request.message, prepared.perception,
+        );
+      } catch {
+        throw new StopTurn('invalid_preparation');
+      }
+      if (fallback == null) throw new StopTurn('invalid_preparation');
+    }
+    try {
+      boundTavernPresetParts(prepared.presetParts);
+    } catch {
+      throw new StopTurn('invalid_preparation');
+    }
     const selections: EmittedTavernBeat[] = [];
     const diagnostics: (TavernUnknownActionDiagnostic | TavernUnknownEffectDiagnostic)[] = [];
     const contracts = new Map<string, TavernBeatActorContract>();
@@ -767,12 +814,31 @@ export class TavernEngine {
       requireId(contract.frontConfigurationId);
       const initial = perception.prepareDispatch(contract.actorId, turn.identity.turnId).input;
       if (contract.persona != null && typeof contract.persona !== 'string') throw new StopTurn('invalid_preparation');
+      let turnWindow: TavernBeatPrefix['turnWindow'];
+      try {
+        turnWindow = perception.recentTurnWindow(contract.actorId, turn.identity.turnId, turn.identity.turnRevision);
+      } catch (error) {
+        if (error instanceof Error && error.message === 'perception_missing_turn') {
+          throw new StopTurn('invalid_preparation');
+        }
+        throw error;
+      }
+      let recall: TavernBeatRecall | undefined;
+      if (contract.recall != null) {
+        try {
+          recall = checkTavernBeatRecall(contract.recall, contract.actorId, prepared.version);
+        } catch {
+          throw new StopTurn('invalid_preparation');
+        }
+      }
       contracts.set(contract.actorId, contract);
       prefixes.set(contract.actorId, {
         persona: contract.persona ?? '',
+        ...(prepared.presetParts == null ? {} : { presetParts: prepared.presetParts }),
+        ...(recall == null ? {} : { recall }),
         materials: initial.materials.filter(material =>
           material.channel === 'memory' || material.channel === 'recall' || material.channel === 'emotion'),
-        turnWindow: initial.turnWindow,
+        turnWindow,
         ...(contract.names == null ? {} : { names: structuredClone(contract.names) }),
       });
       if (contract.beatConfigurationId !== contract.frontConfigurationId) {
@@ -811,6 +877,15 @@ export class TavernEngine {
       turn.summary.dispatches = [...turn.summary.dispatches, dispatch];
       this.#unserved(turn, roster);
       const delivery = perception.prepareDispatch(decision.actorId, turn.identity.turnId);
+      delivery.input.materials = delivery.input.materials.filter(material =>
+        material.channel === 'commitment' || material.channel === 'physiology');
+      const actorWorld = projectTavernActorWorld(world, perception.view(decision.actorId));
+      const broadcast = fallback?.broadcast;
+      const playerBroadcast = broadcast?.readers.includes(decision.actorId) ? {
+        actorId: broadcast.actorId,
+        text: broadcast.text,
+        confidence: broadcast.confidence,
+      } : undefined;
       const firstForActor = !completedActors.has(decision.actorId);
       let intent = intents.get(decision.actorId);
       const contract = contracts.get(decision.actorId);
@@ -820,6 +895,9 @@ export class TavernEngine {
         actorId: decision.actorId,
         beatIndex: decision.beatIndex,
         maxItems: decision.maxItems,
+        remainingSlots: decision.totalBeatLimit - turn.summary.dispatches.length,
+        world: actorWorld,
+        ...(playerBroadcast == null ? {} : { playerBroadcast }),
         firstForActor,
         ...(intent == null ? {} : { intent: structuredClone(intent) }),
         input: structuredClone(delivery.input),
@@ -1038,16 +1116,16 @@ export class TavernEngine {
     this.#check(turn);
     let renderer: 'A' | 'B' = 'B';
     const verified = typeof body === 'string' && this.#ports.verifyRender({
-      packet: structuredClone(packet), body, renderer,
+      identity: structuredClone(turn.identity), packet: structuredClone(packet), body, renderer,
     }) === true;
     this.#check(turn);
     if (!verified) {
       turn.summary.renderFailures++;
       renderer = 'A';
-      body = this.#ports.renderA(structuredClone(packet));
+      body = this.#ports.renderA(structuredClone(packet), structuredClone(turn.identity));
       this.#check(turn);
       if (typeof body !== 'string' || this.#ports.verifyRender({
-        packet: structuredClone(packet), body, renderer,
+        identity: structuredClone(turn.identity), packet: structuredClone(packet), body, renderer,
       }) !== true) throw new StopTurn('invalid_render');
     }
 
